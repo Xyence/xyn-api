@@ -11,7 +11,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/conf.d:/etc/nginx/templates:ro
       - certbot_www:/var/www/certbot
       - certbot_certs:/etc/letsencrypt
 
