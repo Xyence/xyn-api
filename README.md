@@ -1,0 +1,37 @@
+# Xyence Web
+
+Django + React application for Xyence consulting, including a publishing system for articles and admin management.
+
+## Stack
+- Django + Django REST Framework
+- React (Vite)
+- PostgreSQL
+- Docker Compose
+
+## Quick start
+1. Copy env file
+   - `cp backend/.env.example backend/.env`
+2. Update Google OAuth values in `backend/.env` if using SSO.
+3. Launch services:
+   - `docker compose up --build`
+4. Apply migrations and create an admin user:
+   - `docker compose exec backend python manage.py migrate`
+   - `docker compose exec backend python manage.py createsuperuser`
+5. Admin panel: `http://localhost:8000/admin/`
+6. Frontend: `http://localhost:8080/`
+
+## Google SSO
+- Provide `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `backend/.env`.
+- The admin login page includes a Google sign-in button at `http://localhost:8000/admin/`.
+- For new installs, create your first superuser via `createsuperuser`, then add staff privileges to Google users if needed.
+- In Google Cloud OAuth settings, add `http://localhost:8000/accounts/google/login/callback/` (or your production host) as an authorized redirect URI.
+
+## Content management
+- Articles are managed in Django admin with a rich-text editor.
+- Public API is available at `/api/articles/` and `/api/articles/:slug/`.
+
+## AI Studio
+- Create an `OpenAI Config` in admin to store your API key and default model.
+- Access AI Studio at `http://localhost:8000/admin/ai-studio/` to generate drafts.
+- Each AI draft is stored as an `ArticleVersion` and applied to the article as a draft.
+# xyence-web
