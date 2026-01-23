@@ -21,9 +21,6 @@ services:
     volumes:
       - certbot_www:/var/www/certbot
       - certbot_certs:/etc/letsencrypt
-    ports:
-      - "80:80"
-      - "443:443"
     entrypoint: >
       /bin/sh -c "trap exit TERM; while :; do sleep 12h & wait $${!}; certbot renew; done"
 

@@ -35,9 +35,9 @@ docker compose --env-file prod.env -f docker-compose.yml -f docker-compose.prod.
 
 3) Obtain the first certificate (root + www):
 ```
-DOMAIN=xyence.io docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm --service-ports \
-  --entrypoint certbot certbot certonly --standalone -d xyence.io -d www.xyence.io \
-  --email you@xyence.io --agree-tos --no-eff-email
+DOMAIN=xyence.io docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm \
+  -p 80:80 -p 443:443 --entrypoint certbot certbot certonly --standalone \
+  -d xyence.io -d www.xyence.io --email you@xyence.io --agree-tos --no-eff-email
 ```
 
 4) Reload nginx:
