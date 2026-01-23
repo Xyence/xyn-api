@@ -43,10 +43,10 @@ server {
   }
 
   location /static/ {
-    proxy_pass http://backend:8000/static/;
+    alias /var/www/static/;
   }
 
   location /media/ {
-    proxy_pass http://backend:8000/media/;
+    alias /var/www/media/;
   }
 }

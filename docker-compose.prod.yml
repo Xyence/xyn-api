@@ -14,6 +14,8 @@ services:
       - ./nginx/conf.d:/etc/nginx/templates:ro
       - certbot_www:/var/www/certbot
       - certbot_certs:/etc/letsencrypt
+      - backend_static:/var/www/static:ro
+      - backend_media:/var/www/media:ro
 
   certbot:
     image: certbot/certbot:latest

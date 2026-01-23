@@ -47,6 +47,12 @@ docker compose --env-file prod.env -f docker-compose.yml -f docker-compose.prod.
 
 The `nginx-reload` service automatically reloads nginx every 12 hours to pick up renewed certificates.
 
+## Static files in production
+Collect Django static files (admin CSS/JS) after first deploy or when dependencies change:
+```
+docker compose -f docker-compose.yml -f docker-compose.prod.yml exec backend python manage.py collectstatic --noinput
+```
+
 ## Google SSO
 - Provide `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `backend/.env`.
 - The admin login page includes a Google sign-in button at `http://localhost:8000/admin/`.

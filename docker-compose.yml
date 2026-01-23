@@ -27,6 +27,7 @@ services:
       - "8000:8000"
     volumes:
       - backend_media:/app/media
+      - backend_static:/app/staticfiles
 
   frontend:
     build:
@@ -40,3 +41,4 @@ services:
 volumes:
   postgres_data:
   backend_media:
+  backend_static:
