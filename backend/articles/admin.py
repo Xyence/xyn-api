@@ -6,6 +6,7 @@ from django.urls import path
 from django.utils.html import strip_tags
 
 from allauth.account.models import EmailAddress, EmailConfirmation
+from django.contrib.sites.models import Site
 
 from .ai import generate_article_draft
 from .models import Article, ArticleVersion, OpenAIConfig
@@ -174,8 +175,8 @@ admin.site.get_urls = (lambda original: (lambda: _inject_ai_studio_url(original(
     admin.site.get_urls
 )
 
-# Hide allauth email models from admin; user management stays under Auth.
-for model in (EmailAddress, EmailConfirmation):
+# Hide allauth email models and sites from admin; user management stays under Auth.
+for model in (EmailAddress, EmailConfirmation, Site):
     try:
         admin.site.unregister(model)
     except admin.sites.NotRegistered:
