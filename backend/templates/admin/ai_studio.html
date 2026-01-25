@@ -1,40 +1,47 @@
 {% extends "admin/base_site.html" %}
 {% load i18n %}
 
-{% block content %}
-  <h1>AI Studio</h1>
-  <p>Generate draft articles with OpenAI. Drafts are saved as versions and linked to articles.</p>
+{% block bodyclass %}{{ block.super }} dashboard{% endblock %}
 
-  <form method="post" style="max-width: 720px;">
-    {% csrf_token %}
-    <fieldset class="module aligned">
-      <div class="form-row">
-        {{ form.article.label_tag }}
-        {{ form.article }}
-        <p class="help">Select an existing article to update or leave blank to create a new draft.</p>
+{% block nav-sidebar %}
+  {% include "admin/nav_sidebar.html" %}
+{% endblock %}
+
+{% block content %}
+  <div id="content-main">
+    <p>Generate draft articles with OpenAI. Drafts are saved as versions and linked to articles.</p>
+
+    <form method="post" style="max-width: 720px;">
+      {% csrf_token %}
+      <fieldset class="module aligned">
+        <div class="form-row">
+          {{ form.article.label_tag }}
+          {{ form.article }}
+          <p class="help">Select an existing article to update or leave blank to create a new draft.</p>
+        </div>
+        <div class="form-row">
+          {{ form.context_articles.label_tag }}
+          {{ form.context_articles }}
+        </div>
+        <div class="form-row">
+          {{ form.persistent_context.label_tag }}
+          {{ form.persistent_context }}
+        </div>
+        <div class="form-row">
+          {{ form.model_override.label_tag }}
+          {{ form.model_override }}
+        </div>
+        <div class="form-row">
+          <p><strong>No effort is imposed. Ask boldly.</strong></p>
+        </div>
+        <div class="form-row">
+          {{ form.prompt.label_tag }}
+          {{ form.prompt }}
+        </div>
+      </fieldset>
+      <div class="submit-row">
+        <input type="submit" value="Generate draft" class="default" />
       </div>
-      <div class="form-row">
-        {{ form.context_articles.label_tag }}
-        {{ form.context_articles }}
-      </div>
-      <div class="form-row">
-        {{ form.persistent_context.label_tag }}
-        {{ form.persistent_context }}
-      </div>
-      <div class="form-row">
-        {{ form.model_override.label_tag }}
-        {{ form.model_override }}
-      </div>
-      <div class="form-row">
-        <p><strong>No effort is imposed. Ask boldly.</strong></p>
-      </div>
-      <div class="form-row">
-        {{ form.prompt.label_tag }}
-        {{ form.prompt }}
-      </div>
-    </fieldset>
-    <div class="submit-row">
-      <input type="submit" value="Generate draft" class="default" />
-    </div>
-  </form>
+    </form>
+  </div>
 {% endblock %}

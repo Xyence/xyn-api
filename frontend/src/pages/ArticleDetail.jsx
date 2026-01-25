@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
@@ -7,6 +7,7 @@ export default function ArticleDetail() {
   const { slug } = useParams();
   const [article, setArticle] = useState(null);
   const [loading, setLoading] = useState(true);
+  const bodyRef = useRef(null);
 
   useEffect(() => {
     let isMounted = true;
@@ -32,6 +33,39 @@ export default function ArticleDetail() {
       isMounted = false;
     };
   }, [slug]);
+
+  useEffect(() => {
+    const root = bodyRef.current;
+    if (!root || !window.mermaid) return;
+
+    window.mermaid.initialize({ startOnLoad: false });
+
+    const convertBlocks = () => {
+      const blocks = root.querySelectorAll(
+        "pre code.language-mermaid, pre.mermaid, code.language-mermaid"
+      );
+      blocks.forEach((block) => {
+        if (block.dataset && block.dataset.mermaidProcessed) return;
+        const text = block.textContent || "";
+        const container = document.createElement("div");
+        container.className = "mermaid";
+        container.textContent = text.trim();
+        const pre = block.closest("pre");
+        if (pre) {
+          pre.replaceWith(container);
+        } else {
+          block.replaceWith(container);
+        }
+        if (block.dataset) block.dataset.mermaidProcessed = "1";
+      });
+    };
+
+    convertBlocks();
+    const nodes = root.querySelectorAll(".mermaid");
+    if (nodes.length) {
+      window.mermaid.run({ nodes });
+    }
+  }, [article]);
 
   if (loading) {
     return (
@@ -63,6 +97,7 @@ export default function ArticleDetail() {
       {article.summary && <p className="lead">{article.summary}</p>}
       <div
         className="rich-text"
+        ref={bodyRef}
         dangerouslySetInnerHTML={{ __html: article.body }}
       />
     </section>

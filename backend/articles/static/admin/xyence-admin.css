@@ -4,6 +4,23 @@
   --xyence-slate: #f4f6f9;
   --xyence-shadow: 0 12px 30px rgba(24, 59, 102, 0.15);
   --xyence-radius: 14px;
+  --xyence-blue-soft: #2f6ea6;
+  --xyence-blue-ink: #0e243c;
+}
+
+html[data-theme="light"],
+:root {
+  --primary: var(--xyence-blue);
+  --secondary: var(--xyence-blue-dark);
+  --accent: #f5dd5d;
+  --primary-fg: #fff;
+  --button-bg: #2b5f8e;
+  --button-hover-bg: #1f4e8a;
+  --default-button-bg: #1f4e8a;
+  --default-button-hover-bg: #183b66;
+  --breadcrumbs-bg: linear-gradient(135deg, var(--xyence-blue-dark), var(--xyence-blue-soft));
+  --breadcrumbs-fg: #e6eef6;
+  --breadcrumbs-link-fg: #ffffff;
 }
 
 body {
@@ -20,9 +37,60 @@ body {
   box-sizing: border-box;
 }
 
+div.breadcrumbs {
+  background: var(--breadcrumbs-bg);
+}
+
+div.breadcrumbs a {
+  color: var(--breadcrumbs-link-fg);
+}
+
 #container {
   box-sizing: border-box;
   overflow-x: hidden;
+}
+
+#nav-sidebar {
+  overflow-x: hidden;
+}
+
+.main {
+  position: relative;
+}
+
+.toggle-nav-sidebar {
+  position: absolute;
+  left: 10px;
+  top: 8px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid #d9e1ea;
+  background: #f7f9fb;
+  color: #2b4e70;
+  border-right: none;
+}
+
+.toggle-nav-sidebar:hover,
+.toggle-nav-sidebar:focus {
+  background: #e9f0f7;
+}
+
+.nav-sidebar-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 6px 40px;
+}
+
+.nav-sidebar-header #nav-filter {
+  margin: 0;
+  width: 100%;
 }
 
 #branding h1,
@@ -39,6 +107,12 @@ body {
   width: 100%;
   box-sizing: border-box;
   padding-right: 24px;
+}
+
+#content > h1,
+#content > h2,
+#content > .object-tools {
+  flex: 0 0 100%;
 }
 
 .dashboard #content {
@@ -86,6 +160,10 @@ body {
   border: none;
 }
 
+#content-main .module {
+  padding: 18px 20px;
+}
+
 .module h2,
 .module caption {
   background: var(--xyence-blue);
@@ -119,6 +197,22 @@ body {
   color: #5f6c7b;
   background: #eef2f7;
   border-top: 1px solid #d9e1ea;
+}
+
+#nav-filter {
+  margin: 0;
+  border-radius: 10px;
+  padding: 6px 10px;
+  background: #f7f9fb;
+}
+
+#nav-sidebar .module {
+  padding: 0 10px 10px;
+  box-sizing: border-box;
+}
+
+#nav-sidebar table {
+  width: 100%;
 }
 
 /* Hide sidebar column on login page (permission panel/filter bar). */

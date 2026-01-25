@@ -123,7 +123,13 @@ def ai_studio_view(request: HttpRequest) -> HttpResponse:
                 draft, _response = generate_article_draft(prompt, config, model_override)
             except Exception as exc:
                 messages.error(request, f"OpenAI request failed: {exc}")
-                return render(request, "admin/ai_studio.html", {"form": form, "config": config})
+                context = {
+                    **admin.site.each_context(request),
+                    "form": form,
+                    "config": config,
+                    "title": "AI Studio",
+                }
+                return render(request, "admin/ai_studio.html", context)
 
             title = draft.get("title") or "Untitled draft"
             summary = draft.get("summary", "")
@@ -161,7 +167,13 @@ def ai_studio_view(request: HttpRequest) -> HttpResponse:
             initial={"persistent_context": config.persistent_context},
         )
 
-    return render(request, "admin/ai_studio.html", {"form": form, "config": config})
+    context = {
+        **admin.site.each_context(request),
+        "form": form,
+        "config": config,
+        "title": "AI Studio",
+    }
+    return render(request, "admin/ai_studio.html", context)
 
 
 def _inject_ai_studio_url(urls):

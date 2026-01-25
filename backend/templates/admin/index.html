@@ -1,9 +1,33 @@
 {% extends "admin/index.html" %}
 
+{% block nav-sidebar %}
+  {% include "admin/nav_sidebar.html" %}
+{% endblock %}
+
 {% block content %}
-  {{ block.super }}
-  <div style="margin-top: 24px;">
-    <h2>AI Studio</h2>
-    <p><a href="/admin/ai-studio/">Open AI Studio</a> to generate draft articles.</p>
+  <div id="content-main">
+    {% include "admin/app_list.html" with app_list=app_list show_changelinks=True %}
+
+    <div class="app-ai-studio module">
+      <table>
+        <caption>
+          <a href="/admin/ai-studio/" class="section">AI Studio</a>
+        </caption>
+        <thead class="visually-hidden">
+          <tr>
+            <th scope="col">Model name</th>
+            <th scope="col">Add link</th>
+            <th scope="col">Change or view list link</th>
+          </tr>
+        </thead>
+        <tr class="model-ai-studio">
+          <th scope="row" id="ai-studio">
+            <a href="/admin/ai-studio/">Generate draft</a>
+          </th>
+          <td></td>
+          <td></td>
+        </tr>
+      </table>
+    </div>
   </div>
 {% endblock %}

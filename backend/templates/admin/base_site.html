@@ -11,6 +11,40 @@
 {% block extrahead %}
   {{ block.super }}
   <link rel="icon" href="/xyence-logo.png" type="image/png">
+  <script defer src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", () => {
+      if (!window.mermaid) return;
+      window.mermaid.initialize({ startOnLoad: false });
+      const convertMermaidBlocks = () => {
+        const blocks = document.querySelectorAll("pre code.language-mermaid, pre.mermaid, code.language-mermaid");
+        blocks.forEach((block) => {
+          if (block.dataset && block.dataset.mermaidProcessed) return;
+          const text = block.textContent || "";
+          const container = document.createElement("div");
+          container.className = "mermaid";
+          container.textContent = text.trim();
+          const pre = block.closest("pre");
+          if (pre) {
+            pre.replaceWith(container);
+          } else {
+            block.replaceWith(container);
+          }
+          if (block.dataset) block.dataset.mermaidProcessed = "1";
+        });
+      };
+      const runMermaid = () => {
+        convertMermaidBlocks();
+        const nodes = document.querySelectorAll(".mermaid");
+        if (nodes.length) {
+          window.mermaid.run({ nodes });
+        }
+      };
+      runMermaid();
+      const observer = new MutationObserver(() => runMermaid());
+      observer.observe(document.body, { childList: true, subtree: true });
+    });
+  </script>
 {% endblock %}
 
 {% block branding %}

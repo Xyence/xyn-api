@@ -1,16 +1,22 @@
 {% load i18n %}
 <button class="sticky toggle-nav-sidebar" id="toggle-nav-sidebar" aria-label="{% translate 'Toggle navigation' %}"></button>
 <nav class="sticky" id="nav-sidebar" aria-label="{% translate 'Sidebar' %}">
-  <input type="search" id="nav-filter"
-         placeholder="{% translate 'Start typing to filter…' %}"
-         aria-label="{% translate 'Filter navigation items' %}">
+  <div class="nav-sidebar-header">
+    <input type="search" id="nav-filter"
+           placeholder="{% translate 'Start typing to filter…' %}"
+           aria-label="{% translate 'Filter navigation items' %}">
+  </div>
   {% if available_apps %}
     {% for app in available_apps %}
       {% if app.app_label == "articles" %}
         <div class="app-{{ app.app_label }} module{% if app.app_url in request.path|urlencode %} current-app{% endif %}">
           <table>
             <caption>
-              <a href="{{ app.app_url }}" class="section" title="{% blocktranslate with name=app.name %}Models in the {{ name }} application{% endblocktranslate %}">{{ app.name }}</a>
+              {% if app.app_label == "auth" %}
+                <a href="{{ app.app_url }}" class="section" title="{% blocktranslate with name=app.name %}Models in the {{ name }} application{% endblocktranslate %}">Authentication &amp; Authorization</a>
+              {% else %}
+                <a href="{{ app.app_url }}" class="section" title="{% blocktranslate with name=app.name %}Models in the {{ name }} application{% endblocktranslate %}">{{ app.name }}</a>
+              {% endif %}
             </caption>
             <thead class="visually-hidden">
               <tr>
@@ -25,9 +31,23 @@
                   <tr class="model-{{ model_name }}{% if model.admin_url in request.path|urlencode %} current-model{% endif %}">
                     <th scope="row" id="{{ app.app_label }}-{{ model_name }}">
                       {% if model.admin_url %}
-                        <a href="{{ model.admin_url }}"{% if model.admin_url in request.path|urlencode %} aria-current="page"{% endif %}>{{ model.name }}</a>
+                        <a href="{{ model.admin_url }}"{% if model.admin_url in request.path|urlencode %} aria-current="page"{% endif %}>
+                          {% if model.object_name == "OpenAIConfig" %}
+                            OpenAI Configs
+                          {% elif model.object_name == "ArticleVersion" %}
+                            Article Versions
+                          {% else %}
+                            {{ model.name|title }}
+                          {% endif %}
+                        </a>
                       {% else %}
-                        {{ model.name }}
+                        {% if model.object_name == "OpenAIConfig" %}
+                          OpenAI Configs
+                        {% elif model.object_name == "ArticleVersion" %}
+                          Article Versions
+                        {% else %}
+                          {{ model.name|title }}
+                        {% endif %}
                       {% endif %}
                     </th>
                     {% if model.add_url %}
@@ -40,6 +60,30 @@
                 {% endwith %}
               {% endif %}
             {% endfor %}
+          </table>
+        </div>
+
+        <div class="app-ai-studio module">
+          <table>
+            <caption>
+              <span class="section">{% translate 'AI Studio' %}</span>
+            </caption>
+            <thead class="visually-hidden">
+              <tr>
+                <th scope="col">{% translate 'Model name' %}</th>
+                <th scope="col">{% translate 'Add link' %}</th>
+                <th scope="col">{% translate 'Change or view list link' %}</th>
+              </tr>
+            </thead>
+            <tr class="model-ai-studio{% if '/admin/ai-studio/' in request.path %} current-model{% endif %}">
+              <th scope="row" id="ai-studio">
+                <a href="/admin/ai-studio/"{% if '/admin/ai-studio/' in request.path %} aria-current="page"{% endif %}>
+                  {% translate 'Generate draft' %}
+                </a>
+              </th>
+              <td></td>
+              <td></td>
+            </tr>
           </table>
         </div>
 
@@ -64,9 +108,9 @@
                   <tr class="model-{{ model_name }}{% if model.admin_url in request.path|urlencode %} current-model{% endif %}">
                     <th scope="row" id="{{ app.app_label }}-{{ model_name }}">
                       {% if model.admin_url %}
-                        <a href="{{ model.admin_url }}"{% if model.admin_url in request.path|urlencode %} aria-current="page"{% endif %}>{{ model.name }}</a>
+                        <a href="{{ model.admin_url }}"{% if model.admin_url in request.path|urlencode %} aria-current="page"{% endif %}>OpenAI Configs</a>
                       {% else %}
-                        {{ model.name }}
+                        OpenAI Configs
                       {% endif %}
                     </th>
                     {% if model.add_url %}
@@ -85,7 +129,11 @@
         <div class="app-{{ app.app_label }} module{% if app.app_url in request.path|urlencode %} current-app{% endif %}">
           <table>
             <caption>
-              <a href="{{ app.app_url }}" class="section" title="{% blocktranslate with name=app.name %}Models in the {{ name }} application{% endblocktranslate %}">{{ app.name }}</a>
+              {% if app.app_label == "auth" %}
+                <a href="{{ app.app_url }}" class="section" title="{% blocktranslate with name=app.name %}Models in the {{ name }} application{% endblocktranslate %}">Authentication &amp; Authorization</a>
+              {% else %}
+                <a href="{{ app.app_url }}" class="section" title="{% blocktranslate with name=app.name %}Models in the {{ name }} application{% endblocktranslate %}">{{ app.name }}</a>
+              {% endif %}
             </caption>
             <thead class="visually-hidden">
               <tr>
@@ -98,11 +146,25 @@
               {% with model_name=model.object_name|lower %}
                 <tr class="model-{{ model_name }}{% if model.admin_url in request.path|urlencode %} current-model{% endif %}">
                   <th scope="row" id="{{ app.app_label }}-{{ model_name }}">
-                    {% if model.admin_url %}
-                      <a href="{{ model.admin_url }}"{% if model.admin_url in request.path|urlencode %} aria-current="page"{% endif %}>{{ model.name }}</a>
+                  {% if model.admin_url %}
+                    <a href="{{ model.admin_url }}"{% if model.admin_url in request.path|urlencode %} aria-current="page"{% endif %}>
+                      {% if model.object_name == "OpenAIConfig" %}
+                        OpenAI Configs
+                      {% elif model.object_name == "ArticleVersion" %}
+                        Article Versions
+                      {% else %}
+                        {{ model.name|title }}
+                      {% endif %}
+                    </a>
+                  {% else %}
+                    {% if model.object_name == "OpenAIConfig" %}
+                      OpenAI Configs
+                    {% elif model.object_name == "ArticleVersion" %}
+                      Article Versions
                     {% else %}
-                      {{ model.name }}
+                      {{ model.name|title }}
                     {% endif %}
+                  {% endif %}
                   </th>
                   {% if model.add_url %}
                     <td><a href="{{ model.add_url }}" class="addlink" aria-describedby="{{ app.app_label }}-{{ model_name }}">{% translate 'Add' %}</a></td>
