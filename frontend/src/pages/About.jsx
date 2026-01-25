@@ -26,29 +26,56 @@ export default function About() {
           <p className="lead">
             Joshua Restivo is the founder of Xyence, a platform consulting firm
             focused on AI-enabled operations, cloud control planes, and durable
-            engineering systems. With 25+ years in platform architecture and
-            delivery leadership, he partners with teams that need to modernize
-            infrastructure, build AI-native platforms, and bring complex
-            products to market.
+            engineering systems. For more than 25 years, he has worked at the
+            intersection of infrastructure, automation, and complex systems —
+            helping organizations modernize environments, build AI-native
+            platforms, and bring high-stakes products to market.
           </p>
           <p className="lead">
-            He has led platform initiatives for large environments like AT&T,
-            Savvis/CenturyLink, and multiple startups across computer forensics,
-            cloud orchestration, and advanced network engineering. His recent
-            work includes architecting Z1N, a Kubernetes-native, multi-tenant
-            operations platform integrating AI agents, orchestration engines,
+            He lives in downtown St. Louis inside the City Museum — not near it,
+            not inspired by it, but inside it: a giant, climbable, welded,
+            reclaimed architectural dreamscape where art is also structure and
+            structure is also play. It’s an unusual place to call home, but it
+            fits: Joshua has always been drawn to systems that are alive —
+            layered, expressive, intricate, and unapologetically real.
+          </p>
+          <p className="lead">
+            At night, when he drives back into the City from across the river,
+            he watches the skyline gather itself into clarity — brighter,
+            closer, inevitable. The feeling is part awe and part belonging. To
+            him, cities are proof that complexity doesn’t have to be cold.
+            They’re the most ambitious machines humans have ever built:
+            networks of movement, logistics, story, resilience, failure,
+            adaptation, and reinvention — all running at once.
+          </p>
+          <p className="lead">That worldview shows up in his work.</p>
+          <p className="lead">
+            Joshua has led platform initiatives across large environments like
+            AT&T and Savvis/CenturyLink, and in startups spanning computer
+            forensics, cloud orchestration, and advanced network engineering.
+            Most recently, he architected Z1N — a Kubernetes-native, multi-tenant
+            operations platform that unifies AI agents, orchestration engines,
             ERP-class workflows, and telecom automation across hybrid cloud
-            environments. He has also built AIOps reasoning pipelines and
-            enterprise API control planes handling large transaction volumes.
+            systems. He has also built AIOps reasoning pipelines and enterprise
+            API control planes designed to endure high transaction volume,
+            operational chaos, and constant change.
           </p>
           <p className="lead">
-            Joshua has delivered training and expert education to U.S. state and
-            federal law enforcement agents and attorneys, and is known for
-            making complex technical concepts accessible to business leaders,
-            community stakeholders, and university classrooms. He has provided
-            IT-focused volunteer work for major municipalities and charitable
-            organizations, and his work is cited in Jose Baez&apos;s New York
-            Times best-selling book, <em>Presumed Guilty</em>.
+            He’s known for translating complex technical systems into language
+            that makes sense to business leaders, community stakeholders, and
+            classrooms — and has delivered training to U.S. state and federal
+            law enforcement agents and attorneys. His work has supported
+            municipalities and charitable organizations through IT-focused
+            volunteer initiatives, and is cited in Jose Baez’s New York Times
+            best-selling book, <em>Presumed Guilty</em>.
+          </p>
+          <p className="lead">
+            At the center of all of it is a single belief: the systems we build
+            aren’t just technical — they’re cultural. They reveal what we value,
+            what we tolerate, and what we’re willing to make durable. Joshua
+            builds platforms the way he loves cities: layered, resilient,
+            intelligently orchestrated — and capable of holding the full
+            complexity of real life.
           </p>
         </div>
         <div className="about-card">

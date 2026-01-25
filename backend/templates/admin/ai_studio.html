@@ -14,8 +14,23 @@
         <p class="help">Select an existing article to update or leave blank to create a new draft.</p>
       </div>
       <div class="form-row">
+        {{ form.context_articles.label_tag }}
+        {{ form.context_articles }}
+      </div>
+      <div class="form-row">
+        {{ form.context_repos.label_tag }}
+        {{ form.context_repos }}
+      </div>
+      <div class="form-row">
+        {{ form.persistent_context.label_tag }}
+        {{ form.persistent_context }}
+      </div>
+      <div class="form-row">
         {{ form.model_override.label_tag }}
         {{ form.model_override }}
+      </div>
+      <div class="form-row">
+        <p><strong>No effort is imposed. Ask boldly.</strong></p>
       </div>
       <div class="form-row">
         {{ form.prompt.label_tag }}

@@ -67,4 +67,10 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml exec backend pyt
 - Create an `OpenAI Config` in admin to store your API key and default model.
 - Access AI Studio at `http://localhost:8000/admin/ai-studio/` to generate drafts.
 - Each AI draft is stored as an `ArticleVersion` and applied to the article as a draft.
+
+## GitHub Context (AI Studio)
+- Create a `GitHub Config` with a personal access token and organization name.
+- Use the `GitHub Config` admin action to sync repositories.
+- Select repositories in AI Studio to pull relevant markdown context into prompts.
+ - You can also connect GitHub via OAuth (allauth GitHub provider) and leave the PAT empty.
 # xyence-web

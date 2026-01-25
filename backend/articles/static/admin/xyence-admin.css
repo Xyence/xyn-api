@@ -1,0 +1,78 @@
+:root {
+  --xyence-blue: #1f4e8a;
+  --xyence-blue-dark: #183b66;
+  --xyence-slate: #f4f6f9;
+  --xyence-shadow: 0 12px 30px rgba(24, 59, 102, 0.15);
+  --xyence-radius: 14px;
+}
+
+body {
+  background: var(--xyence-slate);
+}
+
+#header {
+  background: linear-gradient(135deg, var(--xyence-blue), var(--xyence-blue-dark));
+  border-radius: var(--xyence-radius);
+  margin: 16px 16px 24px;
+  box-shadow: var(--xyence-shadow);
+}
+
+#branding h1,
+#branding h1 a {
+  color: #fff;
+  font-weight: 600;
+}
+
+#content {
+  display: flex;
+  align-items: flex-start;
+  gap: 24px;
+}
+
+.dashboard #content > h1 {
+  flex: 0 0 100%;
+  margin: 0 0 12px;
+}
+
+#content-main {
+  flex: 1 1 auto;
+  float: none;
+}
+
+#content-related {
+  flex: 0 0 320px;
+  float: none;
+  margin-left: 0;
+}
+
+.module {
+  border-radius: var(--xyence-radius);
+  overflow: hidden;
+  box-shadow: var(--xyence-shadow);
+  border: none;
+}
+
+.module h2,
+.module caption {
+  background: var(--xyence-blue);
+  color: #fff;
+  border-radius: var(--xyence-radius) var(--xyence-radius) 0 0;
+}
+
+.dashboard #content-related {
+  margin-top: 0;
+}
+
+#content-related .module {
+  box-shadow: none;
+}
+
+#content-related .module h2 {
+  background: #e9edf3;
+  color: #1a2b3d;
+}
+
+.submit-row,
+.module .actions {
+  border-radius: 0 0 var(--xyence-radius) var(--xyence-radius);
+}

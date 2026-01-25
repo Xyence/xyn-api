@@ -379,6 +379,10 @@ h1 {
   align-items: start;
 }
 
+.about .lead + .lead {
+  margin-top: 18px;
+}
+
 .about-card {
   background: var(--white);
   padding: 20px;
