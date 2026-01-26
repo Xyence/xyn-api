@@ -160,8 +160,23 @@ def _shineseed_request(method: str, path: str, payload=None):
         headers=headers,
         timeout=15
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response else None
+        if status_code in (401, 403):
+            raise requests.HTTPError("Authorization failed (check SHINESEED_API_TOKEN).", response=exc.response)
+        raise
     return response.json()
+
+
+def _format_shineseed_error(exc: Exception) -> str:
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        status_code = exc.response.status_code
+        if status_code in (401, 403):
+            return "ShineSeed authorization failed. Check SHINESEED_API_TOKEN."
+        return f"ShineSeed request failed (HTTP {status_code})."
+    return str(exc)
 
 
 def ai_studio_view(request: HttpRequest) -> HttpResponse:
@@ -286,7 +301,7 @@ def shineseed_releases_view(request: HttpRequest) -> HttpResponse:
                         )
                         messages.success(request, "Plan generated successfully.")
                     except requests.RequestException as exc:
-                        messages.error(request, f"ShineSeed plan failed: {exc}")
+                        messages.error(request, f"ShineSeed plan failed: {_format_shineseed_error(exc)}")
         elif action == "apply":
             apply_form = ShineSeedApplyForm(request.POST)
             if apply_form.is_valid():
@@ -301,7 +316,7 @@ def shineseed_releases_view(request: HttpRequest) -> HttpResponse:
                     status_form = ShineSeedStatusForm(initial={"release_id": release_id})
                     messages.success(request, "Apply triggered.")
                 except requests.RequestException as exc:
-                    messages.error(request, f"ShineSeed apply failed: {exc}")
+                    messages.error(request, f"ShineSeed apply failed: {_format_shineseed_error(exc)}")
         elif action == "status":
             status_form = ShineSeedStatusForm(request.POST)
             if status_form.is_valid():
@@ -310,7 +325,7 @@ def shineseed_releases_view(request: HttpRequest) -> HttpResponse:
                     status = _shineseed_request("get", f"/releases/{release_id}/status")
                     messages.success(request, "Status refreshed.")
                 except requests.RequestException as exc:
-                    messages.error(request, f"Status check failed: {exc}")
+                    messages.error(request, f"Status check failed: {_format_shineseed_error(exc)}")
 
     if request.method == "GET":
         plan_form = ShineSeedPlanForm(initial={"release_spec": _load_runner_fixture()})
