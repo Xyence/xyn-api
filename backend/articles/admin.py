@@ -91,19 +91,19 @@ class AIStudioForm(forms.Form):
         self.fields["context_articles"].queryset = Article.objects.all()
 
 
-class ShineSeedPlanForm(forms.Form):
+class XynSeedPlanForm(forms.Form):
     release_spec = forms.CharField(
         widget=forms.Textarea(attrs={"rows": 18}),
         help_text="Paste a ReleaseSpec JSON document."
     )
 
 
-class ShineSeedApplyForm(forms.Form):
+class XynSeedApplyForm(forms.Form):
     release_id = forms.CharField(widget=forms.HiddenInput())
     plan_id = forms.CharField(widget=forms.HiddenInput())
 
 
-class ShineSeedStatusForm(forms.Form):
+class XynSeedStatusForm(forms.Form):
     release_id = forms.CharField(
         required=True,
         help_text="Release ID in the form namespace.name"
@@ -162,7 +162,7 @@ def _load_runner_fixture() -> str:
     )
 
 
-def _shineseed_request(method: str, path: str, payload=None):
+def _xyn_seed_request(method: str, path: str, payload=None):
     base_url = os.environ.get("XYN_SEED_BASE_URL", "").strip() or os.environ.get(
         "SHINESEED_BASE_URL",
         "http://localhost:8001/api/v1"
@@ -190,12 +190,12 @@ def _shineseed_request(method: str, path: str, payload=None):
     return response.json()
 
 
-def _format_shineseed_error(exc: Exception) -> str:
+def _format_xyn_seed_error(exc: Exception) -> str:
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
         status_code = exc.response.status_code
         if status_code in (401, 403):
             return "Xyn Seed authorization failed. Check XYN_SEED_API_TOKEN."
-        return f"ShineSeed request failed (HTTP {status_code})."
+        return f"Xyn Seed request failed (HTTP {status_code})."
     return str(exc)
 
 
@@ -289,18 +289,18 @@ def ai_studio_view(request: HttpRequest) -> HttpResponse:
     return render(request, "admin/ai_studio.html", context)
 
 
-def shineseed_releases_view(request: HttpRequest) -> HttpResponse:
+def xyn_seed_releases_view(request: HttpRequest) -> HttpResponse:
     plan = None
     operation = None
     status = None
-    plan_form = ShineSeedPlanForm()
-    apply_form = ShineSeedApplyForm()
-    status_form = ShineSeedStatusForm()
+    plan_form = XynSeedPlanForm()
+    apply_form = XynSeedApplyForm()
+    status_form = XynSeedStatusForm()
 
     if request.method == "POST":
         action = request.POST.get("action", "plan")
         if action == "plan":
-            plan_form = ShineSeedPlanForm(request.POST)
+            plan_form = XynSeedPlanForm(request.POST)
             if plan_form.is_valid():
                 raw = plan_form.cleaned_data["release_spec"]
                 try:
@@ -309,50 +309,50 @@ def shineseed_releases_view(request: HttpRequest) -> HttpResponse:
                     messages.error(request, f"Invalid JSON: {exc.msg}")
                 else:
                     try:
-                        plan = _shineseed_request("post", "/releases/plan", {"release_spec": release_spec})
-                        apply_form = ShineSeedApplyForm(
+                        plan = _xyn_seed_request("post", "/releases/plan", {"release_spec": release_spec})
+                        apply_form = XynSeedApplyForm(
                             initial={
                                 "release_id": plan.get("releaseId", ""),
                                 "plan_id": plan.get("planId", ""),
                             }
                         )
-                        status_form = ShineSeedStatusForm(
+                        status_form = XynSeedStatusForm(
                             initial={"release_id": plan.get("releaseId", "")}
                         )
                         messages.success(request, "Plan generated successfully.")
                     except requests.RequestException as exc:
-                        messages.error(request, f"ShineSeed plan failed: {_format_shineseed_error(exc)}")
+                        messages.error(request, f"Xyn Seed plan failed: {_format_xyn_seed_error(exc)}")
         elif action == "apply":
-            apply_form = ShineSeedApplyForm(request.POST)
+            apply_form = XynSeedApplyForm(request.POST)
             if apply_form.is_valid():
                 release_id = apply_form.cleaned_data["release_id"]
                 plan_id = apply_form.cleaned_data["plan_id"]
                 try:
-                    operation = _shineseed_request(
+                    operation = _xyn_seed_request(
                         "post",
                         "/releases/apply",
                         {"release_id": release_id, "plan_id": plan_id},
                     )
-                    status_form = ShineSeedStatusForm(initial={"release_id": release_id})
+                    status_form = XynSeedStatusForm(initial={"release_id": release_id})
                     messages.success(request, "Apply triggered.")
                 except requests.RequestException as exc:
-                    messages.error(request, f"ShineSeed apply failed: {_format_shineseed_error(exc)}")
+                    messages.error(request, f"Xyn Seed apply failed: {_format_xyn_seed_error(exc)}")
         elif action == "status":
-            status_form = ShineSeedStatusForm(request.POST)
+            status_form = XynSeedStatusForm(request.POST)
             if status_form.is_valid():
                 release_id = status_form.cleaned_data["release_id"]
                 try:
-                    status = _shineseed_request("get", f"/releases/{release_id}/status")
+                    status = _xyn_seed_request("get", f"/releases/{release_id}/status")
                     messages.success(request, "Status refreshed.")
                 except requests.RequestException as exc:
-                    messages.error(request, f"Status check failed: {_format_shineseed_error(exc)}")
+                    messages.error(request, f"Status check failed: {_format_xyn_seed_error(exc)}")
 
     if request.method == "GET":
-        plan_form = ShineSeedPlanForm(initial={"release_spec": _load_runner_fixture()})
+        plan_form = XynSeedPlanForm(initial={"release_spec": _load_runner_fixture()})
 
     context = {
         **admin.site.each_context(request),
-        "title": "ShineSeed Releases",
+        "title": "Xyn Seed Releases",
         "plan_form": plan_form,
         "apply_form": apply_form,
         "status_form": status_form,
@@ -360,13 +360,13 @@ def shineseed_releases_view(request: HttpRequest) -> HttpResponse:
         "operation": operation,
         "status": status,
     }
-    return render(request, "admin/shineseed_releases.html", context)
+    return render(request, "admin/xyn_seed_releases.html", context)
 
 
 def _inject_ai_studio_url(urls):
     return [
         path("ai-studio/", admin.site.admin_view(ai_studio_view), name="ai-studio"),
-        path("xyn-seed/", admin.site.admin_view(shineseed_releases_view), name="xyn-seed-releases"),
+        path("xyn-seed/", admin.site.admin_view(xyn_seed_releases_view), name="xyn-seed-releases"),
         *urls,
     ]
 
