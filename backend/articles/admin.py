@@ -110,10 +110,24 @@ class XynSeedStatusForm(forms.Form):
     )
 
 
+class XynSeedStopForm(forms.Form):
+    release_id = forms.CharField(widget=forms.HiddenInput())
+    confirm_stop = forms.BooleanField(required=False)
+
+
+class XynSeedRestartForm(forms.Form):
+    release_id = forms.CharField(widget=forms.HiddenInput())
+    service_name = forms.CharField(required=True)
+
+
+class XynSeedDestroyForm(forms.Form):
+    release_id = forms.CharField(widget=forms.HiddenInput())
+    remove_volumes = forms.BooleanField(required=False)
+    confirm_destroy = forms.BooleanField(required=False)
+    confirm_text = forms.CharField(required=False)
+
 def _load_runner_fixture() -> str:
-    fixture_root = os.environ.get("XYN_SEED_CONTRACTS_ROOT", "").strip()
-    if not fixture_root:
-        fixture_root = os.environ.get("SHINESEED_CONTRACTS_ROOT", "").strip()
+    fixture_root = os.environ.get("XYNSEED_CONTRACTS_ROOT", "").strip()
     if fixture_root:
         fixture_path = Path(fixture_root) / "fixtures" / "runner.release.json"
         if fixture_path.exists():
@@ -143,17 +157,43 @@ def _load_runner_fixture() -> str:
             "components": [
                 {
                     "name": "runner-api",
-                    "image": "xyence/runner-api:dev",
+                    "image": "xyence/xyn-runner-api:git-b56708f",
                     "ports": [
                         {"name": "http", "containerPort": 8088, "hostPort": 8088, "protocol": "tcp"}
                     ],
                     "env": {
-                        "RUNNER_QUEUE_URL": "redis://runner-redis:6379/0",
+                        "RUNNER_REDIS_URL": "redis://runner-redis:6379/0",
+                        "RUNNER_QUEUE_NAME": "default",
                         "RUNNER_WORKSPACE": "/workspace",
                         "RUNNER_LOG_LEVEL": "info",
                     },
                     "volumeMounts": [{"volume": "runner-workspace", "mountPath": "/workspace"}],
-                }
+                },
+                {
+                    "name": "runner-worker",
+                    "image": "xyence/xyn-runner-worker:git-b56708f",
+                    "env": {
+                        "RUNNER_REDIS_URL": "redis://runner-redis:6379/0",
+                        "RUNNER_QUEUE_NAME": "default",
+                        "RUNNER_WORKSPACE": "/workspace",
+                        "RUNNER_LOG_LEVEL": "info",
+                    },
+                    "volumeMounts": [{"volume": "runner-workspace", "mountPath": "/workspace"}],
+                    "dependsOn": ["runner-redis"],
+                },
+                {
+                    "name": "runner-redis",
+                    "image": "redis:7-alpine",
+                    "healthcheck": {
+                        "test": ["CMD", "redis-cli", "ping"],
+                        "interval": "10s",
+                        "timeout": "5s",
+                        "retries": 5,
+                    },
+                    "ports": [
+                        {"name": "redis", "containerPort": 6379, "hostPort": 6379, "protocol": "tcp"}
+                    ],
+                },
             ],
             "volumes": [{"name": "runner-workspace", "type": "dockerVolume"}],
             "networks": [{"name": "runner-net", "type": "dockerNetwork"}],
@@ -163,13 +203,8 @@ def _load_runner_fixture() -> str:
 
 
 def _xyn_seed_request(method: str, path: str, payload=None):
-    base_url = os.environ.get("XYN_SEED_BASE_URL", "").strip() or os.environ.get(
-        "SHINESEED_BASE_URL",
-        "http://localhost:8001/api/v1"
-    )
-    token = os.environ.get("XYN_SEED_API_TOKEN", "").strip()
-    if not token:
-        token = os.environ.get("SHINESEED_API_TOKEN", "").strip()
+    base_url = os.environ.get("XYNSEED_BASE_URL", "").strip() or "http://localhost:8001/api/v1"
+    token = os.environ.get("XYNSEED_API_TOKEN", "").strip()
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -185,16 +220,39 @@ def _xyn_seed_request(method: str, path: str, payload=None):
     except requests.HTTPError as exc:
         status_code = exc.response.status_code if exc.response else None
         if status_code in (401, 403):
-            raise requests.HTTPError("Authorization failed (check SHINESEED_API_TOKEN).", response=exc.response)
+            raise requests.HTTPError("Authorization failed (check XYNSEED_API_TOKEN).", response=exc.response)
         raise
     return response.json()
+
+
+def _xyn_seed_request_text(method: str, path: str, payload=None) -> str:
+    base_url = os.environ.get("XYNSEED_BASE_URL", "").strip() or "http://localhost:8001/api/v1"
+    token = os.environ.get("XYNSEED_API_TOKEN", "").strip()
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    response = requests.request(
+        method=method,
+        url=f"{base_url}{path}",
+        json=payload,
+        headers=headers,
+        timeout=15
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response else None
+        if status_code in (401, 403):
+            raise requests.HTTPError("Authorization failed (check XYNSEED_API_TOKEN).", response=exc.response)
+        raise
+    return response.text
 
 
 def _format_xyn_seed_error(exc: Exception) -> str:
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
         status_code = exc.response.status_code
         if status_code in (401, 403):
-            return "Xyn Seed authorization failed. Check XYN_SEED_API_TOKEN."
+            return "Xyn Seed authorization failed. Check XYNSEED_API_TOKEN."
         return f"Xyn Seed request failed (HTTP {status_code})."
     return str(exc)
 
@@ -293,9 +351,19 @@ def xyn_seed_releases_view(request: HttpRequest) -> HttpResponse:
     plan = None
     operation = None
     status = None
+    releases = []
+    release_details = None
+    release_spec_json = None
+    operations = []
+    logs = None
     plan_form = XynSeedPlanForm()
     apply_form = XynSeedApplyForm()
     status_form = XynSeedStatusForm()
+    stop_form = XynSeedStopForm()
+    restart_form = XynSeedRestartForm()
+    destroy_form = XynSeedDestroyForm()
+    selected_release_id = request.GET.get("release_id")
+    logs_operation_id = request.GET.get("op_id")
 
     if request.method == "POST":
         action = request.POST.get("action", "plan")
@@ -319,6 +387,7 @@ def xyn_seed_releases_view(request: HttpRequest) -> HttpResponse:
                         status_form = XynSeedStatusForm(
                             initial={"release_id": plan.get("releaseId", "")}
                         )
+                        selected_release_id = plan.get("releaseId")
                         messages.success(request, "Plan generated successfully.")
                     except requests.RequestException as exc:
                         messages.error(request, f"Xyn Seed plan failed: {_format_xyn_seed_error(exc)}")
@@ -334,6 +403,7 @@ def xyn_seed_releases_view(request: HttpRequest) -> HttpResponse:
                         {"release_id": release_id, "plan_id": plan_id},
                     )
                     status_form = XynSeedStatusForm(initial={"release_id": release_id})
+                    selected_release_id = release_id
                     messages.success(request, "Apply triggered.")
                 except requests.RequestException as exc:
                     messages.error(request, f"Xyn Seed apply failed: {_format_xyn_seed_error(exc)}")
@@ -343,12 +413,93 @@ def xyn_seed_releases_view(request: HttpRequest) -> HttpResponse:
                 release_id = status_form.cleaned_data["release_id"]
                 try:
                     status = _xyn_seed_request("get", f"/releases/{release_id}/status")
+                    selected_release_id = release_id
                     messages.success(request, "Status refreshed.")
                 except requests.RequestException as exc:
                     messages.error(request, f"Status check failed: {_format_xyn_seed_error(exc)}")
+        elif action == "plan_stop":
+            stop_form = XynSeedStopForm(request.POST)
+            if stop_form.is_valid():
+                release_id = stop_form.cleaned_data["release_id"]
+                if not stop_form.cleaned_data.get("confirm_stop"):
+                    messages.error(request, "Confirm stop before planning.")
+                else:
+                    try:
+                        plan = _xyn_seed_request("post", f"/releases/{release_id}/plan/stop")
+                        apply_form = XynSeedApplyForm(
+                            initial={"release_id": release_id, "plan_id": plan.get("planId", "")}
+                        )
+                        selected_release_id = release_id
+                        messages.success(request, "Stop plan generated.")
+                    except requests.RequestException as exc:
+                        messages.error(request, f"Xyn Seed stop plan failed: {_format_xyn_seed_error(exc)}")
+        elif action == "plan_restart":
+            restart_form = XynSeedRestartForm(request.POST)
+            if restart_form.is_valid():
+                release_id = restart_form.cleaned_data["release_id"]
+                service_name = restart_form.cleaned_data["service_name"]
+                try:
+                    plan = _xyn_seed_request(
+                        "post",
+                        f"/releases/{release_id}/plan/restart",
+                        {"serviceName": service_name},
+                    )
+                    apply_form = XynSeedApplyForm(
+                        initial={"release_id": release_id, "plan_id": plan.get("planId", "")}
+                    )
+                    selected_release_id = release_id
+                    messages.success(request, "Restart plan generated.")
+                except requests.RequestException as exc:
+                    messages.error(request, f"Xyn Seed restart plan failed: {_format_xyn_seed_error(exc)}")
+        elif action == "plan_destroy":
+            destroy_form = XynSeedDestroyForm(request.POST)
+            if destroy_form.is_valid():
+                release_id = destroy_form.cleaned_data["release_id"]
+                confirm_text = destroy_form.cleaned_data.get("confirm_text", "")
+                if not destroy_form.cleaned_data.get("confirm_destroy") or confirm_text != release_id:
+                    messages.error(request, "Confirm destroy by typing the release ID.")
+                else:
+                    remove_volumes = destroy_form.cleaned_data.get("remove_volumes", False)
+                    try:
+                        plan = _xyn_seed_request(
+                            "post",
+                            f"/releases/{release_id}/plan/destroy",
+                            {"removeVolumes": remove_volumes},
+                        )
+                        apply_form = XynSeedApplyForm(
+                            initial={"release_id": release_id, "plan_id": plan.get("planId", "")}
+                        )
+                        selected_release_id = release_id
+                        messages.success(request, "Destroy plan generated.")
+                    except requests.RequestException as exc:
+                        messages.error(request, f"Xyn Seed destroy plan failed: {_format_xyn_seed_error(exc)}")
 
     if request.method == "GET":
         plan_form = XynSeedPlanForm(initial={"release_spec": _load_runner_fixture()})
+
+    try:
+        releases = _xyn_seed_request("get", "/releases")
+    except requests.RequestException as exc:
+        messages.error(request, f"Release list failed: {_format_xyn_seed_error(exc)}")
+
+    if selected_release_id:
+        try:
+            release_details = _xyn_seed_request("get", f"/releases/{selected_release_id}")
+            release_spec_json = json.dumps(release_details.get("releaseSpec", {}), indent=2)
+            status = _xyn_seed_request("get", f"/releases/{selected_release_id}/status")
+            operations = _xyn_seed_request("get", f"/releases/{selected_release_id}/operations")
+            status_form = XynSeedStatusForm(initial={"release_id": selected_release_id})
+            stop_form = XynSeedStopForm(initial={"release_id": selected_release_id})
+            restart_form = XynSeedRestartForm(initial={"release_id": selected_release_id})
+            destroy_form = XynSeedDestroyForm(initial={"release_id": selected_release_id})
+        except requests.RequestException as exc:
+            messages.error(request, f"Release detail failed: {_format_xyn_seed_error(exc)}")
+
+    if logs_operation_id:
+        try:
+            logs = _xyn_seed_request_text("get", f"/operations/{logs_operation_id}/logs")
+        except requests.RequestException as exc:
+            messages.error(request, f"Log fetch failed: {_format_xyn_seed_error(exc)}")
 
     context = {
         **admin.site.each_context(request),
@@ -356,17 +507,43 @@ def xyn_seed_releases_view(request: HttpRequest) -> HttpResponse:
         "plan_form": plan_form,
         "apply_form": apply_form,
         "status_form": status_form,
+        "stop_form": stop_form,
+        "restart_form": restart_form,
+        "destroy_form": destroy_form,
         "plan": plan,
         "operation": operation,
         "status": status,
+        "releases": releases,
+        "release_details": release_details,
+        "operations": operations,
+        "selected_release_id": selected_release_id,
+        "logs": logs,
+        "logs_operation_id": logs_operation_id,
+        "release_spec_json": release_spec_json,
     }
     return render(request, "admin/xyn_seed_releases.html", context)
+
+
+def xyn_seed_artifact_view(request: HttpRequest, release_id: str, artifact_kind: str) -> HttpResponse:
+    try:
+        content = _xyn_seed_request_text("get", f"/releases/{release_id}/artifacts/{artifact_kind}")
+    except requests.RequestException as exc:
+        messages.error(request, f"Artifact download failed: {_format_xyn_seed_error(exc)}")
+        return redirect(f"/admin/xyn-seed/?release_id={release_id}")
+
+    content_type = "application/json" if artifact_kind in ("releaseSpec", "runtimeSpec") else "text/plain"
+    return HttpResponse(content, content_type=content_type)
 
 
 def _inject_ai_studio_url(urls):
     return [
         path("ai-studio/", admin.site.admin_view(ai_studio_view), name="ai-studio"),
         path("xyn-seed/", admin.site.admin_view(xyn_seed_releases_view), name="xyn-seed-releases"),
+        path(
+            "xyn-seed/artifacts/<str:release_id>/<str:artifact_kind>/",
+            admin.site.admin_view(xyn_seed_artifact_view),
+            name="xyn-seed-artifact",
+        ),
         *urls,
     ]
 

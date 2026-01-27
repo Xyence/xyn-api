@@ -19,8 +19,8 @@ services:
       - ./backend/.env
     environment:
       POSTGRES_HOST: db
-      XYN_SEED_BASE_URL: ${XYN_SEED_BASE_URL:-http://host.docker.internal:8001/api/v1}
-      XYN_SEED_API_TOKEN: ${XYN_SEED_API_TOKEN:-}
+      XYNSEED_BASE_URL: ${XYNSEED_BASE_URL:-http://host.docker.internal:8001/api/v1}
+      XYNSEED_API_TOKEN: ${XYNSEED_API_TOKEN:-}
     depends_on:
       - db
     ports:

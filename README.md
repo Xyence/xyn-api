@@ -71,10 +71,10 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml exec backend pyt
 ## Xyn Seed (service management)
 - Manage long-running releases at `http://localhost:8000/admin/xyn-seed/`.
 - Configure the control plane with env vars:
-  - `XYN_SEED_BASE_URL` (default: `http://localhost:8001/api/v1`)
-  - `XYN_SEED_API_TOKEN` (optional bearer token)
-  - Legacy aliases: `SHINESEED_BASE_URL`, `SHINESEED_API_TOKEN`
- - When running via Docker Compose on Linux, the default `XYN_SEED_BASE_URL` uses `host.docker.internal` and `extra_hosts` to reach the host.
+  - `XYNSEED_BASE_URL` (default: `http://localhost:8001/api/v1`)
+  - `XYNSEED_API_TOKEN` (optional bearer token)
+  - Environment: `XYNSEED_BASE_URL`, `XYNSEED_API_TOKEN`
+ - When running via Docker Compose on Linux, the default `XYNSEED_BASE_URL` uses `host.docker.internal` and `extra_hosts` to reach the host.
 
 ## GitHub Context (AI Studio)
 - Create a `GitHub Config` with a personal access token and organization name.
