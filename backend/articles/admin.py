@@ -132,7 +132,7 @@ def _load_runner_fixture() -> str:
 
     return json.dumps(
         {
-            "apiVersion": "xyn.shineseed/v1",
+            "apiVersion": "xyn.seed/v1",
             "kind": "Release",
             "metadata": {
                 "name": "runner",
