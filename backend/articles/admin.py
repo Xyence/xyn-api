@@ -137,7 +137,7 @@ def _load_runner_fixture() -> str:
             "metadata": {
                 "name": "runner",
                 "namespace": "core",
-                "labels": {"app": "runner", "owner": "shineseed"},
+                "labels": {"app": "runner", "owner": "xyn-seed"},
             },
             "backend": {"type": "compose"},
             "components": [
