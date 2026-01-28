@@ -24,6 +24,7 @@
       <input type="hidden" name="session_id" value="{{ session.id }}" />
       <div class="form-row" id="recording-controls">
         <label>Record audio (browser)</label>
+        <div id="recording-alert" style="margin-bottom: 6px; color: #b45309;"></div>
         <div>
           <button type="button" id="record-start">Start recording</button>
           <button type="button" id="record-stop" disabled>Stop recording</button>
@@ -123,6 +124,7 @@
       const recordingPreview = document.getElementById("recording-preview");
       const recordingAttach = document.getElementById("recording-attach");
       const recordingHint = document.getElementById("recording-hint");
+      const recordingAlert = document.getElementById("recording-alert");
       const voiceNoteFile = document.getElementById("voice-note-file");
       let recorder = null;
       let chunks = [];
@@ -140,12 +142,19 @@
         }
       }
 
+      function setRecordingAlert(message) {
+        if (recordingAlert) {
+          recordingAlert.textContent = message || "";
+        }
+      }
+
       if (!navigator.mediaDevices || !window.MediaRecorder) {
         updateRecordingState("Recording not supported in this browser.");
         if (recordStart) recordStart.disabled = true;
         if (recordStop) recordStop.disabled = true;
         if (recordingAttach) recordingAttach.disabled = true;
         setRecordingHint("Use the Upload audio control (it can open the system recorder on mobile).");
+        setRecordingAlert("In-browser recording is not supported here. Use Upload audio to record.");
       } else {
         recordStart?.addEventListener("click", async () => {
           try {
@@ -173,11 +182,13 @@
             recorder.start();
             updateRecordingState("Recording...");
             setRecordingHint("Recording stored locally until you attach/upload.");
+            setRecordingAlert("");
             if (recordStart) recordStart.disabled = true;
             if (recordStop) recordStop.disabled = false;
           } catch (err) {
             updateRecordingState("Microphone permission denied.");
             setRecordingHint("Check browser permissions for microphone access.");
+            setRecordingAlert("Microphone access denied. Enable mic permissions or use Upload audio.");
           }
         });
         recordStop?.addEventListener("click", () => {

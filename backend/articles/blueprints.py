@@ -486,6 +486,19 @@ def blueprint_studio_view(request: HttpRequest, session_id: str) -> HttpResponse
     voice_notes = VoiceNote.objects.filter(draftsessionvoicenote__draft_session=session).order_by(
         "draftsessionvoicenote__ordering"
     )
+    if not session.context_pack_refs_json:
+        resolved = _resolve_context_packs(session)
+        session.context_pack_refs_json = resolved["refs"]
+        session.effective_context_hash = resolved["hash"]
+        session.effective_context_preview = resolved["preview"]
+        session.save(
+            update_fields=[
+                "context_pack_refs_json",
+                "effective_context_hash",
+                "effective_context_preview",
+                "updated_at",
+            ]
+        )
 
     if request.method == "POST":
         action = request.POST.get("action")
