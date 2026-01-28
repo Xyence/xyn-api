@@ -41,11 +41,17 @@ if command -v apt-get >/dev/null 2>&1; then
   systemctl enable docker
   systemctl start docker
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y docker git curl amazon-ssm-agent
+  dnf install -y docker git amazon-ssm-agent
+  if ! command -v curl >/dev/null 2>&1; then
+    dnf install -y curl --allowerasing || dnf install -y curl-minimal
+  fi
   systemctl enable docker
   systemctl start docker
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y docker git curl amazon-ssm-agent
+  yum install -y docker git amazon-ssm-agent
+  if ! command -v curl >/dev/null 2>&1; then
+    yum install -y curl
+  fi
   systemctl enable docker
   systemctl start docker
 fi
