@@ -37,17 +37,31 @@ mkdir -p /var/lib/xyn
 
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
-  apt-get install -y docker.io docker-compose-plugin git curl
+  apt-get install -y docker.io git curl
   systemctl enable docker
   systemctl start docker
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y docker docker-compose-plugin git curl amazon-ssm-agent
+  dnf install -y docker git curl amazon-ssm-agent
   systemctl enable docker
   systemctl start docker
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y docker docker-compose-plugin git curl amazon-ssm-agent
+  yum install -y docker git curl amazon-ssm-agent
   systemctl enable docker
   systemctl start docker
+fi
+
+# Ensure docker compose plugin is available for `docker compose` usage.
+if ! docker compose version >/dev/null 2>&1; then
+  ARCH=$(uname -m)
+  if [ "$ARCH" = "x86_64" ]; then
+    ARCH="x86_64"
+  elif [ "$ARCH" = "aarch64" ]; then
+    ARCH="aarch64"
+  fi
+  mkdir -p /usr/local/libexec/docker/cli-plugins
+  curl -fsSL "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-$ARCH" \
+    -o /usr/local/libexec/docker/cli-plugins/docker-compose
+  chmod +x /usr/local/libexec/docker/cli-plugins/docker-compose
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
