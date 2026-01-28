@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from typing import Any, Dict, List, Optional
@@ -5,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from django.utils import timezone
 from jsonschema import Draft202012Validator
 
-from .models import BlueprintDraftSession, DraftSessionVoiceNote, OpenAIConfig, VoiceNote, VoiceTranscript
+from .models import BlueprintDraftSession, ContextPack, DraftSessionVoiceNote, OpenAIConfig, VoiceNote, VoiceTranscript
 
 
 def _contracts_root() -> str:
@@ -37,7 +38,7 @@ def _validate_blueprint(spec: Dict[str, Any], kind: str) -> List[str]:
     return errors
 
 
-def _openai_generate_blueprint(transcript: str, kind: str) -> Optional[Dict[str, Any]]:
+def _openai_generate_blueprint(transcript: str, kind: str, context_text: str) -> Optional[Dict[str, Any]]:
     config = OpenAIConfig.objects.first()
     if not config:
         return None
@@ -62,6 +63,8 @@ def _openai_generate_blueprint(transcript: str, kind: str) -> Optional[Dict[str,
             "Return ONLY valid JSON matching SolutionBlueprintSpec schema. "
             "Use apiVersion xyn.blueprint/v1 and include releaseSpec."
         )
+    if context_text:
+        system_prompt = f"{context_text}\n\n{system_prompt}"
     response = client.responses.create(
         model=config.default_model,
         input=[
@@ -138,14 +141,69 @@ def _collect_transcripts(session: BlueprintDraftSession) -> List[str]:
     return transcripts
 
 
+def _resolve_context(session: BlueprintDraftSession) -> Dict[str, Any]:
+    defaults = list(
+        ContextPack.objects.filter(scope="global", is_active=True, is_default=True).order_by("name")
+    )
+    selected = []
+    if session.context_pack_ids:
+        packs = ContextPack.objects.filter(id__in=session.context_pack_ids)
+        pack_map = {str(pack.id): pack for pack in packs}
+        for pack_id in session.context_pack_ids:
+            if pack := pack_map.get(str(pack_id)):
+                selected.append(pack)
+    combined = []
+    seen = set()
+    for pack in defaults + selected:
+        pack_id = str(pack.id)
+        if pack_id in seen:
+            continue
+        seen.add(pack_id)
+        combined.append(pack)
+    sections = []
+    refs = []
+    for pack in combined:
+        refs.append(
+            {
+                "id": str(pack.id),
+                "name": pack.name,
+                "scope": pack.scope,
+                "version": pack.version,
+                "is_active": pack.is_active,
+            }
+        )
+        header = f"### ContextPack: {pack.name} ({pack.scope}) v{pack.version}"
+        sections.append(f"{header}\n{pack.content_markdown}".strip())
+    effective_context = "\n\n".join(sections).strip()
+    digest = hashlib.sha256(effective_context.encode("utf-8")).hexdigest() if effective_context else ""
+    preview = effective_context[:2000] if effective_context else ""
+    return {
+        "effective_context": effective_context,
+        "refs": refs,
+        "hash": digest,
+        "preview": preview,
+    }
+
+
 def generate_blueprint_draft(session_id: str) -> None:
     session = BlueprintDraftSession.objects.get(id=session_id)
     session.status = "drafting"
     session.last_error = ""
     session.save(update_fields=["status", "last_error"])
+    context = _resolve_context(session)
+    session.context_pack_refs_json = context["refs"]
+    session.effective_context_hash = context["hash"]
+    session.effective_context_preview = context["preview"]
+    session.save(
+        update_fields=["context_pack_refs_json", "effective_context_hash", "effective_context_preview", "updated_at"]
+    )
     transcripts = _collect_transcripts(session)
     combined = "\n".join(transcripts)
-    draft = _openai_generate_blueprint(combined, session.blueprint_kind) if combined else None
+    draft = (
+        _openai_generate_blueprint(combined, session.blueprint_kind, context["effective_context"])
+        if combined
+        else None
+    )
     if not draft:
         draft = session.current_draft_json or {}
     errors = _validate_blueprint(draft, session.blueprint_kind) if draft else ["Draft generation failed"]
@@ -172,9 +230,20 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
     session.status = "drafting"
     session.last_error = ""
     session.save(update_fields=["status", "last_error"])
+    context = _resolve_context(session)
+    session.context_pack_refs_json = context["refs"]
+    session.effective_context_hash = context["hash"]
+    session.effective_context_preview = context["preview"]
+    session.save(
+        update_fields=["context_pack_refs_json", "effective_context_hash", "effective_context_preview", "updated_at"]
+    )
     base = session.requirements_summary or ""
     combined = (base + "\n" + instruction).strip()
-    draft = _openai_generate_blueprint(combined, session.blueprint_kind) or session.current_draft_json or {}
+    draft = (
+        _openai_generate_blueprint(combined, session.blueprint_kind, context["effective_context"])
+        or session.current_draft_json
+        or {}
+    )
     errors = _validate_blueprint(draft, session.blueprint_kind) if draft else ["Revision failed"]
     session.current_draft_json = draft
     session.requirements_summary = combined[:2000]

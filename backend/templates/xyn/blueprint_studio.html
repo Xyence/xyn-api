@@ -7,6 +7,16 @@
     <p><strong>Kind:</strong> {{ session.blueprint_kind }}</p>
     <p><strong>Job ID:</strong> <span id="session-job-id">{{ session.job_id }}</span></p>
     <p><a href="/xyn/blueprints/">Back to list</a></p>
+    <h2>Context</h2>
+    <p><strong>Effective context hash:</strong> <span id="context-hash">{{ session.effective_context_hash }}</span></p>
+    <ul id="context-pack-list">
+      {% for ref in session.context_pack_refs_json %}
+        <li>{{ ref.name }} ({{ ref.scope }}) v{{ ref.version }}</li>
+      {% empty %}
+        <li>No context packs resolved yet.</li>
+      {% endfor %}
+    </ul>
+    <pre id="context-preview" style="white-space: pre-wrap;">{{ session.effective_context_preview }}</pre>
 
     <h2>Voice notes</h2>
     <form method="post" action="/xyn/api/voice-notes" enctype="multipart/form-data">
@@ -198,6 +208,24 @@
             document.getElementById("session-job-id").textContent = data.job_id || "";
             document.getElementById("diff-summary").textContent = data.diff_summary || "";
             document.getElementById("last-error").textContent = data.last_error || "";
+            document.getElementById("context-hash").textContent = data.effective_context_hash || "";
+            const contextPreview = document.getElementById("context-preview");
+            if (contextPreview) contextPreview.textContent = data.effective_context_preview || "";
+            const packList = document.getElementById("context-pack-list");
+            if (packList && Array.isArray(data.context_pack_refs)) {
+              packList.innerHTML = "";
+              if (data.context_pack_refs.length === 0) {
+                const li = document.createElement("li");
+                li.textContent = "No context packs resolved yet.";
+                packList.appendChild(li);
+              } else {
+                data.context_pack_refs.forEach((ref) => {
+                  const li = document.createElement("li");
+                  li.textContent = `${ref.name} (${ref.scope}) v${ref.version}`;
+                  packList.appendChild(li);
+                });
+              }
+            }
             const errorsEl = document.getElementById("validation-errors");
             if (errorsEl && Array.isArray(data.validation_errors)) {
               errorsEl.innerHTML = "";

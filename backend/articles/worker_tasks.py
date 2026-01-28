@@ -89,7 +89,7 @@ def _validate_blueprint(spec: Dict[str, Any], kind: str) -> List[str]:
     return errors
 
 
-def _openai_generate_blueprint(transcript: str, kind: str) -> Optional[Dict[str, Any]]:
+def _openai_generate_blueprint(transcript: str, kind: str, context_text: str) -> Optional[Dict[str, Any]]:
     try:
         config = _get_json("/xyn/internal/openai-config")
         api_key = config.get("api_key")
@@ -119,6 +119,8 @@ def _openai_generate_blueprint(transcript: str, kind: str) -> Optional[Dict[str,
             "Return ONLY valid JSON matching SolutionBlueprintSpec schema. "
             "Use apiVersion xyn.blueprint/v1 and include releaseSpec."
         )
+    if context_text:
+        system_prompt = f"{context_text}\n\n{system_prompt}"
     response = client.responses.create(
         model=model,
         input=[
@@ -156,9 +158,11 @@ def generate_blueprint_draft(session_id: str) -> None:
         _post_json(f"/xyn/internal/draft-sessions/{session_id}/status", {"status": "drafting"})
         payload = _get_json(f"/xyn/internal/draft-sessions/{session_id}")
         kind = payload.get("blueprint_kind", "solution")
+        context_payload = _post_json(f"/xyn/internal/draft-sessions/{session_id}/context/resolve", {})
+        context_text = context_payload.get("effective_context", "")
         transcripts = payload.get("transcripts", [])
         combined = "\n".join(transcripts)
-        draft = _openai_generate_blueprint(combined, kind) if combined else None
+        draft = _openai_generate_blueprint(combined, kind, context_text) if combined else None
         if not draft:
             draft = payload.get("draft") or {}
         errors = _validate_blueprint(draft, kind) if draft else ["Draft generation failed"]
@@ -186,9 +190,11 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
         _post_json(f"/xyn/internal/draft-sessions/{session_id}/status", {"status": "drafting"})
         payload = _get_json(f"/xyn/internal/draft-sessions/{session_id}")
         kind = payload.get("blueprint_kind", "solution")
+        context_payload = _post_json(f"/xyn/internal/draft-sessions/{session_id}/context/resolve", {})
+        context_text = context_payload.get("effective_context", "")
         base_summary = payload.get("requirements_summary", "")
         combined = (base_summary + "\n" + instruction).strip()
-        draft = _openai_generate_blueprint(combined, kind) or payload.get("draft") or {}
+        draft = _openai_generate_blueprint(combined, kind, context_text) or payload.get("draft") or {}
         errors = _validate_blueprint(draft, kind) if draft else ["Revision failed"]
         status = "ready" if not errors else "ready_with_errors"
         _post_json(

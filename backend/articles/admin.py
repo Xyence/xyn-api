@@ -23,6 +23,7 @@ from .models import (
     BlueprintRevision,
     Bundle,
     Capability,
+    ContextPack,
     DraftSessionVoiceNote,
     Module,
     OpenAIConfig,
@@ -163,6 +164,13 @@ class ReleasePlanAdmin(admin.ModelAdmin):
     list_display = ("name", "target_kind", "target_fqn", "from_version", "to_version", "updated_at")
     search_fields = ("name", "target_fqn")
     list_filter = ("target_kind",)
+
+
+@admin.register(ContextPack)
+class ContextPackAdmin(admin.ModelAdmin):
+    list_display = ("name", "scope", "version", "is_active", "is_default", "updated_at")
+    search_fields = ("name", "namespace", "project_key")
+    list_filter = ("scope", "is_active", "is_default")
 
 
 

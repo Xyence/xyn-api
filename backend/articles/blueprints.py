@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import uuid
@@ -27,6 +28,7 @@ from .models import (
     BlueprintRevision,
     Bundle,
     Capability,
+    ContextPack,
     DraftSessionVoiceNote,
     Module,
     VoiceNote,
@@ -154,6 +156,54 @@ def _generate_blueprint_spec(session: BlueprintDraftSession, transcripts: List[s
     if transcripts:
         spec["requirements"] = transcripts
     return spec
+
+
+def _resolve_context_packs(
+    session: BlueprintDraftSession,
+    selected_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    ids = selected_ids if selected_ids is not None else (session.context_pack_ids or [])
+    defaults = list(
+        ContextPack.objects.filter(scope="global", is_active=True, is_default=True).order_by("name")
+    )
+    selected = []
+    if ids:
+        packs = ContextPack.objects.filter(id__in=ids)
+        pack_map = {str(pack.id): pack for pack in packs}
+        for pack_id in ids:
+            if pack := pack_map.get(str(pack_id)):
+                selected.append(pack)
+    combined = []
+    seen = set()
+    for pack in defaults + selected:
+        pack_id = str(pack.id)
+        if pack_id in seen:
+            continue
+        seen.add(pack_id)
+        combined.append(pack)
+    sections = []
+    refs = []
+    for pack in combined:
+        refs.append(
+            {
+                "id": str(pack.id),
+                "name": pack.name,
+                "scope": pack.scope,
+                "version": pack.version,
+                "is_active": pack.is_active,
+            }
+        )
+        header = f"### ContextPack: {pack.name} ({pack.scope}) v{pack.version}"
+        sections.append(f"{header}\n{pack.content_markdown}".strip())
+    effective_context = "\n\n".join(sections).strip()
+    digest = hashlib.sha256(effective_context.encode("utf-8")).hexdigest() if effective_context else ""
+    preview = effective_context[:2000] if effective_context else ""
+    return {
+        "effective_context": effective_context,
+        "refs": refs,
+        "hash": digest,
+        "preview": preview,
+    }
 
 
 def _module_from_spec(spec: Dict[str, Any], user) -> Module:
@@ -290,6 +340,7 @@ def blueprint_list_view(request: HttpRequest) -> HttpResponse:
     modules = Module.objects.all().order_by("namespace", "name")
     bundles = Bundle.objects.all().order_by("namespace", "name")
     capabilities = Capability.objects.all().order_by("name")
+    context_packs = ContextPack.objects.filter(is_active=True).order_by("name")
     return render(
         request,
         "xyn/blueprints_list.html",
@@ -299,6 +350,7 @@ def blueprint_list_view(request: HttpRequest) -> HttpResponse:
             "modules": modules,
             "bundles": bundles,
             "capabilities": capabilities,
+            "context_packs": context_packs,
         },
     )
 
@@ -308,9 +360,11 @@ def new_draft_session_view(request: HttpRequest) -> HttpResponse:
     if request.method == "POST":
         name = request.POST.get("name") or f"Blueprint draft {uuid.uuid4()}"
         blueprint_kind = request.POST.get("blueprint_kind", "solution")
+        context_pack_ids = request.POST.getlist("context_pack_ids")
         session = BlueprintDraftSession.objects.create(
             name=name,
             blueprint_kind=blueprint_kind,
+            context_pack_ids=context_pack_ids,
             created_by=request.user,
             updated_by=request.user,
         )
@@ -592,9 +646,13 @@ def create_draft_session(request: HttpRequest) -> JsonResponse:
     payload = json.loads(request.body.decode("utf-8"))
     name = payload.get("name") or f"Blueprint draft {uuid.uuid4()}"
     blueprint_kind = payload.get("blueprint_kind", "solution")
+    context_pack_ids = payload.get("context_pack_ids") or []
+    if not isinstance(context_pack_ids, list):
+        return JsonResponse({"error": "context_pack_ids must be a list"}, status=400)
     session = BlueprintDraftSession.objects.create(
         name=name,
         blueprint_kind=blueprint_kind,
+        context_pack_ids=context_pack_ids,
         created_by=request.user,
         updated_by=request.user,
     )
@@ -765,6 +823,148 @@ def get_bundle(request: HttpRequest, bundle_ref: str) -> JsonResponse:
     )
 
 
+def _coerce_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    return value.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _clear_default_for_scope(scope: str, namespace: str, project_key: str, exclude_id: Optional[str] = None) -> None:
+    qs = ContextPack.objects.filter(scope=scope, is_default=True)
+    if namespace:
+        qs = qs.filter(namespace=namespace)
+    if project_key:
+        qs = qs.filter(project_key=project_key)
+    if exclude_id:
+        qs = qs.exclude(id=exclude_id)
+    qs.update(is_default=False)
+
+
+@csrf_exempt
+@login_required
+def list_context_packs(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "POST":
+        payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+        name = payload.get("name")
+        scope = payload.get("scope", "global")
+        version = payload.get("version")
+        content = payload.get("content_markdown", "")
+        if not name or not version or not content:
+            return JsonResponse({"error": "name, version, content_markdown required"}, status=400)
+        namespace = payload.get("namespace", "")
+        project_key = payload.get("project_key", "")
+        is_active = bool(payload.get("is_active", True))
+        is_default = bool(payload.get("is_default", False))
+        if is_default:
+            _clear_default_for_scope(scope, namespace, project_key)
+        pack = ContextPack.objects.create(
+            name=name,
+            scope=scope,
+            namespace=namespace,
+            project_key=project_key,
+            version=version,
+            is_active=is_active,
+            is_default=is_default,
+            content_markdown=content,
+            applies_to_json=payload.get("applies_to_json", {}),
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        return JsonResponse({"id": str(pack.id)})
+    qs = ContextPack.objects.all()
+    if scope := request.GET.get("scope"):
+        qs = qs.filter(scope=scope)
+    if namespace := request.GET.get("namespace"):
+        qs = qs.filter(namespace=namespace)
+    if project_key := request.GET.get("project_key"):
+        qs = qs.filter(project_key=project_key)
+    if active_param := request.GET.get("active"):
+        if (active_val := _coerce_bool(active_param)) is not None:
+            qs = qs.filter(is_active=active_val)
+    data = [
+        {
+            "id": str(pack.id),
+            "name": pack.name,
+            "scope": pack.scope,
+            "namespace": pack.namespace,
+            "project_key": pack.project_key,
+            "version": pack.version,
+            "is_active": pack.is_active,
+            "is_default": pack.is_default,
+            "applies_to_json": pack.applies_to_json or {},
+            "updated_at": pack.updated_at,
+        }
+        for pack in qs.order_by("name", "version")
+    ]
+    return JsonResponse({"context_packs": data})
+
+
+@csrf_exempt
+@login_required
+def context_pack_detail(request: HttpRequest, pack_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    pack = get_object_or_404(ContextPack, id=pack_id)
+    if request.method == "PUT":
+        payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+        pack.name = payload.get("name", pack.name)
+        pack.scope = payload.get("scope", pack.scope)
+        pack.namespace = payload.get("namespace", pack.namespace)
+        pack.project_key = payload.get("project_key", pack.project_key)
+        pack.version = payload.get("version", pack.version)
+        pack.content_markdown = payload.get("content_markdown", pack.content_markdown)
+        pack.applies_to_json = payload.get("applies_to_json", pack.applies_to_json)
+        is_active = payload.get("is_active")
+        if is_active is not None:
+            pack.is_active = bool(is_active)
+        is_default = payload.get("is_default")
+        if is_default is not None:
+            pack.is_default = bool(is_default)
+        if pack.is_default:
+            _clear_default_for_scope(pack.scope, pack.namespace, pack.project_key, exclude_id=str(pack.id))
+        pack.updated_by = request.user
+        pack.save()
+    return JsonResponse(
+        {
+            "id": str(pack.id),
+            "name": pack.name,
+            "scope": pack.scope,
+            "namespace": pack.namespace,
+            "project_key": pack.project_key,
+            "version": pack.version,
+            "is_active": pack.is_active,
+            "is_default": pack.is_default,
+            "content_markdown": pack.content_markdown,
+            "applies_to_json": pack.applies_to_json or {},
+            "updated_at": pack.updated_at,
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def context_pack_activate(request: HttpRequest, pack_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    pack = get_object_or_404(ContextPack, id=pack_id)
+    pack.is_active = True
+    pack.save(update_fields=["is_active", "updated_at"])
+    return JsonResponse({"status": "active"})
+
+
+@csrf_exempt
+@login_required
+def context_pack_deactivate(request: HttpRequest, pack_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    pack = get_object_or_404(ContextPack, id=pack_id)
+    pack.is_active = False
+    pack.save(update_fields=["is_active", "updated_at"])
+    return JsonResponse({"status": "inactive"})
+
+
 @csrf_exempt
 @login_required
 def upload_voice_note(request: HttpRequest) -> JsonResponse:
@@ -893,6 +1093,9 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             "job_id": session.job_id,
             "last_error": session.last_error,
             "diff_summary": session.diff_summary,
+            "context_pack_refs": session.context_pack_refs_json or [],
+            "effective_context_hash": session.effective_context_hash,
+            "effective_context_preview": session.effective_context_preview,
         }
     )
 
@@ -987,9 +1190,37 @@ def internal_draft_session(request: HttpRequest, session_id: str) -> JsonRespons
         {
             "id": str(session.id),
             "blueprint_kind": session.blueprint_kind,
+            "context_pack_ids": session.context_pack_ids or [],
             "requirements_summary": session.requirements_summary,
             "draft": session.current_draft_json,
             "transcripts": transcripts,
+        }
+    )
+
+
+@csrf_exempt
+def internal_draft_session_context(request: HttpRequest, session_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    resolved = _resolve_context_packs(session)
+    session.context_pack_refs_json = resolved["refs"]
+    session.effective_context_hash = resolved["hash"]
+    session.effective_context_preview = resolved["preview"]
+    session.save(
+        update_fields=[
+            "context_pack_refs_json",
+            "effective_context_hash",
+            "effective_context_preview",
+            "updated_at",
+        ]
+    )
+    return JsonResponse(
+        {
+            "effective_context": resolved["effective_context"],
+            "context_pack_refs": resolved["refs"],
+            "effective_context_hash": resolved["hash"],
+            "effective_context_preview": resolved["preview"],
         }
     )
 

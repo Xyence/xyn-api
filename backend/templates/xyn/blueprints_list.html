@@ -14,6 +14,14 @@
         <option value="module">Module blueprint</option>
         <option value="bundle">Bundle blueprint</option>
       </select>
+      {% if context_packs %}
+        <label style="display: block; margin-top: 8px;">Context packs</label>
+        <select name="context_pack_ids" multiple size="4">
+          {% for pack in context_packs %}
+            <option value="{{ pack.id }}">{{ pack.name }} ({{ pack.scope }}) v{{ pack.version }}</option>
+          {% endfor %}
+        </select>
+      {% endif %}
       <button type="submit">New Draft Session</button>
     </form>
     <ul>

@@ -237,6 +237,10 @@ class BlueprintDraftSession(models.Model):
     diff_summary = models.TextField(blank=True)
     job_id = models.CharField(max_length=100, blank=True)
     last_error = models.TextField(blank=True)
+    context_pack_ids = models.JSONField(default=list, blank=True)
+    context_pack_refs_json = models.JSONField(null=True, blank=True)
+    effective_context_hash = models.CharField(max_length=64, blank=True)
+    effective_context_preview = models.TextField(blank=True)
     linked_blueprint = models.ForeignKey(
         Blueprint, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_sessions"
     )
@@ -366,7 +370,7 @@ class Bundle(models.Model):
 
 class Capability(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(max_length=200, unique=True)
+    name = models.CharField(max_length=200)
     version = models.CharField(max_length=64, default="1.0")
     profiles_json = models.JSONField(null=True, blank=True)
     capability_spec_json = models.JSONField(null=True, blank=True)
@@ -407,3 +411,37 @@ class ReleasePlan(models.Model):
 
     def __str__(self) -> str:
         return f"{self.target_kind}:{self.target_fqn} {self.from_version}->{self.to_version}"
+
+
+class ContextPack(models.Model):
+    SCOPE_CHOICES = [
+        ("global", "Global"),
+        ("namespace", "Namespace"),
+        ("project", "Project"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=200)
+    scope = models.CharField(max_length=20, choices=SCOPE_CHOICES)
+    namespace = models.CharField(max_length=120, blank=True)
+    project_key = models.CharField(max_length=120, blank=True)
+    version = models.CharField(max_length=64)
+    is_active = models.BooleanField(default=True)
+    is_default = models.BooleanField(default=False)
+    content_markdown = models.TextField()
+    applies_to_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="context_packs_created"
+    )
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="context_packs_updated"
+    )
+
+    class Meta:
+        ordering = ["name"]
+        unique_together = ("name", "version", "scope", "namespace", "project_key")
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.scope}) v{self.version}"
