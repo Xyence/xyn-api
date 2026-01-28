@@ -39,7 +39,7 @@
       </div>
       <div class="form-row">
         <label>Upload audio</label>
-        <input type="file" name="file" id="voice-note-file" />
+        <input type="file" name="file" id="voice-note-file" accept="audio/*" capture="microphone" />
       </div>
       <div class="form-row">
         <label>Title</label>
@@ -145,6 +145,7 @@
         if (recordStart) recordStart.disabled = true;
         if (recordStop) recordStop.disabled = true;
         if (recordingAttach) recordingAttach.disabled = true;
+        setRecordingHint("Use the Upload audio control (it can open the system recorder on mobile).");
       } else {
         recordStart?.addEventListener("click", async () => {
           try {
