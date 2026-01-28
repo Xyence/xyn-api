@@ -462,6 +462,37 @@ div.breadcrumbs a {
   .dashboard #content-main .module table {
     min-width: 520px;
   }
+
+  #nav-sidebar {
+    overflow-x: hidden;
+  }
+
+  #nav-sidebar .module {
+    padding: 0 6px 10px;
+  }
+
+  #nav-sidebar table {
+    display: block;
+    width: 100%;
+    table-layout: fixed;
+  }
+
+  #nav-sidebar caption,
+  #nav-sidebar thead,
+  #nav-sidebar tbody,
+  #nav-sidebar tr,
+  #nav-sidebar th,
+  #nav-sidebar td {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  #nav-sidebar th,
+  #nav-sidebar td {
+    white-space: normal;
+    word-break: break-word;
+  }
 }
 
 /* Hide sidebar column on login page (permission panel/filter bar). */
