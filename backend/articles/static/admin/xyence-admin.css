@@ -455,6 +455,11 @@ div.breadcrumbs a {
 }
 
 @media (max-width: 768px) {
+  .dashboard #content {
+    display: block !important;
+    padding-right: 0;
+  }
+
   .dashboard #content-main .module {
     overflow-x: auto;
   }
