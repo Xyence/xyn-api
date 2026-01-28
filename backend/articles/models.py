@@ -445,3 +445,45 @@ class ContextPack(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.scope}) v{self.version}"
+
+
+class ProvisionedInstance(models.Model):
+    STATUS_CHOICES = [
+        ("requested", "Requested"),
+        ("provisioning", "Provisioning"),
+        ("running", "Running"),
+        ("ready", "Ready"),
+        ("error", "Error"),
+        ("terminating", "Terminating"),
+        ("terminated", "Terminated"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=200)
+    aws_region = models.CharField(max_length=50)
+    instance_id = models.CharField(max_length=64, blank=True)
+    instance_type = models.CharField(max_length=64)
+    ami_id = models.CharField(max_length=64)
+    security_group_id = models.CharField(max_length=64, blank=True)
+    subnet_id = models.CharField(max_length=64, blank=True)
+    vpc_id = models.CharField(max_length=64, blank=True)
+    public_ip = models.GenericIPAddressField(null=True, blank=True)
+    private_ip = models.GenericIPAddressField(null=True, blank=True)
+    ssm_status = models.CharField(max_length=64, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="requested")
+    last_error = models.TextField(blank=True)
+    tags_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="provisioned_instances_created"
+    )
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="provisioned_instances_updated"
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.aws_region})"

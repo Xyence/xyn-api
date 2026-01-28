@@ -45,6 +45,12 @@ from articles.blueprints import (
     instantiate_blueprint,
     upload_voice_note,
 )
+from articles.provisioning_views import (
+    bootstrap_log_view,
+    destroy_instance_view,
+    get_instance,
+    list_instances,
+)
 def healthcheck(_request):
     return JsonResponse(
         {"status": "ok", "admin": "/admin/", "articles": "/api/articles/"},
@@ -82,6 +88,10 @@ urlpatterns = [
     path("xyn/api/draft-sessions/<uuid:session_id>/enqueue-draft-generation", enqueue_draft_generation),
     path("xyn/api/draft-sessions/<uuid:session_id>/enqueue-draft-revision", enqueue_draft_revision),
     path("xyn/api/draft-sessions/<uuid:session_id>", get_draft_session),
+    path("xyn/api/provision/instances", list_instances),
+    path("xyn/api/provision/instances/<uuid:instance_id>", get_instance),
+    path("xyn/api/provision/instances/<uuid:instance_id>/destroy", destroy_instance_view),
+    path("xyn/api/provision/instances/<uuid:instance_id>/bootstrap-log", bootstrap_log_view),
     path("xyn/internal/voice-notes/<uuid:voice_note_id>", internal_voice_note),
     path("xyn/internal/voice-notes/<uuid:voice_note_id>/audio", internal_voice_note_audio),
     path("xyn/internal/voice-notes/<uuid:voice_note_id>/transcript", internal_voice_note_transcript),

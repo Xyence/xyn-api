@@ -1,0 +1,91 @@
+import json
+from typing import Any
+
+from django.http import HttpRequest, JsonResponse
+from django.shortcuts import get_object_or_404
+from django.views.decorators.csrf import csrf_exempt
+from django.contrib.auth.decorators import login_required
+
+from .models import ProvisionedInstance
+from .provisioning import (
+    provision_instance,
+    refresh_instance,
+    destroy_instance,
+    fetch_bootstrap_log,
+)
+from .blueprints import _require_staff
+
+
+def _instance_payload(instance: ProvisionedInstance) -> dict:
+    return {
+        "id": str(instance.id),
+        "name": instance.name,
+        "aws_region": instance.aws_region,
+        "instance_id": instance.instance_id,
+        "instance_type": instance.instance_type,
+        "ami_id": instance.ami_id,
+        "security_group_id": instance.security_group_id,
+        "subnet_id": instance.subnet_id,
+        "vpc_id": instance.vpc_id,
+        "public_ip": instance.public_ip,
+        "private_ip": instance.private_ip,
+        "ssm_status": instance.ssm_status,
+        "status": instance.status,
+        "last_error": instance.last_error,
+        "tags": instance.tags_json or {},
+        "created_at": instance.created_at,
+        "updated_at": instance.updated_at,
+    }
+
+
+@csrf_exempt
+@login_required
+def list_instances(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "POST":
+        payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+        try:
+            instance = provision_instance(payload, request.user)
+        except Exception as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
+        return JsonResponse(_instance_payload(instance), status=201)
+
+    instances = ProvisionedInstance.objects.all().order_by("-created_at")
+    data = [_instance_payload(inst) for inst in instances]
+    return JsonResponse({"instances": data})
+
+
+@login_required
+def get_instance(request: HttpRequest, instance_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    if request.method == "GET" and request.GET.get("refresh") == "true":
+        instance = refresh_instance(instance)
+    return JsonResponse(_instance_payload(instance))
+
+
+@csrf_exempt
+@login_required
+def destroy_instance_view(request: HttpRequest, instance_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    instance = destroy_instance(instance)
+    return JsonResponse(_instance_payload(instance))
+
+
+@login_required
+def bootstrap_log_view(request: HttpRequest, instance_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    tail = int(request.GET.get("tail", "200"))
+    try:
+        log = fetch_bootstrap_log(instance, tail=tail)
+    except Exception as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    return JsonResponse({"instance_id": str(instance.id), **log})

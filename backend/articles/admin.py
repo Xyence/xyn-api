@@ -27,6 +27,7 @@ from .models import (
     DraftSessionVoiceNote,
     Module,
     OpenAIConfig,
+    ProvisionedInstance,
     ReleasePlan,
     VoiceNote,
     VoiceTranscript,
@@ -171,6 +172,13 @@ class ContextPackAdmin(admin.ModelAdmin):
     list_display = ("name", "scope", "version", "is_active", "is_default", "updated_at")
     search_fields = ("name", "namespace", "project_key")
     list_filter = ("scope", "is_active", "is_default")
+
+
+@admin.register(ProvisionedInstance)
+class ProvisionedInstanceAdmin(admin.ModelAdmin):
+    list_display = ("name", "aws_region", "instance_id", "status", "public_ip", "updated_at")
+    search_fields = ("name", "instance_id", "public_ip", "private_ip")
+    list_filter = ("status", "aws_region")
 
 
 
