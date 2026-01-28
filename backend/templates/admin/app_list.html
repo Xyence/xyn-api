@@ -1,0 +1,177 @@
+{% load i18n %}
+
+{% for app in app_list %}
+  {% if app.app_label == "articles" %}
+    <div class="app-articles module">
+      <table>
+        <caption><span class="section">Articles</span></caption>
+        <thead class="visually-hidden">
+          <tr>
+            <th scope="col">{% translate 'Model name' %}</th>
+            <th scope="col">{% translate 'Add link' %}</th>
+            <th scope="col">{% translate 'Change or view list link' %}</th>
+          </tr>
+        </thead>
+        {% for model in app.models %}
+          {% if model.object_name == "Article" or model.object_name == "ArticleVersion" %}
+            <tr class="model-{{ model.object_name|lower }}">
+              <th scope="row" id="{{ app.app_label }}-{{ model.object_name|lower }}">
+                {% if model.admin_url %}
+                  <a href="{{ model.admin_url }}">{{ model.name }}</a>
+                {% else %}
+                  {{ model.name }}
+                {% endif %}
+              </th>
+              <td>{% if model.add_url %}<a href="{{ model.add_url }}" class="addlink">{% translate 'Add' %}</a>{% endif %}</td>
+              <td>{% if model.admin_url %}<a href="{{ model.admin_url }}" class="changelink">{% translate 'Change' %}</a>{% endif %}</td>
+            </tr>
+          {% endif %}
+        {% endfor %}
+      </table>
+    </div>
+
+    <div class="app-blueprints module">
+      <table>
+        <caption><span class="section">Blueprints</span></caption>
+        <thead class="visually-hidden">
+          <tr>
+            <th scope="col">{% translate 'Model name' %}</th>
+            <th scope="col">{% translate 'Add link' %}</th>
+            <th scope="col">{% translate 'Change or view list link' %}</th>
+          </tr>
+        </thead>
+        {% for model in app.models %}
+          {% if model.object_name == "Blueprint" or model.object_name == "BlueprintRevision" or model.object_name == "BlueprintDraftSession" or model.object_name == "BlueprintInstance" %}
+            <tr class="model-{{ model.object_name|lower }}">
+              <th scope="row" id="{{ app.app_label }}-{{ model.object_name|lower }}">
+                {% if model.admin_url %}
+                  <a href="{{ model.admin_url }}">{{ model.name }}</a>
+                {% else %}
+                  {{ model.name }}
+                {% endif %}
+              </th>
+              <td>{% if model.add_url %}<a href="{{ model.add_url }}" class="addlink">{% translate 'Add' %}</a>{% endif %}</td>
+              <td>{% if model.admin_url %}<a href="{{ model.admin_url }}" class="changelink">{% translate 'Change' %}</a>{% endif %}</td>
+            </tr>
+          {% endif %}
+        {% endfor %}
+      </table>
+    </div>
+
+    <div class="app-registry module">
+      <table>
+        <caption><span class="section">Registry</span></caption>
+        <thead class="visually-hidden">
+          <tr>
+            <th scope="col">{% translate 'Model name' %}</th>
+            <th scope="col">{% translate 'Add link' %}</th>
+            <th scope="col">{% translate 'Change or view list link' %}</th>
+          </tr>
+        </thead>
+        {% for model in app.models %}
+          {% if model.object_name == "Module" or model.object_name == "Bundle" or model.object_name == "Capability" or model.object_name == "ContextPack" or model.object_name == "ReleasePlan" %}
+            <tr class="model-{{ model.object_name|lower }}">
+              <th scope="row" id="{{ app.app_label }}-{{ model.object_name|lower }}">
+                {% if model.admin_url %}
+                  <a href="{{ model.admin_url }}">{{ model.name }}</a>
+                {% else %}
+                  {{ model.name }}
+                {% endif %}
+              </th>
+              <td>{% if model.add_url %}<a href="{{ model.add_url }}" class="addlink">{% translate 'Add' %}</a>{% endif %}</td>
+              <td>{% if model.admin_url %}<a href="{{ model.admin_url }}" class="changelink">{% translate 'Change' %}</a>{% endif %}</td>
+            </tr>
+          {% endif %}
+        {% endfor %}
+      </table>
+    </div>
+
+    <div class="app-voice module">
+      <table>
+        <caption><span class="section">Voice</span></caption>
+        <thead class="visually-hidden">
+          <tr>
+            <th scope="col">{% translate 'Model name' %}</th>
+            <th scope="col">{% translate 'Add link' %}</th>
+            <th scope="col">{% translate 'Change or view list link' %}</th>
+          </tr>
+        </thead>
+        {% for model in app.models %}
+          {% if model.object_name == "VoiceNote" or model.object_name == "VoiceTranscript" or model.object_name == "DraftSessionVoiceNote" %}
+            <tr class="model-{{ model.object_name|lower }}">
+              <th scope="row" id="{{ app.app_label }}-{{ model.object_name|lower }}">
+                {% if model.admin_url %}
+                  <a href="{{ model.admin_url }}">{{ model.name }}</a>
+                {% else %}
+                  {{ model.name }}
+                {% endif %}
+              </th>
+              <td>{% if model.add_url %}<a href="{{ model.add_url }}" class="addlink">{% translate 'Add' %}</a>{% endif %}</td>
+              <td>{% if model.admin_url %}<a href="{{ model.admin_url }}" class="changelink">{% translate 'Change' %}</a>{% endif %}</td>
+            </tr>
+          {% endif %}
+        {% endfor %}
+      </table>
+    </div>
+
+    <div class="app-integrations module">
+      <table>
+        <caption><span class="section">Integrations</span></caption>
+        <thead class="visually-hidden">
+          <tr>
+            <th scope="col">{% translate 'Model name' %}</th>
+            <th scope="col">{% translate 'Add link' %}</th>
+            <th scope="col">{% translate 'Change or view list link' %}</th>
+          </tr>
+        </thead>
+        {% for model in app.models %}
+          {% if model.object_name == "OpenAIConfig" %}
+            <tr class="model-{{ model.object_name|lower }}">
+              <th scope="row" id="{{ app.app_label }}-{{ model.object_name|lower }}">
+                {% if model.admin_url %}
+                  <a href="{{ model.admin_url }}">{{ model.name }}</a>
+                {% else %}
+                  {{ model.name }}
+                {% endif %}
+              </th>
+              <td>{% if model.add_url %}<a href="{{ model.add_url }}" class="addlink">{% translate 'Add' %}</a>{% endif %}</td>
+              <td>{% if model.admin_url %}<a href="{{ model.admin_url }}" class="changelink">{% translate 'Change' %}</a>{% endif %}</td>
+            </tr>
+          {% endif %}
+        {% endfor %}
+      </table>
+    </div>
+  {% else %}
+    <div class="app-{{ app.app_label }} module">
+      <table>
+        <caption>
+          {% if app.app_url %}
+            <a href="{{ app.app_url }}" class="section">{{ app.name }}</a>
+          {% else %}
+            <span class="section">{{ app.name }}</span>
+          {% endif %}
+        </caption>
+        <thead class="visually-hidden">
+          <tr>
+            <th scope="col">{% translate 'Model name' %}</th>
+            <th scope="col">{% translate 'Add link' %}</th>
+            <th scope="col">{% translate 'Change or view list link' %}</th>
+          </tr>
+        </thead>
+        {% for model in app.models %}
+          <tr class="model-{{ model.object_name|lower }}">
+            <th scope="row" id="{{ app.app_label }}-{{ model.object_name|lower }}">
+              {% if model.admin_url %}
+                <a href="{{ model.admin_url }}">{{ model.name }}</a>
+              {% else %}
+                {{ model.name }}
+              {% endif %}
+            </th>
+            <td>{% if model.add_url %}<a href="{{ model.add_url }}" class="addlink">{% translate 'Add' %}</a>{% endif %}</td>
+            <td>{% if model.admin_url %}<a href="{{ model.admin_url }}" class="changelink">{% translate 'Change' %}</a>{% endif %}</td>
+          </tr>
+        {% endfor %}
+      </table>
+    </div>
+  {% endif %}
+{% endfor %}
