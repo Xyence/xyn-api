@@ -22,6 +22,9 @@ from .models import (
     BlueprintInstance,
     BlueprintRevision,
     Bundle,
+    Registry,
+    Run,
+    RunArtifact,
     Capability,
     ContextPack,
     DraftSessionVoiceNote,
@@ -172,6 +175,25 @@ class ContextPackAdmin(admin.ModelAdmin):
     list_display = ("name", "scope", "version", "is_active", "is_default", "updated_at")
     search_fields = ("name", "namespace", "project_key")
     list_filter = ("scope", "is_active", "is_default")
+
+
+@admin.register(Registry)
+class RegistryAdmin(admin.ModelAdmin):
+    list_display = ("name", "registry_type", "status", "last_sync_at")
+    list_filter = ("registry_type", "status")
+    search_fields = ("name", "url")
+
+
+@admin.register(Run)
+class RunAdmin(admin.ModelAdmin):
+    list_display = ("entity_type", "entity_id", "status", "created_at", "finished_at")
+    list_filter = ("entity_type", "status")
+    search_fields = ("entity_id", "summary")
+
+
+@admin.register(RunArtifact)
+class RunArtifactAdmin(admin.ModelAdmin):
+    list_display = ("name", "kind", "run", "created_at")
 
 
 @admin.register(ProvisionedInstance)

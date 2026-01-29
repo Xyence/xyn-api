@@ -12,6 +12,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
 from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_exempt
 from jsonschema import Draft202012Validator
@@ -31,6 +32,10 @@ from .models import (
     ContextPack,
     DraftSessionVoiceNote,
     Module,
+    Registry,
+    ReleasePlan,
+    Run,
+    RunArtifact,
     VoiceNote,
     VoiceTranscript,
 )
@@ -461,11 +466,27 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
     release_spec = spec.get("releaseSpec")
     if not release_spec:
         return JsonResponse({"error": "Blueprint missing releaseSpec"}, status=400)
-    mode = request.POST.get("mode", "apply")
+    payload = {}
+    if request.body:
+        try:
+            payload = json.loads(request.body.decode("utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+    if not payload:
+        payload = request.POST
+    mode = payload.get("mode", "apply")
     instance = BlueprintInstance.objects.create(
         blueprint=blueprint,
         revision=latest_revision.revision,
         created_by=request.user,
+    )
+    run = Run.objects.create(
+        entity_type="blueprint",
+        entity_id=blueprint.id,
+        status="running",
+        summary=f"Instantiate {blueprint.namespace}.{blueprint.name}",
+        created_by=request.user,
+        started_at=timezone.now(),
     )
     try:
         plan = _xynseed_request("post", "/releases/plan", {"release_spec": release_spec})
@@ -483,11 +504,19 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
             instance.status = "applied" if op.get("status") == "succeeded" else "failed"
         else:
             instance.status = "planned"
+        run.status = "succeeded" if instance.status in {"planned", "applied"} else "failed"
+        run.metadata_json = {"plan": plan, "operation": op}
     except Exception as exc:
         instance.status = "failed"
         instance.error = str(exc)
+        run.status = "failed"
+        run.error = str(exc)
+    run.finished_at = timezone.now()
+    run.save(update_fields=["status", "error", "metadata_json", "finished_at", "updated_at"])
     instance.save(update_fields=["plan_id", "operation_id", "release_id", "status", "error"])
-    return JsonResponse({"instance_id": str(instance.id), "status": instance.status})
+    return JsonResponse(
+        {"instance_id": str(instance.id), "status": instance.status, "run_id": str(run.id)}
+    )
 
 
 @login_required
@@ -1330,3 +1359,71 @@ def internal_openai_config(request: HttpRequest) -> JsonResponse:
             "model": config.default_model,
         }
     )
+
+
+@csrf_exempt
+def internal_run_update(request: HttpRequest, run_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    run = get_object_or_404(Run, id=run_id)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    append_log = payload.pop("append_log", None)
+    for field in ["status", "summary", "error", "metadata_json", "started_at", "finished_at"]:
+        if field in payload:
+            setattr(run, field, payload[field])
+    if append_log:
+        run.log_text = (run.log_text or "") + append_log
+    if run.status == "running" and run.started_at is None:
+        run.started_at = timezone.now()
+    if run.status in {"succeeded", "failed"} and run.finished_at is None:
+        run.finished_at = timezone.now()
+    run.save()
+    return JsonResponse({"status": run.status})
+
+
+@csrf_exempt
+def internal_run_artifact(request: HttpRequest, run_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    run = get_object_or_404(Run, id=run_id)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    name = payload.get("name")
+    if not name:
+        return JsonResponse({"error": "name required"}, status=400)
+    artifact = RunArtifact.objects.create(
+        run=run,
+        name=name,
+        kind=payload.get("kind", ""),
+        url=payload.get("url", ""),
+        metadata_json=payload.get("metadata_json"),
+    )
+    return JsonResponse({"id": str(artifact.id)})
+
+
+@csrf_exempt
+def internal_registry_sync(request: HttpRequest, registry_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    registry = get_object_or_404(Registry, id=registry_id)
+    registry.last_sync_at = timezone.now()
+    registry.save(update_fields=["last_sync_at", "updated_at"])
+    return JsonResponse({"status": "synced", "last_sync_at": registry.last_sync_at})
+
+
+@csrf_exempt
+def internal_release_plan_generate(request: HttpRequest, plan_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    plan = get_object_or_404(ReleasePlan, id=plan_id)
+    if not plan.milestones_json:
+        plan.milestones_json = {"status": "placeholder", "notes": "Generation not implemented yet"}
+        plan.save(update_fields=["milestones_json", "updated_at"])
+    return JsonResponse({"status": "generated"})

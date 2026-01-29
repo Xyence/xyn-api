@@ -213,3 +213,40 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
             f"/xyn/internal/draft-sessions/{session_id}/error",
             {"error": str(exc)},
         )
+
+
+def sync_registry(registry_id: str, run_id: str) -> None:
+    try:
+        _post_json(f"/xyn/internal/runs/{run_id}", {"status": "running", "append_log": "Starting registry sync\n"})
+        result = _post_json(f"/xyn/internal/registries/{registry_id}/sync", {})
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {
+                "status": "succeeded",
+                "append_log": f"Registry sync completed at {result.get('last_sync_at')}\n",
+            },
+        )
+    except Exception as exc:
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {"status": "failed", "error": str(exc), "append_log": f"Registry sync failed: {exc}\n"},
+        )
+
+
+def generate_release_plan(plan_id: str, run_id: str) -> None:
+    try:
+        _post_json(f"/xyn/internal/runs/{run_id}", {"status": "running", "append_log": "Generating release plan\n"})
+        _post_json(f"/xyn/internal/release-plans/{plan_id}/generate", {})
+        _post_json(
+            f"/xyn/internal/runs/{run_id}/artifacts",
+            {"name": "milestones", "kind": "json", "metadata_json": {"plan_id": plan_id}},
+        )
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {"status": "succeeded", "append_log": "Release plan generation completed\n"},
+        )
+    except Exception as exc:
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {"status": "failed", "error": str(exc), "append_log": f"Release plan failed: {exc}\n"},
+        )

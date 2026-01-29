@@ -413,6 +413,93 @@ class ReleasePlan(models.Model):
         return f"{self.target_kind}:{self.target_fqn} {self.from_version}->{self.to_version}"
 
 
+class Registry(models.Model):
+    TYPE_CHOICES = [
+        ("module", "Module"),
+        ("bundle", "Bundle"),
+        ("blueprint", "Blueprint"),
+        ("release", "Release"),
+    ]
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("inactive", "Inactive"),
+        ("error", "Error"),
+    ]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=200)
+    registry_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    description = models.TextField(blank=True)
+    url = models.URLField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="registries_created"
+    )
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="registries_updated"
+    )
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Run(models.Model):
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("running", "Running"),
+        ("succeeded", "Succeeded"),
+        ("failed", "Failed"),
+    ]
+    ENTITY_CHOICES = [
+        ("blueprint", "Blueprint"),
+        ("registry", "Registry"),
+        ("module", "Module"),
+        ("release_plan", "Release plan"),
+    ]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entity_type = models.CharField(max_length=30, choices=ENTITY_CHOICES)
+    entity_id = models.UUIDField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
+    summary = models.CharField(max_length=240, blank=True)
+    log_text = models.TextField(blank=True)
+    error = models.TextField(blank=True)
+    metadata_json = models.JSONField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="runs_created"
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.entity_type}:{self.entity_id} ({self.status})"
+
+
+class RunArtifact(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.ForeignKey(Run, on_delete=models.CASCADE, related_name="artifacts")
+    name = models.CharField(max_length=200)
+    kind = models.CharField(max_length=100, blank=True)
+    url = models.TextField(blank=True)
+    metadata_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.run_id})"
+
+
 class ContextPack(models.Model):
     SCOPE_CHOICES = [
         ("global", "Global"),
