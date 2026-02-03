@@ -34,6 +34,7 @@ from articles.blueprints import (
     internal_registry_detail,
     internal_release_plan_generate,
     internal_release_plan_detail,
+    internal_release_plan_upsert,
     internal_run_artifact,
     internal_run_update,
     internal_context_resolve,
@@ -184,6 +185,7 @@ urlpatterns = [
     path("xyn/internal/registries/<uuid:registry_id>/sync", internal_registry_sync),
     path("xyn/internal/release-plans/<uuid:plan_id>", internal_release_plan_detail),
     path("xyn/internal/release-plans/<uuid:plan_id>/generate", internal_release_plan_generate),
+    path("xyn/internal/release-plans/upsert", internal_release_plan_upsert),
     path("accounts/", include("allauth.urls")),
     path("ckeditor5/", include("django_ckeditor_5.urls")),
 ]

@@ -716,6 +716,12 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
                     "title": f"Codegen for {blueprint.namespace}.{blueprint.name}",
                     "context_purpose": "coder",
                 }
+                ,
+                {
+                    "task_type": "release_plan_generate",
+                    "title": f"Release plan for {blueprint.namespace}.{blueprint.name}",
+                    "context_purpose": "planner",
+                }
             ],
         }
         _write_run_artifact(run, "implementation_plan.json", implementation_plan, "implementation_plan")
@@ -1646,9 +1652,15 @@ def internal_run_update(request: HttpRequest, run_id: str) -> JsonResponse:
 def internal_run_artifact(request: HttpRequest, run_id: str) -> JsonResponse:
     if token_error := _require_internal_token(request):
         return token_error
+    run = get_object_or_404(Run, id=run_id)
+    if request.method == "GET":
+        artifacts = [
+            {"id": str(artifact.id), "name": artifact.name, "kind": artifact.kind, "url": artifact.url}
+            for artifact in run.artifacts.all().order_by("created_at")
+        ]
+        return JsonResponse({"artifacts": artifacts})
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
-    run = get_object_or_404(Run, id=run_id)
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
     name = payload.get("name")
     if not name:
@@ -1721,8 +1733,59 @@ def internal_release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResp
             "from_version": plan.from_version,
             "to_version": plan.to_version,
             "milestones_json": plan.milestones_json,
+            "blueprint_id": str(plan.blueprint_id) if plan.blueprint_id else None,
+            "last_run": str(plan.last_run_id) if plan.last_run_id else None,
         }
     )
+
+
+@csrf_exempt
+def internal_release_plan_upsert(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    blueprint_id = payload.get("blueprint_id")
+    target_kind = payload.get("target_kind", "blueprint")
+    target_fqn = payload.get("target_fqn", "")
+    name = payload.get("name") or (f"Release plan for {target_fqn}" if target_fqn else "Release plan")
+    to_version = payload.get("to_version") or "0.1.0"
+    from_version = payload.get("from_version") or ""
+    milestones_json = payload.get("milestones_json")
+    plan, _created = ReleasePlan.objects.get_or_create(
+        blueprint_id=blueprint_id,
+        target_kind=target_kind,
+        target_fqn=target_fqn,
+        defaults={
+            "name": name,
+            "from_version": from_version,
+            "to_version": to_version,
+            "milestones_json": milestones_json,
+        },
+    )
+    changed = False
+    if name and plan.name != name:
+        plan.name = name
+        changed = True
+    if to_version and plan.to_version != to_version:
+        plan.to_version = to_version
+        changed = True
+    if from_version is not None and plan.from_version != from_version:
+        plan.from_version = from_version
+        changed = True
+    if milestones_json is not None:
+        plan.milestones_json = milestones_json
+        changed = True
+    if blueprint_id and plan.blueprint_id != blueprint_id:
+        plan.blueprint_id = blueprint_id
+        changed = True
+    if payload.get("last_run_id"):
+        plan.last_run_id = payload.get("last_run_id")
+        changed = True
+    if changed:
+        plan.save()
+    return JsonResponse({"id": str(plan.id)})
 
 
 @csrf_exempt
@@ -1768,6 +1831,9 @@ def internal_dev_task_detail(request: HttpRequest, task_id: str) -> JsonResponse
             "task_type": task.task_type,
             "status": task.status,
             "result_run": str(task.result_run_id) if task.result_run_id else None,
+            "source_run": str(task.source_run_id) if task.source_run_id else None,
+            "input_artifact_key": task.input_artifact_key,
+            "target_instance_id": str(task.target_instance_id) if task.target_instance_id else None,
             "context_pack_refs": resolved.get("refs", []),
             "context_hash": resolved.get("hash", ""),
             "context": resolved.get("effective_context", ""),
@@ -1803,12 +1869,25 @@ def internal_dev_task_claim(request: HttpRequest, task_id: str) -> JsonResponse:
         task.result_run = run
         task.save(update_fields=["result_run", "updated_at"])
     resolved = _resolve_context_pack_list(list(task.context_packs.all()))
+    target_instance = task.target_instance
     return JsonResponse(
         {
             "id": str(task.id),
             "task_type": task.task_type,
             "status": task.status,
             "result_run": str(task.result_run_id) if task.result_run_id else None,
+            "source_run": str(task.source_run_id) if task.source_run_id else None,
+            "source_entity_type": task.source_entity_type,
+            "source_entity_id": str(task.source_entity_id),
+            "input_artifact_key": task.input_artifact_key,
+            "target_instance": {
+                "id": str(target_instance.id),
+                "instance_id": target_instance.instance_id,
+                "aws_region": target_instance.aws_region,
+                "name": target_instance.name,
+            }
+            if target_instance
+            else None,
             "context_pack_refs": resolved.get("refs", []),
             "context_hash": resolved.get("hash", ""),
             "context": resolved.get("effective_context", ""),

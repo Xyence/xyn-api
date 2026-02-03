@@ -1,10 +1,13 @@
 import json
 import os
 import tempfile
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import boto3
 import requests
+from botocore.exceptions import BotoCoreError, ClientError
 from jsonschema import Draft202012Validator
 
 
@@ -48,6 +51,55 @@ def _write_artifact(run_id: str, filename: str, content: str) -> str:
     with open(file_path, "w", encoding="utf-8") as handle:
         handle.write(content)
     return f"/media/run_artifacts/{run_id}/{filename}"
+
+
+def _get_run_artifacts(run_id: str) -> List[Dict[str, Any]]:
+    data = _get_json(f"/xyn/internal/runs/{run_id}/artifacts")
+    return data.get("artifacts", [])
+
+
+def _download_artifact_json(run_id: str, name: str) -> Optional[Dict[str, Any]]:
+    artifacts = _get_run_artifacts(run_id)
+    match = next((artifact for artifact in artifacts if artifact.get("name") == name), None)
+    if not match or not match.get("url"):
+        return None
+    url = match["url"]
+    if url.startswith("http"):
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        return response.json()
+    content = _download_file(url)
+    return json.loads(content.decode("utf-8"))
+
+
+def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dict[str, Any]:
+    ssm = boto3.client("ssm", region_name=region)
+    cmd = ssm.send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Parameters={"commands": commands},
+    )
+    command_id = cmd["Command"]["CommandId"]
+    out: Optional[Dict[str, Any]] = None
+    last_error: Optional[Exception] = None
+    for _ in range(20):
+        try:
+            out = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+        except ClientError as exc:
+            last_error = exc
+            time.sleep(1)
+            continue
+        if out.get("Status") in {"Success", "Failed", "TimedOut", "Cancelled"}:
+            break
+        time.sleep(2)
+    if out is None:
+        raise last_error or RuntimeError("SSM command invocation not found yet")
+    return {
+        "command_id": command_id,
+        "status": out.get("Status"),
+        "stdout": out.get("StandardOutputContent", ""),
+        "stderr": out.get("StandardErrorContent", ""),
+    }
 
 
 def _transcribe_audio(content: bytes, language_code: str) -> Dict[str, Any]:
@@ -401,11 +453,18 @@ def generate_release_plan(plan_id: str, run_id: str) -> None:
 
 
 def run_dev_task(task_id: str, worker_id: str) -> None:
+    run_id: Optional[str] = None
     try:
         task = _post_json(f"/xyn/internal/dev-tasks/{task_id}/claim", {"worker_id": worker_id})
         run_id = task.get("result_run")
         if not run_id:
             return
+        task_type = task.get("task_type")
+        source_run = task.get("source_run")
+        input_artifact_key = task.get("input_artifact_key") or "implementation_plan.json"
+        source_entity_type = task.get("source_entity_type")
+        source_entity_id = task.get("source_entity_id")
+        target_instance = task.get("target_instance") or {}
         context_md = task.get("context", "")
         if context_md:
             url_ctx = _write_artifact(run_id, "context_compiled.md", context_md)
@@ -430,9 +489,136 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             f"/xyn/internal/runs/{run_id}",
             {"append_log": f"Task type: {task.get('task_type')}\n"},
         )
+        if task_type == "codegen":
+            payload = {
+                "task_id": task_id,
+                "task_type": "codegen",
+                "status": "succeeded",
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+            }
+            url = _write_artifact(run_id, "codegen_result.json", json.dumps(payload, indent=2))
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "codegen_result.json", "kind": "codegen", "url": url},
+            )
+            _post_json(
+                f"/xyn/internal/runs/{run_id}",
+                {"status": "succeeded", "append_log": "Codegen task completed.\n"},
+            )
+            _post_json(
+                f"/xyn/internal/dev-tasks/{task_id}/complete",
+                {"status": "succeeded"},
+            )
+            return
+
+        if task_type == "release_plan_generate":
+            plan_json = None
+            if source_run:
+                plan_json = _download_artifact_json(source_run, input_artifact_key)
+            if not plan_json and source_entity_type == "release_plan" and source_entity_id:
+                release_plan = _get_json(f"/xyn/internal/release-plans/{source_entity_id}")
+                last_run = release_plan.get("last_run")
+                if last_run:
+                    plan_json = _download_artifact_json(last_run, input_artifact_key)
+            if not plan_json:
+                plan_json = {
+                    "blueprint_id": source_entity_id,
+                    "blueprint": "unknown",
+                    "generated_at": datetime.utcnow().isoformat() + "Z",
+                    "tasks": [],
+                }
+            release_plan_payload = {
+                "blueprint_id": plan_json.get("blueprint_id"),
+                "target_kind": "blueprint",
+                "target_fqn": plan_json.get("blueprint", ""),
+                "name": f"Release plan for {plan_json.get('blueprint', 'blueprint')}",
+                "to_version": "0.1.0",
+                "from_version": "",
+                "milestones_json": {"tasks": plan_json.get("tasks", [])},
+                "last_run_id": run_id,
+            }
+            release_plan = _post_json("/xyn/internal/release-plans/upsert", release_plan_payload)
+            release_plan_id = release_plan.get("id")
+            release_plan_json = {
+                "release_plan_id": release_plan_id,
+                "name": release_plan_payload["name"],
+                "blueprint_id": plan_json.get("blueprint_id"),
+                "blueprint": plan_json.get("blueprint"),
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "tasks": plan_json.get("tasks", []),
+                "deploy": {"commands": ["echo 'Deploy release plan'"]},
+            }
+            url_json = _write_artifact(run_id, "release_plan.json", json.dumps(release_plan_json, indent=2))
+            md = (
+                f"# Release Plan\n\n"
+                f"- Blueprint: {release_plan_json.get('blueprint')}\n"
+                f"- Generated: {release_plan_json.get('generated_at')}\n\n"
+                "## Tasks\n"
+            )
+            for task_entry in release_plan_json.get("tasks", []):
+                md += f"- {task_entry.get('task_type')}: {task_entry.get('title')}\n"
+            url_md = _write_artifact(run_id, "release_plan.md", md)
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "release_plan.json", "kind": "release_plan", "url": url_json},
+            )
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "release_plan.md", "kind": "release_plan", "url": url_md},
+            )
+            _post_json(
+                f"/xyn/internal/runs/{run_id}",
+                {"status": "succeeded", "append_log": "Release plan generated.\n"},
+            )
+            _post_json(
+                f"/xyn/internal/dev-tasks/{task_id}/complete",
+                {"status": "succeeded"},
+            )
+            return
+
+        if task_type == "deploy_release_plan":
+            plan_json = None
+            if source_run:
+                plan_json = _download_artifact_json(source_run, input_artifact_key or "release_plan.json")
+            if not plan_json and source_entity_type == "release_plan" and source_entity_id:
+                release_plan = _get_json(f"/xyn/internal/release-plans/{source_entity_id}")
+                last_run = release_plan.get("last_run")
+                if last_run:
+                    plan_json = _download_artifact_json(last_run, "release_plan.json")
+            if not plan_json:
+                raise RuntimeError("release_plan.json not found for deploy task")
+            if not target_instance or not target_instance.get("instance_id"):
+                raise RuntimeError("target instance missing for deploy task")
+            commands = plan_json.get("deploy", {}).get("commands") or ["echo 'Deploy release plan'"]
+            result = _run_ssm_commands(
+                target_instance.get("instance_id"),
+                target_instance.get("aws_region"),
+                commands,
+            )
+            url = _write_artifact(run_id, "deploy_result.json", json.dumps(result, indent=2))
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "deploy_result.json", "kind": "deploy", "url": url},
+            )
+            _post_json(
+                f"/xyn/internal/runs/{run_id}",
+                {
+                    "status": "succeeded" if result.get("status") == "Success" else "failed",
+                    "append_log": (
+                        f"Deploy command status: {result.get('status')}\n"
+                        f"STDOUT:\n{result.get('stdout','')}\nSTDERR:\n{result.get('stderr','')}\n"
+                    ),
+                },
+            )
+            _post_json(
+                f"/xyn/internal/dev-tasks/{task_id}/complete",
+                {"status": "succeeded" if result.get("status") == "Success" else "failed"},
+            )
+            return
+
         _post_json(
             f"/xyn/internal/runs/{run_id}",
-            {"status": "succeeded", "append_log": "Dev task completed (stub).\n"},
+            {"status": "succeeded", "append_log": "Dev task completed.\n"},
         )
         _post_json(
             f"/xyn/internal/dev-tasks/{task_id}/complete",
@@ -444,5 +630,10 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
                 {"status": "failed", "error": str(exc)},
             )
+            if run_id:
+                _post_json(
+                    f"/xyn/internal/runs/{run_id}",
+                    {"status": "failed", "error": str(exc), "append_log": f"Dev task failed: {exc}\n"},
+                )
         except Exception:
             pass

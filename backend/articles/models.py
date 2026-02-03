@@ -389,6 +389,7 @@ class ReleasePlan(models.Model):
         ("module", "Module"),
         ("bundle", "Bundle"),
         ("release", "Release"),
+        ("blueprint", "Blueprint"),
     ]
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
@@ -397,6 +398,12 @@ class ReleasePlan(models.Model):
     from_version = models.CharField(max_length=64, blank=True)
     to_version = models.CharField(max_length=64)
     milestones_json = models.JSONField(null=True, blank=True)
+    blueprint = models.ForeignKey(
+        "Blueprint", null=True, blank=True, on_delete=models.SET_NULL, related_name="release_plans"
+    )
+    last_run = models.ForeignKey(
+        "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="release_plans"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(
@@ -559,6 +566,7 @@ class DevTask(models.Model):
         ("release_plan_generate", "Release plan generate"),
         ("registry_sync", "Registry sync"),
         ("deploy", "Deploy"),
+        ("deploy_release_plan", "Deploy release plan"),
     ]
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=240)
@@ -581,6 +589,9 @@ class DevTask(models.Model):
     last_error = models.TextField(blank=True)
     context_purpose = models.CharField(max_length=20, default="any")
     context_packs = models.ManyToManyField(ContextPack, blank=True, related_name="dev_tasks")
+    target_instance = models.ForeignKey(
+        "ProvisionedInstance", null=True, blank=True, on_delete=models.SET_NULL, related_name="dev_tasks"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(

@@ -166,7 +166,15 @@ class CapabilityAdmin(admin.ModelAdmin):
 
 @admin.register(ReleasePlan)
 class ReleasePlanAdmin(admin.ModelAdmin):
-    list_display = ("name", "target_kind", "target_fqn", "from_version", "to_version", "updated_at")
+    list_display = (
+        "name",
+        "target_kind",
+        "target_fqn",
+        "from_version",
+        "to_version",
+        "blueprint",
+        "updated_at",
+    )
     search_fields = ("name", "target_fqn")
     list_filter = ("target_kind",)
 
@@ -180,7 +188,16 @@ class ContextPackAdmin(admin.ModelAdmin):
 
 @admin.register(DevTask)
 class DevTaskAdmin(admin.ModelAdmin):
-    list_display = ("title", "task_type", "status", "priority", "attempts", "locked_by", "updated_at")
+    list_display = (
+        "title",
+        "task_type",
+        "status",
+        "priority",
+        "attempts",
+        "locked_by",
+        "target_instance",
+        "updated_at",
+    )
     search_fields = ("title", "source_entity_type", "source_entity_id")
     list_filter = ("task_type", "status")
 

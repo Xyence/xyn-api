@@ -18,7 +18,19 @@ from .blueprints import (
     _resolve_context_pack_list,
     instantiate_blueprint,
 )
-from .models import Blueprint, BlueprintRevision, Bundle, ContextPack, DevTask, Module, Registry, ReleasePlan, Run, RunArtifact
+from .models import (
+    Blueprint,
+    BlueprintRevision,
+    Bundle,
+    ContextPack,
+    DevTask,
+    Module,
+    ProvisionedInstance,
+    Registry,
+    ReleasePlan,
+    Run,
+    RunArtifact,
+)
 
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
@@ -448,6 +460,7 @@ def release_plans_collection(request: HttpRequest) -> JsonResponse:
             from_version=payload.get("from_version", ""),
             to_version=to_version,
             milestones_json=payload.get("milestones_json"),
+            blueprint_id=payload.get("blueprint_id"),
             created_by=request.user,
             updated_by=request.user,
         )
@@ -461,6 +474,8 @@ def release_plans_collection(request: HttpRequest) -> JsonResponse:
             "target_fqn": plan.target_fqn,
             "from_version": plan.from_version,
             "to_version": plan.to_version,
+            "blueprint_id": str(plan.blueprint_id) if plan.blueprint_id else None,
+            "last_run": str(plan.last_run_id) if plan.last_run_id else None,
             "created_at": plan.created_at,
             "updated_at": plan.updated_at,
         }
@@ -480,6 +495,8 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
         for field in ["name", "target_kind", "target_fqn", "from_version", "to_version", "milestones_json"]:
             if field in payload:
                 setattr(plan, field, payload[field])
+        if "blueprint_id" in payload:
+            plan.blueprint_id = payload.get("blueprint_id")
         plan.updated_by = request.user
         plan.save()
         return JsonResponse({"id": str(plan.id)})
@@ -495,6 +512,8 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
             "from_version": plan.from_version,
             "to_version": plan.to_version,
             "milestones_json": plan.milestones_json,
+            "blueprint_id": str(plan.blueprint_id) if plan.blueprint_id else None,
+            "last_run": str(plan.last_run_id) if plan.last_run_id else None,
             "created_at": plan.created_at,
             "updated_at": plan.updated_at,
         }
@@ -613,6 +632,9 @@ def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
         task_type = payload.get("task_type")
         if not title or not task_type:
             return JsonResponse({"error": "title and task_type required"}, status=400)
+        target_instance = None
+        if payload.get("target_instance_id"):
+            target_instance = get_object_or_404(ProvisionedInstance, id=payload["target_instance_id"])
         dev_task = DevTask.objects.create(
             title=title,
             task_type=task_type,
@@ -621,8 +643,10 @@ def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
             max_attempts=payload.get("max_attempts", 3),
             source_entity_type=payload.get("source_entity_type", "manual"),
             source_entity_id=payload.get("source_entity_id") or uuid.uuid4(),
+            source_run_id=payload.get("source_run_id") or None,
             input_artifact_key=payload.get("input_artifact_key", ""),
             context_purpose=payload.get("context_purpose", "any"),
+            target_instance=target_instance,
             created_by=request.user,
             updated_by=request.user,
         )
@@ -635,6 +659,12 @@ def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
         qs = qs.filter(status=status)
     if task_type := request.GET.get("task_type"):
         qs = qs.filter(task_type=task_type)
+    if source_entity_type := request.GET.get("source_entity_type"):
+        qs = qs.filter(source_entity_type=source_entity_type)
+    if source_entity_id := request.GET.get("source_entity_id"):
+        qs = qs.filter(source_entity_id=source_entity_id)
+    if target_instance_id := request.GET.get("target_instance_id"):
+        qs = qs.filter(target_instance_id=target_instance_id)
     data = [
         {
             "id": str(task.id),
@@ -651,6 +681,7 @@ def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
             "source_run": str(task.source_run_id) if task.source_run_id else None,
             "result_run": str(task.result_run_id) if task.result_run_id else None,
             "context_purpose": task.context_purpose,
+            "target_instance_id": str(task.target_instance_id) if task.target_instance_id else None,
             "created_at": task.created_at,
             "updated_at": task.updated_at,
         }
@@ -682,6 +713,7 @@ def dev_task_detail(request: HttpRequest, task_id: str) -> JsonResponse:
             "input_artifact_key": task.input_artifact_key,
             "last_error": task.last_error,
             "context_purpose": task.context_purpose,
+            "target_instance_id": str(task.target_instance_id) if task.target_instance_id else None,
             "context_packs": [
                 {
                     "id": str(pack.id),
