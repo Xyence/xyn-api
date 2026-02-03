@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from django.db import models
+from django.db.models import Q
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
@@ -179,6 +180,34 @@ def _generate_blueprint_spec(session: BlueprintDraftSession, transcripts: List[s
     return spec
 
 
+def _select_context_packs_deterministic(
+    purpose: str,
+    namespace: Optional[str],
+    project_key: Optional[str],
+    action: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    task_type: Optional[str] = None,
+) -> List[ContextPack]:
+    allowed_purposes = {purpose, "any"}
+    packs = ContextPack.objects.filter(is_active=True, purpose__in=allowed_purposes)
+    if not namespace and not project_key:
+        packs = packs.filter(Q(scope="global") | Q(is_default=True))
+    packs = packs.order_by("name", "id")
+    selected = []
+    for pack in packs:
+        if _context_pack_applies(
+            pack,
+            purpose,
+            namespace,
+            project_key,
+            action=action,
+            entity_type=entity_type,
+            task_type=task_type,
+        ):
+            selected.append(pack)
+    return selected
+
+
 def _resolve_context_packs(
     session: Optional[BlueprintDraftSession],
     selected_ids: Optional[List[str]] = None,
@@ -188,15 +217,7 @@ def _resolve_context_packs(
     action: Optional[str] = None,
 ) -> Dict[str, Any]:
     ids = selected_ids if selected_ids is not None else ((session.context_pack_ids or []) if session else [])
-    allowed_purposes = {purpose, "any"}
-    defaults = list(
-        ContextPack.objects.filter(
-            scope="global",
-            is_active=True,
-            is_default=True,
-            purpose__in=allowed_purposes,
-        ).order_by("name")
-    )
+    defaults = _select_context_packs_deterministic(purpose, namespace, project_key, action=action)
     selected = []
     if ids:
         packs = ContextPack.objects.filter(id__in=ids)
@@ -332,31 +353,14 @@ def _select_context_packs_for_dev_task(
     project_key: Optional[str],
     task_type: Optional[str],
 ) -> List[ContextPack]:
-    allowed_purposes = {purpose, "any"}
-    defaults = ContextPack.objects.filter(
-        is_active=True,
-        is_default=True,
-        purpose__in=allowed_purposes,
+    return _select_context_packs_deterministic(
+        purpose,
+        namespace,
+        project_key,
+        action="dev_task",
+        entity_type="dev_task",
+        task_type=task_type,
     )
-    scoped = ContextPack.objects.filter(is_active=True, purpose__in=allowed_purposes)
-    packs = list(defaults | scoped)
-    filtered = []
-    seen = set()
-    for pack in packs:
-        if str(pack.id) in seen:
-            continue
-        seen.add(str(pack.id))
-        if _context_pack_applies(
-            pack,
-            purpose,
-            namespace,
-            project_key,
-            action="dev_task",
-            entity_type="dev_task",
-            task_type=task_type,
-        ):
-            filtered.append(pack)
-    return filtered
 
 
 def _queue_dev_tasks_for_plan(
