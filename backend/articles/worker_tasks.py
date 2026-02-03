@@ -546,7 +546,12 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "blueprint": plan_json.get("blueprint"),
                 "generated_at": datetime.utcnow().isoformat() + "Z",
                 "tasks": plan_json.get("tasks", []),
-                "deploy": {"commands": ["echo 'Deploy release plan'"]},
+                "steps": [
+                    {
+                        "name": "deploy",
+                        "commands": ["echo 'Deploy release plan'"],
+                    }
+                ],
             }
             url_json = _write_artifact(run_id, "release_plan.json", json.dumps(release_plan_json, indent=2))
             md = (
@@ -589,13 +594,37 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 raise RuntimeError("release_plan.json not found for deploy task")
             if not target_instance or not target_instance.get("instance_id"):
                 raise RuntimeError("target instance missing for deploy task")
-            commands = plan_json.get("deploy", {}).get("commands") or ["echo 'Deploy release plan'"]
-            result = _run_ssm_commands(
-                target_instance.get("instance_id"),
-                target_instance.get("aws_region"),
-                commands,
-            )
-            url = _write_artifact(run_id, "deploy_result.json", json.dumps(result, indent=2))
+            steps = plan_json.get("steps")
+            if not steps:
+                commands = plan_json.get("deploy", {}).get("commands") or ["echo 'Deploy release plan'"]
+                steps = [{"name": "deploy", "commands": commands}]
+            results = []
+            success = True
+            for step in steps:
+                commands = step.get("commands") or []
+                if not commands:
+                    continue
+                result = _run_ssm_commands(
+                    target_instance.get("instance_id"),
+                    target_instance.get("aws_region"),
+                    commands,
+                )
+                result_entry = {
+                    "name": step.get("name") or "step",
+                    "commands": commands,
+                    "command_id": result.get("command_id"),
+                    "status": result.get("status"),
+                    "stdout": result.get("stdout"),
+                    "stderr": result.get("stderr"),
+                }
+                results.append(result_entry)
+                if result.get("status") != "Success":
+                    success = False
+            deploy_result = {
+                "target_instance_id": target_instance.get("id"),
+                "steps": results,
+            }
+            url = _write_artifact(run_id, "deploy_result.json", json.dumps(deploy_result, indent=2))
             _post_json(
                 f"/xyn/internal/runs/{run_id}/artifacts",
                 {"name": "deploy_result.json", "kind": "deploy", "url": url},
@@ -603,16 +632,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             _post_json(
                 f"/xyn/internal/runs/{run_id}",
                 {
-                    "status": "succeeded" if result.get("status") == "Success" else "failed",
-                    "append_log": (
-                        f"Deploy command status: {result.get('status')}\n"
-                        f"STDOUT:\n{result.get('stdout','')}\nSTDERR:\n{result.get('stderr','')}\n"
-                    ),
+                    "status": "succeeded" if success else "failed",
+                    "append_log": "Deploy completed.\n",
                 },
             )
             _post_json(
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
-                {"status": "succeeded" if result.get("status") == "Success" else "failed"},
+                {"status": "succeeded" if success else "failed"},
             )
             return
 

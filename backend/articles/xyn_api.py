@@ -632,6 +632,8 @@ def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
         task_type = payload.get("task_type")
         if not title or not task_type:
             return JsonResponse({"error": "title and task_type required"}, status=400)
+        if task_type == "deploy_release_plan" and not payload.get("target_instance_id"):
+            return JsonResponse({"error": "target_instance_id required for deploy_release_plan"}, status=400)
         target_instance = None
         if payload.get("target_instance_id"):
             target_instance = get_object_or_404(ProvisionedInstance, id=payload["target_instance_id"])
@@ -740,6 +742,8 @@ def dev_task_run(request: HttpRequest, task_id: str) -> JsonResponse:
     task = get_object_or_404(DevTask, id=task_id)
     if task.status == "running":
         return JsonResponse({"error": "Task already running"}, status=409)
+    if task.task_type == "deploy_release_plan" and not task.target_instance_id:
+        return JsonResponse({"error": "target_instance_id required for deploy_release_plan"}, status=400)
     task.status = "queued"
     task.updated_by = request.user
     task.save(update_fields=["status", "updated_by", "updated_at"])

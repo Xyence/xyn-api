@@ -1850,6 +1850,8 @@ def internal_dev_task_claim(request: HttpRequest, task_id: str) -> JsonResponse:
     task = get_object_or_404(DevTask, id=task_id)
     if task.status not in {"queued", "running"}:
         return JsonResponse({"error": "Task not runnable"}, status=409)
+    if task.task_type == "deploy_release_plan" and not task.target_instance_id:
+        return JsonResponse({"error": "target_instance_id required for deploy_release_plan"}, status=400)
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
     worker_id = payload.get("worker_id", "worker")
     task.status = "running"
