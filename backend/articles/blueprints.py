@@ -276,6 +276,8 @@ def _context_pack_applies(
     namespace: Optional[str],
     project_key: Optional[str],
     action: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    task_type: Optional[str] = None,
 ) -> bool:
     if not pack.is_active:
         return False
@@ -293,6 +295,12 @@ def _context_pack_applies(
     if isinstance(applies, dict):
         actions = applies.get("actions")
         if action and actions and action not in actions and "any" not in actions:
+            return False
+        entity_types = applies.get("entity_types")
+        if entity_type and entity_types and entity_type not in entity_types and "any" not in entity_types:
+            return False
+        task_types = applies.get("task_types")
+        if task_type and task_types and task_type not in task_types and "any" not in task_types:
             return False
         purposes = applies.get("purposes")
         if purposes and purpose not in purposes and "any" not in purposes:
@@ -322,6 +330,7 @@ def _select_context_packs_for_dev_task(
     purpose: str,
     namespace: Optional[str],
     project_key: Optional[str],
+    task_type: Optional[str],
 ) -> List[ContextPack]:
     allowed_purposes = {purpose, "any"}
     defaults = ContextPack.objects.filter(
@@ -337,7 +346,15 @@ def _select_context_packs_for_dev_task(
         if str(pack.id) in seen:
             continue
         seen.add(str(pack.id))
-        if _context_pack_applies(pack, purpose, namespace, project_key, "dev_task"):
+        if _context_pack_applies(
+            pack,
+            purpose,
+            namespace,
+            project_key,
+            action="dev_task",
+            entity_type="dev_task",
+            task_type=task_type,
+        ):
             filtered.append(pack)
     return filtered
 
@@ -351,7 +368,7 @@ def _queue_dev_tasks_for_plan(
     tasks = []
     for item in plan.get("tasks", []):
         task_type = item.get("task_type") or "codegen"
-        title = item.get("title") or f"{task_type} for {blueprint.namespace}.{blueprint.name}"
+        title = item.get("title") or f"{task_type} for {plan.get('blueprint')}"
         context_purpose = item.get("context_purpose") or "coder"
         dev_task = DevTask.objects.create(
             title=title,
@@ -359,14 +376,14 @@ def _queue_dev_tasks_for_plan(
             status="queued",
             priority=item.get("priority", 0),
             source_entity_type="blueprint",
-            source_entity_id=blueprint.id,
+            source_entity_id=plan.get("blueprint_id") or blueprint.id,
             source_run=run,
             input_artifact_key="implementation_plan.json",
             context_purpose=context_purpose,
             created_by=run.created_by,
             updated_by=run.created_by,
         )
-        packs = _select_context_packs_for_dev_task(context_purpose, namespace, None)
+        packs = _select_context_packs_for_dev_task(context_purpose, namespace, None, task_type)
         if packs:
             dev_task.context_packs.add(*packs)
         tasks.append(dev_task)
