@@ -30,6 +30,7 @@ from .models import (
     ReleasePlan,
     Run,
     RunArtifact,
+    RunCommandExecution,
 )
 
 
@@ -558,6 +559,8 @@ def runs_collection(request: HttpRequest) -> JsonResponse:
         qs = qs.filter(entity_type=entity_type)
     if entity_id := request.GET.get("id"):
         qs = qs.filter(entity_id=entity_id)
+    if status := request.GET.get("status"):
+        qs = qs.filter(status=status)
     data = [
         {
             "id": str(run.id),
@@ -621,6 +624,30 @@ def run_artifacts(request: HttpRequest, run_id: str) -> JsonResponse:
     return JsonResponse({"artifacts": artifacts})
 
 
+@login_required
+def run_commands(request: HttpRequest, run_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    run = get_object_or_404(Run, id=run_id)
+    commands = [
+        {
+            "id": str(cmd.id),
+            "step_name": cmd.step_name,
+            "command_index": cmd.command_index,
+            "shell": cmd.shell,
+            "status": cmd.status,
+            "exit_code": cmd.exit_code,
+            "started_at": cmd.started_at,
+            "finished_at": cmd.finished_at,
+            "ssm_command_id": cmd.ssm_command_id,
+            "stdout": cmd.stdout,
+            "stderr": cmd.stderr,
+        }
+        for cmd in run.command_executions.all()
+    ]
+    return JsonResponse({"commands": commands})
+
+
 @csrf_exempt
 @login_required
 def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
@@ -649,6 +676,7 @@ def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
             input_artifact_key=payload.get("input_artifact_key", ""),
             context_purpose=payload.get("context_purpose", "any"),
             target_instance=target_instance,
+            force=bool(payload.get("force")),
             created_by=request.user,
             updated_by=request.user,
         )
@@ -684,6 +712,7 @@ def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
             "result_run": str(task.result_run_id) if task.result_run_id else None,
             "context_purpose": task.context_purpose,
             "target_instance_id": str(task.target_instance_id) if task.target_instance_id else None,
+            "force": task.force,
             "created_at": task.created_at,
             "updated_at": task.updated_at,
         }
@@ -716,6 +745,7 @@ def dev_task_detail(request: HttpRequest, task_id: str) -> JsonResponse:
             "last_error": task.last_error,
             "context_purpose": task.context_purpose,
             "target_instance_id": str(task.target_instance_id) if task.target_instance_id else None,
+            "force": task.force,
             "context_packs": [
                 {
                     "id": str(pack.id),
@@ -744,6 +774,44 @@ def dev_task_run(request: HttpRequest, task_id: str) -> JsonResponse:
         return JsonResponse({"error": "Task already running"}, status=409)
     if task.task_type == "deploy_release_plan" and not task.target_instance_id:
         return JsonResponse({"error": "target_instance_id required for deploy_release_plan"}, status=400)
+    if request.GET.get("force") == "1":
+        task.force = True
+    task.force = bool(task.force)
+    task.status = "queued"
+    task.updated_by = request.user
+    task.save(update_fields=["status", "updated_by", "updated_at", "force"])
+    run = Run.objects.create(
+        entity_type="dev_task",
+        entity_id=task.id,
+        status="pending",
+        summary=f"Run dev task {task.title}",
+        created_by=request.user,
+        started_at=timezone.now(),
+    )
+    task.result_run = run
+    task.save(update_fields=["result_run", "updated_at"])
+    resolved = _resolve_context_pack_list(list(task.context_packs.all()))
+    run.context_pack_refs_json = resolved.get("refs", [])
+    run.context_hash = resolved.get("hash", "")
+    _build_context_artifacts(run, resolved)
+    run.save(update_fields=["context_pack_refs_json", "context_hash", "updated_at"])
+    mode = _async_mode()
+    if mode == "redis":
+        _enqueue_job("articles.worker_tasks.run_dev_task", str(task.id), "worker")
+        return JsonResponse({"run_id": str(run.id), "status": "queued"})
+    return JsonResponse({"run_id": str(run.id), "status": "pending"})
+
+
+@csrf_exempt
+@login_required
+def dev_task_retry(request: HttpRequest, task_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    task = get_object_or_404(DevTask, id=task_id)
+    if task.status not in {"failed", "canceled"}:
+        return JsonResponse({"error": "Task not retryable"}, status=409)
     task.status = "queued"
     task.updated_by = request.user
     task.save(update_fields=["status", "updated_by", "updated_at"])
@@ -751,7 +819,7 @@ def dev_task_run(request: HttpRequest, task_id: str) -> JsonResponse:
         entity_type="dev_task",
         entity_id=task.id,
         status="pending",
-        summary=f"Run dev task {task.title}",
+        summary=f"Retry dev task {task.title}",
         created_by=request.user,
         started_at=timezone.now(),
     )

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -100,6 +101,11 @@ def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dic
         "stdout": out.get("StandardOutputContent", ""),
         "stderr": out.get("StandardErrorContent", ""),
     }
+
+
+def _hash_release_plan(plan: Dict[str, Any]) -> str:
+    canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _transcribe_audio(content: bytes, language_code: str) -> Dict[str, Any]:
@@ -594,40 +600,98 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 raise RuntimeError("release_plan.json not found for deploy task")
             if not target_instance or not target_instance.get("instance_id"):
                 raise RuntimeError("target instance missing for deploy task")
+            plan_hash = _hash_release_plan(plan_json)
+            deploy_state = _get_json(
+                f"/xyn/internal/release-plans/{source_entity_id}/deploy-state?instance_id={target_instance.get('id')}"
+            )
+            state = deploy_state.get("state")
+            if state and state.get("last_applied_hash") == plan_hash and not task.get("force"):
+                _post_json(
+                    f"/xyn/internal/runs/{run_id}",
+                    {"status": "succeeded", "append_log": "Deploy skipped (already applied).\n"},
+                )
+                _post_json(
+                    f"/xyn/internal/dev-tasks/{task_id}/complete",
+                    {"status": "succeeded"},
+                )
+                return
             steps = plan_json.get("steps")
             if not steps:
                 commands = plan_json.get("deploy", {}).get("commands") or ["echo 'Deploy release plan'"]
                 steps = [{"name": "deploy", "commands": commands}]
             results = []
             success = True
+            command_records = []
             for step in steps:
                 commands = step.get("commands") or []
                 if not commands:
                     continue
-                result = _run_ssm_commands(
-                    target_instance.get("instance_id"),
-                    target_instance.get("aws_region"),
-                    commands,
-                )
-                result_entry = {
-                    "name": step.get("name") or "step",
-                    "commands": commands,
-                    "command_id": result.get("command_id"),
-                    "status": result.get("status"),
-                    "stdout": result.get("stdout"),
-                    "stderr": result.get("stderr"),
-                }
-                results.append(result_entry)
-                if result.get("status") != "Success":
-                    success = False
+                for index, command in enumerate(commands):
+                    started_at = datetime.utcnow().isoformat() + "Z"
+                    result = _run_ssm_commands(
+                        target_instance.get("instance_id"),
+                        target_instance.get("aws_region"),
+                        [command],
+                    )
+                    finished_at = datetime.utcnow().isoformat() + "Z"
+                    record = {
+                        "step_name": step.get("name") or "step",
+                        "command_index": index,
+                        "shell": "sh",
+                        "status": "succeeded" if result.get("status") == "Success" else "failed",
+                        "exit_code": 0 if result.get("status") == "Success" else 1,
+                        "started_at": started_at,
+                        "finished_at": finished_at,
+                        "ssm_command_id": result.get("command_id"),
+                        "stdout": result.get("stdout", ""),
+                        "stderr": result.get("stderr", ""),
+                    }
+                    command_records.append(record)
+                    _post_json(f"/xyn/internal/runs/{run_id}/commands", record)
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}",
+                        {
+                            "append_log": (
+                                f"[{record['step_name']}#{record['command_index']}] "
+                                f"{record['status']} (exit {record['exit_code']})\n"
+                                f"STDOUT:\n{record['stdout']}\nSTDERR:\n{record['stderr']}\n"
+                            ),
+                        },
+                    )
+                    result_entry = {
+                        "name": record["step_name"],
+                        "command": command,
+                        "command_id": record["ssm_command_id"],
+                        "status": record["status"],
+                        "stdout": record["stdout"],
+                        "stderr": record["stderr"],
+                        "started_at": started_at,
+                        "finished_at": finished_at,
+                    }
+                    results.append(result_entry)
+                    if record["status"] != "succeeded":
+                        success = False
             deploy_result = {
                 "target_instance_id": target_instance.get("id"),
                 "steps": results,
+                "release_plan_hash": plan_hash,
+            }
+            deploy_execution = {
+                "target_instance_id": target_instance.get("id"),
+                "commands": command_records,
+                "release_plan_hash": plan_hash,
             }
             url = _write_artifact(run_id, "deploy_result.json", json.dumps(deploy_result, indent=2))
+            exec_url = _write_artifact(
+                run_id, "deploy_execution.json", json.dumps(deploy_execution, indent=2)
+            )
             _post_json(
                 f"/xyn/internal/runs/{run_id}/artifacts",
                 {"name": "deploy_result.json", "kind": "deploy", "url": url},
+            )
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "deploy_execution.json", "kind": "deploy", "url": exec_url},
             )
             _post_json(
                 f"/xyn/internal/runs/{run_id}",
@@ -636,6 +700,15 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     "append_log": "Deploy completed.\n",
                 },
             )
+            if success:
+                _post_json(
+                    f"/xyn/internal/release-plans/{source_entity_id}/deploy-state",
+                    {
+                        "instance_id": target_instance.get("id"),
+                        "last_applied_hash": plan_hash,
+                        "last_applied_at": datetime.utcnow().isoformat() + "Z",
+                    },
+                )
             _post_json(
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
                 {"status": "succeeded" if success else "failed"},

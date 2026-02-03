@@ -25,6 +25,7 @@ from .models import (
     Registry,
     Run,
     RunArtifact,
+    RunCommandExecution,
     Capability,
     ContextPack,
     DraftSessionVoiceNote,
@@ -33,6 +34,7 @@ from .models import (
     OpenAIConfig,
     ProvisionedInstance,
     ReleasePlan,
+    ReleasePlanDeployState,
     VoiceNote,
     VoiceTranscript,
 )
@@ -219,6 +221,19 @@ class RunAdmin(admin.ModelAdmin):
 @admin.register(RunArtifact)
 class RunArtifactAdmin(admin.ModelAdmin):
     list_display = ("name", "kind", "run", "created_at")
+
+
+@admin.register(RunCommandExecution)
+class RunCommandExecutionAdmin(admin.ModelAdmin):
+    list_display = ("run", "step_name", "command_index", "status", "exit_code", "ssm_command_id")
+    list_filter = ("status", "shell")
+    search_fields = ("step_name", "ssm_command_id", "run__id")
+
+
+@admin.register(ReleasePlanDeployState)
+class ReleasePlanDeployStateAdmin(admin.ModelAdmin):
+    list_display = ("release_plan", "instance", "last_applied_hash", "last_applied_at", "updated_at")
+    search_fields = ("release_plan__name", "instance__name")
 
 
 @admin.register(ProvisionedInstance)

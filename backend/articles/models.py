@@ -510,6 +510,47 @@ class RunArtifact(models.Model):
         return f"{self.name} ({self.run_id})"
 
 
+class RunCommandExecution(models.Model):
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("running", "Running"),
+        ("succeeded", "Succeeded"),
+        ("failed", "Failed"),
+    ]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.ForeignKey(Run, on_delete=models.CASCADE, related_name="command_executions")
+    step_name = models.CharField(max_length=120, blank=True)
+    command_index = models.PositiveIntegerField(default=0)
+    shell = models.CharField(max_length=40, default="sh")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
+    exit_code = models.IntegerField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    ssm_command_id = models.CharField(max_length=120, blank=True)
+    stdout = models.TextField(blank=True)
+    stderr = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+
+class ReleasePlanDeployState(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    release_plan = models.ForeignKey(ReleasePlan, on_delete=models.CASCADE, related_name="deploy_states")
+    instance = models.ForeignKey(
+        "ProvisionedInstance", on_delete=models.CASCADE, related_name="deploy_states"
+    )
+    last_applied_hash = models.CharField(max_length=64, blank=True)
+    last_applied_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("release_plan", "instance")
+
+
 class ContextPack(models.Model):
     PURPOSE_CHOICES = [
         ("any", "Any"),
@@ -592,6 +633,7 @@ class DevTask(models.Model):
     target_instance = models.ForeignKey(
         "ProvisionedInstance", null=True, blank=True, on_delete=models.SET_NULL, related_name="dev_tasks"
     )
+    force = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(

@@ -16,6 +16,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.conf import settings
 from django.utils.text import slugify
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 from jsonschema import Draft202012Validator
 
@@ -37,7 +38,9 @@ from .models import (
     Module,
     Registry,
     ReleasePlan,
+    ReleasePlanDeployState,
     Run,
+    RunCommandExecution,
     RunArtifact,
     VoiceNote,
     VoiceTranscript,
@@ -1676,6 +1679,50 @@ def internal_run_artifact(request: HttpRequest, run_id: str) -> JsonResponse:
 
 
 @csrf_exempt
+def internal_run_commands(request: HttpRequest, run_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    run = get_object_or_404(Run, id=run_id)
+    if request.method == "GET":
+        data = [
+            {
+                "id": str(cmd.id),
+                "step_name": cmd.step_name,
+                "command_index": cmd.command_index,
+                "shell": cmd.shell,
+                "status": cmd.status,
+                "exit_code": cmd.exit_code,
+                "started_at": cmd.started_at,
+                "finished_at": cmd.finished_at,
+                "ssm_command_id": cmd.ssm_command_id,
+                "stdout": cmd.stdout,
+                "stderr": cmd.stderr,
+            }
+            for cmd in run.command_executions.all()
+        ]
+        return JsonResponse({"commands": data})
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    started_at = parse_datetime(payload.get("started_at")) if payload.get("started_at") else None
+    finished_at = parse_datetime(payload.get("finished_at")) if payload.get("finished_at") else None
+    cmd = RunCommandExecution.objects.create(
+        run=run,
+        step_name=payload.get("step_name", ""),
+        command_index=int(payload.get("command_index") or 0),
+        shell=payload.get("shell", "sh"),
+        status=payload.get("status", "pending"),
+        exit_code=payload.get("exit_code"),
+        started_at=started_at,
+        finished_at=finished_at,
+        ssm_command_id=payload.get("ssm_command_id", ""),
+        stdout=payload.get("stdout", ""),
+        stderr=payload.get("stderr", ""),
+    )
+    return JsonResponse({"id": str(cmd.id)})
+
+
+@csrf_exempt
 def internal_registry_sync(request: HttpRequest, registry_id: str) -> JsonResponse:
     if token_error := _require_internal_token(request):
         return token_error
@@ -1789,6 +1836,44 @@ def internal_release_plan_upsert(request: HttpRequest) -> JsonResponse:
 
 
 @csrf_exempt
+def internal_release_plan_deploy_state(request: HttpRequest, plan_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method == "GET":
+        instance_id = request.GET.get("instance_id")
+        if not instance_id:
+            return JsonResponse({"error": "instance_id required"}, status=400)
+        state = ReleasePlanDeployState.objects.filter(
+            release_plan_id=plan_id, instance_id=instance_id
+        ).first()
+        if not state:
+            return JsonResponse({"state": None})
+        return JsonResponse(
+            {
+                "state": {
+                    "last_applied_hash": state.last_applied_hash,
+                    "last_applied_at": state.last_applied_at,
+                }
+            }
+        )
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    instance_id = payload.get("instance_id")
+    if not instance_id:
+        return JsonResponse({"error": "instance_id required"}, status=400)
+    state, _ = ReleasePlanDeployState.objects.get_or_create(
+        release_plan_id=plan_id, instance_id=instance_id
+    )
+    if payload.get("last_applied_hash") is not None:
+        state.last_applied_hash = payload.get("last_applied_hash", "")
+    if payload.get("last_applied_at"):
+        state.last_applied_at = payload.get("last_applied_at")
+    state.save()
+    return JsonResponse({"status": "ok"})
+
+
+@csrf_exempt
 def internal_context_resolve(request: HttpRequest) -> JsonResponse:
     if token_error := _require_internal_token(request):
         return token_error
@@ -1834,6 +1919,7 @@ def internal_dev_task_detail(request: HttpRequest, task_id: str) -> JsonResponse
             "source_run": str(task.source_run_id) if task.source_run_id else None,
             "input_artifact_key": task.input_artifact_key,
             "target_instance_id": str(task.target_instance_id) if task.target_instance_id else None,
+            "force": task.force,
             "context_pack_refs": resolved.get("refs", []),
             "context_hash": resolved.get("hash", ""),
             "context": resolved.get("effective_context", ""),
@@ -1890,6 +1976,7 @@ def internal_dev_task_claim(request: HttpRequest, task_id: str) -> JsonResponse:
             }
             if target_instance
             else None,
+            "force": task.force,
             "context_pack_refs": resolved.get("refs", []),
             "context_hash": resolved.get("hash", ""),
             "context": resolved.get("effective_context", ""),
