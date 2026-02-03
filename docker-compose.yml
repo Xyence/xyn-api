@@ -57,6 +57,7 @@ services:
       XYENCE_JOBS_REDIS_URL: ${XYENCE_JOBS_REDIS_URL:-redis://redis:6379/0}
       XYENCE_INTERNAL_BASE_URL: http://backend:8000
       XYENCE_INTERNAL_TOKEN: ${XYENCE_INTERNAL_TOKEN:-change-me}
+      XYENCE_MEDIA_ROOT: /app/media
     depends_on:
       - redis
       - backend
@@ -64,6 +65,7 @@ services:
     volumes:
       - /home/ubuntu/src/xyn-contracts:/xyn-contracts:ro
       - /home/ubuntu/central-xyence-io-9d049e62e994.json:/secrets/gcp-speech.json:ro
+      - backend_media:/app/media
 
 volumes:
   postgres_data:

@@ -469,6 +469,8 @@ class Run(models.Model):
     log_text = models.TextField(blank=True)
     error = models.TextField(blank=True)
     metadata_json = models.JSONField(null=True, blank=True)
+    context_pack_refs_json = models.JSONField(null=True, blank=True)
+    context_hash = models.CharField(max_length=64, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -501,6 +503,13 @@ class RunArtifact(models.Model):
 
 
 class ContextPack(models.Model):
+    PURPOSE_CHOICES = [
+        ("any", "Any"),
+        ("planner", "Planner"),
+        ("coder", "Coder"),
+        ("deployer", "Deployer"),
+        ("operator", "Operator"),
+    ]
     SCOPE_CHOICES = [
         ("global", "Global"),
         ("namespace", "Namespace"),
@@ -509,6 +518,7 @@ class ContextPack(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
+    purpose = models.CharField(max_length=20, choices=PURPOSE_CHOICES, default="any")
     scope = models.CharField(max_length=20, choices=SCOPE_CHOICES)
     namespace = models.CharField(max_length=120, blank=True)
     project_key = models.CharField(max_length=120, blank=True)
@@ -528,7 +538,7 @@ class ContextPack(models.Model):
 
     class Meta:
         ordering = ["name"]
-        unique_together = ("name", "version", "scope", "namespace", "project_key")
+        unique_together = ("name", "version", "purpose", "scope", "namespace", "project_key")
 
     def __str__(self) -> str:
         return f"{self.name} ({self.scope}) v{self.version}"

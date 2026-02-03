@@ -13,6 +13,7 @@ from django.contrib.auth.decorators import login_required
 from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
+from django.conf import settings
 from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_exempt
 from jsonschema import Draft202012Validator
@@ -41,6 +42,20 @@ from .models import (
 )
 
 _executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _write_run_artifact(run: Run, filename: str, content: str | dict | list, kind: str) -> RunArtifact:
+    artifacts_root = os.path.join(settings.MEDIA_ROOT, "run_artifacts", str(run.id))
+    os.makedirs(artifacts_root, exist_ok=True)
+    file_path = os.path.join(artifacts_root, filename)
+    if isinstance(content, (dict, list)):
+        serialized = json.dumps(content, indent=2)
+    else:
+        serialized = content
+    with open(file_path, "w", encoding="utf-8") as handle:
+        handle.write(serialized)
+    url = f"{settings.MEDIA_URL.rstrip('/')}/run_artifacts/{run.id}/{filename}"
+    return RunArtifact.objects.create(run=run, name=filename, kind=kind, url=url)
 
 
 def _async_mode() -> str:
@@ -164,12 +179,21 @@ def _generate_blueprint_spec(session: BlueprintDraftSession, transcripts: List[s
 
 
 def _resolve_context_packs(
-    session: BlueprintDraftSession,
+    session: Optional[BlueprintDraftSession],
     selected_ids: Optional[List[str]] = None,
+    purpose: str = "any",
+    namespace: Optional[str] = None,
+    project_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    ids = selected_ids if selected_ids is not None else (session.context_pack_ids or [])
+    ids = selected_ids if selected_ids is not None else ((session.context_pack_ids or []) if session else [])
+    allowed_purposes = {purpose, "any"}
     defaults = list(
-        ContextPack.objects.filter(scope="global", is_active=True, is_default=True).order_by("name")
+        ContextPack.objects.filter(
+            scope="global",
+            is_active=True,
+            is_default=True,
+            purpose__in=allowed_purposes,
+        ).order_by("name")
     )
     selected = []
     if ids:
@@ -189,12 +213,17 @@ def _resolve_context_packs(
     sections = []
     refs = []
     for pack in combined:
+        if not _context_pack_applies(pack, purpose, namespace, project_key):
+            continue
+        content_hash = hashlib.sha256(pack.content_markdown.encode("utf-8")).hexdigest()
         refs.append(
             {
                 "id": str(pack.id),
                 "name": pack.name,
+                "purpose": pack.purpose,
                 "scope": pack.scope,
                 "version": pack.version,
+                "content_hash": content_hash,
                 "is_active": pack.is_active,
             }
         )
@@ -209,6 +238,50 @@ def _resolve_context_packs(
         "hash": digest,
         "preview": preview,
     }
+
+
+def _context_pack_applies(
+    pack: ContextPack,
+    purpose: str,
+    namespace: Optional[str],
+    project_key: Optional[str],
+) -> bool:
+    if not pack.is_active:
+        return False
+    if pack.purpose not in {"any", purpose}:
+        return False
+    if pack.scope == "namespace" and namespace and pack.namespace != namespace:
+        return False
+    if pack.scope == "project" and project_key and pack.project_key != project_key:
+        return False
+    if pack.scope == "namespace" and not namespace:
+        return False
+    if pack.scope == "project" and not project_key:
+        return False
+    applies = pack.applies_to_json or {}
+    if isinstance(applies, dict):
+        purposes = applies.get("purposes")
+        if purposes and purpose not in purposes and "any" not in purposes:
+            return False
+        namespaces = applies.get("namespaces")
+        if namespaces and namespace and namespace not in namespaces:
+            return False
+        projects = applies.get("projects")
+        if projects and project_key and project_key not in projects:
+            return False
+        scopes = applies.get("scopes")
+        if scopes and pack.scope not in scopes:
+            return False
+    return True
+
+
+def _build_context_artifacts(run: Run, resolved: Dict[str, Any]) -> None:
+    manifest = {
+        "context_hash": resolved.get("hash"),
+        "packs": resolved.get("refs", []),
+    }
+    _write_run_artifact(run, "context_compiled.md", resolved.get("effective_context", ""), "context")
+    _write_run_artifact(run, "context_manifest.json", manifest, "context")
 
 
 def _module_from_spec(spec: Dict[str, Any], user) -> Module:
@@ -488,8 +561,21 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
         created_by=request.user,
         started_at=timezone.now(),
     )
+    context_resolved = _resolve_context_packs(
+        session=None,
+        selected_ids=None,
+        purpose="planner",
+        namespace=blueprint.namespace,
+        project_key=None,
+    )
+    run.context_pack_refs_json = context_resolved.get("refs", [])
+    run.context_hash = context_resolved.get("hash", "")
+    _build_context_artifacts(run, context_resolved)
     try:
+        run.log_text = "Starting blueprint instantiate\n"
         plan = _xynseed_request("post", "/releases/plan", {"release_spec": release_spec})
+        _write_run_artifact(run, "plan.json", plan, "plan")
+        run.log_text += "Release plan created\n"
         op = None
         if mode == "apply":
             op = _xynseed_request(
@@ -497,6 +583,9 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
                 "/releases/apply",
                 {"release_id": plan.get("releaseId"), "plan_id": plan.get("planId")},
             )
+            if op:
+                _write_run_artifact(run, "operation.json", op, "operation")
+                run.log_text += "Release apply executed\n"
         instance.plan_id = plan.get("planId", "")
         instance.release_id = plan.get("releaseId", "")
         if op:
@@ -511,8 +600,20 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
         instance.error = str(exc)
         run.status = "failed"
         run.error = str(exc)
+        run.log_text = (run.log_text or "") + f"Error: {exc}\n"
     run.finished_at = timezone.now()
-    run.save(update_fields=["status", "error", "metadata_json", "finished_at", "updated_at"])
+    run.save(
+        update_fields=[
+            "status",
+            "error",
+            "metadata_json",
+            "finished_at",
+            "updated_at",
+            "log_text",
+            "context_pack_refs_json",
+            "context_hash",
+        ]
+    )
     instance.save(update_fields=["plan_id", "operation_id", "release_id", "status", "error"])
     return JsonResponse(
         {"instance_id": str(instance.id), "status": instance.status, "run_id": str(run.id)}
@@ -915,6 +1016,7 @@ def list_context_packs(request: HttpRequest) -> JsonResponse:
         payload = json.loads(request.body.decode("utf-8")) if request.body else {}
         name = payload.get("name")
         scope = payload.get("scope", "global")
+        purpose = payload.get("purpose", "any")
         version = payload.get("version")
         content = payload.get("content_markdown", "")
         if not name or not version or not content:
@@ -927,6 +1029,7 @@ def list_context_packs(request: HttpRequest) -> JsonResponse:
             _clear_default_for_scope(scope, namespace, project_key)
         pack = ContextPack.objects.create(
             name=name,
+            purpose=purpose,
             scope=scope,
             namespace=namespace,
             project_key=project_key,
@@ -942,6 +1045,8 @@ def list_context_packs(request: HttpRequest) -> JsonResponse:
     qs = ContextPack.objects.all()
     if scope := request.GET.get("scope"):
         qs = qs.filter(scope=scope)
+    if purpose := request.GET.get("purpose"):
+        qs = qs.filter(purpose=purpose)
     if namespace := request.GET.get("namespace"):
         qs = qs.filter(namespace=namespace)
     if project_key := request.GET.get("project_key"):
@@ -953,6 +1058,7 @@ def list_context_packs(request: HttpRequest) -> JsonResponse:
         {
             "id": str(pack.id),
             "name": pack.name,
+            "purpose": pack.purpose,
             "scope": pack.scope,
             "namespace": pack.namespace,
             "project_key": pack.project_key,
@@ -976,6 +1082,7 @@ def context_pack_detail(request: HttpRequest, pack_id: str) -> JsonResponse:
     if request.method == "PUT":
         payload = json.loads(request.body.decode("utf-8")) if request.body else {}
         pack.name = payload.get("name", pack.name)
+        pack.purpose = payload.get("purpose", pack.purpose)
         pack.scope = payload.get("scope", pack.scope)
         pack.namespace = payload.get("namespace", pack.namespace)
         pack.project_key = payload.get("project_key", pack.project_key)
@@ -996,6 +1103,7 @@ def context_pack_detail(request: HttpRequest, pack_id: str) -> JsonResponse:
         {
             "id": str(pack.id),
             "name": pack.name,
+            "purpose": pack.purpose,
             "scope": pack.scope,
             "namespace": pack.namespace,
             "project_key": pack.project_key,
@@ -1370,7 +1478,16 @@ def internal_run_update(request: HttpRequest, run_id: str) -> JsonResponse:
     run = get_object_or_404(Run, id=run_id)
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
     append_log = payload.pop("append_log", None)
-    for field in ["status", "summary", "error", "metadata_json", "started_at", "finished_at"]:
+    for field in [
+        "status",
+        "summary",
+        "error",
+        "metadata_json",
+        "context_pack_refs_json",
+        "context_hash",
+        "started_at",
+        "finished_at",
+    ]:
         if field in payload:
             setattr(run, field, payload[field])
     if append_log:
@@ -1411,8 +1528,11 @@ def internal_registry_sync(request: HttpRequest, registry_id: str) -> JsonRespon
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
     registry = get_object_or_404(Registry, id=registry_id)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    if status := payload.get("status"):
+        registry.status = status
     registry.last_sync_at = timezone.now()
-    registry.save(update_fields=["last_sync_at", "updated_at"])
+    registry.save(update_fields=["last_sync_at", "status", "updated_at"])
     return JsonResponse({"status": "synced", "last_sync_at": registry.last_sync_at})
 
 
@@ -1427,3 +1547,64 @@ def internal_release_plan_generate(request: HttpRequest, plan_id: str) -> JsonRe
         plan.milestones_json = {"status": "placeholder", "notes": "Generation not implemented yet"}
         plan.save(update_fields=["milestones_json", "updated_at"])
     return JsonResponse({"status": "generated"})
+
+
+def internal_registry_detail(request: HttpRequest, registry_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    registry = get_object_or_404(Registry, id=registry_id)
+    return JsonResponse(
+        {
+            "id": str(registry.id),
+            "name": registry.name,
+            "registry_type": registry.registry_type,
+            "description": registry.description,
+            "url": registry.url,
+            "status": registry.status,
+            "last_sync_at": registry.last_sync_at,
+        }
+    )
+
+
+def internal_release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    plan = get_object_or_404(ReleasePlan, id=plan_id)
+    return JsonResponse(
+        {
+            "id": str(plan.id),
+            "name": plan.name,
+            "target_kind": plan.target_kind,
+            "target_fqn": plan.target_fqn,
+            "from_version": plan.from_version,
+            "to_version": plan.to_version,
+            "milestones_json": plan.milestones_json,
+        }
+    )
+
+
+@csrf_exempt
+def internal_context_resolve(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    purpose = payload.get("purpose", "any")
+    namespace = payload.get("namespace")
+    project_key = payload.get("project_key")
+    selected_ids = payload.get("selected_ids")
+    if selected_ids is not None and not isinstance(selected_ids, list):
+        return JsonResponse({"error": "selected_ids must be a list"}, status=400)
+    resolved = _resolve_context_packs(
+        session=None,
+        selected_ids=selected_ids,
+        purpose=purpose,
+        namespace=namespace,
+        project_key=project_key,
+    )
+    return JsonResponse(
+        {
+            "effective_context": resolved.get("effective_context", ""),
+            "context_pack_refs": resolved.get("refs", []),
+            "context_hash": resolved.get("hash", ""),
+        }
+    )

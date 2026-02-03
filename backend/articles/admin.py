@@ -172,9 +172,9 @@ class ReleasePlanAdmin(admin.ModelAdmin):
 
 @admin.register(ContextPack)
 class ContextPackAdmin(admin.ModelAdmin):
-    list_display = ("name", "scope", "version", "is_active", "is_default", "updated_at")
+    list_display = ("name", "purpose", "scope", "version", "is_active", "is_default", "updated_at")
     search_fields = ("name", "namespace", "project_key")
-    list_filter = ("scope", "is_active", "is_default")
+    list_filter = ("purpose", "scope", "is_active", "is_default")
 
 
 @admin.register(Registry)

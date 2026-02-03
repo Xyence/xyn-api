@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -10,6 +11,7 @@ from jsonschema import Draft202012Validator
 INTERNAL_BASE_URL = os.environ.get("XYENCE_INTERNAL_BASE_URL", "http://backend:8000").rstrip("/")
 INTERNAL_TOKEN = os.environ.get("XYENCE_INTERNAL_TOKEN", "").strip()
 CONTRACTS_ROOT = os.environ.get("XYNSEED_CONTRACTS_ROOT", "/xyn-contracts")
+MEDIA_ROOT = os.environ.get("XYENCE_MEDIA_ROOT", "/app/media")
 
 
 def _headers() -> Dict[str, str]:
@@ -37,6 +39,15 @@ def _download_file(path: str) -> bytes:
     response = requests.get(f"{INTERNAL_BASE_URL}{path}", headers=_headers(), timeout=60)
     response.raise_for_status()
     return response.content
+
+
+def _write_artifact(run_id: str, filename: str, content: str) -> str:
+    target_dir = os.path.join(MEDIA_ROOT, "run_artifacts", run_id)
+    os.makedirs(target_dir, exist_ok=True)
+    file_path = os.path.join(target_dir, filename)
+    with open(file_path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return f"/media/run_artifacts/{run_id}/{filename}"
 
 
 def _transcribe_audio(content: bytes, language_code: str) -> Dict[str, Any]:
@@ -218,7 +229,74 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
 def sync_registry(registry_id: str, run_id: str) -> None:
     try:
         _post_json(f"/xyn/internal/runs/{run_id}", {"status": "running", "append_log": "Starting registry sync\n"})
-        result = _post_json(f"/xyn/internal/registries/{registry_id}/sync", {})
+        context = _post_json(
+            "/xyn/internal/context-packs/resolve",
+            {"purpose": "operator"},
+        )
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {
+                "context_pack_refs_json": context.get("context_pack_refs", []),
+                "context_hash": context.get("context_hash", ""),
+            },
+        )
+        context_md = context.get("effective_context", "")
+        if context_md:
+            url_ctx = _write_artifact(run_id, "context_compiled.md", context_md)
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "context_compiled.md", "kind": "context", "url": url_ctx},
+            )
+        manifest = json.dumps(
+            {
+                "context_hash": context.get("context_hash", ""),
+                "packs": context.get("context_pack_refs", []),
+            },
+            indent=2,
+        )
+        url_manifest = _write_artifact(run_id, "context_manifest.json", manifest)
+        _post_json(
+            f"/xyn/internal/runs/{run_id}/artifacts",
+            {"name": "context_manifest.json", "kind": "context", "url": url_manifest},
+        )
+        registry = _get_json(f"/xyn/internal/registries/{registry_id}")
+        source_url = (registry.get("url") or "").strip()
+        snapshot = {
+            "id": registry.get("id"),
+            "name": registry.get("name"),
+            "registry_type": registry.get("registry_type"),
+            "source": source_url or "inline",
+            "synced_at": datetime.utcnow().isoformat() + "Z",
+            "items": [],
+        }
+        if source_url.startswith("http"):
+            response = requests.get(source_url, timeout=30)
+            response.raise_for_status()
+            content = response.text
+            try:
+                snapshot["items"] = json.loads(content)
+            except json.JSONDecodeError:
+                snapshot["raw"] = content
+        elif source_url.startswith("file://") or source_url.startswith("/"):
+            path = source_url.replace("file://", "")
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            try:
+                snapshot["items"] = json.loads(content)
+            except json.JSONDecodeError:
+                try:
+                    import yaml  # type: ignore
+
+                    snapshot["items"] = yaml.safe_load(content)
+                except Exception:
+                    snapshot["raw"] = content
+        snapshot_content = json.dumps(snapshot, indent=2)
+        url = _write_artifact(run_id, "registry_snapshot.json", snapshot_content)
+        _post_json(
+            f"/xyn/internal/runs/{run_id}/artifacts",
+            {"name": "registry_snapshot.json", "kind": "registry_snapshot", "url": url},
+        )
+        result = _post_json(f"/xyn/internal/registries/{registry_id}/sync", {"status": "active"})
         _post_json(
             f"/xyn/internal/runs/{run_id}",
             {
@@ -227,6 +305,10 @@ def sync_registry(registry_id: str, run_id: str) -> None:
             },
         )
     except Exception as exc:
+        try:
+            _post_json(f"/xyn/internal/registries/{registry_id}/sync", {"status": "error"})
+        except Exception:
+            pass
         _post_json(
             f"/xyn/internal/runs/{run_id}",
             {"status": "failed", "error": str(exc), "append_log": f"Registry sync failed: {exc}\n"},
@@ -236,14 +318,80 @@ def sync_registry(registry_id: str, run_id: str) -> None:
 def generate_release_plan(plan_id: str, run_id: str) -> None:
     try:
         _post_json(f"/xyn/internal/runs/{run_id}", {"status": "running", "append_log": "Generating release plan\n"})
-        _post_json(f"/xyn/internal/release-plans/{plan_id}/generate", {})
-        _post_json(
-            f"/xyn/internal/runs/{run_id}/artifacts",
-            {"name": "milestones", "kind": "json", "metadata_json": {"plan_id": plan_id}},
+        context = _post_json(
+            "/xyn/internal/context-packs/resolve",
+            {"purpose": "planner"},
         )
         _post_json(
             f"/xyn/internal/runs/{run_id}",
-            {"status": "succeeded", "append_log": "Release plan generation completed\n"},
+            {
+                "context_pack_refs_json": context.get("context_pack_refs", []),
+                "context_hash": context.get("context_hash", ""),
+            },
+        )
+        context_md = context.get("effective_context", "")
+        if context_md:
+            url_ctx = _write_artifact(run_id, "context_compiled.md", context_md)
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "context_compiled.md", "kind": "context", "url": url_ctx},
+            )
+        manifest = json.dumps(
+            {
+                "context_hash": context.get("context_hash", ""),
+                "packs": context.get("context_pack_refs", []),
+            },
+            indent=2,
+        )
+        url_manifest = _write_artifact(run_id, "context_manifest.json", manifest)
+        _post_json(
+            f"/xyn/internal/runs/{run_id}/artifacts",
+            {"name": "context_manifest.json", "kind": "context", "url": url_manifest},
+        )
+        plan = _get_json(f"/xyn/internal/release-plans/{plan_id}")
+        _post_json(f"/xyn/internal/release-plans/{plan_id}/generate", {})
+        release_plan = {
+            "id": plan.get("id"),
+            "name": plan.get("name"),
+            "target": {
+                "kind": plan.get("target_kind"),
+                "fqn": plan.get("target_fqn"),
+            },
+            "from_version": plan.get("from_version"),
+            "to_version": plan.get("to_version"),
+            "milestones": plan.get("milestones_json") or [],
+        }
+        release_plan_json = json.dumps(release_plan, indent=2)
+        release_plan_md = (
+            f"# Release Plan: {release_plan.get('name')}\n\n"
+            f"- Target: {release_plan['target']['kind']} {release_plan['target']['fqn']}\n"
+            f"- From: {release_plan.get('from_version') or 'n/a'}\n"
+            f"- To: {release_plan.get('to_version') or 'n/a'}\n\n"
+            "## Milestones\n"
+        )
+        if isinstance(release_plan.get("milestones"), list):
+            for milestone in release_plan["milestones"]:
+                release_plan_md += f"- {milestone}\n"
+        url_json = _write_artifact(run_id, "release_plan.json", release_plan_json)
+        url_md = _write_artifact(run_id, "release_plan.md", release_plan_md)
+        _post_json(
+            f"/xyn/internal/runs/{run_id}/artifacts",
+            {"name": "release_plan.json", "kind": "release_plan", "url": url_json},
+        )
+        _post_json(
+            f"/xyn/internal/runs/{run_id}/artifacts",
+            {"name": "release_plan.md", "kind": "release_plan", "url": url_md},
+        )
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {
+                "status": "succeeded",
+                "append_log": (
+                    "Release plan generation completed\n"
+                    f"Inputs: target={release_plan['target']['kind']} {release_plan['target']['fqn']}, "
+                    f"from={release_plan.get('from_version')}, to={release_plan.get('to_version')}\n"
+                ),
+            },
         )
     except Exception as exc:
         _post_json(
