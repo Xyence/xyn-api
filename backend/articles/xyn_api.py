@@ -1,4 +1,5 @@
 import json
+import uuid
 from typing import Any, Dict, Optional
 
 from django.core.paginator import Paginator
@@ -9,8 +10,15 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
 
-from .blueprints import _async_mode, _enqueue_job, _require_staff, instantiate_blueprint
-from .models import Blueprint, BlueprintRevision, Bundle, Module, Registry, ReleasePlan, Run, RunArtifact
+from .blueprints import (
+    _async_mode,
+    _build_context_artifacts,
+    _enqueue_job,
+    _require_staff,
+    _resolve_context_pack_list,
+    instantiate_blueprint,
+)
+from .models import Blueprint, BlueprintRevision, Bundle, ContextPack, DevTask, Module, Registry, ReleasePlan, Run, RunArtifact
 
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
@@ -592,3 +600,174 @@ def run_artifacts(request: HttpRequest, run_id: str) -> JsonResponse:
         for artifact in run.artifacts.all()
     ]
     return JsonResponse({"artifacts": artifacts})
+
+
+@csrf_exempt
+@login_required
+def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "POST":
+        payload = _parse_json(request)
+        title = payload.get("title")
+        task_type = payload.get("task_type")
+        if not title or not task_type:
+            return JsonResponse({"error": "title and task_type required"}, status=400)
+        dev_task = DevTask.objects.create(
+            title=title,
+            task_type=task_type,
+            status=payload.get("status", "queued"),
+            priority=payload.get("priority", 0),
+            max_attempts=payload.get("max_attempts", 3),
+            source_entity_type=payload.get("source_entity_type", "manual"),
+            source_entity_id=payload.get("source_entity_id") or uuid.uuid4(),
+            input_artifact_key=payload.get("input_artifact_key", ""),
+            context_purpose=payload.get("context_purpose", "any"),
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        if pack_ids := payload.get("context_pack_ids"):
+            packs = ContextPack.objects.filter(id__in=pack_ids)
+            dev_task.context_packs.add(*packs)
+        return JsonResponse({"id": str(dev_task.id)})
+    qs = DevTask.objects.all()
+    if status := request.GET.get("status"):
+        qs = qs.filter(status=status)
+    if task_type := request.GET.get("task_type"):
+        qs = qs.filter(task_type=task_type)
+    data = [
+        {
+            "id": str(task.id),
+            "title": task.title,
+            "task_type": task.task_type,
+            "status": task.status,
+            "priority": task.priority,
+            "attempts": task.attempts,
+            "max_attempts": task.max_attempts,
+            "locked_by": task.locked_by,
+            "locked_at": task.locked_at,
+            "source_entity_type": task.source_entity_type,
+            "source_entity_id": str(task.source_entity_id),
+            "source_run": str(task.source_run_id) if task.source_run_id else None,
+            "result_run": str(task.result_run_id) if task.result_run_id else None,
+            "context_purpose": task.context_purpose,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+        }
+        for task in qs.order_by("-created_at")
+    ]
+    return _paginate(request, data, "dev_tasks")
+
+
+@login_required
+def dev_task_detail(request: HttpRequest, task_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    task = get_object_or_404(DevTask, id=task_id)
+    return JsonResponse(
+        {
+            "id": str(task.id),
+            "title": task.title,
+            "task_type": task.task_type,
+            "status": task.status,
+            "priority": task.priority,
+            "attempts": task.attempts,
+            "max_attempts": task.max_attempts,
+            "locked_by": task.locked_by,
+            "locked_at": task.locked_at,
+            "source_entity_type": task.source_entity_type,
+            "source_entity_id": str(task.source_entity_id),
+            "source_run": str(task.source_run_id) if task.source_run_id else None,
+            "result_run": str(task.result_run_id) if task.result_run_id else None,
+            "input_artifact_key": task.input_artifact_key,
+            "last_error": task.last_error,
+            "context_purpose": task.context_purpose,
+            "context_packs": [
+                {
+                    "id": str(pack.id),
+                    "name": pack.name,
+                    "purpose": pack.purpose,
+                    "scope": pack.scope,
+                    "version": pack.version,
+                }
+                for pack in task.context_packs.all()
+            ],
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def dev_task_run(request: HttpRequest, task_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    task = get_object_or_404(DevTask, id=task_id)
+    if task.status == "running":
+        return JsonResponse({"error": "Task already running"}, status=409)
+    task.status = "queued"
+    task.updated_by = request.user
+    task.save(update_fields=["status", "updated_by", "updated_at"])
+    run = Run.objects.create(
+        entity_type="dev_task",
+        entity_id=task.id,
+        status="pending",
+        summary=f"Run dev task {task.title}",
+        created_by=request.user,
+        started_at=timezone.now(),
+    )
+    task.result_run = run
+    task.save(update_fields=["result_run", "updated_at"])
+    resolved = _resolve_context_pack_list(list(task.context_packs.all()))
+    run.context_pack_refs_json = resolved.get("refs", [])
+    run.context_hash = resolved.get("hash", "")
+    _build_context_artifacts(run, resolved)
+    run.save(update_fields=["context_pack_refs_json", "context_hash", "updated_at"])
+    mode = _async_mode()
+    if mode == "redis":
+        _enqueue_job("articles.worker_tasks.run_dev_task", str(task.id), "worker")
+        return JsonResponse({"run_id": str(run.id), "status": "queued"})
+    return JsonResponse({"run_id": str(run.id), "status": "pending"})
+
+
+@csrf_exempt
+@login_required
+def dev_task_cancel(request: HttpRequest, task_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    task = get_object_or_404(DevTask, id=task_id)
+    if task.status in {"succeeded", "failed", "canceled"}:
+        return JsonResponse({"status": task.status})
+    task.status = "canceled"
+    task.updated_by = request.user
+    task.save(update_fields=["status", "updated_by", "updated_at"])
+    return JsonResponse({"status": "canceled"})
+
+
+@login_required
+def blueprint_dev_tasks(request: HttpRequest, blueprint_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    tasks = DevTask.objects.filter(source_entity_type="blueprint", source_entity_id=blueprint_id).order_by(
+        "-created_at"
+    )
+    data = [
+        {
+            "id": str(task.id),
+            "title": task.title,
+            "task_type": task.task_type,
+            "status": task.status,
+            "priority": task.priority,
+            "attempts": task.attempts,
+            "max_attempts": task.max_attempts,
+            "result_run": str(task.result_run_id) if task.result_run_id else None,
+            "created_at": task.created_at,
+        }
+        for task in tasks
+    ]
+    return JsonResponse({"dev_tasks": data})

@@ -31,6 +31,7 @@ from .models import (
     Bundle,
     Capability,
     ContextPack,
+    DevTask,
     DraftSessionVoiceNote,
     Module,
     Registry,
@@ -184,6 +185,7 @@ def _resolve_context_packs(
     purpose: str = "any",
     namespace: Optional[str] = None,
     project_key: Optional[str] = None,
+    action: Optional[str] = None,
 ) -> Dict[str, Any]:
     ids = selected_ids if selected_ids is not None else ((session.context_pack_ids or []) if session else [])
     allowed_purposes = {purpose, "any"}
@@ -213,7 +215,7 @@ def _resolve_context_packs(
     sections = []
     refs = []
     for pack in combined:
-        if not _context_pack_applies(pack, purpose, namespace, project_key):
+        if not _context_pack_applies(pack, purpose, namespace, project_key, action):
             continue
         content_hash = hashlib.sha256(pack.content_markdown.encode("utf-8")).hexdigest()
         refs.append(
@@ -240,11 +242,40 @@ def _resolve_context_packs(
     }
 
 
+def _resolve_context_pack_list(packs: List[ContextPack]) -> Dict[str, Any]:
+    sections = []
+    refs = []
+    for pack in packs:
+        content_hash = hashlib.sha256(pack.content_markdown.encode("utf-8")).hexdigest()
+        refs.append(
+            {
+                "id": str(pack.id),
+                "name": pack.name,
+                "purpose": pack.purpose,
+                "scope": pack.scope,
+                "version": pack.version,
+                "content_hash": content_hash,
+            }
+        )
+        header = f"### ContextPack: {pack.name} ({pack.scope}) v{pack.version}"
+        sections.append(f"{header}\n{pack.content_markdown}".strip())
+    effective_context = "\n\n".join(sections).strip()
+    digest = hashlib.sha256(effective_context.encode("utf-8")).hexdigest() if effective_context else ""
+    preview = effective_context[:2000] if effective_context else ""
+    return {
+        "effective_context": effective_context,
+        "refs": refs,
+        "hash": digest,
+        "preview": preview,
+    }
+
+
 def _context_pack_applies(
     pack: ContextPack,
     purpose: str,
     namespace: Optional[str],
     project_key: Optional[str],
+    action: Optional[str] = None,
 ) -> bool:
     if not pack.is_active:
         return False
@@ -260,6 +291,9 @@ def _context_pack_applies(
         return False
     applies = pack.applies_to_json or {}
     if isinstance(applies, dict):
+        actions = applies.get("actions")
+        if action and actions and action not in actions and "any" not in actions:
+            return False
         purposes = applies.get("purposes")
         if purposes and purpose not in purposes and "any" not in purposes:
             return False
@@ -282,6 +316,61 @@ def _build_context_artifacts(run: Run, resolved: Dict[str, Any]) -> None:
     }
     _write_run_artifact(run, "context_compiled.md", resolved.get("effective_context", ""), "context")
     _write_run_artifact(run, "context_manifest.json", manifest, "context")
+
+
+def _select_context_packs_for_dev_task(
+    purpose: str,
+    namespace: Optional[str],
+    project_key: Optional[str],
+) -> List[ContextPack]:
+    allowed_purposes = {purpose, "any"}
+    defaults = ContextPack.objects.filter(
+        is_active=True,
+        is_default=True,
+        purpose__in=allowed_purposes,
+    )
+    scoped = ContextPack.objects.filter(is_active=True, purpose__in=allowed_purposes)
+    packs = list(defaults | scoped)
+    filtered = []
+    seen = set()
+    for pack in packs:
+        if str(pack.id) in seen:
+            continue
+        seen.add(str(pack.id))
+        if _context_pack_applies(pack, purpose, namespace, project_key, "dev_task"):
+            filtered.append(pack)
+    return filtered
+
+
+def _queue_dev_tasks_for_plan(
+    blueprint: Blueprint,
+    run: Run,
+    plan: Dict[str, Any],
+    namespace: Optional[str],
+) -> List[DevTask]:
+    tasks = []
+    for item in plan.get("tasks", []):
+        task_type = item.get("task_type") or "codegen"
+        title = item.get("title") or f"{task_type} for {blueprint.namespace}.{blueprint.name}"
+        context_purpose = item.get("context_purpose") or "coder"
+        dev_task = DevTask.objects.create(
+            title=title,
+            task_type=task_type,
+            status="queued",
+            priority=item.get("priority", 0),
+            source_entity_type="blueprint",
+            source_entity_id=blueprint.id,
+            source_run=run,
+            input_artifact_key="implementation_plan.json",
+            context_purpose=context_purpose,
+            created_by=run.created_by,
+            updated_by=run.created_by,
+        )
+        packs = _select_context_packs_for_dev_task(context_purpose, namespace, None)
+        if packs:
+            dev_task.context_packs.add(*packs)
+        tasks.append(dev_task)
+    return tasks
 
 
 def _module_from_spec(spec: Dict[str, Any], user) -> Module:
@@ -548,6 +637,7 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
     if not payload:
         payload = request.POST
     mode = payload.get("mode", "apply")
+    queue_dev_tasks = request.GET.get("queue_dev_tasks") == "1"
     instance = BlueprintInstance.objects.create(
         blueprint=blueprint,
         revision=latest_revision.revision,
@@ -595,6 +685,37 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
             instance.status = "planned"
         run.status = "succeeded" if instance.status in {"planned", "applied"} else "failed"
         run.metadata_json = {"plan": plan, "operation": op}
+        implementation_plan = {
+            "blueprint_id": str(blueprint.id),
+            "blueprint": f"{blueprint.namespace}.{blueprint.name}",
+            "generated_at": timezone.now().isoformat(),
+            "tasks": [
+                {
+                    "task_type": "codegen",
+                    "title": f"Codegen for {blueprint.namespace}.{blueprint.name}",
+                    "context_purpose": "coder",
+                }
+            ],
+        }
+        _write_run_artifact(run, "implementation_plan.json", implementation_plan, "implementation_plan")
+        plan_md = (
+            f"# Implementation Plan\n\n"
+            f"- Blueprint: {blueprint.namespace}.{blueprint.name}\n"
+            f"- Generated: {implementation_plan['generated_at']}\n\n"
+            "## Tasks\n"
+        )
+        for task in implementation_plan["tasks"]:
+            plan_md += f"- {task['task_type']}: {task['title']}\n"
+        _write_run_artifact(run, "implementation_plan.md", plan_md, "implementation_plan")
+        run.log_text += "Implementation plan generated\n"
+        if queue_dev_tasks:
+            dev_tasks = _queue_dev_tasks_for_plan(
+                blueprint=blueprint,
+                run=run,
+                plan=implementation_plan,
+                namespace=blueprint.namespace,
+            )
+            run.log_text += f"Queued {len(dev_tasks)} dev tasks\n"
     except Exception as exc:
         instance.status = "failed"
         instance.error = str(exc)
@@ -1600,6 +1721,7 @@ def internal_context_resolve(request: HttpRequest) -> JsonResponse:
         purpose=purpose,
         namespace=namespace,
         project_key=project_key,
+        action=payload.get("action"),
     )
     return JsonResponse(
         {
@@ -1608,3 +1730,85 @@ def internal_context_resolve(request: HttpRequest) -> JsonResponse:
             "context_hash": resolved.get("hash", ""),
         }
     )
+
+
+@csrf_exempt
+def internal_dev_task_detail(request: HttpRequest, task_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    task = get_object_or_404(DevTask, id=task_id)
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    resolved = _resolve_context_pack_list(list(task.context_packs.all()))
+    return JsonResponse(
+        {
+            "id": str(task.id),
+            "title": task.title,
+            "task_type": task.task_type,
+            "status": task.status,
+            "result_run": str(task.result_run_id) if task.result_run_id else None,
+            "context_pack_refs": resolved.get("refs", []),
+            "context_hash": resolved.get("hash", ""),
+            "context": resolved.get("effective_context", ""),
+        }
+    )
+
+
+@csrf_exempt
+def internal_dev_task_claim(request: HttpRequest, task_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    task = get_object_or_404(DevTask, id=task_id)
+    if task.status not in {"queued", "running"}:
+        return JsonResponse({"error": "Task not runnable"}, status=409)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    worker_id = payload.get("worker_id", "worker")
+    task.status = "running"
+    task.locked_by = worker_id
+    task.locked_at = timezone.now()
+    task.attempts += 1
+    task.save(update_fields=["status", "locked_by", "locked_at", "attempts", "updated_at"])
+    if not task.result_run_id:
+        run = Run.objects.create(
+            entity_type="dev_task",
+            entity_id=task.id,
+            status="running",
+            summary=f"Run dev task {task.title}",
+            created_by=task.created_by,
+            started_at=timezone.now(),
+        )
+        task.result_run = run
+        task.save(update_fields=["result_run", "updated_at"])
+    resolved = _resolve_context_pack_list(list(task.context_packs.all()))
+    return JsonResponse(
+        {
+            "id": str(task.id),
+            "task_type": task.task_type,
+            "status": task.status,
+            "result_run": str(task.result_run_id) if task.result_run_id else None,
+            "context_pack_refs": resolved.get("refs", []),
+            "context_hash": resolved.get("hash", ""),
+            "context": resolved.get("effective_context", ""),
+        }
+    )
+
+
+@csrf_exempt
+def internal_dev_task_complete(request: HttpRequest, task_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    task = get_object_or_404(DevTask, id=task_id)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    status = payload.get("status")
+    if status:
+        task.status = status
+    if error := payload.get("error"):
+        task.last_error = error
+    task.locked_by = ""
+    task.locked_at = None
+    task.save(update_fields=["status", "last_error", "locked_by", "locked_at", "updated_at"])
+    return JsonResponse({"status": task.status})

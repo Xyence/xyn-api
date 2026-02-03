@@ -28,6 +28,7 @@ from .models import (
     Capability,
     ContextPack,
     DraftSessionVoiceNote,
+    DevTask,
     Module,
     OpenAIConfig,
     ProvisionedInstance,
@@ -175,6 +176,13 @@ class ContextPackAdmin(admin.ModelAdmin):
     list_display = ("name", "purpose", "scope", "version", "is_active", "is_default", "updated_at")
     search_fields = ("name", "namespace", "project_key")
     list_filter = ("purpose", "scope", "is_active", "is_default")
+
+
+@admin.register(DevTask)
+class DevTaskAdmin(admin.ModelAdmin):
+    list_display = ("title", "task_type", "status", "priority", "attempts", "locked_by", "updated_at")
+    search_fields = ("title", "source_entity_type", "source_entity_id")
+    list_filter = ("task_type", "status")
 
 
 @admin.register(Registry)

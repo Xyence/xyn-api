@@ -460,6 +460,7 @@ class Run(models.Model):
         ("registry", "Registry"),
         ("module", "Module"),
         ("release_plan", "Release plan"),
+        ("dev_task", "Dev task"),
     ]
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     entity_type = models.CharField(max_length=30, choices=ENTITY_CHOICES)
@@ -542,6 +543,58 @@ class ContextPack(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.scope}) v{self.version}"
+
+
+class DevTask(models.Model):
+    STATUS_CHOICES = [
+        ("queued", "Queued"),
+        ("running", "Running"),
+        ("succeeded", "Succeeded"),
+        ("failed", "Failed"),
+        ("canceled", "Canceled"),
+    ]
+    TYPE_CHOICES = [
+        ("codegen", "Codegen"),
+        ("module_scaffold", "Module scaffold"),
+        ("release_plan_generate", "Release plan generate"),
+        ("registry_sync", "Registry sync"),
+        ("deploy", "Deploy"),
+    ]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=240)
+    task_type = models.CharField(max_length=40, choices=TYPE_CHOICES)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="queued")
+    priority = models.IntegerField(default=0)
+    attempts = models.PositiveIntegerField(default=0)
+    max_attempts = models.PositiveIntegerField(default=3)
+    locked_by = models.CharField(max_length=120, blank=True)
+    locked_at = models.DateTimeField(null=True, blank=True)
+    source_entity_type = models.CharField(max_length=60)
+    source_entity_id = models.UUIDField()
+    source_run = models.ForeignKey(
+        Run, null=True, blank=True, on_delete=models.SET_NULL, related_name="dev_tasks_source"
+    )
+    input_artifact_key = models.CharField(max_length=200, blank=True)
+    result_run = models.ForeignKey(
+        Run, null=True, blank=True, on_delete=models.SET_NULL, related_name="dev_tasks_result"
+    )
+    last_error = models.TextField(blank=True)
+    context_purpose = models.CharField(max_length=20, default="any")
+    context_packs = models.ManyToManyField(ContextPack, blank=True, related_name="dev_tasks")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="dev_tasks_created"
+    )
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="dev_tasks_updated"
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.title} ({self.task_type})"
 
 
 class ProvisionedInstance(models.Model):

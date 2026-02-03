@@ -398,3 +398,51 @@ def generate_release_plan(plan_id: str, run_id: str) -> None:
             f"/xyn/internal/runs/{run_id}",
             {"status": "failed", "error": str(exc), "append_log": f"Release plan failed: {exc}\n"},
         )
+
+
+def run_dev_task(task_id: str, worker_id: str) -> None:
+    try:
+        task = _post_json(f"/xyn/internal/dev-tasks/{task_id}/claim", {"worker_id": worker_id})
+        run_id = task.get("result_run")
+        if not run_id:
+            return
+        context_md = task.get("context", "")
+        if context_md:
+            url_ctx = _write_artifact(run_id, "context_compiled.md", context_md)
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "context_compiled.md", "kind": "context", "url": url_ctx},
+            )
+        manifest = json.dumps(
+            {"context_hash": task.get("context_hash", ""), "packs": task.get("context_pack_refs", [])},
+            indent=2,
+        )
+        url_manifest = _write_artifact(run_id, "context_manifest.json", manifest)
+        _post_json(
+            f"/xyn/internal/runs/{run_id}/artifacts",
+            {"name": "context_manifest.json", "kind": "context", "url": url_manifest},
+        )
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {"status": "running", "append_log": f"Executing dev task {task_id}\n"},
+        )
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {"append_log": f"Task type: {task.get('task_type')}\n"},
+        )
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {"status": "succeeded", "append_log": "Dev task completed (stub).\n"},
+        )
+        _post_json(
+            f"/xyn/internal/dev-tasks/{task_id}/complete",
+            {"status": "succeeded"},
+        )
+    except Exception as exc:
+        try:
+            _post_json(
+                f"/xyn/internal/dev-tasks/{task_id}/complete",
+                {"status": "failed", "error": str(exc)},
+            )
+        except Exception:
+            pass
