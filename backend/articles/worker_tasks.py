@@ -555,7 +555,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "steps": [
                     {
                         "name": "deploy",
-                        "commands": ["echo 'Deploy release plan'"],
+                        "commands": ["uname -a"],
                     }
                 ],
             }
@@ -617,7 +617,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 return
             steps = plan_json.get("steps")
             if not steps:
-                commands = plan_json.get("deploy", {}).get("commands") or ["echo 'Deploy release plan'"]
+                commands = plan_json.get("deploy", {}).get("commands") or ["uname -a"]
                 steps = [{"name": "deploy", "commands": commands}]
             results = []
             success = True
