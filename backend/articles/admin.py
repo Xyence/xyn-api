@@ -35,6 +35,7 @@ from .models import (
     ProvisionedInstance,
     ReleasePlan,
     ReleasePlanDeployState,
+    ReleasePlanDeployment,
     VoiceNote,
     VoiceTranscript,
 )
@@ -232,6 +233,12 @@ class RunCommandExecutionAdmin(admin.ModelAdmin):
 
 @admin.register(ReleasePlanDeployState)
 class ReleasePlanDeployStateAdmin(admin.ModelAdmin):
+    list_display = ("release_plan", "instance", "last_applied_hash", "last_applied_at", "updated_at")
+    search_fields = ("release_plan__name", "instance__name")
+
+
+@admin.register(ReleasePlanDeployment)
+class ReleasePlanDeploymentAdmin(admin.ModelAdmin):
     list_display = ("release_plan", "instance", "last_applied_hash", "last_applied_at", "updated_at")
     search_fields = ("release_plan__name", "instance__name")
 

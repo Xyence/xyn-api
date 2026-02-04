@@ -551,6 +551,21 @@ class ReleasePlanDeployState(models.Model):
         unique_together = ("release_plan", "instance")
 
 
+class ReleasePlanDeployment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    release_plan = models.ForeignKey(ReleasePlan, on_delete=models.CASCADE, related_name="deployments")
+    instance = models.ForeignKey(
+        "ProvisionedInstance", on_delete=models.CASCADE, related_name="deployments"
+    )
+    last_applied_hash = models.CharField(max_length=64, blank=True)
+    last_applied_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("release_plan", "instance")
+
+
 class ContextPack(models.Model):
     PURPOSE_CHOICES = [
         ("any", "Any"),

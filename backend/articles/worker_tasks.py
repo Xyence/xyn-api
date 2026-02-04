@@ -83,23 +83,31 @@ def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dic
     command_id = cmd["Command"]["CommandId"]
     out: Optional[Dict[str, Any]] = None
     last_error: Optional[Exception] = None
-    for _ in range(20):
+    started_at = datetime.utcnow().isoformat() + "Z"
+    for _ in range(30):
         try:
             out = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
         except ClientError as exc:
             last_error = exc
             time.sleep(1)
             continue
-        if out.get("Status") in {"Success", "Failed", "TimedOut", "Cancelled"}:
+        status = out.get("Status")
+        if status in {"Success", "Failed", "TimedOut", "Cancelled"}:
             break
         time.sleep(2)
     if out is None:
         raise last_error or RuntimeError("SSM command invocation not found yet")
+    finished_at = datetime.utcnow().isoformat() + "Z"
+    stdout = (out.get("StandardOutputContent") or "")[-4000:]
+    stderr = (out.get("StandardErrorContent") or "")[-4000:]
     return {
-        "command_id": command_id,
-        "status": out.get("Status"),
-        "stdout": out.get("StandardOutputContent", ""),
-        "stderr": out.get("StandardErrorContent", ""),
+        "ssm_command_id": command_id,
+        "invocation_status": out.get("Status"),
+        "response_code": out.get("ResponseCode"),
+        "stdout": stdout,
+        "stderr": stderr,
+        "started_at": started_at,
+        "finished_at": finished_at,
     }
 
 
@@ -606,6 +614,19 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             )
             state = deploy_state.get("state")
             if state and state.get("last_applied_hash") == plan_hash and not task.get("force"):
+                deploy_execution = {
+                    "status": "skipped_idempotent",
+                    "target_instance_id": target_instance.get("id"),
+                    "release_plan_hash": plan_hash,
+                    "steps": [],
+                }
+                exec_url = _write_artifact(
+                    run_id, "deploy_execution.json", json.dumps(deploy_execution, indent=2)
+                )
+                _post_json(
+                    f"/xyn/internal/runs/{run_id}/artifacts",
+                    {"name": "deploy_execution.json", "kind": "deploy", "url": exec_url},
+                )
                 _post_json(
                     f"/xyn/internal/runs/{run_id}",
                     {"status": "succeeded", "append_log": "Deploy skipped (already applied).\n"},
@@ -622,27 +643,28 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             results = []
             success = True
             command_records = []
+            failed_record: Optional[Dict[str, Any]] = None
             for step in steps:
                 commands = step.get("commands") or []
                 if not commands:
                     continue
                 for index, command in enumerate(commands):
-                    started_at = datetime.utcnow().isoformat() + "Z"
                     result = _run_ssm_commands(
                         target_instance.get("instance_id"),
                         target_instance.get("aws_region"),
                         [command],
                     )
-                    finished_at = datetime.utcnow().isoformat() + "Z"
                     record = {
                         "step_name": step.get("name") or "step",
                         "command_index": index,
                         "shell": "sh",
-                        "status": "succeeded" if result.get("status") == "Success" else "failed",
-                        "exit_code": 0 if result.get("status") == "Success" else 1,
-                        "started_at": started_at,
-                        "finished_at": finished_at,
-                        "ssm_command_id": result.get("command_id"),
+                        "status": "succeeded"
+                        if result.get("invocation_status") == "Success" and result.get("response_code") == 0
+                        else "failed",
+                        "exit_code": result.get("response_code"),
+                        "started_at": result.get("started_at"),
+                        "finished_at": result.get("finished_at"),
+                        "ssm_command_id": result.get("ssm_command_id"),
                         "stdout": result.get("stdout", ""),
                         "stderr": result.get("stderr", ""),
                     }
@@ -665,21 +687,27 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         "status": record["status"],
                         "stdout": record["stdout"],
                         "stderr": record["stderr"],
-                        "started_at": started_at,
-                        "finished_at": finished_at,
+                        "started_at": record["started_at"],
+                        "finished_at": record["finished_at"],
                     }
                     results.append(result_entry)
                     if record["status"] != "succeeded":
                         success = False
+                        failed_record = record
+                        break
+                if not success:
+                    break
             deploy_result = {
                 "target_instance_id": target_instance.get("id"),
                 "steps": results,
                 "release_plan_hash": plan_hash,
             }
             deploy_execution = {
+                "status": "succeeded" if success else "failed",
                 "target_instance_id": target_instance.get("id"),
                 "commands": command_records,
                 "release_plan_hash": plan_hash,
+                "failed_command": failed_record,
             }
             url = _write_artifact(run_id, "deploy_result.json", json.dumps(deploy_result, indent=2))
             exec_url = _write_artifact(

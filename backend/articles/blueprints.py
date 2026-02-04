@@ -39,6 +39,7 @@ from .models import (
     Registry,
     ReleasePlan,
     ReleasePlanDeployState,
+    ReleasePlanDeployment,
     Run,
     RunCommandExecution,
     RunArtifact,
@@ -1843,7 +1844,7 @@ def internal_release_plan_deploy_state(request: HttpRequest, plan_id: str) -> Js
         instance_id = request.GET.get("instance_id")
         if not instance_id:
             return JsonResponse({"error": "instance_id required"}, status=400)
-        state = ReleasePlanDeployState.objects.filter(
+        state = ReleasePlanDeployment.objects.filter(
             release_plan_id=plan_id, instance_id=instance_id
         ).first()
         if not state:
@@ -1862,7 +1863,7 @@ def internal_release_plan_deploy_state(request: HttpRequest, plan_id: str) -> Js
     instance_id = payload.get("instance_id")
     if not instance_id:
         return JsonResponse({"error": "instance_id required"}, status=400)
-    state, _ = ReleasePlanDeployState.objects.get_or_create(
+    state, _ = ReleasePlanDeployment.objects.get_or_create(
         release_plan_id=plan_id, instance_id=instance_id
     )
     if payload.get("last_applied_hash") is not None:
