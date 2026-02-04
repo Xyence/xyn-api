@@ -37,6 +37,7 @@ from .models import (
     DraftSessionVoiceNote,
     Module,
     Registry,
+    Release,
     ReleasePlan,
     ReleasePlanDeployState,
     ReleasePlanDeployment,
@@ -1872,6 +1873,31 @@ def internal_release_plan_deploy_state(request: HttpRequest, plan_id: str) -> Js
         state.last_applied_at = payload.get("last_applied_at")
     state.save()
     return JsonResponse({"status": "ok"})
+
+
+@csrf_exempt
+def internal_release_create(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    blueprint_id = payload.get("blueprint_id")
+    release_plan_id = payload.get("release_plan_id")
+    created_from_run_id = payload.get("created_from_run_id")
+    version = payload.get("version")
+    if not version:
+        count = Release.objects.filter(blueprint_id=blueprint_id).count() + 1
+        version = f"v{count}"
+    release = Release.objects.create(
+        blueprint_id=blueprint_id,
+        release_plan_id=release_plan_id,
+        created_from_run_id=created_from_run_id,
+        version=version,
+        status=payload.get("status", "draft"),
+        artifacts_json=payload.get("artifacts_json"),
+    )
+    return JsonResponse({"id": str(release.id), "version": release.version})
 
 
 @csrf_exempt

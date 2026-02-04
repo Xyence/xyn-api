@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -541,18 +542,18 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     "generated_at": datetime.utcnow().isoformat() + "Z",
                     "tasks": [],
                 }
-            release_plan_payload = {
-                "blueprint_id": plan_json.get("blueprint_id"),
-                "target_kind": "blueprint",
-                "target_fqn": plan_json.get("blueprint", ""),
-                "name": f"Release plan for {plan_json.get('blueprint', 'blueprint')}",
-                "to_version": "0.1.0",
-                "from_version": "",
-                "milestones_json": {"tasks": plan_json.get("tasks", [])},
-                "last_run_id": run_id,
-            }
-            release_plan = _post_json("/xyn/internal/release-plans/upsert", release_plan_payload)
-            release_plan_id = release_plan.get("id")
+        release_plan_payload = {
+            "blueprint_id": plan_json.get("blueprint_id"),
+            "target_kind": "blueprint",
+            "target_fqn": plan_json.get("blueprint", ""),
+            "name": f"Release plan for {plan_json.get('blueprint', 'blueprint')}",
+            "to_version": "0.1.0",
+            "from_version": "",
+            "milestones_json": {"tasks": plan_json.get("tasks", [])},
+            "last_run_id": run_id,
+        }
+        release_plan = _post_json("/xyn/internal/release-plans/upsert", release_plan_payload)
+        release_plan_id = release_plan.get("id")
             release_plan_json = {
                 "release_plan_id": release_plan_id,
                 "name": release_plan_payload["name"],
@@ -567,28 +568,40 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     }
                 ],
             }
-            url_json = _write_artifact(run_id, "release_plan.json", json.dumps(release_plan_json, indent=2))
-            md = (
-                f"# Release Plan\n\n"
-                f"- Blueprint: {release_plan_json.get('blueprint')}\n"
-                f"- Generated: {release_plan_json.get('generated_at')}\n\n"
-                "## Tasks\n"
-            )
-            for task_entry in release_plan_json.get("tasks", []):
-                md += f"- {task_entry.get('task_type')}: {task_entry.get('title')}\n"
-            url_md = _write_artifact(run_id, "release_plan.md", md)
-            _post_json(
-                f"/xyn/internal/runs/{run_id}/artifacts",
-                {"name": "release_plan.json", "kind": "release_plan", "url": url_json},
-            )
-            _post_json(
-                f"/xyn/internal/runs/{run_id}/artifacts",
-                {"name": "release_plan.md", "kind": "release_plan", "url": url_md},
-            )
-            _post_json(
-                f"/xyn/internal/runs/{run_id}",
-                {"status": "succeeded", "append_log": "Release plan generated.\n"},
-            )
+        url_json = _write_artifact(run_id, "release_plan.json", json.dumps(release_plan_json, indent=2))
+        md = (
+            f"# Release Plan\n\n"
+            f"- Blueprint: {release_plan_json.get('blueprint')}\n"
+            f"- Generated: {release_plan_json.get('generated_at')}\n\n"
+            "## Tasks\n"
+        )
+        for task_entry in release_plan_json.get("tasks", []):
+            md += f"- {task_entry.get('task_type')}: {task_entry.get('title')}\n"
+        url_md = _write_artifact(run_id, "release_plan.md", md)
+        _post_json(
+            f"/xyn/internal/runs/{run_id}/artifacts",
+            {"name": "release_plan.json", "kind": "release_plan", "url": url_json},
+        )
+        _post_json(
+            f"/xyn/internal/runs/{run_id}/artifacts",
+            {"name": "release_plan.md", "kind": "release_plan", "url": url_md},
+        )
+        _post_json(
+            "/xyn/internal/releases",
+            {
+                "blueprint_id": plan_json.get("blueprint_id"),
+                "release_plan_id": release_plan_id,
+                "created_from_run_id": run_id,
+                "artifacts_json": [
+                    {"name": "release_plan.json", "url": url_json},
+                    {"name": "release_plan.md", "url": url_md},
+                ],
+            },
+        )
+        _post_json(
+            f"/xyn/internal/runs/{run_id}",
+            {"status": "succeeded", "append_log": "Release plan generated.\n"},
+        )
             _post_json(
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
                 {"status": "succeeded"},
@@ -636,83 +649,68 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     {"status": "succeeded"},
                 )
                 return
-            steps = plan_json.get("steps")
-            if not steps:
-                commands = plan_json.get("deploy", {}).get("commands") or ["uname -a"]
-                steps = [{"name": "deploy", "commands": commands}]
-            results = []
-            success = True
+            plan_body = json.dumps(plan_json, indent=2)
+            plan_b64 = base64.b64encode(plan_body.encode("utf-8")).decode("utf-8")
+            upload_commands = [
+                "mkdir -p /var/lib/xyn",
+                f"echo '{plan_b64}' | base64 -d > /var/lib/xyn/release_plan.json",
+            ]
+            _run_ssm_commands(
+                target_instance.get("instance_id"),
+                target_instance.get("aws_region"),
+                upload_commands,
+            )
+            apply_result = _run_ssm_commands(
+                target_instance.get("instance_id"),
+                target_instance.get("aws_region"),
+                ["xynctl apply --from /var/lib/xyn/release_plan.json"],
+            )
+            exec_result = _run_ssm_commands(
+                target_instance.get("instance_id"),
+                target_instance.get("aws_region"),
+                ["cat /var/lib/xyn/deploy_execution.json"],
+            )
+            deploy_execution = {}
+            try:
+                deploy_execution = json.loads(exec_result.get("stdout", "") or "{}")
+            except json.JSONDecodeError:
+                deploy_execution = {
+                    "status": "failed",
+                    "error": "Failed to parse deploy_execution.json",
+                    "stdout": exec_result.get("stdout", ""),
+                    "stderr": exec_result.get("stderr", ""),
+                }
+            deploy_execution["release_plan_hash"] = plan_hash
+            deploy_execution.setdefault("target_instance_id", target_instance.get("id"))
             command_records = []
-            failed_record: Optional[Dict[str, Any]] = None
-            for step in steps:
-                commands = step.get("commands") or []
-                if not commands:
-                    continue
-                for index, command in enumerate(commands):
-                    result = _run_ssm_commands(
-                        target_instance.get("instance_id"),
-                        target_instance.get("aws_region"),
-                        [command],
-                    )
+            for step in deploy_execution.get("steps", []):
+                for index, command in enumerate(step.get("commands", [])):
                     record = {
                         "step_name": step.get("name") or "step",
                         "command_index": index,
                         "shell": "sh",
-                        "status": "succeeded"
-                        if result.get("invocation_status") == "Success" and result.get("response_code") == 0
-                        else "failed",
-                        "exit_code": result.get("response_code"),
-                        "started_at": result.get("started_at"),
-                        "finished_at": result.get("finished_at"),
-                        "ssm_command_id": result.get("ssm_command_id"),
-                        "stdout": result.get("stdout", ""),
-                        "stderr": result.get("stderr", ""),
+                        "status": command.get("status"),
+                        "exit_code": command.get("exit_code"),
+                        "started_at": command.get("started_at"),
+                        "finished_at": command.get("finished_at"),
+                        "ssm_command_id": command.get("ssm_command_id", ""),
+                        "stdout": command.get("stdout", ""),
+                        "stderr": command.get("stderr", ""),
                     }
                     command_records.append(record)
                     _post_json(f"/xyn/internal/runs/{run_id}/commands", record)
-                    _post_json(
-                        f"/xyn/internal/runs/{run_id}",
-                        {
-                            "append_log": (
-                                f"[{record['step_name']}#{record['command_index']}] "
-                                f"{record['status']} (exit {record['exit_code']})\n"
-                                f"STDOUT:\n{record['stdout']}\nSTDERR:\n{record['stderr']}\n"
-                            ),
-                        },
-                    )
-                    result_entry = {
-                        "name": record["step_name"],
-                        "command": command,
-                        "command_id": record["ssm_command_id"],
-                        "status": record["status"],
-                        "stdout": record["stdout"],
-                        "stderr": record["stderr"],
-                        "started_at": record["started_at"],
-                        "finished_at": record["finished_at"],
-                    }
-                    results.append(result_entry)
-                    if record["status"] != "succeeded":
-                        success = False
-                        failed_record = record
-                        break
-                if not success:
-                    break
+            success = (
+                apply_result.get("invocation_status") == "Success"
+                and apply_result.get("response_code") == 0
+                and deploy_execution.get("status") != "failed"
+            )
             deploy_result = {
                 "target_instance_id": target_instance.get("id"),
-                "steps": results,
                 "release_plan_hash": plan_hash,
-            }
-            deploy_execution = {
-                "status": "succeeded" if success else "failed",
-                "target_instance_id": target_instance.get("id"),
-                "commands": command_records,
-                "release_plan_hash": plan_hash,
-                "failed_command": failed_record,
+                "apply": apply_result,
             }
             url = _write_artifact(run_id, "deploy_result.json", json.dumps(deploy_result, indent=2))
-            exec_url = _write_artifact(
-                run_id, "deploy_execution.json", json.dumps(deploy_execution, indent=2)
-            )
+            exec_url = _write_artifact(run_id, "deploy_execution.json", json.dumps(deploy_execution, indent=2))
             _post_json(
                 f"/xyn/internal/runs/{run_id}/artifacts",
                 {"name": "deploy_result.json", "kind": "deploy", "url": url},

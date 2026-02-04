@@ -34,6 +34,7 @@ from .models import (
     OpenAIConfig,
     ProvisionedInstance,
     ReleasePlan,
+    Release,
     ReleasePlanDeployState,
     ReleasePlanDeployment,
     VoiceNote,
@@ -180,6 +181,13 @@ class ReleasePlanAdmin(admin.ModelAdmin):
     )
     search_fields = ("name", "target_fqn")
     list_filter = ("target_kind",)
+
+
+@admin.register(Release)
+class ReleaseAdmin(admin.ModelAdmin):
+    list_display = ("version", "status", "blueprint", "release_plan", "updated_at")
+    list_filter = ("status",)
+    search_fields = ("version",)
 
 
 @admin.register(ContextPack)

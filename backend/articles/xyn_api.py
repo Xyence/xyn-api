@@ -28,6 +28,7 @@ from .models import (
     ProvisionedInstance,
     Registry,
     ReleasePlan,
+    Release,
     Run,
     RunArtifact,
     RunCommandExecution,
@@ -548,6 +549,78 @@ def release_plan_generate(request: HttpRequest, plan_id: str) -> JsonResponse:
     run.finished_at = timezone.now()
     run.save(update_fields=["status", "finished_at", "updated_at"])
     return JsonResponse({"run_id": str(run.id), "status": run.status})
+
+
+@csrf_exempt
+@login_required
+def releases_collection(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "POST":
+        payload = _parse_json(request)
+        version = payload.get("version")
+        if not version:
+            return JsonResponse({"error": "version required"}, status=400)
+        release = Release.objects.create(
+            blueprint_id=payload.get("blueprint_id"),
+            release_plan_id=payload.get("release_plan_id"),
+            created_from_run_id=payload.get("created_from_run_id"),
+            version=version,
+            status=payload.get("status", "draft"),
+            artifacts_json=payload.get("artifacts_json"),
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        return JsonResponse({"id": str(release.id)})
+    qs = Release.objects.all().order_by("-created_at")
+    if blueprint_id := request.GET.get("blueprint_id"):
+        qs = qs.filter(blueprint_id=blueprint_id)
+    data = [
+        {
+            "id": str(release.id),
+            "version": release.version,
+            "status": release.status,
+            "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
+            "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
+            "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
+            "created_at": release.created_at,
+            "updated_at": release.updated_at,
+        }
+        for release in qs
+    ]
+    return _paginate(request, data, "releases")
+
+
+@csrf_exempt
+@login_required
+def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    release = get_object_or_404(Release, id=release_id)
+    if request.method == "PATCH":
+        payload = _parse_json(request)
+        for field in ["version", "status", "artifacts_json", "release_plan_id", "blueprint_id"]:
+            if field in payload:
+                setattr(release, field, payload[field])
+        release.updated_by = request.user
+        release.save()
+        return JsonResponse({"id": str(release.id)})
+    if request.method == "DELETE":
+        release.delete()
+        return JsonResponse({"status": "deleted"})
+    return JsonResponse(
+        {
+            "id": str(release.id),
+            "version": release.version,
+            "status": release.status,
+            "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
+            "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
+            "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
+            "artifacts_json": release.artifacts_json,
+            "created_at": release.created_at,
+            "updated_at": release.updated_at,
+        }
+    )
 
 
 @login_required

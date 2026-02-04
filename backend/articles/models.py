@@ -420,6 +420,41 @@ class ReleasePlan(models.Model):
         return f"{self.target_kind}:{self.target_fqn} {self.from_version}->{self.to_version}"
 
 
+class Release(models.Model):
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("published", "Published"),
+        ("deprecated", "Deprecated"),
+    ]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    blueprint = models.ForeignKey(
+        "Blueprint", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
+    )
+    version = models.CharField(max_length=64)
+    release_plan = models.ForeignKey(
+        ReleasePlan, null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
+    )
+    created_from_run = models.ForeignKey(
+        "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
+    artifacts_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases_created"
+    )
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases_updated"
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.version} ({self.status})"
+
+
 class Registry(models.Model):
     TYPE_CHOICES = [
         ("module", "Module"),
