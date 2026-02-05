@@ -735,6 +735,24 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         "last_applied_at": datetime.utcnow().isoformat() + "Z",
                     },
                 )
+                instance_detail = _get_json(f"/xyn/internal/instances/{target_instance.get('id')}")
+                _post_json(
+                    f"/xyn/internal/instances/{target_instance.get('id')}/state",
+                    {
+                        "observed_release_id": instance_detail.get("desired_release_id"),
+                        "observed_at": datetime.utcnow().isoformat() + "Z",
+                        "last_deploy_run_id": run_id,
+                        "health_status": "healthy",
+                    },
+                )
+            else:
+                _post_json(
+                    f"/xyn/internal/instances/{target_instance.get('id')}/state",
+                    {
+                        "last_deploy_run_id": run_id,
+                        "health_status": "failed",
+                    },
+                )
             _post_json(
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
                 {"status": "succeeded" if success else "failed"},

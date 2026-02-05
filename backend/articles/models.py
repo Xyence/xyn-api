@@ -710,6 +710,12 @@ class ProvisionedInstance(models.Model):
         ("terminating", "Terminating"),
         ("terminated", "Terminated"),
     ]
+    HEALTH_CHOICES = [
+        ("unknown", "Unknown"),
+        ("healthy", "Healthy"),
+        ("degraded", "Degraded"),
+        ("failed", "Failed"),
+    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
@@ -725,6 +731,17 @@ class ProvisionedInstance(models.Model):
     ssm_status = models.CharField(max_length=64, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="requested")
     last_error = models.TextField(blank=True)
+    desired_release = models.ForeignKey(
+        "Release", null=True, blank=True, on_delete=models.SET_NULL, related_name="desired_instances"
+    )
+    observed_release = models.ForeignKey(
+        "Release", null=True, blank=True, on_delete=models.SET_NULL, related_name="observed_instances"
+    )
+    observed_at = models.DateTimeField(null=True, blank=True)
+    last_deploy_run = models.ForeignKey(
+        "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="deploy_runs"
+    )
+    health_status = models.CharField(max_length=20, choices=HEALTH_CHOICES, default="unknown")
     tags_json = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

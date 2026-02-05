@@ -16,6 +16,7 @@ from .blueprints import (
     _enqueue_job,
     _require_staff,
     _resolve_context_pack_list,
+    _write_run_summary,
     instantiate_blueprint,
 )
 from .models import (
@@ -439,6 +440,7 @@ def registry_sync(request: HttpRequest, registry_id: str) -> JsonResponse:
     run.status = "succeeded"
     run.finished_at = timezone.now()
     run.save(update_fields=["status", "finished_at", "updated_at"])
+    _write_run_summary(run)
     return JsonResponse({"status": "synced", "last_sync_at": registry.last_sync_at, "run_id": str(run.id)})
 
 
@@ -548,6 +550,7 @@ def release_plan_generate(request: HttpRequest, plan_id: str) -> JsonResponse:
     run.status = "succeeded"
     run.finished_at = timezone.now()
     run.save(update_fields=["status", "finished_at", "updated_at"])
+    _write_run_summary(run)
     return JsonResponse({"run_id": str(run.id), "status": run.status})
 
 
@@ -734,9 +737,15 @@ def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
             return JsonResponse({"error": "title and task_type required"}, status=400)
         if task_type == "deploy_release_plan" and not payload.get("target_instance_id"):
             return JsonResponse({"error": "target_instance_id required for deploy_release_plan"}, status=400)
+        release = None
+        if payload.get("release_id"):
+            release = get_object_or_404(Release, id=payload["release_id"])
         target_instance = None
         if payload.get("target_instance_id"):
             target_instance = get_object_or_404(ProvisionedInstance, id=payload["target_instance_id"])
+            if release:
+                target_instance.desired_release = release
+                target_instance.save(update_fields=["desired_release", "updated_at"])
         dev_task = DevTask.objects.create(
             title=title,
             task_type=task_type,

@@ -253,7 +253,17 @@ class ReleasePlanDeploymentAdmin(admin.ModelAdmin):
 
 @admin.register(ProvisionedInstance)
 class ProvisionedInstanceAdmin(admin.ModelAdmin):
-    list_display = ("name", "aws_region", "instance_id", "status", "public_ip", "updated_at")
+    list_display = (
+        "name",
+        "aws_region",
+        "instance_id",
+        "status",
+        "health_status",
+        "desired_release",
+        "observed_release",
+        "public_ip",
+        "updated_at",
+    )
     search_fields = ("name", "instance_id", "public_ip", "private_ip")
     list_filter = ("status", "aws_region")
 

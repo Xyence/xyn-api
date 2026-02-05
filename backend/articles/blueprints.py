@@ -41,6 +41,8 @@ from .models import (
     ReleasePlan,
     ReleasePlanDeployState,
     ReleasePlanDeployment,
+    Release,
+    ProvisionedInstance,
     Run,
     RunCommandExecution,
     RunArtifact,
@@ -350,6 +352,37 @@ def _build_context_artifacts(run: Run, resolved: Dict[str, Any]) -> None:
     }
     _write_run_artifact(run, "context_compiled.md", resolved.get("effective_context", ""), "context")
     _write_run_artifact(run, "context_manifest.json", manifest, "context")
+
+
+def _write_run_summary(run: Run) -> None:
+    summary = {
+        "id": str(run.id),
+        "entity_type": run.entity_type,
+        "entity_id": str(run.entity_id),
+        "status": run.status,
+        "summary": run.summary,
+        "error": run.error,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "created_at": run.created_at,
+    }
+    _write_run_artifact(run, "run_summary.json", summary, "summary")
+
+
+def _prune_run_artifacts() -> None:
+    retention_days = int(os.environ.get("XYENCE_RUN_ARTIFACT_RETENTION_DAYS", "30"))
+    cutoff = timezone.now() - timezone.timedelta(days=retention_days)
+    old_artifacts = RunArtifact.objects.filter(created_at__lt=cutoff)
+    media_root = os.environ.get("XYENCE_MEDIA_ROOT") or getattr(settings, "MEDIA_ROOT", "/app/media")
+    for artifact in old_artifacts:
+        if artifact.url and artifact.url.startswith("/media/"):
+            file_path = os.path.join(media_root, artifact.url.replace("/media/", ""))
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except OSError:
+                pass
+        artifact.delete()
 
 
 def _select_context_packs_for_dev_task(
@@ -767,6 +800,8 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
             "context_hash",
         ]
     )
+    if run.status in {"succeeded", "failed"}:
+        _write_run_summary(run)
     instance.save(update_fields=["plan_id", "operation_id", "release_id", "status", "error"])
     return JsonResponse(
         {"instance_id": str(instance.id), "status": instance.status, "run_id": str(run.id)}
@@ -1650,6 +1685,9 @@ def internal_run_update(request: HttpRequest, run_id: str) -> JsonResponse:
     if run.status in {"succeeded", "failed"} and run.finished_at is None:
         run.finished_at = timezone.now()
     run.save()
+    if run.status in {"succeeded", "failed"}:
+        _write_run_summary(run)
+        _prune_run_artifacts()
     return JsonResponse({"status": run.status})
 
 
@@ -1898,6 +1936,58 @@ def internal_release_create(request: HttpRequest) -> JsonResponse:
         artifacts_json=payload.get("artifacts_json"),
     )
     return JsonResponse({"id": str(release.id), "version": release.version})
+
+
+@csrf_exempt
+def internal_instance_detail(request: HttpRequest, instance_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    return JsonResponse(
+        {
+            "id": str(instance.id),
+            "desired_release_id": str(instance.desired_release_id)
+            if instance.desired_release_id
+            else None,
+            "observed_release_id": str(instance.observed_release_id)
+            if instance.observed_release_id
+            else None,
+            "health_status": instance.health_status,
+        }
+    )
+
+
+@csrf_exempt
+def internal_instance_state(request: HttpRequest, instance_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    if payload.get("desired_release_id") is not None:
+        instance.desired_release_id = payload.get("desired_release_id")
+    if payload.get("observed_release_id") is not None:
+        instance.observed_release_id = payload.get("observed_release_id")
+    if payload.get("observed_at") is not None:
+        instance.observed_at = parse_datetime(payload.get("observed_at"))
+    if payload.get("last_deploy_run_id") is not None:
+        instance.last_deploy_run_id = payload.get("last_deploy_run_id")
+    if payload.get("health_status") is not None:
+        instance.health_status = payload.get("health_status")
+    instance.save(
+        update_fields=[
+            "desired_release",
+            "observed_release",
+            "observed_at",
+            "last_deploy_run",
+            "health_status",
+            "updated_at",
+        ]
+    )
+    return JsonResponse({"status": "ok"})
 
 
 @csrf_exempt
