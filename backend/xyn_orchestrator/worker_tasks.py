@@ -170,6 +170,23 @@ uvicorn==0.27.1
 """,
         )
         _write_file(
+            p("Dockerfile"),
+            """FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \\
+    && pip install --no-cache-dir -r /app/requirements.txt
+
+COPY ems_api /app/ems_api
+
+EXPOSE 8000
+
+CMD ["uvicorn", "ems_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+""",
+        )
+        _write_file(
             p("pyproject.toml"),
             """[project]
 name = "ems-api"
@@ -252,6 +269,7 @@ def test_health_placeholder():
             [
                 "README.md",
                 "requirements.txt",
+                "Dockerfile",
                 "pyproject.toml",
                 "ems_api/__init__.py",
                 "ems_api/main.py",
@@ -437,6 +455,18 @@ From the `xyn-api` repo root:
 docker compose -f apps/ems-stack/docker-compose.yml up -d --build
 ```
 
+If your UI repo lives elsewhere, set:
+
+```bash
+export XYN_UI_PATH=/absolute/path/to/xyn-ui/apps/ems-ui
+```
+
+To run with verification checks (Docker required):
+
+```bash
+VERIFY_DOCKER=1 docker compose -f apps/ems-stack/docker-compose.yml up -d --build
+```
+
 Open:
 - http://localhost:8080/
 - http://localhost:8080/health
@@ -454,6 +484,7 @@ docker compose -f apps/ems-stack/docker-compose.yml down -v
             """POSTGRES_USER=ems
 POSTGRES_PASSWORD=ems
 POSTGRES_DB=ems
+XYN_UI_PATH=../../xyn-ui/apps/ems-ui
 """,
         )
         _write_file(
@@ -483,7 +514,7 @@ POSTGRES_DB=ems
     image: node:20-alpine
     working_dir: /app
     volumes:
-      - ../../xyn-ui/apps/ems-ui:/app
+      - ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}:/app
     command: sh -lc "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
     expose:
       - "5173"
@@ -511,14 +542,23 @@ http {
     listen 8080;
 
     location /health {
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_pass http://ems-api:8000/health;
     }
 
     location /api/ {
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_pass http://ems-api:8000/;
     }
 
     location / {
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_pass http://ems-ui:5173/;
     }
   }

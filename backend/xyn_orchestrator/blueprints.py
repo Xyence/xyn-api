@@ -460,6 +460,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "paths": [
                         "apps/ems-api/README.md",
                         "apps/ems-api/requirements.txt",
+                        "apps/ems-api/Dockerfile",
                         "apps/ems-api/pyproject.toml",
                         "apps/ems-api/ems_api/__init__.py",
                         "apps/ems-api/ems_api/main.py",

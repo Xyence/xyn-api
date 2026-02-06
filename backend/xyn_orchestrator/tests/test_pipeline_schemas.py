@@ -237,3 +237,23 @@ class PipelineSchemaTests(TestCase):
             self.assertIn("services", data)
             for service in ["ems-api", "ems-ui", "postgres", "nginx"]:
                 self.assertIn(service, data["services"])
+            self.assertIn("XYN_UI_PATH", compose_path.read_text(encoding="utf-8"))
+
+    def test_api_scaffold_writes_dockerfile(self):
+        work_item = {
+            "id": "ems-api-scaffold",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(work_item, repo_dir)
+            dockerfile = Path(repo_dir, "apps/ems-api/Dockerfile")
+            self.assertTrue(dockerfile.exists())
