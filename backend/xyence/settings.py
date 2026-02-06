@@ -7,6 +7,8 @@ SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-insecure-change-me")
 DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
 
 ALLOWED_HOSTS = [host.strip() for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",") if host.strip()]
+if "*" not in ALLOWED_HOSTS and "backend" not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append("backend")
 
 # Respect proxy headers from nginx so OAuth redirects use https.
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")

@@ -526,6 +526,48 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             )
             return
 
+        if task_type == "release_spec_generate":
+            plan_json = None
+            if source_run:
+                plan_json = _download_artifact_json(source_run, input_artifact_key)
+            blueprint_id = plan_json.get("blueprint_id") if plan_json else source_entity_id
+            blueprint_fqn = plan_json.get("blueprint") if plan_json else "unknown"
+            release_spec = {
+                "blueprint_id": blueprint_id,
+                "blueprint": blueprint_fqn,
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "release_spec": {
+                    "name": f"{blueprint_fqn} release spec",
+                    "version": "0.1.0",
+                    "modules": [],
+                },
+            }
+            url_json = _write_artifact(run_id, "release_spec.json", json.dumps(release_spec, indent=2))
+            md = (
+                "# Release Spec\n\n"
+                f"- Blueprint: {release_spec.get('blueprint')}\n"
+                f"- Generated: {release_spec.get('generated_at')}\n\n"
+                "## Modules\n"
+            )
+            url_md = _write_artifact(run_id, "release_spec.md", md)
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "release_spec.json", "kind": "release_spec", "url": url_json},
+            )
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "release_spec.md", "kind": "release_spec", "url": url_md},
+            )
+            _post_json(
+                f"/xyn/internal/runs/{run_id}",
+                {"status": "succeeded", "append_log": "Release spec generated.\n"},
+            )
+            _post_json(
+                f"/xyn/internal/dev-tasks/{task_id}/complete",
+                {"status": "succeeded"},
+            )
+            return
+
         if task_type == "release_plan_generate":
             plan_json = None
             if source_run:
@@ -542,18 +584,18 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     "generated_at": datetime.utcnow().isoformat() + "Z",
                     "tasks": [],
                 }
-        release_plan_payload = {
-            "blueprint_id": plan_json.get("blueprint_id"),
-            "target_kind": "blueprint",
-            "target_fqn": plan_json.get("blueprint", ""),
-            "name": f"Release plan for {plan_json.get('blueprint', 'blueprint')}",
-            "to_version": "0.1.0",
-            "from_version": "",
-            "milestones_json": {"tasks": plan_json.get("tasks", [])},
-            "last_run_id": run_id,
-        }
-        release_plan = _post_json("/xyn/internal/release-plans/upsert", release_plan_payload)
-        release_plan_id = release_plan.get("id")
+            release_plan_payload = {
+                "blueprint_id": plan_json.get("blueprint_id"),
+                "target_kind": "blueprint",
+                "target_fqn": plan_json.get("blueprint", ""),
+                "name": f"Release plan for {plan_json.get('blueprint', 'blueprint')}",
+                "to_version": "0.1.0",
+                "from_version": "",
+                "milestones_json": {"tasks": plan_json.get("tasks", [])},
+                "last_run_id": run_id,
+            }
+            release_plan = _post_json("/xyn/internal/release-plans/upsert", release_plan_payload)
+            release_plan_id = release_plan.get("id")
             release_plan_json = {
                 "release_plan_id": release_plan_id,
                 "name": release_plan_payload["name"],
@@ -568,40 +610,40 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     }
                 ],
             }
-        url_json = _write_artifact(run_id, "release_plan.json", json.dumps(release_plan_json, indent=2))
-        md = (
-            f"# Release Plan\n\n"
-            f"- Blueprint: {release_plan_json.get('blueprint')}\n"
-            f"- Generated: {release_plan_json.get('generated_at')}\n\n"
-            "## Tasks\n"
-        )
-        for task_entry in release_plan_json.get("tasks", []):
-            md += f"- {task_entry.get('task_type')}: {task_entry.get('title')}\n"
-        url_md = _write_artifact(run_id, "release_plan.md", md)
-        _post_json(
-            f"/xyn/internal/runs/{run_id}/artifacts",
-            {"name": "release_plan.json", "kind": "release_plan", "url": url_json},
-        )
-        _post_json(
-            f"/xyn/internal/runs/{run_id}/artifacts",
-            {"name": "release_plan.md", "kind": "release_plan", "url": url_md},
-        )
-        _post_json(
-            "/xyn/internal/releases",
-            {
-                "blueprint_id": plan_json.get("blueprint_id"),
-                "release_plan_id": release_plan_id,
-                "created_from_run_id": run_id,
-                "artifacts_json": [
-                    {"name": "release_plan.json", "url": url_json},
-                    {"name": "release_plan.md", "url": url_md},
-                ],
-            },
-        )
-        _post_json(
-            f"/xyn/internal/runs/{run_id}",
-            {"status": "succeeded", "append_log": "Release plan generated.\n"},
-        )
+            url_json = _write_artifact(run_id, "release_plan.json", json.dumps(release_plan_json, indent=2))
+            md = (
+                f"# Release Plan\n\n"
+                f"- Blueprint: {release_plan_json.get('blueprint')}\n"
+                f"- Generated: {release_plan_json.get('generated_at')}\n\n"
+                "## Tasks\n"
+            )
+            for task_entry in release_plan_json.get("tasks", []):
+                md += f"- {task_entry.get('task_type')}: {task_entry.get('title')}\n"
+            url_md = _write_artifact(run_id, "release_plan.md", md)
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "release_plan.json", "kind": "release_plan", "url": url_json},
+            )
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "release_plan.md", "kind": "release_plan", "url": url_md},
+            )
+            _post_json(
+                "/xyn/internal/releases",
+                {
+                    "blueprint_id": plan_json.get("blueprint_id"),
+                    "release_plan_id": release_plan_id,
+                    "created_from_run_id": run_id,
+                    "artifacts_json": [
+                        {"name": "release_plan.json", "url": url_json},
+                        {"name": "release_plan.md", "url": url_md},
+                    ],
+                },
+            )
+            _post_json(
+                f"/xyn/internal/runs/{run_id}",
+                {"status": "succeeded", "append_log": "Release plan generated.\n"},
+            )
             _post_json(
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
                 {"status": "succeeded"},

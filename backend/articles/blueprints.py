@@ -168,6 +168,37 @@ def _load_runner_release_spec() -> Optional[Dict[str, Any]]:
     return json.loads(fixture.read_text())
 
 
+def _has_release_spec_hints(spec: Dict[str, Any], blueprint: Blueprint) -> bool:
+    if blueprint.spec_text or blueprint.metadata_json:
+        return True
+    metadata = spec.get("metadata") or {}
+    if metadata.get("labels") or metadata.get("name"):
+        return True
+    for key in ("requirements", "modules_required", "stack", "services", "ingress"):
+        if key in spec:
+            return True
+    return False
+
+
+def _default_release_spec_from_hints(spec: Dict[str, Any], blueprint: Blueprint) -> Optional[Dict[str, Any]]:
+    release_spec = _load_runner_release_spec()
+    if release_spec:
+        return release_spec
+    metadata = spec.get("metadata") or {}
+    name = metadata.get("name") or blueprint.name or "blueprint"
+    namespace = metadata.get("namespace") or blueprint.namespace or "core"
+    return {
+        "name": f"{namespace}.{name}",
+        "version": "0.1.0",
+        "modules": [
+            {
+                "fqn": "core.app-web-stack",
+                "version": "0.1.0",
+            }
+        ],
+    }
+
+
 def _generate_blueprint_spec(session: BlueprintDraftSession, transcripts: List[str]) -> Dict[str, Any]:
     release_spec = _load_runner_release_spec()
     name = slugify(session.name) or "blueprint"
@@ -355,6 +386,11 @@ def _build_context_artifacts(run: Run, resolved: Dict[str, Any]) -> None:
 
 
 def _write_run_summary(run: Run) -> None:
+    def _dt(value: Optional[timezone.datetime]) -> Optional[str]:
+        if not value:
+            return None
+        return value.isoformat()
+
     summary = {
         "id": str(run.id),
         "entity_type": run.entity_type,
@@ -362,9 +398,9 @@ def _write_run_summary(run: Run) -> None:
         "status": run.status,
         "summary": run.summary,
         "error": run.error,
-        "started_at": run.started_at,
-        "finished_at": run.finished_at,
-        "created_at": run.created_at,
+        "started_at": _dt(run.started_at),
+        "finished_at": _dt(run.finished_at),
+        "created_at": _dt(run.created_at),
     }
     _write_run_artifact(run, "run_summary.json", summary, "summary")
 
@@ -406,6 +442,7 @@ def _queue_dev_tasks_for_plan(
     run: Run,
     plan: Dict[str, Any],
     namespace: Optional[str],
+    enqueue_jobs: bool = False,
 ) -> List[DevTask]:
     tasks = []
     for item in plan.get("tasks", []):
@@ -429,6 +466,8 @@ def _queue_dev_tasks_for_plan(
         if packs:
             dev_task.context_packs.add(*packs)
         tasks.append(dev_task)
+        if enqueue_jobs:
+            _enqueue_job("articles.worker_tasks.run_dev_task", str(dev_task.id), "worker")
     return tasks
 
 
@@ -686,7 +725,27 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
     spec = latest_revision.spec_json
     release_spec = spec.get("releaseSpec")
     if not release_spec:
-        return JsonResponse({"error": "Blueprint missing releaseSpec"}, status=400)
+        if _has_release_spec_hints(spec, blueprint):
+            release_spec = _default_release_spec_from_hints(spec, blueprint)
+        else:
+            return JsonResponse(
+                {
+                    "error": "Blueprint missing releaseSpec and not enough hints to infer a default.",
+                    "guidance": {
+                        "add_releaseSpec": True,
+                        "minimum_example": {
+                            "releaseSpec": {
+                                "name": f"{blueprint.namespace}.{blueprint.name}",
+                                "version": "0.1.0",
+                                "modules": [
+                                    {"fqn": "core.app-web-stack", "version": "0.1.0"}
+                                ],
+                            }
+                        },
+                    },
+                },
+                status=400,
+            )
     payload = {}
     if request.body:
         try:
@@ -722,28 +781,33 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
     _build_context_artifacts(run, context_resolved)
     try:
         run.log_text = "Starting blueprint instantiate\n"
-        plan = _xynseed_request("post", "/releases/plan", {"release_spec": release_spec})
-        _write_run_artifact(run, "plan.json", plan, "plan")
-        run.log_text += "Release plan created\n"
+        plan = None
         op = None
-        if mode == "apply":
-            op = _xynseed_request(
-                "post",
-                "/releases/apply",
-                {"release_id": plan.get("releaseId"), "plan_id": plan.get("planId")},
-            )
+        if release_spec:
+            plan = _xynseed_request("post", "/releases/plan", {"release_spec": release_spec})
+            _write_run_artifact(run, "plan.json", plan, "plan")
+            run.log_text += "Release plan created\n"
+            if mode == "apply":
+                op = _xynseed_request(
+                    "post",
+                    "/releases/apply",
+                    {"release_id": plan.get("releaseId"), "plan_id": plan.get("planId")},
+                )
+                if op:
+                    _write_run_artifact(run, "operation.json", op, "operation")
+                    run.log_text += "Release apply executed\n"
+            instance.plan_id = plan.get("planId", "")
+            instance.release_id = plan.get("releaseId", "")
             if op:
-                _write_run_artifact(run, "operation.json", op, "operation")
-                run.log_text += "Release apply executed\n"
-        instance.plan_id = plan.get("planId", "")
-        instance.release_id = plan.get("releaseId", "")
-        if op:
-            instance.operation_id = op.get("operationId", "")
-            instance.status = "applied" if op.get("status") == "succeeded" else "failed"
+                instance.operation_id = op.get("operationId", "")
+                instance.status = "applied" if op.get("status") == "succeeded" else "failed"
+            else:
+                instance.status = "planned"
+            run.metadata_json = {"plan": plan, "operation": op}
+            run.status = "succeeded" if instance.status in {"planned", "applied"} else "failed"
         else:
             instance.status = "planned"
-        run.status = "succeeded" if instance.status in {"planned", "applied"} else "failed"
-        run.metadata_json = {"plan": plan, "operation": op}
+            run.status = "succeeded"
         implementation_plan = {
             "blueprint_id": str(blueprint.id),
             "blueprint": f"{blueprint.namespace}.{blueprint.name}",
@@ -758,6 +822,11 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
                 {
                     "task_type": "release_plan_generate",
                     "title": f"Release plan for {blueprint.namespace}.{blueprint.name}",
+                    "context_purpose": "planner",
+                },
+                {
+                    "task_type": "release_spec_generate",
+                    "title": f"Release spec for {blueprint.namespace}.{blueprint.name}",
                     "context_purpose": "planner",
                 }
             ],
@@ -779,6 +848,7 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
                 run=run,
                 plan=implementation_plan,
                 namespace=blueprint.namespace,
+                enqueue_jobs=True,
             )
             run.log_text += f"Queued {len(dev_tasks)} dev tasks\n"
     except Exception as exc:
@@ -995,6 +1065,7 @@ def create_draft_session(request: HttpRequest) -> JsonResponse:
     session = BlueprintDraftSession.objects.create(
         name=name,
         blueprint_kind=blueprint_kind,
+        blueprint_id=payload.get("blueprint_id"),
         context_pack_ids=context_pack_ids,
         created_by=request.user,
         updated_by=request.user,
