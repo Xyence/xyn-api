@@ -1,10 +1,15 @@
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 from django.test import TestCase
 from jsonschema import Draft202012Validator
 
 from articles.blueprints import _generate_implementation_plan, _select_context_packs_for_dev_task
+from articles.worker_tasks import _apply_scaffold_for_work_item, _collect_git_diff, _mark_noop_codegen
 from articles.models import Blueprint, ContextPack
 
 
@@ -104,3 +109,41 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("any-pack", planner_names)
         self.assertIn("planner-pack", planner_names)
         self.assertIn("ems-pack", planner_names)
+
+    def test_codegen_patch_can_apply_to_clean_repo(self):
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        work_item = {
+            "id": "ems-api-scaffold",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            subprocess.run(["git", "init"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_dir, check=True)
+            Path(repo_dir, ".gitignore").write_text("# test\n", encoding="utf-8")
+            subprocess.run(["git", "add", ".gitignore"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True)
+
+            _apply_scaffold_for_work_item(work_item, repo_dir)
+            diff = _collect_git_diff(repo_dir)
+            self.assertIn("apps/ems-api/ems_api/main.py", diff)
+
+            subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "apply", "-"], input=diff, text=True, cwd=repo_dir, check=True)
+            self.assertTrue(Path(repo_dir, "apps/ems-api/ems_api/main.py").exists())
+
+    def test_codegen_no_changes_marks_failure(self):
+        errors = []
+        success = _mark_noop_codegen(False, "noop-item", errors)
+        self.assertFalse(success)
+        self.assertEqual(errors[0]["code"], "no_changes")

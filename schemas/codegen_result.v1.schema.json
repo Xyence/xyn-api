@@ -96,16 +96,21 @@
             }
           },
           "commit": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["sha", "message", "branch", "pushed"],
-            "properties": {
-              "sha": {"type": "string"},
-              "message": {"type": "string"},
-              "branch": {"type": "string"},
-              "pushed": {"type": "boolean"},
-              "pr_url": {"type": "string"}
-            }
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["sha", "message", "branch", "pushed"],
+                "properties": {
+                  "sha": {"type": "string"},
+                  "message": {"type": "string"},
+                  "branch": {"type": "string"},
+                  "pushed": {"type": "boolean"},
+                  "pr_url": {"type": "string"}
+                }
+              },
+              {"type": "null"}
+            ]
           }
         }
       }

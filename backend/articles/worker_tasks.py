@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import time
 from datetime import datetime
@@ -128,6 +129,19 @@ def _collect_git_diff(repo_dir: str) -> str:
 def _list_changed_files(repo_dir: str) -> List[str]:
     output = os.popen(f"cd {repo_dir} && git diff --cached --name-only").read()
     return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _mark_noop_codegen(changes_made: bool, work_item_id: str, errors: List[Dict[str, Any]]) -> bool:
+    if changes_made:
+        return True
+    errors.append(
+        {
+            "code": "no_changes",
+            "message": "Codegen produced no patches or files.",
+            "detail": {"work_item_id": work_item_id},
+        }
+    )
+    return False
 
 
 def _apply_scaffold_for_work_item(work_item: Dict[str, Any], repo_dir: str) -> List[str]:
@@ -616,7 +630,7 @@ def _transcribe_audio(content: bytes, language_code: str) -> Dict[str, Any]:
     }
 
 
-def _load_schema(name: str) -> Dict[str, Any]:
+def _load_contract_schema(name: str) -> Dict[str, Any]:
     path = os.path.join(CONTRACTS_ROOT, "schemas", name)
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -632,7 +646,7 @@ def _schema_for_kind(kind: str) -> str:
 
 
 def _validate_blueprint(spec: Dict[str, Any], kind: str) -> List[str]:
-    schema = _load_schema(_schema_for_kind(kind))
+    schema = _load_contract_schema(_schema_for_kind(kind))
     validator = Draft202012Validator(schema)
     errors = []
     for error in sorted(validator.iter_errors(spec), key=lambda e: e.path):
@@ -1000,6 +1014,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             artifacts = []
             errors = []
             success = True
+            changes_made = False
             for repo in work_item.get("repo_targets", []):
                 repo_dir = _ensure_repo_workspace(repo, workspace_root)
                 _apply_scaffold_for_work_item(work_item, repo_dir)
@@ -1007,6 +1022,60 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 files_changed = _list_changed_files(repo_dir)
                 patches = []
                 if diff.strip():
+                    changes_made = True
+                    worktree_dir = tempfile.mkdtemp(prefix="apply-check-", dir=workspace_root)
+                    try:
+                        wt_proc = subprocess.run(
+                            ["git", "worktree", "add", "--detach", worktree_dir, "HEAD"],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if wt_proc.returncode != 0:
+                            raise RuntimeError(wt_proc.stderr or wt_proc.stdout or "git worktree add failed")
+                        apply_proc = subprocess.run(
+                            ["git", "apply", "--check", "-"],
+                            input=diff,
+                            text=True,
+                            cwd=worktree_dir,
+                            capture_output=True,
+                        )
+                        if apply_proc.returncode != 0:
+                            err_key = f"patch_apply_error_{repo['name']}.log"
+                            err_output = (apply_proc.stderr or "") + (apply_proc.stdout or "")
+                            err_url = _write_artifact(run_id, err_key, err_output)
+                            _post_json(
+                                f"/xyn/internal/runs/{run_id}/artifacts",
+                                {"name": err_key, "kind": "codegen", "url": err_url},
+                            )
+                            errors.append(
+                                {
+                                    "code": "patch_apply_failed",
+                                    "message": "Generated patch failed to apply cleanly.",
+                                    "detail": {
+                                        "repo": repo.get("name"),
+                                        "stderr_artifact": err_key,
+                                        "repro_steps": f"cd {worktree_dir} && git apply --check <patch>",
+                                    },
+                                }
+                            )
+                            success = False
+                    except Exception as exc:
+                        errors.append(
+                            {
+                                "code": "patch_apply_failed",
+                                "message": "Patch apply check failed to run.",
+                                "detail": {"repo": repo.get("name"), "error": str(exc)},
+                            }
+                        )
+                        success = False
+                    finally:
+                        subprocess.run(
+                            ["git", "worktree", "remove", "--force", worktree_dir],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            text=True,
+                        )
                     patch_name = f"codegen_patch_{repo['name']}.diff"
                     patch_url = _write_artifact(run_id, patch_name, diff)
                     artifacts.append(
@@ -1051,6 +1120,12 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             "stderr_artifact": "",
                         }
                     )
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}",
+                        {
+                            "append_log": f"Verify: {cmd} (cwd={cwd}) exit={int(exit_code)}\n",
+                        },
+                    )
                     expected = verify.get("expect_exit_code", 0)
                     if int(exit_code) != int(expected):
                         success = False
@@ -1065,11 +1140,11 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 if diff.strip() and CODEGEN_COMMIT:
                     branch = f"codegen/{task_id}"
                     _git_cmd(repo_dir, f"git checkout -b {branch}")
-                    _git_cmd(repo_dir, f\"git commit -am \\\"codegen: {work_item_id}\\\"\")
-                    sha = os.popen(f\"cd {repo_dir} && git rev-parse HEAD\").read().strip()
+                    _git_cmd(repo_dir, f"git commit -am \"codegen: {work_item_id}\"")
+                    sha = os.popen(f"cd {repo_dir} && git rev-parse HEAD").read().strip()
                     pushed = False
                     if CODEGEN_PUSH:
-                        _git_cmd(repo_dir, f\"git push -u origin {branch}\")
+                        _git_cmd(repo_dir, f"git push -u origin {branch}")
                         pushed = True
                     commit_info = {
                         "sha": sha,
@@ -1091,6 +1166,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         "commit": commit_info,
                     }
                 )
+            success = success and _mark_noop_codegen(changes_made, work_item_id, errors)
             result = {
                 "schema_version": "codegen_result.v1",
                 "task_id": task_id,
@@ -1098,7 +1174,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "blueprint_id": plan_json.get("blueprint_id"),
                 "summary": {
                     "outcome": "succeeded" if success else "failed",
-                    "changes": f"{len(repo_results)} repo(s) updated",
+                    "changes": f"{len(repo_results)} repo(s) updated" if success else "No changes",
                     "risks": "Scaffolds only; requires implementation.",
                     "next_steps": "Review patches and iterate.",
                 },
@@ -1109,6 +1185,18 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "finished_at": datetime.utcnow().isoformat() + "Z",
                 "errors": errors,
             }
+            raw_url = _write_artifact(run_id, "codegen_result_raw.json", json.dumps(result, indent=2))
+            _post_json(
+                f"/xyn/internal/runs/{run_id}/artifacts",
+                {"name": "codegen_result_raw.json", "kind": "codegen", "url": raw_url},
+            )
+            artifacts.append(
+                {
+                    "key": "codegen_result_raw.json",
+                    "content_type": "application/json",
+                    "description": "Raw codegen result before schema validation",
+                }
+            )
             validation_errors = _validate_schema(result, "codegen_result.v1.schema.json")
             if validation_errors:
                 success = False

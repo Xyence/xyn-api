@@ -1318,6 +1318,9 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
             run.log_text += "Implementation plan schema errors:\n"
             for err in plan_errors:
                 run.log_text += f"- {err}\n"
+            _write_run_artifact(run, "implementation_plan.json", implementation_plan, "implementation_plan")
+            _write_run_artifact(run, "implementation_plan.md", "Implementation plan validation failed.", "implementation_plan")
+            raise RuntimeError("Implementation plan schema validation failed")
         _write_run_artifact(run, "implementation_plan.json", implementation_plan, "implementation_plan")
         plan_md = (
             f"# Implementation Plan\n\n"
