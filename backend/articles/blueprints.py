@@ -406,7 +406,7 @@ def _write_run_summary(run: Run) -> None:
 
 
 def _load_schema(name: str) -> Dict[str, Any]:
-    base_dir = Path(__file__).resolve().parents[2]
+    base_dir = Path(__file__).resolve().parents[1]
     path = base_dir / "schemas" / name
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
