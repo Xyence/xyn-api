@@ -168,6 +168,7 @@ FastAPI scaffold for the EMS platform.
             """fastapi==0.110.0
 uvicorn==0.27.1
 pytest==8.1.1
+httpx==0.27.0
 """,
         )
         _write_file(
@@ -181,6 +182,7 @@ requires-python = ">=3.10"
 [project.optional-dependencies]
 dev = [
   "pytest==8.1.1",
+  "httpx==0.27.0",
 ]
 """,
         )
@@ -1129,20 +1131,42 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     )
                     patches.append({"path_hint": repo.get("path_root", ""), "diff_unified": diff})
                 commands_executed = []
+                path_root = repo.get("path_root", "").strip("/")
+                default_cwd = path_root or "."
+                venv_dir = os.path.join(repo_dir, ".venv")
+                req_path = os.path.join(repo_dir, path_root, "requirements.txt") if path_root else os.path.join(repo_dir, "requirements.txt")
+                venv_env = os.environ.copy()
+                if os.path.isfile(req_path):
+                    try:
+                        if not os.path.isdir(venv_dir):
+                            subprocess.run(["python", "-m", "venv", venv_dir], cwd=repo_dir, check=True)
+                        pip_path = os.path.join(venv_dir, "bin", "pip")
+                        subprocess.run([pip_path, "install", "-q", "-r", req_path], cwd=repo_dir, check=True)
+                        venv_env["VIRTUAL_ENV"] = venv_dir
+                        venv_env["PATH"] = os.path.join(venv_dir, "bin") + os.pathsep + venv_env.get("PATH", "")
+                    except Exception as exc:
+                        success = False
+                        errors.append(
+                            {
+                                "code": "verify_env_failed",
+                                "message": "Failed to prepare verification environment.",
+                                "detail": {"repo": repo.get("name"), "error": str(exc)},
+                            }
+                        )
                 for verify in work_item.get("verify", []):
                     cmd = verify.get("command")
-                    cwd = verify.get("cwd") or "."
+                    cwd = verify.get("cwd") or default_cwd
                     full_cwd = os.path.join(repo_dir, cwd)
-                    proc = os.popen(f"cd {full_cwd} && {cmd} 2>&1")
-                    output = proc.read()
-                    exit_status = proc.close()
-                    if exit_status is None:
-                        exit_code = 0
-                    else:
-                        try:
-                            exit_code = os.waitstatus_to_exitcode(exit_status)
-                        except AttributeError:
-                            exit_code = int(exit_status)
+                    result_proc = subprocess.run(
+                        cmd,
+                        shell=True,
+                        cwd=full_cwd,
+                        env=venv_env,
+                        capture_output=True,
+                        text=True,
+                    )
+                    output = (result_proc.stdout or "") + (result_proc.stderr or "")
+                    exit_code = result_proc.returncode
                     stdout_key = f"verify_{repo['name']}_{len(commands_executed)}.log"
                     stdout_url = _write_artifact(run_id, stdout_key, output)
                     _post_json(

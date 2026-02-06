@@ -142,6 +142,40 @@ class PipelineSchemaTests(TestCase):
             subprocess.run(["git", "apply", "-"], input=diff, text=True, cwd=repo_dir, check=True)
             self.assertTrue(Path(repo_dir, "apps/ems-api/ems_api/main.py").exists())
 
+    def test_scaffold_imports_main(self):
+        work_item = {
+            "id": "ems-api-scaffold",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(work_item, repo_dir)
+            app_root = Path(repo_dir, "apps/ems-api")
+            fastapi_stub = app_root / "fastapi"
+            fastapi_stub.mkdir(parents=True, exist_ok=True)
+            (fastapi_stub / "__init__.py").write_text(
+                "class FastAPI:\\n    def __init__(self, *args, **kwargs):\\n        pass\\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(app_root)
+            result = subprocess.run(
+                ["python", "-c", "import ems_api.main"],
+                cwd=app_root,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_codegen_no_changes_marks_failure(self):
         errors = []
         success = _mark_noop_codegen(False, "noop-item", errors)
