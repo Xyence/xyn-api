@@ -110,6 +110,7 @@ from articles.xyn_api import (
     dev_task_retry,
     dev_task_retry,
     blueprint_dev_tasks,
+    oidc_exchange,
 )
 from web.public_views import (
     public_home,
@@ -136,6 +137,7 @@ urlpatterns = [
     path("xyn/api/public/site", public_site_config),
     path("xyn/api/public/articles", public_articles),
     path("xyn/api/public/articles/<slug:slug>", public_article_detail),
+    path("xyn/api/auth/oidc/exchange", oidc_exchange),
     path("xyn/blueprints/", blueprint_list_view, name="blueprint-list"),
     path("xyn/studio/blueprints/new", new_draft_session_view, name="blueprint-session-new"),
     path("xyn/blueprints/<uuid:blueprint_id>/", blueprint_detail_view, name="blueprint-detail"),

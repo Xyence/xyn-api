@@ -1,7 +1,10 @@
 import json
+import os
+import time
 import uuid
 from typing import Any, Dict, Optional
 
+import requests
 from django.core.paginator import Paginator
 from django.db import models
 from django.http import HttpRequest, JsonResponse
@@ -9,6 +12,8 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
+
+from xyence.middleware import _get_or_create_user_from_claims, _verify_oidc_token
 
 from .blueprints import (
     _async_mode,
@@ -60,6 +65,82 @@ def _paginate(request: HttpRequest, qs, key: str) -> JsonResponse:
             "count": paginator.count,
             "next": page.next_page_number() if page.has_next() else None,
             "prev": page.previous_page_number() if page.has_previous() else None,
+        }
+    )
+
+
+_OIDC_CONFIG: Optional[Dict[str, Any]] = None
+_OIDC_CONFIG_TS: float = 0.0
+
+
+def _get_oidc_config(issuer: str) -> Optional[Dict[str, Any]]:
+    global _OIDC_CONFIG, _OIDC_CONFIG_TS
+    now = time.time()
+    if _OIDC_CONFIG and now - _OIDC_CONFIG_TS < 3600:
+        return _OIDC_CONFIG
+    try:
+        response = requests.get(f"{issuer.rstrip('/')}/.well-known/openid-configuration", timeout=10)
+        response.raise_for_status()
+        _OIDC_CONFIG = response.json()
+        _OIDC_CONFIG_TS = now
+        return _OIDC_CONFIG
+    except Exception:
+        return None
+
+
+@csrf_exempt
+def oidc_exchange(request: HttpRequest) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    code = payload.get("code")
+    code_verifier = payload.get("code_verifier")
+    redirect_uri = payload.get("redirect_uri")
+    if not code or not code_verifier or not redirect_uri:
+        return JsonResponse({"error": "code, code_verifier, and redirect_uri are required"}, status=400)
+    issuer = os.environ.get("OIDC_ISSUER", "https://accounts.google.com").strip()
+    client_id = os.environ.get("OIDC_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("OIDC_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        return JsonResponse({"error": "OIDC client not configured"}, status=500)
+    config = _get_oidc_config(issuer)
+    if not config or not config.get("token_endpoint"):
+        return JsonResponse({"error": "OIDC configuration unavailable"}, status=502)
+    try:
+        token_response = requests.post(
+            config["token_endpoint"],
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
+            },
+            timeout=15,
+        )
+    except Exception as exc:
+        return JsonResponse({"error": f"token exchange failed: {exc}"}, status=502)
+    if token_response.status_code >= 400:
+        try:
+            details = token_response.json()
+        except Exception:
+            details = token_response.text
+        return JsonResponse({"error": "token exchange failed", "details": details}, status=400)
+    token_payload = token_response.json()
+    id_token = token_payload.get("id_token")
+    if not id_token:
+        return JsonResponse({"error": "id_token missing"}, status=400)
+    claims = _verify_oidc_token(id_token)
+    if not claims:
+        return JsonResponse({"error": "invalid id_token"}, status=401)
+    user = _get_or_create_user_from_claims(claims)
+    if not user:
+        return JsonResponse({"error": "user not allowed"}, status=403)
+    return JsonResponse(
+        {
+            "id_token": id_token,
+            "expires_in": token_payload.get("expires_in"),
         }
     )
 
