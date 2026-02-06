@@ -168,6 +168,8 @@ class Blueprint(models.Model):
     name = models.CharField(max_length=120)
     namespace = models.CharField(max_length=120, default="core")
     description = models.TextField(blank=True)
+    spec_text = models.TextField(blank=True)
+    metadata_json = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(
@@ -228,6 +230,9 @@ class BlueprintDraftSession(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
+    blueprint = models.ForeignKey(
+        Blueprint, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_sessions_source"
+    )
     blueprint_kind = models.CharField(max_length=20, choices=KIND_CHOICES, default="solution")
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="drafting")
     current_draft_json = models.JSONField(null=True, blank=True)
@@ -384,6 +389,22 @@ class Capability(models.Model):
         return f"{self.name} v{self.version}"
 
 
+class Environment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=120, unique=True)
+    base_domain = models.CharField(max_length=200, blank=True)
+    aws_region = models.CharField(max_length=50, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class ReleasePlan(models.Model):
     TARGET_CHOICES = [
         ("module", "Module"),
@@ -400,6 +421,9 @@ class ReleasePlan(models.Model):
     milestones_json = models.JSONField(null=True, blank=True)
     blueprint = models.ForeignKey(
         "Blueprint", null=True, blank=True, on_delete=models.SET_NULL, related_name="release_plans"
+    )
+    environment = models.ForeignKey(
+        "Environment", null=True, blank=True, on_delete=models.SET_NULL, related_name="release_plans"
     )
     last_run = models.ForeignKey(
         "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="release_plans"
@@ -433,6 +457,9 @@ class Release(models.Model):
     version = models.CharField(max_length=64)
     release_plan = models.ForeignKey(
         ReleasePlan, null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
+    )
+    environment = models.ForeignKey(
+        "Environment", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
     )
     created_from_run = models.ForeignKey(
         "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
@@ -719,6 +746,9 @@ class ProvisionedInstance(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
+    environment = models.ForeignKey(
+        "Environment", null=True, blank=True, on_delete=models.SET_NULL, related_name="instances"
+    )
     aws_region = models.CharField(max_length=50)
     instance_id = models.CharField(max_length=64, blank=True)
     instance_type = models.CharField(max_length=64)

@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-from .models import ProvisionedInstance
+from .models import Environment, ProvisionedInstance
 
 
 DEFAULT_ALLOWED_CIDR = os.environ.get("XYENCE_PROVISION_ALLOW_CIDR", "0.0.0.0/0")
@@ -125,7 +125,10 @@ def _ensure_security_group(region: str, vpc_id: Optional[str]) -> str:
 
 
 def provision_instance(payload: Dict[str, Any], user) -> ProvisionedInstance:
-    region = payload.get("region") or DEFAULT_REGION
+    environment = None
+    if payload.get("environment_id"):
+        environment = Environment.objects.filter(id=payload["environment_id"]).first()
+    region = payload.get("region") or (environment.aws_region if environment else None) or DEFAULT_REGION
     if not region:
         raise ValueError("AWS region required (AWS_REGION or payload.region)")
     ami_id = payload.get("ami_id") or DEFAULT_AMI
@@ -145,6 +148,7 @@ def provision_instance(payload: Dict[str, Any], user) -> ProvisionedInstance:
 
     instance = ProvisionedInstance.objects.create(
         name=name,
+        environment=environment,
         aws_region=region,
         instance_type=instance_type,
         ami_id=ami_id,

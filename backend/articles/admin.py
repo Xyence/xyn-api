@@ -22,6 +22,7 @@ from .models import (
     BlueprintInstance,
     BlueprintRevision,
     Bundle,
+    Environment,
     Registry,
     Run,
     RunArtifact,
@@ -123,8 +124,8 @@ class BlueprintRevisionAdmin(admin.ModelAdmin):
 
 @admin.register(BlueprintDraftSession)
 class BlueprintDraftSessionAdmin(admin.ModelAdmin):
-    list_display = ("name", "blueprint_kind", "status", "job_id", "updated_at")
-    search_fields = ("name",)
+    list_display = ("name", "blueprint", "blueprint_kind", "status", "job_id", "updated_at")
+    search_fields = ("name", "blueprint__name")
 
 
 @admin.register(DraftSessionVoiceNote)
@@ -168,6 +169,12 @@ class CapabilityAdmin(admin.ModelAdmin):
     search_fields = ("name",)
 
 
+@admin.register(Environment)
+class EnvironmentAdmin(admin.ModelAdmin):
+    list_display = ("name", "slug", "base_domain", "aws_region", "updated_at")
+    search_fields = ("name", "slug", "base_domain")
+
+
 @admin.register(ReleasePlan)
 class ReleasePlanAdmin(admin.ModelAdmin):
     list_display = (
@@ -177,16 +184,17 @@ class ReleasePlanAdmin(admin.ModelAdmin):
         "from_version",
         "to_version",
         "blueprint",
+        "environment",
         "updated_at",
     )
     search_fields = ("name", "target_fqn")
-    list_filter = ("target_kind",)
+    list_filter = ("target_kind", "environment")
 
 
 @admin.register(Release)
 class ReleaseAdmin(admin.ModelAdmin):
-    list_display = ("version", "status", "blueprint", "release_plan", "updated_at")
-    list_filter = ("status",)
+    list_display = ("version", "status", "blueprint", "release_plan", "environment", "updated_at")
+    list_filter = ("status", "environment")
     search_fields = ("version",)
 
 
@@ -255,6 +263,7 @@ class ReleasePlanDeploymentAdmin(admin.ModelAdmin):
 class ProvisionedInstanceAdmin(admin.ModelAdmin):
     list_display = (
         "name",
+        "environment",
         "aws_region",
         "instance_id",
         "status",
@@ -265,7 +274,7 @@ class ProvisionedInstanceAdmin(admin.ModelAdmin):
         "updated_at",
     )
     search_fields = ("name", "instance_id", "public_ip", "private_ip")
-    list_filter = ("status", "aws_region")
+    list_filter = ("status", "aws_region", "environment")
 
 
 

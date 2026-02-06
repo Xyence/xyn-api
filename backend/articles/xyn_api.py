@@ -22,9 +22,13 @@ from .blueprints import (
 from .models import (
     Blueprint,
     BlueprintRevision,
+    BlueprintDraftSession,
+    DraftSessionVoiceNote,
+    VoiceNote,
     Bundle,
     ContextPack,
     DevTask,
+    Environment,
     Module,
     ProvisionedInstance,
     Registry,
@@ -75,13 +79,28 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
         blueprint, created = Blueprint.objects.get_or_create(
             name=name,
             namespace=namespace,
-            defaults={"description": description, "created_by": request.user, "updated_by": request.user},
+            defaults={
+                "description": description,
+                "spec_text": payload.get("spec_text", ""),
+                "metadata_json": payload.get("metadata_json"),
+                "created_by": request.user,
+                "updated_by": request.user,
+            },
         )
         if not created:
             blueprint.description = description
+            if "spec_text" in payload:
+                blueprint.spec_text = payload.get("spec_text", "")
+            if "metadata_json" in payload:
+                blueprint.metadata_json = payload.get("metadata_json")
             blueprint.updated_by = request.user
-            blueprint.save(update_fields=["description", "updated_by", "updated_at"])
+            blueprint.save(update_fields=["description", "spec_text", "metadata_json", "updated_by", "updated_at"])
         spec_json = payload.get("spec_json")
+        if not spec_json and (payload.get("spec_text") or payload.get("metadata_json")):
+            spec_json = {
+                "spec_text": payload.get("spec_text", ""),
+                "metadata": payload.get("metadata_json") or {},
+            }
         if spec_json:
             revision = blueprint.revisions.order_by("-revision").first()
             next_rev = (revision.revision + 1) if revision else 1
@@ -103,6 +122,8 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
             "name": b.name,
             "namespace": b.namespace,
             "description": b.description,
+            "spec_text": b.spec_text,
+            "metadata_json": b.metadata_json,
             "created_at": b.created_at,
             "updated_at": b.updated_at,
             "latest_revision": b.revisions.order_by("-revision").first().revision if b.revisions.exists() else None,
@@ -120,11 +141,13 @@ def blueprint_detail(request: HttpRequest, blueprint_id: str) -> JsonResponse:
     blueprint = get_object_or_404(Blueprint, id=blueprint_id)
     if request.method == "PATCH":
         payload = _parse_json(request)
-        for field in ["name", "namespace", "description"]:
+        for field in ["name", "namespace", "description", "spec_text", "metadata_json"]:
             if field in payload:
                 setattr(blueprint, field, payload[field])
         blueprint.updated_by = request.user
-        blueprint.save(update_fields=["name", "namespace", "description", "updated_by", "updated_at"])
+        blueprint.save(
+            update_fields=["name", "namespace", "description", "spec_text", "metadata_json", "updated_by", "updated_at"]
+        )
         if payload.get("spec_json"):
             revision = blueprint.revisions.order_by("-revision").first()
             next_rev = (revision.revision + 1) if revision else 1
@@ -147,6 +170,8 @@ def blueprint_detail(request: HttpRequest, blueprint_id: str) -> JsonResponse:
             "name": blueprint.name,
             "namespace": blueprint.namespace,
             "description": blueprint.description,
+            "spec_text": blueprint.spec_text,
+            "metadata_json": blueprint.metadata_json,
             "created_at": blueprint.created_at,
             "updated_at": blueprint.updated_at,
             "latest_revision": latest.revision if latest else None,
@@ -178,6 +203,71 @@ def blueprint_runs(request: HttpRequest, blueprint_id: str) -> JsonResponse:
         for run in runs
     ]
     return _paginate(request, data, "runs")
+
+
+@csrf_exempt
+@login_required
+def blueprint_draft_sessions(request: HttpRequest, blueprint_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    blueprint = get_object_or_404(Blueprint, id=blueprint_id)
+    if request.method == "POST":
+        payload = _parse_json(request)
+        name = payload.get("name") or f"{blueprint.namespace}.{blueprint.name} Draft"
+        blueprint_kind = payload.get("blueprint_kind", "solution")
+        context_pack_ids = payload.get("context_pack_ids") or []
+        if not isinstance(context_pack_ids, list):
+            return JsonResponse({"error": "context_pack_ids must be a list"}, status=400)
+        session = BlueprintDraftSession.objects.create(
+            name=name,
+            blueprint=blueprint,
+            blueprint_kind=blueprint_kind,
+            context_pack_ids=context_pack_ids,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        return JsonResponse({"session_id": str(session.id)})
+    sessions = BlueprintDraftSession.objects.filter(blueprint=blueprint).order_by("-created_at")
+    data = [
+        {
+            "id": str(session.id),
+            "name": session.name,
+            "status": session.status,
+            "blueprint_kind": session.blueprint_kind,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+        }
+        for session in sessions
+    ]
+    return JsonResponse({"sessions": data})
+
+
+@login_required
+def blueprint_voice_notes(request: HttpRequest, blueprint_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    sessions = BlueprintDraftSession.objects.filter(blueprint_id=blueprint_id)
+    links = DraftSessionVoiceNote.objects.filter(draft_session__in=sessions).select_related(
+        "voice_note", "voice_note__transcript"
+    )
+    data = []
+    for link in links:
+        note = link.voice_note
+        transcript = getattr(note, "transcript", None)
+        data.append(
+            {
+                "id": str(note.id),
+                "title": note.title,
+                "status": note.status,
+                "created_at": note.created_at,
+                "session_id": str(link.draft_session_id),
+                "job_id": note.job_id,
+                "last_error": note.error,
+                "transcript_text": transcript.transcript_text if transcript else None,
+                "transcript_confidence": transcript.confidence if transcript else None,
+            }
+        )
+    return JsonResponse({"voice_notes": data})
 
 
 @csrf_exempt
@@ -465,11 +555,14 @@ def release_plans_collection(request: HttpRequest) -> JsonResponse:
             to_version=to_version,
             milestones_json=payload.get("milestones_json"),
             blueprint_id=payload.get("blueprint_id"),
+            environment_id=payload.get("environment_id"),
             created_by=request.user,
             updated_by=request.user,
         )
         return JsonResponse({"id": str(plan.id)})
     qs = ReleasePlan.objects.all().order_by("-created_at")
+    if env_id := request.GET.get("environment_id"):
+        qs = qs.filter(environment_id=env_id)
     data = [
         {
             "id": str(plan.id),
@@ -479,6 +572,7 @@ def release_plans_collection(request: HttpRequest) -> JsonResponse:
             "from_version": plan.from_version,
             "to_version": plan.to_version,
             "blueprint_id": str(plan.blueprint_id) if plan.blueprint_id else None,
+            "environment_id": str(plan.environment_id) if plan.environment_id else None,
             "last_run": str(plan.last_run_id) if plan.last_run_id else None,
             "created_at": plan.created_at,
             "updated_at": plan.updated_at,
@@ -501,6 +595,8 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
                 setattr(plan, field, payload[field])
         if "blueprint_id" in payload:
             plan.blueprint_id = payload.get("blueprint_id")
+        if "environment_id" in payload:
+            plan.environment_id = payload.get("environment_id")
         plan.updated_by = request.user
         plan.save()
         return JsonResponse({"id": str(plan.id)})
@@ -517,6 +613,7 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
             "to_version": plan.to_version,
             "milestones_json": plan.milestones_json,
             "blueprint_id": str(plan.blueprint_id) if plan.blueprint_id else None,
+            "environment_id": str(plan.environment_id) if plan.environment_id else None,
             "last_run": str(plan.last_run_id) if plan.last_run_id else None,
             "created_at": plan.created_at,
             "updated_at": plan.updated_at,
@@ -567,6 +664,7 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
         release = Release.objects.create(
             blueprint_id=payload.get("blueprint_id"),
             release_plan_id=payload.get("release_plan_id"),
+            environment_id=payload.get("environment_id"),
             created_from_run_id=payload.get("created_from_run_id"),
             version=version,
             status=payload.get("status", "draft"),
@@ -578,6 +676,8 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
     qs = Release.objects.all().order_by("-created_at")
     if blueprint_id := request.GET.get("blueprint_id"):
         qs = qs.filter(blueprint_id=blueprint_id)
+    if env_id := request.GET.get("environment_id"):
+        qs = qs.filter(environment_id=env_id)
     data = [
         {
             "id": str(release.id),
@@ -586,6 +686,7 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
             "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
             "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
             "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
+            "environment_id": str(release.environment_id) if release.environment_id else None,
             "created_at": release.created_at,
             "updated_at": release.updated_at,
         }
@@ -605,6 +706,8 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
         for field in ["version", "status", "artifacts_json", "release_plan_id", "blueprint_id"]:
             if field in payload:
                 setattr(release, field, payload[field])
+        if "environment_id" in payload:
+            release.environment_id = payload.get("environment_id")
         release.updated_by = request.user
         release.save()
         return JsonResponse({"id": str(release.id)})
@@ -620,8 +723,72 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
             "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
             "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
             "artifacts_json": release.artifacts_json,
+            "environment_id": str(release.environment_id) if release.environment_id else None,
             "created_at": release.created_at,
             "updated_at": release.updated_at,
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def environments_collection(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "POST":
+        payload = _parse_json(request)
+        name = payload.get("name")
+        slug = payload.get("slug")
+        if not name or not slug:
+            return JsonResponse({"error": "name and slug required"}, status=400)
+        environment = Environment.objects.create(
+            name=name,
+            slug=slug,
+            base_domain=payload.get("base_domain", ""),
+            aws_region=payload.get("aws_region", ""),
+        )
+        return JsonResponse({"id": str(environment.id)})
+    qs = Environment.objects.all().order_by("name")
+    data = [
+        {
+            "id": str(env.id),
+            "name": env.name,
+            "slug": env.slug,
+            "base_domain": env.base_domain,
+            "aws_region": env.aws_region,
+            "created_at": env.created_at,
+            "updated_at": env.updated_at,
+        }
+        for env in qs
+    ]
+    return _paginate(request, data, "environments")
+
+
+@csrf_exempt
+@login_required
+def environment_detail(request: HttpRequest, env_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    environment = get_object_or_404(Environment, id=env_id)
+    if request.method == "PATCH":
+        payload = _parse_json(request)
+        for field in ["name", "slug", "base_domain", "aws_region"]:
+            if field in payload:
+                setattr(environment, field, payload[field])
+        environment.save()
+        return JsonResponse({"id": str(environment.id)})
+    if request.method == "DELETE":
+        environment.delete()
+        return JsonResponse({"status": "deleted"})
+    return JsonResponse(
+        {
+            "id": str(environment.id),
+            "name": environment.name,
+            "slug": environment.slug,
+            "base_domain": environment.base_domain,
+            "aws_region": environment.aws_region,
+            "created_at": environment.created_at,
+            "updated_at": environment.updated_at,
         }
     )
 

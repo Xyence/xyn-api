@@ -20,6 +20,7 @@ def _instance_payload(instance: ProvisionedInstance) -> dict:
     return {
         "id": str(instance.id),
         "name": instance.name,
+        "environment_id": str(instance.environment_id) if instance.environment_id else None,
         "aws_region": instance.aws_region,
         "instance_id": instance.instance_id,
         "instance_type": instance.instance_type,
@@ -57,6 +58,8 @@ def list_instances(request: HttpRequest) -> JsonResponse:
         return JsonResponse(_instance_payload(instance), status=201)
 
     instances = ProvisionedInstance.objects.all().order_by("-created_at")
+    if env_id := request.GET.get("environment_id"):
+        instances = instances.filter(environment_id=env_id)
     data = [_instance_payload(inst) for inst in instances]
     return JsonResponse({"instances": data})
 
