@@ -452,17 +452,31 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
             {
                 "id": "ems-api-scaffold",
                 "title": "Scaffold EMS API service",
-                "description": "Create FastAPI scaffolding and base project structure.",
+                "description": "Create FastAPI scaffolding, router wiring, and health checks.",
                 "type": "scaffold",
                 "repo_targets": [repo_targets[0]],
                 "inputs": {"artifacts": ["implementation_plan.json"], "context": ["ems-platform-blueprint"]},
-                "outputs": {"paths": ["apps/ems-api/README.md", "apps/ems-api/main.py"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/README.md",
+                        "apps/ems-api/requirements.txt",
+                        "apps/ems-api/pyproject.toml",
+                        "apps/ems-api/ems_api/__init__.py",
+                        "apps/ems-api/ems_api/main.py",
+                        "apps/ems-api/ems_api/routes/__init__.py",
+                        "apps/ems-api/ems_api/routes/health.py",
+                        "apps/ems-api/ems_api/tests/test_health.py",
+                    ]
+                },
                 "acceptance_criteria": [
                     "FastAPI app boots with /health endpoint.",
                     "Project README describes local run steps.",
                 ],
                 "verify": [
-                    {"name": "api-structure", "command": "test -f apps/ems-api/main.py"},
+                    {
+                        "name": "api-structure",
+                        "command": "test -f apps/ems-api/ems_api/main.py && test -f apps/ems-api/ems_api/routes/health.py && test -f apps/ems-api/ems_api/tests/test_health.py",
+                    },
                 ],
                 "depends_on": [],
                 "labels": ["scaffold", "api"],
@@ -474,13 +488,20 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "type": "feature",
                 "repo_targets": [repo_targets[0]],
                 "inputs": {"artifacts": ["implementation_plan.json"], "context": ["xyn-planner-canon"]},
-                "outputs": {"paths": ["apps/ems-api/auth/oidc.py"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/ems_api/auth/__init__.py",
+                        "apps/ems-api/ems_api/auth/oidc.py",
+                        "apps/ems-api/ems_api/deps.py",
+                        "apps/ems-api/ems_api/tests/test_auth.py",
+                    ]
+                },
                 "acceptance_criteria": [
                     "OIDC settings present with placeholders.",
                     "Login endpoint returns placeholder JWT.",
                 ],
                 "verify": [
-                    {"name": "auth-file", "command": "test -f apps/ems-api/auth/oidc.py"},
+                    {"name": "auth-file", "command": "test -f apps/ems-api/ems_api/auth/oidc.py"},
                 ],
                 "depends_on": ["ems-api-scaffold"],
                 "labels": ["auth", "api"],
@@ -492,13 +513,18 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "type": "feature",
                 "repo_targets": [repo_targets[0]],
                 "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-api/auth/rbac.py"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/ems_api/auth/rbac.py",
+                        "apps/ems-api/ems_api/tests/test_rbac.py",
+                    ]
+                },
                 "acceptance_criteria": [
                     "Roles Admin/Operator/Viewer defined.",
                     "RBAC check utility available.",
                 ],
                 "verify": [
-                    {"name": "rbac-file", "command": "test -f apps/ems-api/auth/rbac.py"},
+                    {"name": "rbac-file", "command": "test -f apps/ems-api/ems_api/auth/rbac.py"},
                 ],
                 "depends_on": ["ems-api-authn-oidc"],
                 "labels": ["rbac", "api"],
@@ -510,13 +536,18 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "type": "feature",
                 "repo_targets": [repo_targets[0]],
                 "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-api/routes/devices.py"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/ems_api/routes/devices.py",
+                        "apps/ems-api/ems_api/tests/test_devices.py",
+                    ]
+                },
                 "acceptance_criteria": [
                     "CRUD endpoints exist for devices.",
                     "Viewer role can only read.",
                 ],
                 "verify": [
-                    {"name": "devices-file", "command": "test -f apps/ems-api/routes/devices.py"},
+                    {"name": "devices-file", "command": "test -f apps/ems-api/ems_api/routes/devices.py"},
                 ],
                 "depends_on": ["ems-api-rbac"],
                 "labels": ["api", "devices"],
@@ -528,12 +559,17 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "type": "feature",
                 "repo_targets": [repo_targets[0]],
                 "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-api/routes/reports.py"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/ems_api/routes/reports.py",
+                        "apps/ems-api/ems_api/tests/test_reports.py",
+                    ]
+                },
                 "acceptance_criteria": [
                     "Reports endpoint returns placeholder report data.",
                 ],
                 "verify": [
-                    {"name": "reports-file", "command": "test -f apps/ems-api/routes/reports.py"},
+                    {"name": "reports-file", "command": "test -f apps/ems-api/ems_api/routes/reports.py"},
                 ],
                 "depends_on": ["ems-api-rbac"],
                 "labels": ["api", "reports"],
@@ -541,16 +577,28 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
             {
                 "id": "ems-ui-scaffold",
                 "title": "Scaffold EMS UI",
-                "description": "Create React app shell for EMS UI.",
+                "description": "Create React app shell with routing and entrypoints.",
                 "type": "scaffold",
                 "repo_targets": [repo_targets[1]],
                 "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-ui/README.md", "apps/ems-ui/src/App.tsx"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-ui/README.md",
+                        "apps/ems-ui/package.json",
+                        "apps/ems-ui/tsconfig.json",
+                        "apps/ems-ui/vite.config.ts",
+                        "apps/ems-ui/index.html",
+                        "apps/ems-ui/src/main.tsx",
+                        "apps/ems-ui/src/App.tsx",
+                        "apps/ems-ui/src/routes.tsx",
+                        "apps/ems-ui/src/styles.css",
+                    ]
+                },
                 "acceptance_criteria": [
                     "UI app renders basic layout and navigation.",
                 ],
                 "verify": [
-                    {"name": "ui-structure", "command": "test -f apps/ems-ui/src/App.tsx"},
+                    {"name": "ui-structure", "command": "test -f apps/ems-ui/src/App.tsx && test -f apps/ems-ui/src/main.tsx"},
                 ],
                 "depends_on": [],
                 "labels": ["scaffold", "ui"],
@@ -562,7 +610,12 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "type": "feature",
                 "repo_targets": [repo_targets[1]],
                 "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-ui/src/auth/Login.tsx"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-ui/src/auth/Login.tsx",
+                        "apps/ems-ui/src/auth/AuthProvider.tsx",
+                    ]
+                },
                 "acceptance_criteria": [
                     "Login page exists with placeholder flow.",
                 ],
@@ -579,7 +632,12 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "type": "feature",
                 "repo_targets": [repo_targets[1]],
                 "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-ui/src/devices/DeviceList.tsx"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-ui/src/devices/DeviceList.tsx",
+                        "apps/ems-ui/src/devices/DeviceDetail.tsx",
+                    ]
+                },
                 "acceptance_criteria": [
                     "Device list page renders mock data.",
                 ],
@@ -613,7 +671,13 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "type": "deploy",
                 "repo_targets": [repo_targets[0]],
                 "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-api/deploy/docker-compose.yml", "apps/ems-api/deploy/nginx.conf"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/deploy/README.md",
+                        "apps/ems-api/deploy/docker-compose.yml",
+                        "apps/ems-api/deploy/nginx.conf",
+                    ]
+                },
                 "acceptance_criteria": [
                     "Compose file defines api + ui services.",
                 ],
@@ -630,12 +694,18 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "type": "integration",
                 "repo_targets": [repo_targets[0]],
                 "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-api/integrations/route53.py"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/ems_api/integrations/__init__.py",
+                        "apps/ems-api/ems_api/integrations/route53.py",
+                        "apps/ems-api/ems_api/tests/test_route53.py",
+                    ]
+                },
                 "acceptance_criteria": [
                     "Route53 module stub exists with create/update function signatures.",
                 ],
                 "verify": [
-                    {"name": "route53-file", "command": "test -f apps/ems-api/integrations/route53.py"},
+                    {"name": "route53-file", "command": "test -f apps/ems-api/ems_api/integrations/route53.py"},
                 ],
                 "depends_on": ["ems-api-scaffold"],
                 "labels": ["dns", "integration"],

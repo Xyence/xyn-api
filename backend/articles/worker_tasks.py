@@ -142,24 +142,81 @@ def _apply_scaffold_for_work_item(work_item: Dict[str, Any], repo_dir: str) -> L
             p("README.md"),
             """# EMS API
 
-Scaffold for EMS API.
+FastAPI scaffold for the EMS platform.
+
+## Run
+- `pip install -r requirements.txt`
+- `uvicorn ems_api.main:app --reload`
 """,
         )
         _write_file(
-            p("main.py"),
+            p("requirements.txt"),
+            """fastapi==0.110.0
+uvicorn==0.27.1
+""",
+        )
+        _write_file(
+            p("pyproject.toml"),
+            """[project]
+name = "ems-api"
+version = "0.1.0"
+description = "EMS API scaffold"
+requires-python = ">=3.10"
+""",
+        )
+        _write_file(p("ems_api/__init__.py"), "")
+        _write_file(
+            p("ems_api/main.py"),
             """from fastapi import FastAPI
+from ems_api.routes import health, devices, reports
 
 app = FastAPI(title="EMS API")
 
-@app.get("/health")
+app.include_router(health.router)
+app.include_router(devices.router)
+app.include_router(reports.router)
+""",
+        )
+        _write_file(
+            p("ems_api/routes/__init__.py"),
+            "",
+        )
+        _write_file(
+            p("ems_api/routes/health.py"),
+            """from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/health")
 def health():
     return {"status": "ok"}
 """,
         )
-        changed.extend(["README.md", "main.py"])
+        _write_file(
+            p("ems_api/tests/test_health.py"),
+            """def test_health_placeholder():
+    assert True
+""",
+        )
+        changed.extend(
+            [
+                "README.md",
+                "requirements.txt",
+                "pyproject.toml",
+                "ems_api/__init__.py",
+                "ems_api/main.py",
+                "ems_api/routes/__init__.py",
+                "ems_api/routes/health.py",
+                "ems_api/tests/test_health.py",
+            ]
+        )
     if work_item["id"] == "ems-api-authn-oidc":
         _write_file(
-            p("auth/oidc.py"),
+            p("ems_api/auth/__init__.py"),
+            "",
+        )
+        _write_file(
+            p("ems_api/auth/oidc.py"),
             """def oidc_config():
     return {
         'issuer': '<OIDC_ISSUER>',
@@ -171,10 +228,22 @@ def login():
     return {"token": "<jwt>"}
 """,
         )
-        changed.append("auth/oidc.py")
+        _write_file(
+            p("ems_api/deps.py"),
+            """def get_current_user():
+    return {"sub": "user-1", "roles": ["admin"]}
+""",
+        )
+        _write_file(
+            p("ems_api/tests/test_auth.py"),
+            """def test_auth_stub():
+    assert True
+""",
+        )
+        changed.extend(["ems_api/auth/__init__.py", "ems_api/auth/oidc.py", "ems_api/deps.py", "ems_api/tests/test_auth.py"])
     if work_item["id"] == "ems-api-rbac":
         _write_file(
-            p("auth/rbac.py"),
+            p("ems_api/auth/rbac.py"),
             """ROLES = ['admin', 'operator', 'viewer']
 
 
@@ -188,10 +257,19 @@ def can(role: str, action: str) -> bool:
     return False
 """,
         )
-        changed.append("auth/rbac.py")
+        _write_file(
+            p("ems_api/tests/test_rbac.py"),
+            """from ems_api.auth import rbac
+
+
+def test_rbac_admin():
+    assert rbac.can("admin", "write") is True
+""",
+        )
+        changed.extend(["ems_api/auth/rbac.py", "ems_api/tests/test_rbac.py"])
     if work_item["id"] == "ems-api-devices":
         _write_file(
-            p("routes/devices.py"),
+            p("ems_api/routes/devices.py"),
             """from fastapi import APIRouter
 
 router = APIRouter(prefix="/devices")
@@ -205,10 +283,16 @@ def create_device():
     return {"id": "device-1"}
 """,
         )
-        changed.append("routes/devices.py")
+        _write_file(
+            p("ems_api/tests/test_devices.py"),
+            """def test_devices_stub():
+    assert True
+""",
+        )
+        changed.extend(["ems_api/routes/devices.py", "ems_api/tests/test_devices.py"])
     if work_item["id"] == "ems-api-reports":
         _write_file(
-            p("routes/reports.py"),
+            p("ems_api/routes/reports.py"),
             """from fastapi import APIRouter
 
 router = APIRouter(prefix="/reports")
@@ -218,16 +302,38 @@ def get_reports():
     return {"summary": "placeholder"}
 """,
         )
-        changed.append("routes/reports.py")
+        _write_file(
+            p("ems_api/tests/test_reports.py"),
+            """def test_reports_stub():
+    assert True
+""",
+        )
+        changed.extend(["ems_api/routes/reports.py", "ems_api/tests/test_reports.py"])
     if work_item["id"] == "ems-dns-route53":
         _write_file(
-            p("integrations/route53.py"),
+            p("ems_api/integrations/__init__.py"),
+            "",
+        )
+        _write_file(
+            p("ems_api/integrations/route53.py"),
             """def ensure_record(subdomain: str, target: str) -> None:
     # TODO: implement Route53 record management
     return None
 """,
         )
-        changed.append("integrations/route53.py")
+        _write_file(
+            p("ems_api/tests/test_route53.py"),
+            """def test_route53_stub():
+    assert True
+""",
+        )
+        changed.extend(
+            [
+                "ems_api/integrations/__init__.py",
+                "ems_api/integrations/route53.py",
+                "ems_api/tests/test_route53.py",
+            ]
+        )
     if work_item["id"] == "ems-deploy-compose":
         _write_file(
             p("deploy/docker-compose.yml"),
@@ -244,6 +350,13 @@ services:
 """,
         )
         _write_file(
+            p("deploy/README.md"),
+            """# EMS Deploy
+
+This folder contains docker-compose and nginx scaffolds.
+""",
+        )
+        _write_file(
             p("deploy/nginx.conf"),
             """server {
   listen 80;
@@ -251,7 +364,7 @@ services:
 }
 """,
         )
-        changed.extend(["deploy/docker-compose.yml", "deploy/nginx.conf"])
+        changed.extend(["deploy/README.md", "deploy/docker-compose.yml", "deploy/nginx.conf"])
     if work_item["id"] == "ems-ui-scaffold":
         _write_file(
             p("README.md"),
@@ -261,13 +374,134 @@ Scaffold for EMS UI.
 """,
         )
         _write_file(
+            p("package.json"),
+            """{
+  "name": "ems-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.22.2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "@types/react": "^18.2.66",
+    "@types/react-dom": "^18.2.22",
+    "typescript": "^5.4.5",
+    "vite": "^5.4.0"
+  }
+}""",
+        )
+        _write_file(
+            p("tsconfig.json"),
+            """{
+  "compilerOptions": {
+    "target": "ES2020",
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true
+  }
+}""",
+        )
+        _write_file(
+            p("vite.config.ts"),
+            """import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+});
+""",
+        )
+        _write_file(
+            p("index.html"),
+            """<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EMS UI</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+""",
+        )
+        _write_file(
+            p("src/main.tsx"),
+            """import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./styles.css";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+""",
+        )
+        _write_file(
             p("src/App.tsx"),
-            """export default function App() {
-  return <div>EMS UI</div>;
+            """import { BrowserRouter } from "react-router-dom";
+import RoutesView from "./routes";
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <RoutesView />
+    </BrowserRouter>
+  );
 }
 """,
         )
-        changed.extend(["README.md", "src/App.tsx"])
+        _write_file(
+            p("src/routes.tsx"),
+            """import { Routes, Route } from "react-router-dom";
+import Login from "./auth/Login";
+import DeviceList from "./devices/DeviceList";
+import Reports from "./reports/Reports";
+
+export default function RoutesView() {
+  return (
+    <Routes>
+      <Route path="/" element={<Login />} />
+      <Route path="/devices" element={<DeviceList />} />
+      <Route path="/reports" element={<Reports />} />
+    </Routes>
+  );
+}
+""",
+        )
+        _write_file(
+            p("src/styles.css"),
+            """body { font-family: sans-serif; margin: 0; padding: 0; }
+""",
+        )
+        changed.extend(
+            [
+                "README.md",
+                "package.json",
+                "tsconfig.json",
+                "vite.config.ts",
+                "index.html",
+                "src/main.tsx",
+                "src/App.tsx",
+                "src/routes.tsx",
+                "src/styles.css",
+            ]
+        )
     if work_item["id"] == "ems-ui-auth":
         _write_file(
             p("src/auth/Login.tsx"),
@@ -276,7 +510,16 @@ Scaffold for EMS UI.
 }
 """,
         )
-        changed.append("src/auth/Login.tsx")
+        _write_file(
+            p("src/auth/AuthProvider.tsx"),
+            """import { ReactNode } from "react";
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  return <>{children}</>;
+}
+""",
+        )
+        changed.extend(["src/auth/Login.tsx", "src/auth/AuthProvider.tsx"])
     if work_item["id"] == "ems-ui-devices":
         _write_file(
             p("src/devices/DeviceList.tsx"),
@@ -285,7 +528,14 @@ Scaffold for EMS UI.
 }
 """,
         )
-        changed.append("src/devices/DeviceList.tsx")
+        _write_file(
+            p("src/devices/DeviceDetail.tsx"),
+            """export default function DeviceDetail() {
+  return <div>Device Detail</div>;
+}
+""",
+        )
+        changed.extend(["src/devices/DeviceList.tsx", "src/devices/DeviceDetail.tsx"])
     if work_item["id"] == "ems-ui-reports":
         _write_file(
             p("src/reports/Reports.tsx"),

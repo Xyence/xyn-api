@@ -10,7 +10,7 @@ from articles.models import Blueprint, ContextPack
 
 class PipelineSchemaTests(TestCase):
     def _load_schema(self, name: str) -> dict:
-        path = Path(__file__).resolve().parents[3] / "schemas" / name
+        path = Path(__file__).resolve().parents[2] / "schemas" / name
         return json.loads(path.read_text(encoding="utf-8"))
 
     def test_implementation_plan_schema_for_ems(self):
