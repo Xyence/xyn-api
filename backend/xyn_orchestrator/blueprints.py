@@ -509,7 +509,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "Login endpoint returns placeholder JWT.",
                 ],
                 "verify": [
-                    {"name": "auth-file", "command": "test -f apps/ems-api/ems_api/auth/oidc.py"},
+                    {"name": "auth-file", "command": "test -f ems_api/auth/oidc.py", "cwd": "apps/ems-api"},
                 ],
                 "depends_on": ["ems-api-scaffold"],
                 "labels": ["auth", "api"],
@@ -532,7 +532,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "RBAC check utility available.",
                 ],
                 "verify": [
-                    {"name": "rbac-file", "command": "test -f apps/ems-api/ems_api/auth/rbac.py"},
+                    {"name": "rbac-file", "command": "test -f ems_api/auth/rbac.py", "cwd": "apps/ems-api"},
                 ],
                 "depends_on": ["ems-api-authn-oidc"],
                 "labels": ["rbac", "api"],
@@ -555,7 +555,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "Viewer role can only read.",
                 ],
                 "verify": [
-                    {"name": "devices-file", "command": "test -f apps/ems-api/ems_api/routes/devices.py"},
+                    {"name": "devices-file", "command": "test -f ems_api/routes/devices.py", "cwd": "apps/ems-api"},
                 ],
                 "depends_on": ["ems-api-rbac"],
                 "labels": ["api", "devices"],
@@ -577,7 +577,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "Reports endpoint returns placeholder report data.",
                 ],
                 "verify": [
-                    {"name": "reports-file", "command": "test -f apps/ems-api/ems_api/routes/reports.py"},
+                    {"name": "reports-file", "command": "test -f ems_api/routes/reports.py", "cwd": "apps/ems-api"},
                 ],
                 "depends_on": ["ems-api-rbac"],
                 "labels": ["api", "reports"],
@@ -606,7 +606,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "UI app renders basic layout and navigation.",
                 ],
                 "verify": [
-                    {"name": "ui-structure", "command": "test -f apps/ems-ui/src/App.tsx && test -f apps/ems-ui/src/main.tsx"},
+                    {"name": "ui-structure", "command": "test -f src/App.tsx && test -f src/main.tsx", "cwd": "apps/ems-ui"},
                 ],
                 "depends_on": [],
                 "labels": ["scaffold", "ui"],
@@ -628,7 +628,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "Login page exists with placeholder flow.",
                 ],
                 "verify": [
-                    {"name": "login-view", "command": "test -f apps/ems-ui/src/auth/Login.tsx"},
+                    {"name": "login-view", "command": "test -f src/auth/Login.tsx", "cwd": "apps/ems-ui"},
                 ],
                 "depends_on": ["ems-ui-scaffold"],
                 "labels": ["ui", "auth"],
@@ -650,7 +650,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "Device list page renders mock data.",
                 ],
                 "verify": [
-                    {"name": "device-ui", "command": "test -f apps/ems-ui/src/devices/DeviceList.tsx"},
+                    {"name": "device-ui", "command": "test -f src/devices/DeviceList.tsx", "cwd": "apps/ems-ui"},
                 ],
                 "depends_on": ["ems-ui-scaffold"],
                 "labels": ["ui", "devices"],
@@ -667,7 +667,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "Reports page exists and renders placeholder content.",
                 ],
                 "verify": [
-                    {"name": "reports-ui", "command": "test -f apps/ems-ui/src/reports/Reports.tsx"},
+                    {"name": "reports-ui", "command": "test -f src/reports/Reports.tsx", "cwd": "apps/ems-ui"},
                 ],
                 "depends_on": ["ems-ui-scaffold"],
                 "labels": ["ui", "reports"],
@@ -690,7 +690,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "Compose file defines api + ui services.",
                 ],
                 "verify": [
-                    {"name": "compose-file", "command": "test -f apps/ems-api/deploy/docker-compose.yml"},
+                    {"name": "compose-file", "command": "test -f deploy/docker-compose.yml", "cwd": "apps/ems-api"},
                 ],
                 "depends_on": ["ems-api-scaffold", "ems-ui-scaffold"],
                 "labels": ["deploy", "infra"],
@@ -713,7 +713,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "Route53 module stub exists with create/update function signatures.",
                 ],
                 "verify": [
-                    {"name": "route53-file", "command": "test -f apps/ems-api/ems_api/integrations/route53.py"},
+                    {"name": "route53-file", "command": "test -f ems_api/integrations/route53.py", "cwd": "apps/ems-api"},
                 ],
                 "depends_on": ["ems-api-scaffold"],
                 "labels": ["dns", "integration"],
