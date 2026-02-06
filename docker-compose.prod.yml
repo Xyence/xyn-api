@@ -29,6 +29,10 @@ services:
   xyn-ui:
     build:
       context: ../xyn-ui
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+        VITE_API_TOKEN: ${VITE_API_TOKEN:-}
+        VITE_AUTH_MODE: ${VITE_AUTH_MODE:-token}
     image: xyn-ui
     restart: unless-stopped
 
