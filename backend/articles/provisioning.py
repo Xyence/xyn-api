@@ -295,7 +295,17 @@ def refresh_instance(instance: ProvisionedInstance) -> ProvisionedInstance:
     client = _ec2(instance.aws_region)
     try:
         resp = client.describe_instances(InstanceIds=[instance.instance_id])
-    except (ClientError, BotoCoreError) as exc:
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code == "InvalidInstanceID.NotFound":
+            instance.status = "terminated"
+            instance.last_error = ""
+            instance.save(update_fields=["status", "last_error", "updated_at"])
+            return instance
+        instance.last_error = str(exc)
+        instance.save(update_fields=["last_error", "updated_at"])
+        return instance
+    except BotoCoreError as exc:
         instance.last_error = str(exc)
         instance.save(update_fields=["last_error", "updated_at"])
         return instance
