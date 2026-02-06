@@ -8,9 +8,9 @@ from pathlib import Path
 from django.test import TestCase
 from jsonschema import Draft202012Validator
 
-from articles.blueprints import _generate_implementation_plan, _select_context_packs_for_dev_task
-from articles.worker_tasks import _apply_scaffold_for_work_item, _collect_git_diff, _mark_noop_codegen
-from articles.models import Blueprint, ContextPack
+from xyn_orchestrator.blueprints import _generate_implementation_plan, _select_context_packs_for_dev_task
+from xyn_orchestrator.worker_tasks import _apply_scaffold_for_work_item, _collect_git_diff, _mark_noop_codegen
+from xyn_orchestrator.models import Blueprint, ContextPack
 
 
 class PipelineSchemaTests(TestCase):

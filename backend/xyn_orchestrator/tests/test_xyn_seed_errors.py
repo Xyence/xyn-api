@@ -8,7 +8,7 @@ import requests
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "xyence.settings")
 django.setup()
 
-from articles.admin import _format_xyn_seed_error  # noqa: E402
+from xyn_orchestrator.admin import _format_xyn_seed_error  # noqa: E402
 
 
 def _http_error(status_code: int) -> requests.HTTPError:

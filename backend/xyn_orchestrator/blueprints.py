@@ -465,6 +465,8 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                         "apps/ems-api/ems_api/main.py",
                         "apps/ems-api/ems_api/routes/__init__.py",
                         "apps/ems-api/ems_api/routes/health.py",
+                        "apps/ems-api/ems_api/routes/devices.py",
+                        "apps/ems-api/ems_api/routes/reports.py",
                         "apps/ems-api/ems_api/tests/test_health.py",
                     ]
                 },
@@ -474,8 +476,14 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 ],
                 "verify": [
                     {
-                        "name": "api-structure",
-                        "command": "test -f apps/ems-api/ems_api/main.py && test -f apps/ems-api/ems_api/routes/health.py && test -f apps/ems-api/ems_api/tests/test_health.py",
+                        "name": "import app",
+                        "command": "python -c \"from ems_api.main import app; assert app\"",
+                        "cwd": "apps/ems-api",
+                    },
+                    {
+                        "name": "pytest health",
+                        "command": "pytest -q ems_api/tests/test_health.py",
+                        "cwd": "apps/ems-api",
                     },
                 ],
                 "depends_on": [],
@@ -840,7 +848,7 @@ def _queue_dev_tasks_for_plan(
             dev_task.context_packs.add(*packs)
         tasks.append(dev_task)
         if enqueue_jobs:
-            _enqueue_job("articles.worker_tasks.run_dev_task", str(dev_task.id), "worker")
+            _enqueue_job("xyn_orchestrator.worker_tasks.run_dev_task", str(dev_task.id), "worker")
     return tasks
 
 
@@ -1818,7 +1826,7 @@ def enqueue_transcription(request: HttpRequest, voice_note_id: str) -> JsonRespo
     mode = _async_mode()
     if mode == "redis":
         voice_note.status = "queued"
-        job_id = _enqueue_job("articles.worker_tasks.transcribe_voice_note", str(voice_note.id))
+        job_id = _enqueue_job("xyn_orchestrator.worker_tasks.transcribe_voice_note", str(voice_note.id))
     else:
         voice_note.status = "transcribing"
         job_id = str(uuid.uuid4())
@@ -1838,7 +1846,7 @@ def enqueue_draft_generation(request: HttpRequest, session_id: str) -> JsonRespo
     mode = _async_mode()
     if mode == "redis":
         session.status = "queued"
-        job_id = _enqueue_job("articles.worker_tasks.generate_blueprint_draft", str(session.id))
+        job_id = _enqueue_job("xyn_orchestrator.worker_tasks.generate_blueprint_draft", str(session.id))
     else:
         session.status = "drafting"
         job_id = str(uuid.uuid4())
@@ -1864,7 +1872,7 @@ def enqueue_draft_revision(request: HttpRequest, session_id: str) -> JsonRespons
     mode = _async_mode()
     if mode == "redis":
         session.status = "queued"
-        job_id = _enqueue_job("articles.worker_tasks.revise_blueprint_draft", str(session.id), instruction)
+        job_id = _enqueue_job("xyn_orchestrator.worker_tasks.revise_blueprint_draft", str(session.id), instruction)
     else:
         session.status = "drafting"
         job_id = str(uuid.uuid4())

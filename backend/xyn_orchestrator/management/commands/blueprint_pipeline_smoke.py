@@ -6,9 +6,9 @@ from pathlib import Path
 from django.core.files.base import File
 from django.core.management.base import BaseCommand, CommandError
 
-from articles.blueprints import _async_mode, _enqueue_job
-from articles.models import BlueprintDraftSession, DraftSessionVoiceNote, VoiceNote
-from articles.services import generate_blueprint_draft, revise_blueprint_draft, transcribe_voice_note
+from xyn_orchestrator.blueprints import _async_mode, _enqueue_job
+from xyn_orchestrator.models import BlueprintDraftSession, DraftSessionVoiceNote, VoiceNote
+from xyn_orchestrator.services import generate_blueprint_draft, revise_blueprint_draft, transcribe_voice_note
 
 
 class Command(BaseCommand):
@@ -84,7 +84,7 @@ class Command(BaseCommand):
     def _enqueue_transcription(self, voice_note: VoiceNote, mode: str) -> None:
         if mode == "redis":
             voice_note.status = "queued"
-            job_id = _enqueue_job("articles.worker_tasks.transcribe_voice_note", str(voice_note.id))
+            job_id = _enqueue_job("xyn_orchestrator.worker_tasks.transcribe_voice_note", str(voice_note.id))
         else:
             voice_note.status = "transcribing"
             job_id = str(uuid.uuid4())
@@ -97,7 +97,7 @@ class Command(BaseCommand):
     def _enqueue_draft_generation(self, session: BlueprintDraftSession, mode: str) -> None:
         if mode == "redis":
             session.status = "queued"
-            job_id = _enqueue_job("articles.worker_tasks.generate_blueprint_draft", str(session.id))
+            job_id = _enqueue_job("xyn_orchestrator.worker_tasks.generate_blueprint_draft", str(session.id))
         else:
             session.status = "drafting"
             job_id = str(uuid.uuid4())
@@ -110,7 +110,7 @@ class Command(BaseCommand):
     def _enqueue_revision(self, session: BlueprintDraftSession, instruction: str, mode: str) -> None:
         if mode == "redis":
             session.status = "queued"
-            job_id = _enqueue_job("articles.worker_tasks.revise_blueprint_draft", str(session.id), instruction)
+            job_id = _enqueue_job("xyn_orchestrator.worker_tasks.revise_blueprint_draft", str(session.id), instruction)
         else:
             session.status = "drafting"
             job_id = str(uuid.uuid4())

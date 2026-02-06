@@ -4,7 +4,7 @@ from django.contrib import admin
 from django.http import JsonResponse
 from django.urls import include, path
 
-from articles.blueprints import (
+from xyn_orchestrator.blueprints import (
     blueprint_detail_view,
     blueprint_list_view,
     blueprint_studio_view,
@@ -70,15 +70,15 @@ from articles.blueprints import (
     instantiate_blueprint,
     upload_voice_note,
 )
-from articles.provisioning_views import (
+from xyn_orchestrator.provisioning_views import (
     bootstrap_log_view,
     destroy_instance_view,
     get_instance,
     list_instances,
     retry_instance_view,
 )
-from articles.public_views import public_article_detail, public_articles
-from articles.xyn_api import (
+from xyn_orchestrator.public_views import public_article_detail, public_articles
+from xyn_orchestrator.xyn_api import (
     blueprints_collection,
     blueprint_detail,
     blueprint_runs,
@@ -129,7 +129,7 @@ def healthcheck(_request):
 urlpatterns = [
     path("", healthcheck),
     path("admin/", admin.site.urls),
-    path("api/", include("articles.urls")),
+    path("api/", include("xyn_orchestrator.urls")),
     path("xyn/api/public/menu", public_menu),
     path("xyn/api/public/pages", public_pages),
     path("xyn/api/public/pages/<slug:slug>", public_page_detail),

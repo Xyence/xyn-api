@@ -603,7 +603,7 @@ def registry_sync(request: HttpRequest, registry_id: str) -> JsonResponse:
     )
     mode = _async_mode()
     if mode == "redis":
-        _enqueue_job("articles.worker_tasks.sync_registry", str(registry.id), str(run.id))
+        _enqueue_job("xyn_orchestrator.worker_tasks.sync_registry", str(registry.id), str(run.id))
         return JsonResponse({"status": "queued", "run_id": str(run.id)})
     registry.last_sync_at = timezone.now()
     registry.updated_by = request.user
@@ -720,7 +720,7 @@ def release_plan_generate(request: HttpRequest, plan_id: str) -> JsonResponse:
     )
     mode = _async_mode()
     if mode == "redis":
-        _enqueue_job("articles.worker_tasks.generate_release_plan", str(plan.id), str(run.id))
+        _enqueue_job("xyn_orchestrator.worker_tasks.generate_release_plan", str(plan.id), str(run.id))
         return JsonResponse({"run_id": str(run.id), "status": "queued"})
     if not plan.milestones_json:
         plan.milestones_json = {"status": "placeholder", "notes": "Generation not implemented yet"}
@@ -1130,7 +1130,7 @@ def dev_task_run(request: HttpRequest, task_id: str) -> JsonResponse:
     run.save(update_fields=["context_pack_refs_json", "context_hash", "updated_at"])
     mode = _async_mode()
     if mode == "redis":
-        _enqueue_job("articles.worker_tasks.run_dev_task", str(task.id), "worker")
+        _enqueue_job("xyn_orchestrator.worker_tasks.run_dev_task", str(task.id), "worker")
         return JsonResponse({"run_id": str(run.id), "status": "queued"})
     return JsonResponse({"run_id": str(run.id), "status": "pending"})
 
@@ -1165,7 +1165,7 @@ def dev_task_retry(request: HttpRequest, task_id: str) -> JsonResponse:
     run.save(update_fields=["context_pack_refs_json", "context_hash", "updated_at"])
     mode = _async_mode()
     if mode == "redis":
-        _enqueue_job("articles.worker_tasks.run_dev_task", str(task.id), "worker")
+        _enqueue_job("xyn_orchestrator.worker_tasks.run_dev_task", str(task.id), "worker")
         return JsonResponse({"run_id": str(run.id), "status": "queued"})
     return JsonResponse({"run_id": str(run.id), "status": "pending"})
 

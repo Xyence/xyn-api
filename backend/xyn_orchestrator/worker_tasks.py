@@ -167,6 +167,7 @@ FastAPI scaffold for the EMS platform.
             p("requirements.txt"),
             """fastapi==0.110.0
 uvicorn==0.27.1
+pytest==8.1.1
 """,
         )
         _write_file(
@@ -176,6 +177,11 @@ name = "ems-api"
 version = "0.1.0"
 description = "EMS API scaffold"
 requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.1.1",
+]
 """,
         )
         _write_file(p("ems_api/__init__.py"), "")
@@ -207,9 +213,39 @@ def health():
 """,
         )
         _write_file(
+            p("ems_api/routes/devices.py"),
+            """from fastapi import APIRouter
+
+router = APIRouter(prefix="/devices", tags=["devices"])
+
+
+@router.get("")
+def list_devices():
+    return []
+""",
+        )
+        _write_file(
+            p("ems_api/routes/reports.py"),
+            """from fastapi import APIRouter
+
+router = APIRouter(prefix="/reports", tags=["reports"])
+
+
+@router.get("")
+def list_reports():
+    return []
+""",
+        )
+        _write_file(
             p("ems_api/tests/test_health.py"),
-            """def test_health_placeholder():
-    assert True
+            """from fastapi.testclient import TestClient
+from ems_api.main import app
+
+
+def test_health_placeholder():
+    client = TestClient(app)
+    resp = client.get("/health")
+    assert resp.status_code == 200
 """,
         )
         changed.extend(
@@ -221,6 +257,8 @@ def health():
                 "ems_api/main.py",
                 "ems_api/routes/__init__.py",
                 "ems_api/routes/health.py",
+                "ems_api/routes/devices.py",
+                "ems_api/routes/reports.py",
                 "ems_api/tests/test_health.py",
             ]
         )

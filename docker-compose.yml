@@ -61,7 +61,7 @@ services:
     depends_on:
       - redis
       - backend
-    command: python -m articles.worker
+    command: python -m xyn_orchestrator.worker
     volumes:
       - /home/ubuntu/src/xyn-contracts:/xyn-contracts:ro
       - /home/ubuntu/central-xyence-io-9d049e62e994.json:/secrets/gcp-speech.json:ro

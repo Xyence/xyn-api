@@ -4,7 +4,7 @@ from pathlib import Path
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from articles.models import ContextPack
+from xyn_orchestrator.models import ContextPack
 
 
 class Command(BaseCommand):

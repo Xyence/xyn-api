@@ -1,6 +1,7 @@
 from django.apps import AppConfig
 
 
-class ArticlesConfig(AppConfig):
+class XynOrchestratorConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
-    name = "articles"
+    name = "xyn_orchestrator"
+    label = "articles"

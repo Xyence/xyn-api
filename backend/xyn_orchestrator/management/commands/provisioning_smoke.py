@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand
 
-from articles.models import ProvisionedInstance
-from articles.provisioning import refresh_instance, fetch_bootstrap_log
+from xyn_orchestrator.models import ProvisionedInstance
+from xyn_orchestrator.provisioning import refresh_instance, fetch_bootstrap_log
 
 
 class Command(BaseCommand):
