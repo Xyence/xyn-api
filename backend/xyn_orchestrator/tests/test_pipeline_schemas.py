@@ -7,6 +7,7 @@ from pathlib import Path
 
 from django.test import TestCase
 from jsonschema import Draft202012Validator
+import yaml
 
 from xyn_orchestrator.blueprints import _generate_implementation_plan, _select_context_packs_for_dev_task
 from xyn_orchestrator.worker_tasks import _apply_scaffold_for_work_item, _collect_git_diff, _mark_noop_codegen
@@ -210,3 +211,29 @@ class PipelineSchemaTests(TestCase):
             ]
             for rel in expected:
                 self.assertTrue((app_root / rel).exists(), rel)
+
+    def test_compose_chassis_outputs(self):
+        work_item = {
+            "id": "ems-compose-local-chassis",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-stack",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(work_item, repo_dir)
+            root = Path(repo_dir, "apps/ems-stack")
+            compose_path = root / "docker-compose.yml"
+            nginx_path = root / "nginx/nginx.conf"
+            self.assertTrue(compose_path.exists())
+            self.assertTrue(nginx_path.exists())
+            data = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+            self.assertIn("services", data)
+            for service in ["ems-api", "ems-ui", "postgres", "nginx"]:
+                self.assertIn(service, data["services"])

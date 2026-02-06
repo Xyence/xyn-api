@@ -417,6 +417,142 @@ This folder contains docker-compose and nginx scaffolds.
 """,
         )
         changed.extend(["deploy/README.md", "deploy/docker-compose.yml", "deploy/nginx.conf"])
+    if work_item["id"] == "ems-compose-local-chassis":
+        _write_file(
+            p("README.md"),
+            """# EMS Local Chassis
+
+This stack runs the EMS API + UI locally using Docker Compose.
+
+## Repo Layout
+This compose file assumes you have these repos side-by-side:
+
+- `../xyn-api`
+- `../xyn-ui`
+
+## Usage
+From the `xyn-api` repo root:
+
+```bash
+docker compose -f apps/ems-stack/docker-compose.yml up -d --build
+```
+
+Open:
+- http://localhost:8080/
+- http://localhost:8080/health
+- http://localhost:8080/api/health
+
+To stop:
+
+```bash
+docker compose -f apps/ems-stack/docker-compose.yml down -v
+```
+""",
+        )
+        _write_file(
+            p(".env.example"),
+            """POSTGRES_USER=ems
+POSTGRES_PASSWORD=ems
+POSTGRES_DB=ems
+""",
+        )
+        _write_file(
+            p("docker-compose.yml"),
+            """services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ems}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ems}
+      POSTGRES_DB: ${POSTGRES_DB:-ems}
+    volumes:
+      - ems_pgdata:/var/lib/postgresql/data
+
+  ems-api:
+    build:
+      context: ../
+      dockerfile: apps/ems-api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}
+    depends_on:
+      - postgres
+    expose:
+      - "8000"
+
+  ems-ui:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ../../xyn-ui/apps/ems-ui:/app
+    command: sh -lc "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    expose:
+      - "5173"
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - ems-api
+      - ems-ui
+
+volumes:
+  ems_pgdata: {}
+""",
+        )
+        _write_file(
+            p("nginx/nginx.conf"),
+            """events {}
+
+http {
+  server {
+    listen 8080;
+
+    location /health {
+      proxy_pass http://ems-api:8000/health;
+    }
+
+    location /api/ {
+      proxy_pass http://ems-api:8000/;
+    }
+
+    location / {
+      proxy_pass http://ems-ui:5173/;
+    }
+  }
+}
+""",
+        )
+        _write_file(
+            p("scripts/verify.sh"),
+            """#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
+
+docker compose -f "$ROOT_DIR/docker-compose.yml" up -d --build
+for i in {1..30}; do
+  if curl -fsS http://localhost:8080/health >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+curl -fsS -o /dev/null -w "%{http_code}\n" http://localhost:8080/ | grep -E "^(200|302)$"
+docker compose -f "$ROOT_DIR/docker-compose.yml" down -v
+""",
+        )
+        os.chmod(p("scripts/verify.sh"), 0o755)
+        changed.extend(
+            [
+                "README.md",
+                ".env.example",
+                "docker-compose.yml",
+                "nginx/nginx.conf",
+                "scripts/verify.sh",
+            ]
+        )
     if work_item["id"] == "ems-ui-scaffold":
         _write_file(
             p("README.md"),

@@ -700,6 +700,66 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "labels": ["deploy", "infra"],
             },
             {
+                "id": "ems-compose-local-chassis",
+                "title": "Local docker-compose chassis",
+                "description": "Local EMS stack with ems-api, ems-ui, postgres, nginx.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": "apps/ems-stack",
+                        "auth": "https_token",
+                        "allow_write": True,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-stack/README.md",
+                        "apps/ems-stack/docker-compose.yml",
+                        "apps/ems-stack/nginx/nginx.conf",
+                        "apps/ems-stack/.env.example",
+                        "apps/ems-stack/scripts/verify.sh",
+                    ]
+                },
+                "acceptance_criteria": [
+                    "Local stack can be brought up via docker-compose.",
+                    "/health returns 200 via nginx.",
+                    "UI root serves HTML.",
+                ],
+                "verify": [
+                    {
+                        "name": "stack-files",
+                        "command": "test -f apps/ems-stack/docker-compose.yml && test -f apps/ems-stack/nginx/nginx.conf",
+                        "cwd": ".",
+                    },
+                    {
+                        "name": "stack-up",
+                        "command": "if [ \"${VERIFY_DOCKER}\" = \"1\" ]; then docker compose -f apps/ems-stack/docker-compose.yml up -d --build; else echo \"VERIFY_DOCKER not set\"; fi",
+                        "cwd": ".",
+                    },
+                    {
+                        "name": "health-check",
+                        "command": "if [ \"${VERIFY_DOCKER}\" = \"1\" ]; then bash -lc \"for i in {1..30}; do curl -fsS http://localhost:8080/health && exit 0; sleep 1; done; exit 1\"; else echo \"VERIFY_DOCKER not set\"; fi",
+                        "cwd": ".",
+                    },
+                    {
+                        "name": "ui-check",
+                        "command": "if [ \"${VERIFY_DOCKER}\" = \"1\" ]; then curl -fsS -o /dev/null -w \"%{http_code}\\n\" http://localhost:8080/ | grep -E \"^(200|302)$\"; else echo \"VERIFY_DOCKER not set\"; fi",
+                        "cwd": ".",
+                    },
+                    {
+                        "name": "stack-down",
+                        "command": "if [ \"${VERIFY_DOCKER}\" = \"1\" ]; then docker compose -f apps/ems-stack/docker-compose.yml down -v; else echo \"VERIFY_DOCKER not set\"; fi",
+                        "cwd": ".",
+                    },
+                ],
+                "depends_on": ["ems-api-scaffold", "ems-ui-scaffold"],
+                "labels": ["deploy", "local", "compose"],
+            },
+            {
                 "id": "ems-dns-route53",
                 "title": "Route53 DNS stub",
                 "description": "Add Route53 integration placeholder for subdomain creation.",
