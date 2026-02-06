@@ -1,22 +1,30 @@
 import json
 import os
+import sys
 import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 
 from django.test import TestCase
 from jsonschema import Draft202012Validator
 import yaml
 
-from xyn_orchestrator.blueprints import _generate_implementation_plan, _select_context_packs_for_dev_task
+from xyn_orchestrator.blueprints import (
+    _build_module_catalog,
+    _build_run_history_summary,
+    _generate_implementation_plan,
+    _select_context_packs_for_dev_task,
+    _write_run_artifact,
+)
 from xyn_orchestrator.worker_tasks import (
     _apply_scaffold_for_work_item,
     _collect_git_diff,
     _mark_noop_codegen,
     _stage_all,
 )
-from xyn_orchestrator.models import Blueprint, ContextPack
+from xyn_orchestrator.models import Blueprint, ContextPack, DevTask, Run
 
 
 class PipelineSchemaTests(TestCase):
@@ -30,11 +38,14 @@ class PipelineSchemaTests(TestCase):
         schema = self._load_schema("implementation_plan.v1.schema.json")
         errors = list(Draft202012Validator(schema).iter_errors(plan))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
-        self.assertGreaterEqual(len(plan.get("work_items", [])), 8)
+        self.assertGreaterEqual(len(plan.get("work_items", [])), 1)
         chassis = next((w for w in plan.get("work_items", []) if w.get("id") == "ems-compose-local-chassis"), None)
         self.assertIsNotNone(chassis)
         verify_cmds = [entry.get("command", "") for entry in chassis.get("verify", [])]
         self.assertTrue(any("scripts/verify.sh" in cmd for cmd in verify_cmds))
+        self.assertIn("plan_rationale", plan)
+        self.assertIn("module_catalog.v1.json", chassis.get("inputs", {}).get("artifacts", []))
+        self.assertIn("run_history_summary.v1.json", chassis.get("inputs", {}).get("artifacts", []))
 
     def test_codegen_result_schema(self):
         schema = self._load_schema("codegen_result.v1.schema.json")
@@ -120,6 +131,66 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("planner-pack", planner_names)
         self.assertIn("ems-pack", planner_names)
 
+    def test_module_catalog_schema(self):
+        catalog = _build_module_catalog()
+        schema = self._load_schema("module_catalog.v1.schema.json")
+        errors = list(Draft202012Validator(schema).iter_errors(catalog))
+        self.assertEqual(errors, [], f"Schema errors: {errors}")
+        self.assertGreaterEqual(len(catalog.get("modules", [])), 1)
+
+    def test_run_history_summary_schema(self):
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        summary = _build_run_history_summary(blueprint)
+        schema = self._load_schema("run_history_summary.v1.schema.json")
+        errors = list(Draft202012Validator(schema).iter_errors(summary))
+        self.assertEqual(errors, [], f"Schema errors: {errors}")
+
+    def test_planner_selects_persistence_slice(self):
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        for work_item_id in [
+            "ems-api-jwt-protect-me",
+            "ems-stack-pass-jwt-secret-and-verify-me",
+            "ems-api-devices-rbac",
+            "ems-stack-verify-rbac",
+        ]:
+            run = Run.objects.create(
+                entity_type="dev_task",
+                entity_id=uuid.uuid4(),
+                status="succeeded",
+            )
+            _write_run_artifact(
+                run,
+                "codegen_result.json",
+                {"success": True, "repo_results": []},
+                "codegen_result",
+            )
+            DevTask.objects.create(
+                title=work_item_id,
+                task_type="codegen",
+                status="succeeded",
+                source_entity_type="blueprint",
+                source_entity_id=blueprint.id,
+                work_item_id=work_item_id,
+                result_run=run,
+            )
+        module_catalog = _build_module_catalog()
+        run_history = _build_run_history_summary(blueprint)
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=module_catalog,
+            run_history_summary=run_history,
+        )
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("ems-api-devices-postgres", ids)
+        self.assertIn("ems-stack-verify-persistence", ids)
+        self.assertNotIn("ems-api-jwt-protect-me", ids)
+        self.assertNotIn("ems-api-devices-rbac", ids)
+        rationale = plan.get("plan_rationale", {})
+        self.assertIn("persistence_devices", rationale.get("gaps_detected", []))
+        sample = next(iter(plan.get("work_items", [])))
+        self.assertIn("capabilities_required", sample)
+        self.assertIn("module_refs", sample)
+
     def test_codegen_patch_can_apply_to_clean_repo(self):
         if shutil.which("git") is None:
             self.skipTest("git not available")
@@ -153,7 +224,7 @@ class PipelineSchemaTests(TestCase):
             self.assertTrue(Path(repo_dir, "apps/ems-api/ems_api/main.py").exists())
 
     def test_scaffold_verify_commands(self):
-        work_item = {
+        scaffold = {
             "id": "ems-api-scaffold",
             "repo_targets": [
                 {
@@ -166,8 +237,22 @@ class PipelineSchemaTests(TestCase):
                 }
             ],
         }
+        devices_rbac = {
+            "id": "ems-api-devices-rbac",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
         with tempfile.TemporaryDirectory() as repo_dir:
-            _apply_scaffold_for_work_item(work_item, repo_dir)
+            _apply_scaffold_for_work_item(scaffold, repo_dir)
+            _apply_scaffold_for_work_item(devices_rbac, repo_dir)
             app_root = Path(repo_dir, "apps/ems-api")
             env = os.environ.copy()
             compile_result = subprocess.run(
@@ -252,6 +337,8 @@ class PipelineSchemaTests(TestCase):
             verify_contents = verify_path.read_text(encoding="utf-8")
             self.assertIn("/health", verify_contents)
             self.assertIn("/api/health", verify_contents)
+            self.assertIn("/api/me", verify_contents)
+            self.assertIn("Expected /api/me", verify_contents)
             self.assertIn("Health check failed", verify_contents)
 
     def test_ui_login_uses_api_health(self):
@@ -273,6 +360,7 @@ class PipelineSchemaTests(TestCase):
             login_path = Path(repo_dir, "apps/ems-ui/src/auth/Login.tsx")
             self.assertTrue(login_path.exists())
             self.assertIn("/api/health", login_path.read_text(encoding="utf-8"))
+            self.assertIn("/api/me", login_path.read_text(encoding="utf-8"))
 
     def test_stage_all_stages_untracked_files(self):
         with tempfile.TemporaryDirectory() as repo_dir:
@@ -290,6 +378,168 @@ class PipelineSchemaTests(TestCase):
                 capture_output=True,
             ).stdout.strip()
             self.assertEqual(status, "")
+
+    def test_ems_api_jwt_decode(self):
+        work_item = {
+            "id": "ems-api-scaffold",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(work_item, repo_dir)
+            ems_root = Path(repo_dir, "apps/ems-api")
+            self.assertTrue((ems_root / "ems_api").exists())
+            sys.path.insert(0, str(ems_root))
+            import importlib  # noqa: WPS433
+            importlib.invalidate_caches()
+            for key in list(sys.modules.keys()):
+                if key.startswith("ems_api"):
+                    del sys.modules[key]
+            os.environ["EMS_JWT_SECRET"] = "test-secret"
+            os.environ["EMS_JWT_ISSUER"] = "xyn-ems"
+            os.environ["EMS_JWT_AUDIENCE"] = "ems"
+            import jwt  # noqa: WPS433
+            decode_token = importlib.import_module("ems_api.auth").decode_token  # noqa: WPS433
+
+            token = jwt.encode(
+                {
+                    "iss": "xyn-ems",
+                    "aud": "ems",
+                    "sub": "dev-user",
+                    "email": "dev@example.com",
+                },
+                "test-secret",
+                algorithm="HS256",
+            )
+            claims = decode_token(token)
+            self.assertEqual(claims["sub"], "dev-user")
+
+    def test_devices_rbac(self):
+        scaffold = {
+            "id": "ems-api-scaffold",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        devices_rbac = {
+            "id": "ems-api-devices-rbac",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(scaffold, repo_dir)
+            _apply_scaffold_for_work_item(devices_rbac, repo_dir)
+            ems_root = Path(repo_dir, "apps/ems-api")
+            self.assertTrue((ems_root / "ems_api").exists())
+            sys.path.insert(0, str(ems_root))
+            import importlib  # noqa: WPS433
+            importlib.invalidate_caches()
+            for key in list(sys.modules.keys()):
+                if key.startswith("ems_api"):
+                    del sys.modules[key]
+            os.environ["EMS_JWT_SECRET"] = "test-secret"
+            os.environ["EMS_JWT_ISSUER"] = "xyn-ems"
+            os.environ["EMS_JWT_AUDIENCE"] = "ems"
+            from fastapi import HTTPException  # noqa: WPS433
+            from ems_api.rbac import require_roles  # noqa: WPS433
+
+            viewer_user = {"roles": ["viewer"]}
+            admin_user = {"roles": ["admin"]}
+            require_admin = require_roles("admin")
+            with self.assertRaises(HTTPException) as ctx:
+                require_admin(user=viewer_user)
+            self.assertEqual(ctx.exception.status_code, 403)
+            self.assertEqual(require_admin(user=admin_user), admin_user)
+
+    def test_devices_sqlite_persistence(self):
+        scaffold = {
+            "id": "ems-api-scaffold",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        db_foundation = {
+            "id": "ems-api-db-foundation",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        devices_postgres = {
+            "id": "ems-api-devices-postgres",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-api",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(scaffold, repo_dir)
+            _apply_scaffold_for_work_item(db_foundation, repo_dir)
+            _apply_scaffold_for_work_item(devices_postgres, repo_dir)
+            ems_root = Path(repo_dir, "apps/ems-api")
+            sys.path.insert(0, str(ems_root))
+            import importlib  # noqa: WPS433
+            importlib.invalidate_caches()
+            for key in list(sys.modules.keys()):
+                if key.startswith("ems_api"):
+                    del sys.modules[key]
+            os.environ["DATABASE_URL"] = f"sqlite:///{Path(repo_dir, 'devices.db')}"
+            db_module = importlib.import_module("ems_api.db")
+            models_module = importlib.import_module("ems_api.models")
+            models_module.Base.metadata.create_all(bind=db_module.engine)
+            session = db_module.SessionLocal()
+            try:
+                device = models_module.Device(name="persist1")
+                session.add(device)
+                session.commit()
+                session.refresh(device)
+                result = session.query(models_module.Device).all()
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0].name, "persist1")
+            finally:
+                session.close()
 
     def test_api_scaffold_writes_dockerfile(self):
         work_item = {

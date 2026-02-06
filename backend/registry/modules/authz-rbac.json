@@ -1,0 +1,25 @@
+{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "authz-rbac",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "authz.rbac.enforce"
+    }
+  },
+  "description": "RBAC enforcement helpers for API routes.",
+  "module": {
+    "type": "lib",
+    "fqn": "core.authz-rbac",
+    "capabilitiesProvided": [
+      "authz.rbac.enforce"
+    ],
+    "interfaces": {
+      "roles": ["admin", "viewer"],
+      "policy": "admin: CRUD; viewer: read-only"
+    },
+    "dependencies": {}
+  }
+}

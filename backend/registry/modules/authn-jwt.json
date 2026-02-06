@@ -1,0 +1,32 @@
+{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "authn-jwt",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "authn.jwt.validate"
+    }
+  },
+  "description": "JWT validation module (HS256) for EMS API services.",
+  "module": {
+    "type": "lib",
+    "fqn": "core.authn-jwt",
+    "capabilitiesProvided": [
+      "authn.jwt.validate"
+    ],
+    "interfaces": {
+      "config": {
+        "EMS_JWT_SECRET": "Shared secret for HS256 verification.",
+        "EMS_JWT_ISSUER": "Token issuer (default: xyn-ems).",
+        "EMS_JWT_AUDIENCE": "Token audience (default: ems)."
+      },
+      "claims": {
+        "required": ["sub", "email"],
+        "optional": ["roles"]
+      }
+    },
+    "dependencies": {}
+  }
+}

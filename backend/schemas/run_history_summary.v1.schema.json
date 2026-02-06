@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xyence.io/schemas/run_history_summary.v1.schema.json",
+  "title": "Run History Summary v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "blueprint_id", "generated_at", "completed_work_items", "acceptance_checks_status"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "run_history_summary.v1"},
+    "blueprint_id": {"type": "string"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "completed_work_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["work_item_id", "outcome"],
+        "properties": {
+          "work_item_id": {"type": "string"},
+          "outcome": {"type": "string", "enum": ["succeeded", "failed"]},
+          "commit_sha": {"type": "string"},
+          "artifacts": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "acceptance_checks_status": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status"],
+        "properties": {
+          "id": {"type": "string"},
+          "status": {"type": "string", "enum": ["pass", "fail"]}
+        }
+      }
+    }
+  }
+}

@@ -67,6 +67,19 @@ def _write_run_artifact(run: Run, filename: str, content: str | dict | list, kin
     return RunArtifact.objects.create(run=run, name=filename, kind=kind, url=url)
 
 
+def _read_run_artifact_json(artifact: RunArtifact) -> Optional[Dict[str, Any]]:
+    if not artifact.url or not artifact.url.startswith("/media/"):
+        return None
+    file_path = os.path.join(settings.MEDIA_ROOT, artifact.url.replace("/media/", ""))
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except json.JSONDecodeError:
+        return None
+
+
 def _async_mode() -> str:
     mode = os.environ.get("XYENCE_ASYNC_JOBS_MODE", "").strip().lower()
     if mode:
@@ -443,7 +456,303 @@ def _default_repo_targets() -> List[Dict[str, Any]]:
     ]
 
 
-def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
+def _build_module_catalog() -> Dict[str, Any]:
+    repo_targets = _default_repo_targets()
+    catalog: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    registry_root = Path(__file__).resolve().parents[1] / "registry" / "modules"
+    if registry_root.exists():
+        for path in sorted(registry_root.glob("*.json")):
+            try:
+                spec = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            metadata = spec.get("metadata", {})
+            module_spec = spec.get("module", {})
+            module_id = metadata.get("name") or path.stem
+            entry = {
+                "id": module_id,
+                "version": metadata.get("version", "0.1.0"),
+                "capabilities": module_spec.get("capabilitiesProvided", []),
+                "repo": {
+                    "name": "xyn-api",
+                    "url": repo_targets[0]["url"],
+                    "ref": repo_targets[0]["ref"],
+                    "path_root": f"backend/registry/modules/{path.name}",
+                },
+                "templates": ["module-spec", "docs"],
+                "default_work_items": [],
+            }
+            catalog.append(entry)
+            seen.add(module_id)
+
+    curated = [
+        {
+            "id": "ems-api",
+            "version": "0.1.0",
+            "capabilities": [
+                "app.api.fastapi",
+                "ems.devices.api",
+                "ems.reports.api",
+                "authn.jwt.validate",
+                "authz.rbac.enforce",
+                "storage.postgres",
+                "storage.migrations.alembic",
+            ],
+            "repo": {
+                "name": repo_targets[0]["name"],
+                "url": repo_targets[0]["url"],
+                "ref": repo_targets[0]["ref"],
+                "path_root": "apps/ems-api",
+            },
+            "templates": [
+                "fastapi-scaffold",
+                "jwt-protect",
+                "devices-rbac",
+                "devices-persistence",
+            ],
+            "default_work_items": ["ems-api-scaffold"],
+        },
+        {
+            "id": "ems-ui",
+            "version": "0.1.0",
+            "capabilities": ["app.ui.react", "ems.devices.ui", "ems.reports.ui"],
+            "repo": {
+                "name": repo_targets[1]["name"],
+                "url": repo_targets[1]["url"],
+                "ref": repo_targets[1]["ref"],
+                "path_root": "apps/ems-ui",
+            },
+            "templates": ["react-scaffold", "ems-ui-devices"],
+            "default_work_items": ["ems-ui-scaffold"],
+        },
+        {
+            "id": "ems-stack",
+            "version": "0.1.0",
+            "capabilities": ["deploy.compose.local", "proxy.nginx"],
+            "repo": {
+                "name": repo_targets[0]["name"],
+                "url": repo_targets[0]["url"],
+                "ref": repo_targets[0]["ref"],
+                "path_root": "apps/ems-stack",
+            },
+            "templates": ["compose-chassis", "verify-stack"],
+            "default_work_items": ["ems-compose-local-chassis"],
+        },
+        {
+            "id": "storage-postgres",
+            "version": "0.1.0",
+            "capabilities": ["storage.postgres"],
+            "repo": {
+                "name": repo_targets[0]["name"],
+                "url": repo_targets[0]["url"],
+                "ref": repo_targets[0]["ref"],
+                "path_root": "apps/ems-api",
+            },
+            "templates": ["db-foundation"],
+            "default_work_items": ["ems-api-db-foundation"],
+        },
+        {
+            "id": "migrations-alembic",
+            "version": "0.1.0",
+            "capabilities": ["storage.migrations.alembic"],
+            "repo": {
+                "name": repo_targets[0]["name"],
+                "url": repo_targets[0]["url"],
+                "ref": repo_targets[0]["ref"],
+                "path_root": "apps/ems-api",
+            },
+            "templates": ["alembic-migrations"],
+            "default_work_items": ["ems-api-alembic-migrations"],
+        },
+    ]
+    for entry in curated:
+        if entry["id"] in seen:
+            continue
+        catalog.append(entry)
+        seen.add(entry["id"])
+
+    return {
+        "schema_version": "module_catalog.v1",
+        "generated_at": timezone.now().isoformat(),
+        "modules": catalog,
+    }
+
+
+def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str]]:
+    metadata = blueprint.metadata_json or {}
+    acceptance = metadata.get("acceptance_checks")
+    if isinstance(acceptance, dict):
+        return {key: list(value) for key, value in acceptance.items()}
+    blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
+    if blueprint_fqn == "core.ems.platform":
+        return {
+            "local_chassis": ["ems-compose-local-chassis"],
+            "jwt_required": ["ems-api-jwt-protect-me", "ems-stack-pass-jwt-secret-and-verify-me"],
+            "rbac_devices": ["ems-api-devices-rbac", "ems-stack-verify-rbac"],
+            "persistence_devices": ["ems-api-devices-postgres", "ems-stack-verify-persistence"],
+        }
+    return {}
+
+
+def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
+    completed: List[Dict[str, Any]] = []
+    completed_ids: set[str] = set()
+    tasks = DevTask.objects.filter(
+        source_entity_type="blueprint", source_entity_id=blueprint.id
+    ).select_related("result_run")
+    for task in tasks:
+        if not task.result_run:
+            continue
+        artifacts = list(task.result_run.artifacts.all())
+        result = None
+        for artifact in artifacts:
+            if artifact.name == "codegen_result.json":
+                result = _read_run_artifact_json(artifact)
+                break
+        success = False
+        commit_sha = ""
+        if result:
+            success = bool(result.get("success"))
+            repo_results = result.get("repo_results") or []
+            for repo in repo_results:
+                commit = repo.get("commit") or {}
+                if commit.get("sha"):
+                    commit_sha = commit.get("sha")
+                    break
+        outcome = "succeeded" if task.status == "succeeded" and success else "failed"
+        completed.append(
+            {
+                "work_item_id": task.work_item_id or "",
+                "outcome": outcome,
+                "commit_sha": commit_sha,
+                "artifacts": [artifact.name for artifact in artifacts],
+            }
+        )
+        if task.work_item_id and outcome == "succeeded":
+            completed_ids.add(task.work_item_id)
+
+    acceptance_map = _acceptance_checks_for_blueprint(blueprint)
+    acceptance_status = []
+    for check_id, work_items in acceptance_map.items():
+        status = "pass" if all(item in completed_ids for item in work_items) else "fail"
+        acceptance_status.append({"id": check_id, "status": status})
+
+    return {
+        "schema_version": "run_history_summary.v1",
+        "blueprint_id": str(blueprint.id),
+        "generated_at": timezone.now().isoformat(),
+        "completed_work_items": completed,
+        "acceptance_checks_status": acceptance_status,
+    }
+
+
+def _select_next_slice(
+    blueprint: Blueprint,
+    work_items: List[Dict[str, Any]],
+    run_history_summary: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    priority = ["local_chassis", "jwt_required", "rbac_devices", "persistence_devices", "oidc", "route53_acme_ssm"]
+    status_map = {entry["id"]: entry["status"] for entry in run_history_summary.get("acceptance_checks_status", [])}
+    next_gap = None
+    for gap in priority:
+        if status_map.get(gap) != "pass":
+            next_gap = gap
+            break
+    completed_ids = {
+        entry.get("work_item_id")
+        for entry in run_history_summary.get("completed_work_items", [])
+        if entry.get("outcome") == "succeeded"
+    }
+    gap_to_items = {
+        "local_chassis": ["ems-compose-local-chassis"],
+        "jwt_required": ["ems-authn-jwt-module", "ems-api-jwt-protect-me", "ems-ui-token-input-me-call", "ems-stack-pass-jwt-secret-and-verify-me"],
+        "rbac_devices": ["ems-authz-rbac-module", "ems-api-devices-rbac", "ems-ui-devices-role-aware", "ems-stack-verify-rbac"],
+        "persistence_devices": [
+            "ems-api-db-foundation",
+            "ems-api-alembic-migrations",
+            "ems-api-container-startup-migrate",
+            "ems-api-devices-postgres",
+            "ems-stack-verify-persistence",
+        ],
+        "oidc": ["ems-api-authn-oidc", "ems-ui-auth"],
+        "route53_acme_ssm": ["ems-api-route53", "ems-api-acme", "ems-ssm-deploy"],
+    }
+    if not next_gap:
+        return work_items, {"gaps_detected": [], "modules_selected": [], "why_next": ["All known gaps satisfied."]}
+    selected_ids = gap_to_items.get(next_gap, [])
+    selected = [item for item in work_items if item["id"] in selected_ids and item["id"] not in completed_ids]
+    rationale = {
+        "gaps_detected": [next_gap],
+        "modules_selected": [],
+        "why_next": [f"Selected next slice for gap {next_gap}."],
+    }
+    return selected or work_items, rationale
+
+
+def _annotate_work_items(
+    work_items: List[Dict[str, Any]],
+    module_catalog: Dict[str, Any],
+) -> None:
+    module_versions = {m["id"]: m.get("version", "0.1.0") for m in module_catalog.get("modules", [])}
+    work_item_caps = {
+        "ems-api-scaffold": ["app.api.fastapi"],
+        "ems-ui-scaffold": ["app.ui.react"],
+        "ems-compose-local-chassis": ["deploy.compose.local"],
+        "ems-authn-jwt-module": ["authn.jwt.validate"],
+        "ems-authz-rbac-module": ["authz.rbac.enforce"],
+        "ems-api-jwt-protect-me": ["authn.jwt.validate"],
+        "ems-api-devices-rbac": ["authz.rbac.enforce", "ems.devices.api"],
+        "ems-api-devices-postgres": ["storage.postgres", "ems.devices.persistence"],
+        "ems-api-db-foundation": ["storage.postgres"],
+        "ems-api-alembic-migrations": ["storage.migrations.alembic"],
+        "ems-api-container-startup-migrate": ["storage.migrations.alembic"],
+        "ems-stack-verify-persistence": ["deploy.compose.local.verify"],
+        "ems-stack-verify-rbac": ["deploy.compose.local.verify"],
+        "ems-stack-pass-jwt-secret-and-verify-me": ["deploy.compose.local.verify"],
+        "ems-ui-token-input-me-call": ["app.ui.react", "authn.jwt.validate"],
+        "ems-ui-devices-role-aware": ["app.ui.react", "authz.rbac.enforce"],
+    }
+    work_item_modules = {
+        "ems-api-scaffold": ["ems-api"],
+        "ems-ui-scaffold": ["ems-ui"],
+        "ems-compose-local-chassis": ["ems-stack"],
+        "ems-authn-jwt-module": ["authn-jwt"],
+        "ems-authz-rbac-module": ["authz-rbac"],
+        "ems-api-jwt-protect-me": ["authn-jwt", "ems-api"],
+        "ems-api-devices-rbac": ["authz-rbac", "ems-api"],
+        "ems-api-devices-postgres": ["storage-postgres", "ems-api"],
+        "ems-api-db-foundation": ["storage-postgres"],
+        "ems-api-alembic-migrations": ["migrations-alembic"],
+        "ems-api-container-startup-migrate": ["migrations-alembic"],
+        "ems-stack-verify-persistence": ["ems-stack"],
+        "ems-stack-verify-rbac": ["ems-stack"],
+        "ems-stack-pass-jwt-secret-and-verify-me": ["ems-stack"],
+        "ems-ui-token-input-me-call": ["ems-ui"],
+        "ems-ui-devices-role-aware": ["ems-ui"],
+    }
+    for item in work_items:
+        item_id = item.get("id")
+        caps = work_item_caps.get(item_id, [])
+        modules = work_item_modules.get(item_id, [])
+        if caps:
+            item["capabilities_required"] = caps
+        if modules:
+            item["module_refs"] = [{"id": module_id, "version": module_versions.get(module_id, "0.1.0")} for module_id in modules]
+            item.setdefault("labels", [])
+            for module_id in modules:
+                if f"module:{module_id}" not in item["labels"]:
+                    item["labels"].append(f"module:{module_id}")
+            for cap in caps:
+                if f"capability:{cap}" not in item["labels"]:
+                    item["labels"].append(f"capability:{cap}")
+
+
+def _generate_implementation_plan(
+    blueprint: Blueprint,
+    module_catalog: Optional[Dict[str, Any]] = None,
+    run_history_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     repo_targets = _default_repo_targets()
     work_items: List[Dict[str, Any]] = []
@@ -609,12 +918,366 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "verify": [
                     {
                         "name": "ui-structure",
-                        "command": "test -f src/App.tsx && test -f src/main.tsx && test -f src/routes.tsx && test -f src/auth/Login.tsx && test -f src/devices/DeviceList.tsx && test -f src/reports/Reports.tsx && grep -q \"/api/health\" src/auth/Login.tsx",
+                        "command": "test -f src/App.tsx && test -f src/main.tsx && test -f src/routes.tsx && test -f src/auth/Login.tsx && test -f src/devices/DeviceList.tsx && test -f src/reports/Reports.tsx && grep -q \"/api/health\" src/auth/Login.tsx && grep -q \"/api/me\" src/auth/Login.tsx",
                         "cwd": "apps/ems-ui",
                     },
                 ],
                 "depends_on": [],
                 "labels": ["scaffold", "ui"],
+            },
+            {
+                "id": "ems-authn-jwt-module",
+                "title": "JWT auth module scaffold",
+                "description": "Define reusable JWT auth module spec and docs.",
+                "type": "scaffold",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": "backend/registry/modules",
+                        "auth": "https_token",
+                        "allow_write": True,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {
+                    "paths": [
+                        "backend/registry/modules/authn-jwt.json",
+                        "backend/registry/modules/README.md",
+                    ]
+                },
+                "acceptance_criteria": [
+                    "Module spec describes JWT validation capability and configuration.",
+                ],
+                "verify": [
+                    {
+                        "name": "module-spec",
+                        "command": "test -f backend/registry/modules/authn-jwt.json",
+                        "cwd": ".",
+                    }
+                ],
+                "depends_on": [],
+                "labels": ["module", "auth"],
+            },
+            {
+                "id": "ems-authz-rbac-module",
+                "title": "RBAC module scaffold",
+                "description": "Define reusable RBAC module spec and docs.",
+                "type": "scaffold",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": "backend/registry/modules",
+                        "auth": "https_token",
+                        "allow_write": True,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["backend/registry/modules/authz-rbac.json"]},
+                "acceptance_criteria": [
+                    "Module spec describes RBAC enforcement capability and roles.",
+                ],
+                "verify": [
+                    {
+                        "name": "rbac-module-spec",
+                        "command": "test -f backend/registry/modules/authz-rbac.json",
+                        "cwd": ".",
+                    }
+                ],
+                "depends_on": [],
+                "labels": ["module", "authz"],
+            },
+            {
+                "id": "ems-api-jwt-protect-me",
+                "title": "Protect /me with JWT",
+                "description": "Add JWT validation, /me endpoint, and dev token helper.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/ems_api/auth.py",
+                        "apps/ems-api/ems_api/routes/me.py",
+                        "apps/ems-api/scripts/issue_dev_token.py",
+                        "apps/ems-api/requirements.txt",
+                    ]
+                },
+                "acceptance_criteria": [
+                    "/me returns claims with valid JWT.",
+                    "/me returns 401 when unauthenticated.",
+                ],
+                "verify": [
+                    {
+                        "name": "jwt-files",
+                        "command": "test -f ems_api/auth.py && test -f ems_api/routes/me.py && test -f scripts/issue_dev_token.py",
+                        "cwd": "apps/ems-api",
+                    },
+                ],
+                "depends_on": ["ems-authn-jwt-module", "ems-api-scaffold"],
+                "labels": ["api", "auth"],
+            },
+            {
+                "id": "ems-api-db-foundation",
+                "title": "Database foundation",
+                "description": "SQLAlchemy base, session utilities, and device model.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/ems_api/db.py",
+                        "apps/ems-api/ems_api/models.py",
+                    ]
+                },
+                "acceptance_criteria": ["Database utilities and models exist."],
+                "verify": [
+                    {"name": "db-files", "command": "test -f ems_api/db.py && test -f ems_api/models.py", "cwd": "apps/ems-api"},
+                ],
+                "depends_on": ["ems-api-jwt-protect-me"],
+                "labels": ["api", "db"],
+            },
+            {
+                "id": "ems-api-alembic-migrations",
+                "title": "Alembic migrations",
+                "description": "Add Alembic config and initial devices migration.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/alembic.ini",
+                        "apps/ems-api/alembic/env.py",
+                        "apps/ems-api/alembic/versions/20260206_ems_devices.py",
+                    ]
+                },
+                "acceptance_criteria": ["Alembic migration for devices exists."],
+                "verify": [
+                    {"name": "alembic-files", "command": "test -f alembic.ini && test -f alembic/env.py", "cwd": "apps/ems-api"},
+                ],
+                "depends_on": ["ems-api-db-foundation"],
+                "labels": ["api", "db"],
+            },
+            {
+                "id": "ems-api-container-startup-migrate",
+                "title": "Run migrations on startup",
+                "description": "Add entrypoint to run alembic before uvicorn.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/scripts/entrypoint.sh",
+                        "apps/ems-api/Dockerfile",
+                    ]
+                },
+                "acceptance_criteria": ["Container runs alembic upgrade head on boot."],
+                "verify": [
+                    {"name": "entrypoint", "command": "test -f scripts/entrypoint.sh", "cwd": "apps/ems-api"},
+                ],
+                "depends_on": ["ems-api-alembic-migrations"],
+                "labels": ["api", "db", "deploy"],
+            },
+            {
+                "id": "ems-api-devices-rbac",
+                "title": "RBAC enforcement for devices",
+                "description": "Require admin for device writes and allow viewer/admin reads.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-api/ems_api/rbac.py",
+                        "apps/ems-api/ems_api/routes/devices.py",
+                    ]
+                },
+                "acceptance_criteria": [
+                    "Viewer can list devices but cannot create/delete.",
+                    "Admin can create/delete devices.",
+                ],
+                "verify": [
+                    {
+                        "name": "devices-rbac",
+                        "command": "test -f ems_api/rbac.py && grep -q require_roles ems_api/routes/devices.py",
+                        "cwd": "apps/ems-api",
+                    }
+                ],
+                "depends_on": ["ems-api-jwt-protect-me", "ems-authz-rbac-module"],
+                "labels": ["api", "authz"],
+            },
+            {
+                "id": "ems-api-devices-postgres",
+                "title": "Persist devices in Postgres",
+                "description": "Refactor devices CRUD to use SQLAlchemy/Postgres.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-api/ems_api/routes/devices.py"]},
+                "acceptance_criteria": ["Devices CRUD uses database storage."],
+                "verify": [
+                    {"name": "devices-db", "command": "grep -q 'Session' ems_api/routes/devices.py", "cwd": "apps/ems-api"},
+                ],
+                "depends_on": ["ems-api-db-foundation", "ems-api-devices-rbac"],
+                "labels": ["api", "db"],
+            },
+            {
+                "id": "ems-token-script-roles",
+                "title": "Dev token roles",
+                "description": "Allow dev token script to issue admin/viewer tokens.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-api/scripts/issue_dev_token.py"]},
+                "acceptance_criteria": [
+                    "issue_dev_token.py supports --role admin|viewer.",
+                ],
+                "verify": [
+                    {
+                        "name": "token-roles",
+                        "command": "grep -q -- '--role' scripts/issue_dev_token.py",
+                        "cwd": "apps/ems-api",
+                    }
+                ],
+                "depends_on": ["ems-api-jwt-protect-me"],
+                "labels": ["api", "auth"],
+            },
+            {
+                "id": "ems-ui-token-input-me-call",
+                "title": "UI token input and /me call",
+                "description": "Add token input and /api/me call to UI login.",
+                "type": "feature",
+                "repo_targets": [repo_targets[1]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-ui/src/auth/Login.tsx",
+                    ]
+                },
+                "acceptance_criteria": [
+                    "UI shows API health and /api/me identity response.",
+                ],
+                "verify": [
+                    {
+                        "name": "login-me-call",
+                        "command": "test -f src/auth/Login.tsx && grep -q \"/api/me\" src/auth/Login.tsx",
+                        "cwd": "apps/ems-ui",
+                    },
+                ],
+                "depends_on": ["ems-ui-scaffold", "ems-api-jwt-protect-me"],
+                "labels": ["ui", "auth"],
+            },
+            {
+                "id": "ems-ui-devices-role-aware",
+                "title": "Role-aware devices UI",
+                "description": "Render device list and show admin controls only for admin role.",
+                "type": "feature",
+                "repo_targets": [repo_targets[1]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-ui/src/devices/DeviceList.tsx"]},
+                "acceptance_criteria": [
+                    "Viewer sees list only; admin sees create/delete controls.",
+                ],
+                "verify": [
+                    {
+                        "name": "devices-ui",
+                        "command": "grep -q /api/devices src/devices/DeviceList.tsx",
+                        "cwd": "apps/ems-ui",
+                    }
+                ],
+                "depends_on": ["ems-ui-scaffold", "ems-api-devices-rbac"],
+                "labels": ["ui", "authz"],
+            },
+            {
+                "id": "ems-stack-pass-jwt-secret-and-verify-me",
+                "title": "Chassis JWT config and /me verification",
+                "description": "Pass EMS_JWT_SECRET and verify /api/me through the stack.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": "apps/ems-stack",
+                        "auth": "https_token",
+                        "allow_write": True,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {
+                    "paths": [
+                        "apps/ems-stack/.env.example",
+                        "apps/ems-stack/docker-compose.yml",
+                        "apps/ems-stack/scripts/verify.sh",
+                    ]
+                },
+                "acceptance_criteria": [
+                    "Stack passes EMS_JWT_SECRET and /api/me checks in verify script.",
+                ],
+                "verify": [
+                    {
+                        "name": "stack-jwt-files",
+                        "command": "grep -q EMS_JWT_SECRET apps/ems-stack/docker-compose.yml && grep -q /api/me apps/ems-stack/scripts/verify.sh",
+                        "cwd": ".",
+                    }
+                ],
+                "depends_on": ["ems-compose-local-chassis", "ems-api-jwt-protect-me"],
+                "labels": ["deploy", "auth"],
+            },
+            {
+                "id": "ems-stack-verify-rbac",
+                "title": "Chassis RBAC verification",
+                "description": "Verify viewer/admin behavior for /api/devices.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": "apps/ems-stack",
+                        "auth": "https_token",
+                        "allow_write": True,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-stack/scripts/verify.sh"]},
+                "acceptance_criteria": [
+                    "verify.sh asserts viewer 403 and admin 200/201 on /api/devices.",
+                ],
+                "verify": [
+                    {
+                        "name": "rbac-verify-script",
+                        "command": "grep -q /api/devices apps/ems-stack/scripts/verify.sh && grep -q viewer apps/ems-stack/scripts/verify.sh",
+                        "cwd": ".",
+                    }
+                ],
+                "depends_on": ["ems-stack-pass-jwt-secret-and-verify-me", "ems-api-devices-rbac"],
+                "labels": ["deploy", "authz"],
+            },
+            {
+                "id": "ems-stack-verify-persistence",
+                "title": "Verify device persistence",
+                "description": "Ensure devices persist across ems-api restart.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": "apps/ems-stack",
+                        "auth": "https_token",
+                        "allow_write": True,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-stack/scripts/verify.sh"]},
+                "acceptance_criteria": ["verify.sh checks persistence across restart."],
+                "verify": [
+                    {"name": "persistence-check", "command": "grep -q persist1 apps/ems-stack/scripts/verify.sh", "cwd": "."},
+                ],
+                "depends_on": ["ems-stack-verify-rbac", "ems-api-devices-postgres"],
+                "labels": ["deploy", "db"],
             },
             {
                 "id": "ems-ui-auth",
@@ -786,16 +1449,43 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
             }
         ]
 
-    tasks = []
+    if module_catalog is None:
+        module_catalog = _build_module_catalog()
+    if run_history_summary is None:
+        run_history_summary = _build_run_history_summary(blueprint)
+
     for item in work_items:
-        tasks.append(
-            {
-                "task_type": "codegen",
-                "title": f"Codegen: {item['title']}",
-                "context_purpose": item.get("context_purpose_override") or "coder",
-                "work_item_id": item["id"],
-            }
-        )
+        inputs = item.setdefault("inputs", {})
+        artifacts = inputs.setdefault("artifacts", [])
+        for artifact_name in ("module_catalog.v1.json", "run_history_summary.v1.json"):
+            if artifact_name not in artifacts:
+                artifacts.append(artifact_name)
+
+    plan_rationale = {"gaps_detected": [], "modules_selected": [], "why_next": ["Default plan generated."]}
+    if run_history_summary.get("acceptance_checks_status"):
+        work_items, plan_rationale = _select_next_slice(blueprint, work_items, run_history_summary)
+
+    _annotate_work_items(work_items, module_catalog)
+    modules_selected = sorted(
+        {
+            ref.get("id")
+            for item in work_items
+            for ref in item.get("module_refs", [])
+            if isinstance(ref, dict) and ref.get("id")
+        }
+    )
+    if modules_selected:
+        plan_rationale["modules_selected"] = modules_selected
+
+    tasks = [
+        {
+            "task_type": "codegen",
+            "title": f"Codegen: {item['title']}",
+            "context_purpose": item.get("context_purpose_override") or "coder",
+            "work_item_id": item["id"],
+        }
+        for item in work_items
+    ]
     tasks.extend(
         [
             {
@@ -820,6 +1510,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
         "global_repo_targets": repo_targets,
         "work_items": work_items,
         "tasks": tasks,
+        "plan_rationale": plan_rationale,
     }
 
 
@@ -1370,7 +2061,15 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
         else:
             instance.status = "planned"
             run.status = "succeeded"
-        implementation_plan = _generate_implementation_plan(blueprint)
+        module_catalog = _build_module_catalog()
+        _write_run_artifact(run, "module_catalog.v1.json", module_catalog, "module_catalog")
+        run_history_summary = _build_run_history_summary(blueprint)
+        _write_run_artifact(run, "run_history_summary.v1.json", run_history_summary, "run_history_summary")
+        implementation_plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=module_catalog,
+            run_history_summary=run_history_summary,
+        )
         plan_errors = _validate_schema(implementation_plan, "implementation_plan.v1.schema.json")
         if plan_errors:
             run.log_text += "Implementation plan schema errors:\n"

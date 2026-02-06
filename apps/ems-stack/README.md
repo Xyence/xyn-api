@@ -21,6 +21,12 @@ If your UI repo lives elsewhere, set:
 export XYN_UI_PATH=/absolute/path/to/xyn-ui/apps/ems-ui
 ```
 
+JWT secret (required for /api/me):
+
+```bash
+export EMS_JWT_SECRET=dev-secret-change-me
+```
+
 To run with verification checks (Docker required):
 
 ```bash

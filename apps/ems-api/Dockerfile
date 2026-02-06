@@ -7,7 +7,12 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir -r /app/requirements.txt
 
 COPY ems_api /app/ems_api
+COPY scripts /app/scripts
+COPY alembic /app/alembic
+COPY alembic.ini /app/alembic.ini
 
 EXPOSE 8000
 
-CMD ["uvicorn", "ems_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+RUN chmod +x /app/scripts/entrypoint.sh
+
+CMD ["/app/scripts/entrypoint.sh"]

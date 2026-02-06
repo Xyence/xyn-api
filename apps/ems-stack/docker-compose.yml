@@ -14,6 +14,9 @@ services:
       dockerfile: Dockerfile
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}
+      EMS_JWT_SECRET: ${EMS_JWT_SECRET:-dev-secret-change-me}
+      EMS_JWT_ISSUER: ${EMS_JWT_ISSUER:-xyn-ems}
+      EMS_JWT_AUDIENCE: ${EMS_JWT_AUDIENCE:-ems}
     depends_on:
       - postgres
     expose:

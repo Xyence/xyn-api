@@ -43,6 +43,7 @@ from .models import (
     RunArtifact,
     RunCommandExecution,
 )
+from .module_registry import maybe_sync_modules_from_registry
 
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
@@ -381,6 +382,7 @@ def modules_collection(request: HttpRequest) -> JsonResponse:
             module.updated_by = request.user
             module.save(update_fields=["latest_module_spec_json", "updated_by", "updated_at"])
         return JsonResponse({"id": str(module.id), "fqn": module.fqn})
+    maybe_sync_modules_from_registry()
     qs = Module.objects.all().order_by("namespace", "name")
     if query := request.GET.get("q"):
         qs = qs.filter(models.Q(name__icontains=query) | models.Q(fqn__icontains=query))
@@ -406,6 +408,8 @@ def modules_collection(request: HttpRequest) -> JsonResponse:
 def module_detail(request: HttpRequest, module_ref: str) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
+    if request.method == "GET":
+        maybe_sync_modules_from_registry()
     try:
         module = Module.objects.get(id=module_ref)
     except (Module.DoesNotExist, ValueError):

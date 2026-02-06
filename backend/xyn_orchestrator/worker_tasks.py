@@ -177,12 +177,27 @@ FastAPI scaffold for the EMS platform.
 ## Run
 - `pip install -r requirements.txt`
 - `uvicorn ems_api.main:app --reload`
+ 
+## Dev JWT
+Set `EMS_JWT_SECRET` and issue a dev token:
+
+```bash
+export EMS_JWT_SECRET=dev-secret-change-me
+python scripts/issue_dev_token.py
+```
+
+Use the token to call `/api/me` through nginx:
+
+```bash
+curl -H "Authorization: Bearer <token>" http://localhost:8080/api/me
+```
 """,
         )
         _write_file(
             p("requirements.txt"),
             """fastapi==0.110.0
 uvicorn==0.27.1
+PyJWT==2.8.0
 """,
         )
         _write_file(
@@ -196,6 +211,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \\
     && pip install --no-cache-dir -r /app/requirements.txt
 
 COPY ems_api /app/ems_api
+COPY scripts /app/scripts
 
 EXPOSE 8000
 
@@ -221,11 +237,12 @@ dev = [
         _write_file(
             p("ems_api/main.py"),
             """from fastapi import FastAPI
-from ems_api.routes import health, devices, reports
+from ems_api.routes import health, devices, reports, me
 
 app = FastAPI(title="EMS API")
 
 app.include_router(health.router)
+app.include_router(me.router)
 app.include_router(devices.router)
 app.include_router(reports.router)
 """,
@@ -233,6 +250,62 @@ app.include_router(reports.router)
         _write_file(
             p("ems_api/routes/__init__.py"),
             "",
+        )
+        _write_file(
+            p("ems_api/auth.py"),
+            """import os
+from typing import Any, Dict
+
+import jwt
+from fastapi import HTTPException, Request, status
+
+
+def _get_required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Missing required environment variable: {name}",
+        )
+    return value
+
+
+def decode_token(token: str) -> Dict[str, Any]:
+    secret = _get_required_env("EMS_JWT_SECRET")
+    issuer = os.environ.get("EMS_JWT_ISSUER", "xyn-ems")
+    audience = os.environ.get("EMS_JWT_AUDIENCE", "ems")
+    return jwt.decode(
+        token,
+        secret,
+        algorithms=["HS256"],
+        issuer=issuer,
+        audience=audience,
+    )
+
+
+def require_user(request: Request) -> Dict[str, Any]:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+        )
+    token = auth_header.replace("Bearer ", "", 1).strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+        )
+    try:
+        claims = decode_token(token)
+    except jwt.PyJWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {exc}",
+        ) from exc
+    request.state.user = claims
+    return claims
+""",
         )
         _write_file(
             p("ems_api/routes/health.py"),
@@ -246,27 +319,83 @@ def health():
 """,
         )
         _write_file(
+            p("ems_api/routes/me.py"),
+            """from fastapi import APIRouter, Depends
+
+from ems_api.auth import require_user
+
+router = APIRouter(prefix="/me", tags=["me"])
+
+
+@router.get("")
+def whoami(user=Depends(require_user)):
+    return {
+        "sub": user.get("sub"),
+        "email": user.get("email"),
+        "roles": user.get("roles", []),
+        "issuer": user.get("iss"),
+        "audience": user.get("aud"),
+    }
+""",
+        )
+        _write_file(
             p("ems_api/routes/devices.py"),
-            """from fastapi import APIRouter
+            """from fastapi import APIRouter, Depends
+
+from ems_api.auth import require_user
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
 
 @router.get("")
-def list_devices():
+def list_devices(user=Depends(require_user)):
     return []
 """,
         )
         _write_file(
             p("ems_api/routes/reports.py"),
-            """from fastapi import APIRouter
+            """from fastapi import APIRouter, Depends
+
+from ems_api.auth import require_user
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
 
 @router.get("")
-def list_reports():
+def list_reports(user=Depends(require_user)):
     return []
+""",
+        )
+        _write_file(
+            p("scripts/issue_dev_token.py"),
+            """import os
+import time
+
+import jwt
+
+
+def main() -> None:
+    secret = os.environ.get("EMS_JWT_SECRET", "").strip()
+    if not secret:
+        raise SystemExit("EMS_JWT_SECRET is required")
+    issuer = os.environ.get("EMS_JWT_ISSUER", "xyn-ems")
+    audience = os.environ.get("EMS_JWT_AUDIENCE", "ems")
+    now = int(time.time())
+    payload = {
+        "iss": issuer,
+        "aud": audience,
+        "iat": now,
+        "exp": now + 3600,
+        "sub": "dev-user",
+        "email": "dev@example.com",
+        "roles": ["admin"],
+    }
+    token = jwt.encode(payload, secret, algorithm="HS256")
+    print(token)
+
+
+if __name__ == "__main__":
+    main()
 """,
         )
         _write_file(
@@ -288,11 +417,14 @@ def test_health_placeholder():
                 "Dockerfile",
                 "pyproject.toml",
                 "ems_api/__init__.py",
+                "ems_api/auth.py",
                 "ems_api/main.py",
                 "ems_api/routes/__init__.py",
                 "ems_api/routes/health.py",
+                "ems_api/routes/me.py",
                 "ems_api/routes/devices.py",
                 "ems_api/routes/reports.py",
+                "scripts/issue_dev_token.py",
                 "ems_api/tests/test_health.py",
             ]
         )
@@ -356,16 +488,18 @@ def test_rbac_admin():
     if work_item["id"] == "ems-api-devices":
         _write_file(
             p("ems_api/routes/devices.py"),
-            """from fastapi import APIRouter
+            """from fastapi import APIRouter, Depends
+
+from ems_api.auth import require_user
 
 router = APIRouter(prefix="/devices")
 
 @router.get("/")
-def list_devices():
+def list_devices(user=Depends(require_user)):
     return []
 
 @router.post("/")
-def create_device():
+def create_device(user=Depends(require_user)):
     return {"id": "device-1"}
 """,
         )
@@ -379,12 +513,16 @@ def create_device():
     if work_item["id"] == "ems-api-reports":
         _write_file(
             p("ems_api/routes/reports.py"),
-            """from fastapi import APIRouter
+            """from fastapi import APIRouter, Depends
+
+from ems_api.auth import require_user
+
+from ems_api.rbac import require_roles
 
 router = APIRouter(prefix="/reports")
 
 @router.get("/")
-def get_reports():
+def get_reports(user=Depends(require_roles("admin", "viewer"))):
     return {"summary": "placeholder"}
 """,
         )
@@ -477,6 +615,12 @@ If your UI repo lives elsewhere, set:
 export XYN_UI_PATH=/absolute/path/to/xyn-ui/apps/ems-ui
 ```
 
+JWT secret (required for /api/me):
+
+```bash
+export EMS_JWT_SECRET=dev-secret-change-me
+```
+
 To run with verification checks (Docker required):
 
 ```bash
@@ -501,6 +645,7 @@ docker compose -f apps/ems-stack/docker-compose.yml down -v
 POSTGRES_PASSWORD=ems
 POSTGRES_DB=ems
 XYN_UI_PATH=../../xyn-ui/apps/ems-ui
+EMS_JWT_SECRET=dev-secret-change-me
 """,
         )
         _write_file(
@@ -521,6 +666,9 @@ XYN_UI_PATH=../../xyn-ui/apps/ems-ui
       dockerfile: Dockerfile
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}
+      EMS_JWT_SECRET: ${EMS_JWT_SECRET:-dev-secret-change-me}
+      EMS_JWT_ISSUER: ${EMS_JWT_ISSUER:-xyn-ems}
+      EMS_JWT_AUDIENCE: ${EMS_JWT_AUDIENCE:-ems}
     depends_on:
       - postgres
     expose:
@@ -600,6 +748,892 @@ cleanup() {
 trap cleanup EXIT
 
 docker compose -f "$ROOT_DIR/docker-compose.yml" up -d --build
+sleep 2
+healthy=0
+for i in {1..60}; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health || true)
+  if [ "$code" = "200" ]; then
+    healthy=1
+    break
+  fi
+  sleep 1
+done
+
+if [ "$healthy" -ne 1 ]; then
+  echo "Health check failed: /health did not become ready in time."
+  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-api || true
+  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 nginx || true
+  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-ui || true
+  exit 1
+fi
+
+api_healthy=0
+for i in {1..30}; do
+  api_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/health || true)
+  if [ "$api_code" = "200" ]; then
+    api_healthy=1
+    break
+  fi
+  sleep 1
+done
+
+if [ "$api_healthy" -ne 1 ]; then
+  echo "API health check failed: /api/health did not become ready in time."
+  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-api || true
+  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 nginx || true
+  exit 1
+fi
+sleep 2
+for i in {1..10}; do
+  status_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/me)
+  if [ "$status_code" = "401" ]; then
+    break
+  fi
+  sleep 1
+done
+if [ "$status_code" != "401" ]; then
+  echo "Expected /api/me to return 401 without token, got ${status_code}"
+  exit 1
+fi
+viewer_token=$(docker compose -f "$ROOT_DIR/docker-compose.yml" exec -T ems-api python scripts/issue_dev_token.py --role viewer)
+for i in {1..10}; do
+  viewer_list_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${viewer_token}" http://localhost:8080/api/devices)
+  if [ "$viewer_list_code" = "200" ]; then
+    break
+  fi
+  sleep 1
+done
+if [ "$viewer_list_code" != "200" ]; then
+  echo "Expected viewer GET /api/devices to return 200, got ${viewer_list_code}"
+  exit 1
+fi
+viewer_status=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${viewer_token}" -H "Content-Type: application/json" -d '{"name":"dev-viewer"}' http://localhost:8080/api/devices)
+if [ "$viewer_status" != "403" ]; then
+  echo "Expected viewer POST /api/devices to return 403, got ${viewer_status}"
+  exit 1
+fi
+admin_token=$(docker compose -f "$ROOT_DIR/docker-compose.yml" exec -T ems-api python scripts/issue_dev_token.py --role admin)
+for i in {1..10}; do
+  admin_me_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${admin_token}" http://localhost:8080/api/me)
+  if [ "$admin_me_code" = "200" ]; then
+    break
+  fi
+  sleep 1
+done
+if [ "$admin_me_code" != "200" ]; then
+  echo "Expected admin GET /api/me to return 200, got ${admin_me_code}"
+  exit 1
+fi
+admin_post=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${admin_token}" -H "Content-Type: application/json" -d '{"name":"dev1"}' http://localhost:8080/api/devices)
+if [ "$admin_post" != "200" ] && [ "$admin_post" != "201" ]; then
+  echo "Expected admin POST /api/devices to return 200/201, got ${admin_post}"
+  exit 1
+fi
+admin_list=$(curl -s -H "Authorization: Bearer ${admin_token}" http://localhost:8080/api/devices || true)
+echo "$admin_list" | grep -q "dev1"
+curl -fsS -H "Authorization: Bearer ${admin_token}" -H "Content-Type: application/json" -d '{"name":"persist1"}' http://localhost:8080/api/devices >/dev/null
+docker compose -f "$ROOT_DIR/docker-compose.yml" restart ems-api
+for i in {1..30}; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health || true)
+  if [ "$code" = "200" ]; then
+    break
+  fi
+  sleep 1
+done
+curl -fsS -H "Authorization: Bearer ${admin_token}" http://localhost:8080/api/devices | grep -q "persist1"
+ui_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/)
+if [ "$ui_code" != "200" ] && [ "$ui_code" != "302" ]; then
+  echo "Expected UI root to return 200/302, got ${ui_code}"
+  exit 1
+fi
+""",
+        )
+        os.chmod(p("scripts/verify.sh"), 0o755)
+        changed.extend(
+            [
+                "README.md",
+                ".env.example",
+                "docker-compose.yml",
+                "nginx/nginx.conf",
+                "scripts/verify.sh",
+            ]
+        )
+    if work_item["id"] == "ems-authn-jwt-module":
+        _write_file(
+            p("README.md"),
+            """# Module Registry (Local)
+
+This directory holds local module specs that can be seeded into the registry.
+
+- `authn-jwt.json`: JWT verification capability scaffold for EMS.
+""",
+        )
+        _write_file(
+            p("authn-jwt.json"),
+            """{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "authn-jwt",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "authn.jwt.validate"
+    }
+  },
+  "description": "JWT validation module (HS256) for EMS API services.",
+  "module": {
+    "type": "lib",
+    "fqn": "core.authn-jwt",
+    "capabilitiesProvided": [
+      "authn.jwt.validate"
+    ],
+    "interfaces": {
+      "config": {
+        "EMS_JWT_SECRET": "Shared secret for HS256 verification.",
+        "EMS_JWT_ISSUER": "Token issuer (default: xyn-ems).",
+        "EMS_JWT_AUDIENCE": "Token audience (default: ems)."
+      },
+      "claims": {
+        "required": ["sub", "email"],
+        "optional": ["roles"]
+      }
+    },
+    "dependencies": {}
+  }
+}
+""",
+        )
+        changed.extend(["README.md", "authn-jwt.json"])
+    if work_item["id"] == "ems-authz-rbac-module":
+        _write_file(
+            p("README.md"),
+            """# Module Registry (Local)
+
+This directory holds local module specs that can be seeded into the registry.
+
+- `authn-jwt.json`: JWT verification capability scaffold for EMS.
+- `authz-rbac.json`: RBAC enforcement capability scaffold for EMS.
+""",
+        )
+        _write_file(
+            p("authz-rbac.json"),
+            """{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "authz-rbac",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "authz.rbac.enforce"
+    }
+  },
+  "description": "RBAC enforcement helpers for API routes.",
+  "module": {
+    "type": "lib",
+    "fqn": "core.authz-rbac",
+    "capabilitiesProvided": [
+      "authz.rbac.enforce"
+    ],
+    "interfaces": {
+      "roles": ["admin", "viewer"],
+      "policy": "admin: CRUD; viewer: read-only"
+    },
+    "dependencies": {}
+  }
+}
+""",
+        )
+        changed.extend(["README.md", "authz-rbac.json"])
+    if work_item["id"] == "ems-api-jwt-protect-me":
+        _write_file(
+            p("requirements.txt"),
+            """fastapi==0.110.0
+uvicorn==0.27.1
+PyJWT==2.8.0
+SQLAlchemy==2.0.30
+alembic==1.13.1
+psycopg[binary]==3.1.19
+""",
+        )
+        _write_file(
+            p("ems_api/auth.py"),
+            """import os
+from typing import Any, Dict
+
+import jwt
+from fastapi import HTTPException, Request, status
+
+
+def _get_required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Missing required environment variable: {name}",
+        )
+    return value
+
+
+def decode_token(token: str) -> Dict[str, Any]:
+    secret = _get_required_env("EMS_JWT_SECRET")
+    issuer = os.environ.get("EMS_JWT_ISSUER", "xyn-ems")
+    audience = os.environ.get("EMS_JWT_AUDIENCE", "ems")
+    return jwt.decode(
+        token,
+        secret,
+        algorithms=["HS256"],
+        issuer=issuer,
+        audience=audience,
+    )
+
+
+def require_user(request: Request) -> Dict[str, Any]:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+        )
+    token = auth_header.replace("Bearer ", "", 1).strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+        )
+    try:
+        claims = decode_token(token)
+    except jwt.PyJWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {exc}",
+        ) from exc
+    request.state.user = claims
+    return claims
+""",
+        )
+        _write_file(
+            p("ems_api/routes/me.py"),
+            """from fastapi import APIRouter, Depends
+
+from ems_api.auth import require_user
+
+router = APIRouter(prefix="/me", tags=["me"])
+
+
+@router.get("")
+def whoami(user=Depends(require_user)):
+    return {
+        "sub": user.get("sub"),
+        "email": user.get("email"),
+        "roles": user.get("roles", []),
+        "issuer": user.get("iss"),
+        "audience": user.get("aud"),
+    }
+""",
+        )
+        _write_file(
+            p("ems_api/main.py"),
+            """from fastapi import FastAPI
+from ems_api.routes import health, devices, reports, me
+
+app = FastAPI(title="EMS API")
+
+app.include_router(health.router)
+app.include_router(me.router)
+app.include_router(devices.router)
+app.include_router(reports.router)
+""",
+        )
+        _write_file(
+            p("scripts/issue_dev_token.py"),
+            """import os
+import time
+
+import jwt
+
+
+def main() -> None:
+    secret = os.environ.get("EMS_JWT_SECRET", "").strip()
+    if not secret:
+        raise SystemExit("EMS_JWT_SECRET is required")
+    issuer = os.environ.get("EMS_JWT_ISSUER", "xyn-ems")
+    audience = os.environ.get("EMS_JWT_AUDIENCE", "ems")
+    now = int(time.time())
+    payload = {
+        "iss": issuer,
+        "aud": audience,
+        "iat": now,
+        "exp": now + 3600,
+        "sub": "dev-user",
+        "email": "dev@example.com",
+        "roles": ["admin"],
+    }
+    token = jwt.encode(payload, secret, algorithm="HS256")
+    print(token)
+
+
+if __name__ == "__main__":
+    main()
+""",
+        )
+        changed.extend(
+            [
+                "requirements.txt",
+                "ems_api/auth.py",
+                "ems_api/rbac.py",
+                "ems_api/routes/me.py",
+                "ems_api/main.py",
+                "scripts/issue_dev_token.py",
+            ]
+        )
+    if work_item["id"] == "ems-api-db-foundation":
+        _write_file(
+            p("ems_api/db.py"),
+            """import os
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+
+def _database_url() -> str:
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is required")
+    return url
+
+
+def _build_engine():
+    url = _database_url()
+    connect_args = {}
+    if url.startswith("sqlite"):
+        connect_args = {"check_same_thread": False}
+    return create_engine(url, future=True, pool_pre_ping=True, connect_args=connect_args)
+
+
+engine = _build_engine()
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+
+
+def get_db():
+    db: Session = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+""",
+        )
+        _write_file(
+            p("ems_api/models.py"),
+            """import uuid
+
+from sqlalchemy import DateTime, String, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Device(Base):
+    __tablename__ = "devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+""",
+        )
+        changed.extend(["ems_api/db.py", "ems_api/models.py"])
+    if work_item["id"] == "ems-api-alembic-migrations":
+        _write_file(
+            p("alembic.ini"),
+            """[alembic]
+script_location = alembic
+sqlalchemy.url = driver://
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+""",
+        )
+        _write_file(
+            p("alembic/env.py"),
+            """import os
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import engine_from_config, pool
+
+from ems_api.models import Base
+
+
+config = context.config
+if config.config_file_name:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+
+def _get_url() -> str:
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is required for migrations")
+    return url
+
+
+def run_migrations_offline():
+    url = _get_url()
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online():
+    configuration = config.get_section(config.config_ini_section) or {}
+    configuration["sqlalchemy.url"] = _get_url()
+    connectable = engine_from_config(
+        configuration,
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+        future=True,
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+""",
+        )
+        _write_file(
+            p("alembic/versions/20260206_ems_devices.py"),
+            '''"""create devices table
+
+Revision ID: 20260206_ems_devices
+Revises:
+Create Date: 2026-02-06
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+revision = "20260206_ems_devices"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "devices",
+        sa.Column("id", sa.String(length=36), primary_key=True),
+        sa.Column("name", sa.String(length=200), nullable=False),
+        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
+    )
+
+
+def downgrade() -> None:
+    op.drop_table("devices")
+''',
+        )
+        changed.extend(
+            [
+                "alembic.ini",
+                "alembic/env.py",
+                "alembic/versions/20260206_ems_devices.py",
+            ]
+        )
+    if work_item["id"] == "ems-api-container-startup-migrate":
+        _write_file(
+            p("scripts/entrypoint.sh"),
+            """#!/usr/bin/env sh
+set -e
+
+if [ -z "${DATABASE_URL:-}" ]; then
+  echo "DATABASE_URL is required"
+  exit 1
+fi
+
+echo "Running migrations..."
+alembic -c /app/alembic.ini upgrade head
+
+echo "Starting API..."
+exec uvicorn ems_api.main:app --host 0.0.0.0 --port 8000
+""",
+        )
+        _write_file(
+            p("Dockerfile"),
+            """FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \\
+    && pip install --no-cache-dir -r /app/requirements.txt
+
+COPY ems_api /app/ems_api
+COPY scripts /app/scripts
+COPY alembic /app/alembic
+COPY alembic.ini /app/alembic.ini
+
+EXPOSE 8000
+
+RUN chmod +x /app/scripts/entrypoint.sh
+
+CMD ["/app/scripts/entrypoint.sh"]
+""",
+        )
+        changed.extend(["scripts/entrypoint.sh", "Dockerfile"])
+    if work_item["id"] == "ems-api-devices-postgres":
+        _write_file(
+            p("ems_api/routes/devices.py"),
+            """from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ems_api.auth import require_user
+from ems_api.db import get_db
+from ems_api.models import Device
+from ems_api.rbac import require_roles
+
+router = APIRouter(prefix="/devices", tags=["devices"])
+
+
+class DeviceIn(BaseModel):
+    name: str
+
+
+@router.get("")
+def list_devices(user=Depends(require_user), db: Session = Depends(get_db)):
+    devices = db.execute(select(Device)).scalars().all()
+    return [{"id": device.id, "name": device.name} for device in devices]
+
+
+@router.post("")
+def create_device(payload: DeviceIn, user=Depends(require_roles("admin")), db: Session = Depends(get_db)):
+    device = Device(name=payload.name)
+    db.add(device)
+    db.commit()
+    db.refresh(device)
+    return {"id": device.id, "name": device.name}
+
+
+@router.delete("/{device_id}")
+def delete_device(device_id: str, user=Depends(require_roles("admin")), db: Session = Depends(get_db)):
+    device = db.get(Device, device_id)
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    db.delete(device)
+    db.commit()
+    return {"id": device.id, "name": device.name}
+""",
+        )
+        changed.extend(["ems_api/routes/devices.py"])
+    if work_item["id"] == "ems-api-devices-rbac":
+        _write_file(
+            p("ems_api/rbac.py"),
+            """from fastapi import Depends, HTTPException, status
+
+from ems_api.auth import require_user
+
+
+def has_role(user: dict, role: str) -> bool:
+    return role in (user.get("roles") or [])
+
+
+def require_roles(*roles: str):
+    def _check(user=Depends(require_user)):
+        user_roles = set(user.get("roles") or [])
+        if not user_roles.intersection(set(roles)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Missing required role: {', '.join(roles)}",
+            )
+        return user
+
+    return _check
+""",
+        )
+        _write_file(
+            p("ems_api/routes/devices.py"),
+            """import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+
+from ems_api.auth import require_user
+from ems_api.rbac import require_roles
+
+router = APIRouter(prefix="/devices", tags=["devices"])
+_DEVICES: dict[str, dict] = {}
+
+
+class DeviceIn(BaseModel):
+    name: str
+
+
+@router.get("")
+def list_devices(user=Depends(require_user)):
+    return list(_DEVICES.values())
+
+
+@router.post("")
+def create_device(payload: DeviceIn, user=Depends(require_roles("admin"))):
+    device_id = str(uuid.uuid4())
+    device = {"id": device_id, "name": payload.name}
+    _DEVICES[device_id] = device
+    return device
+
+
+@router.delete("/{device_id}")
+def delete_device(device_id: str, user=Depends(require_roles("admin"))):
+    if device_id not in _DEVICES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    return _DEVICES.pop(device_id)
+""",
+        )
+        changed.extend(["ems_api/rbac.py", "ems_api/routes/devices.py"])
+    if work_item["id"] == "ems-token-script-roles":
+        _write_file(
+            p("scripts/issue_dev_token.py"),
+            """import argparse
+import os
+import time
+
+import jwt
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Issue a dev JWT for EMS.")
+    parser.add_argument("--role", choices=["admin", "viewer"], default="admin")
+    args = parser.parse_args()
+    secret = os.environ.get("EMS_JWT_SECRET", "").strip()
+    if not secret:
+        raise SystemExit("EMS_JWT_SECRET is required")
+    issuer = os.environ.get("EMS_JWT_ISSUER", "xyn-ems")
+    audience = os.environ.get("EMS_JWT_AUDIENCE", "ems")
+    now = int(time.time())
+    payload = {
+        "iss": issuer,
+        "aud": audience,
+        "iat": now,
+        "exp": now + 3600,
+        "sub": f"dev-{args.role}",
+        "email": f"{args.role}@example.com",
+        "roles": [args.role],
+    }
+    token = jwt.encode(payload, secret, algorithm="HS256")
+    print(token)
+
+
+if __name__ == "__main__":
+    main()
+""",
+        )
+        changed.extend(["scripts/issue_dev_token.py"])
+    if work_item["id"] == "ems-ui-token-input-me-call":
+        _write_file(
+            p("src/auth/Login.tsx"),
+            """import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
+
+export default function Login() {
+  const [status, setStatus] = useState<"ok" | "down" | "checking">("checking");
+  const [token, setToken] = useState("");
+  const [meResult, setMeResult] = useState<string>("");
+  const [meIdentity, setMeIdentity] = useState<string>("");
+  const meLabel = useMemo(() => (meResult ? "Response:" : "Response will appear here."), [meResult]);
+
+  const checkHealth = useCallback(async () => {
+    setStatus("checking");
+    try {
+      const response = await fetch("/api/health");
+      if (!response.ok) {
+        setStatus("down");
+        return;
+      }
+      const payload = (await response.json()) as { status?: string };
+      setStatus(payload.status === "ok" ? "ok" : "down");
+    } catch {
+      setStatus("down");
+    }
+  }, []);
+
+  const callMe = useCallback(async () => {
+    setMeResult("");
+    setMeIdentity("");
+    try {
+      const response = await fetch("/api/me", {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!response.ok) {
+        setMeResult(`Unauthorized (${response.status})`);
+        return;
+      }
+      const payload = await response.json();
+      if (payload?.email) {
+        setMeIdentity(`Logged in as ${payload.email}`);
+      } else if (payload?.sub) {
+        setMeIdentity(`Logged in as ${payload.sub}`);
+      }
+      setMeResult(JSON.stringify(payload, null, 2));
+    } catch (err) {
+      setMeResult(`Request failed: ${String(err)}`);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    checkHealth();
+  }, [checkHealth]);
+
+  return (
+    <main>
+      <h1>Login (OIDC stub)</h1>
+      <p>This is a placeholder login view.</p>
+      <p>API: {status === "ok" ? "OK" : status === "down" ? "DOWN" : "CHECKING"}</p>
+      <button type="button" onClick={checkHealth}>
+        Retry
+      </button>
+      <div>
+        <label htmlFor="token-input">JWT Token</label>
+        <input
+          id="token-input"
+          type="text"
+          value={token}
+          onChange={(event) => setToken(event.target.value)}
+          placeholder="Paste token from issue_dev_token.py"
+        />
+        <button type="button" onClick={callMe}>
+          Call /api/me
+        </button>
+      </div>
+      {meIdentity ? <p>{meIdentity}</p> : null}
+      <pre>{meLabel}{meResult ? `\n${meResult}` : ""}</pre>
+      <Link to="/devices">Continue to Devices</Link>
+    </main>
+  );
+}
+""",
+        )
+        changed.extend(["src/auth/Login.tsx"])
+    if work_item["id"] == "ems-stack-pass-jwt-secret-and-verify-me":
+        _write_file(
+            p(".env.example"),
+            """POSTGRES_USER=ems
+POSTGRES_PASSWORD=ems
+POSTGRES_DB=ems
+XYN_UI_PATH=../../xyn-ui/apps/ems-ui
+EMS_JWT_SECRET=dev-secret-change-me
+""",
+        )
+        _write_file(
+            p("docker-compose.yml"),
+            """services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ems}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ems}
+      POSTGRES_DB: ${POSTGRES_DB:-ems}
+    volumes:
+      - ems_pgdata:/var/lib/postgresql/data
+
+  ems-api:
+    build:
+      context: ../../apps/ems-api
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}
+      EMS_JWT_SECRET: ${EMS_JWT_SECRET:-dev-secret-change-me}
+      EMS_JWT_ISSUER: ${EMS_JWT_ISSUER:-xyn-ems}
+      EMS_JWT_AUDIENCE: ${EMS_JWT_AUDIENCE:-ems}
+    depends_on:
+      - postgres
+    expose:
+      - "8000"
+
+  ems-ui:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}:/app
+    command: sh -lc "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    expose:
+      - "5173"
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - ems-api
+      - ems-ui
+
+volumes:
+  ems_pgdata: {}
+""",
+        )
+        _write_file(
+            p("scripts/verify.sh"),
+            """#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
+
+if [ "${VERIFY_DOCKER:-}" != "1" ]; then
+  echo "VERIFY_DOCKER not set; skipping Docker verification."
+  exit 0
+fi
+
+cleanup() {
+  docker compose -f "$ROOT_DIR/docker-compose.yml" down -v
+}
+
+trap cleanup EXIT
+
+docker compose -f "$ROOT_DIR/docker-compose.yml" up -d --build
 healthy=0
 for i in {1..30}; do
   if curl -fsS http://localhost:8080/health >/dev/null; then
@@ -615,19 +1649,18 @@ if [ "$healthy" -ne 1 ]; then
 fi
 
 curl -fsS http://localhost:8080/api/health >/dev/null
+status_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/me)
+if [ "$status_code" != "401" ]; then
+  echo "Expected /api/me to return 401 without token, got ${status_code}"
+  exit 1
+fi
+token=$(docker compose -f "$ROOT_DIR/docker-compose.yml" exec -T ems-api python scripts/issue_dev_token.py)
+curl -fsS -H "Authorization: Bearer ${token}" http://localhost:8080/api/me >/dev/null
 curl -fsS -o /dev/null -w "%{http_code}\n" http://localhost:8080/ | grep -E "^(200|302)$"
 """,
         )
         os.chmod(p("scripts/verify.sh"), 0o755)
-        changed.extend(
-            [
-                "README.md",
-                ".env.example",
-                "docker-compose.yml",
-                "nginx/nginx.conf",
-                "scripts/verify.sh",
-            ]
-        )
+        changed.extend([".env.example", "docker-compose.yml", "scripts/verify.sh"])
     if work_item["id"] == "ems-ui-scaffold":
         _write_file(
             p("README.md"),
@@ -751,11 +1784,15 @@ export default function RoutesView() {
         )
         _write_file(
             p("src/auth/Login.tsx"),
-            """import { useCallback, useEffect, useState } from "react";
+            """import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 export default function Login() {
   const [status, setStatus] = useState<"ok" | "down" | "checking">("checking");
+  const [token, setToken] = useState("");
+  const [meResult, setMeResult] = useState<string>("");
+  const [meIdentity, setMeIdentity] = useState<string>("");
+  const meLabel = useMemo(() => (meResult ? "Response:" : "Response will appear here."), [meResult]);
 
   const checkHealth = useCallback(async () => {
     setStatus("checking");
@@ -772,6 +1809,29 @@ export default function Login() {
     }
   }, []);
 
+  const callMe = useCallback(async () => {
+    setMeResult("");
+    setMeIdentity("");
+    try {
+      const response = await fetch("/api/me", {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!response.ok) {
+        setMeResult(`Unauthorized (${response.status})`);
+        return;
+      }
+      const payload = await response.json();
+      if (payload?.email) {
+        setMeIdentity(`Logged in as ${payload.email}`);
+      } else if (payload?.sub) {
+        setMeIdentity(`Logged in as ${payload.sub}`);
+      }
+      setMeResult(JSON.stringify(payload, null, 2));
+    } catch (err) {
+      setMeResult(`Request failed: ${String(err)}`);
+    }
+  }, [token]);
+
   useEffect(() => {
     checkHealth();
   }, [checkHealth]);
@@ -784,6 +1844,21 @@ export default function Login() {
       <button type="button" onClick={checkHealth}>
         Retry
       </button>
+      <div>
+        <label htmlFor="token-input">JWT Token</label>
+        <input
+          id="token-input"
+          type="text"
+          value={token}
+          onChange={(event) => setToken(event.target.value)}
+          placeholder="Paste token from issue_dev_token.py"
+        />
+        <button type="button" onClick={callMe}>
+          Call /api/me
+        </button>
+      </div>
+      {meIdentity ? <p>{meIdentity}</p> : null}
+      <pre>{meLabel}{meResult ? `\n${meResult}` : ""}</pre>
       <Link to="/devices">Continue to Devices</Link>
     </main>
   );

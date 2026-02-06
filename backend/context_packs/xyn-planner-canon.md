@@ -7,12 +7,18 @@ Scope: global
 - Schema file: `schemas/implementation_plan.v1.schema.json`
 - Output must conform to `schema_version: implementation_plan.v1`.
 - Primary output is `work_items[]` with actionable steps.
+- Include `capabilities_required` and `module_refs` per work_item.
+- Include `plan_rationale` with gaps detected and why the next slice was chosen.
+- Use `module_catalog.v1.json` and `run_history_summary.v1.json` artifacts as inputs.
 
 ## Planning Algorithm
-1. Parse blueprint spec and metadata into a module inventory and system goals.
-2. Expand into ordered `work_items` with explicit repo targets, inputs, outputs, and verification.
-3. Assign labels: `scaffold`, `auth`, `rbac`, `deploy`, `dns`, `reports`, `ui`, `api`, `infra`.
-4. Ensure dependencies reflect build order: scaffold -> auth -> rbac -> features -> deploy.
+1. Read `module_catalog.v1.json` to determine available modules/capabilities.
+2. Read `run_history_summary.v1.json` to avoid already-completed work items.
+3. Parse blueprint spec and metadata into system goals and acceptance checks.
+4. Identify gaps vs acceptance checks and select the next slice of work.
+5. Expand into ordered `work_items` with explicit repo targets, inputs, outputs, and verification.
+6. Assign labels: `scaffold`, `auth`, `rbac`, `deploy`, `dns`, `reports`, `ui`, `api`, `infra`, plus `module:<id>` and `capability:<cap>`.
+7. Ensure dependencies reflect build order: scaffold -> auth -> rbac -> features -> deploy.
 
 ## ReleaseSpec Expectations
 ReleaseSpec must include:
@@ -30,3 +36,4 @@ ReleaseSpec must include:
 ## Guardrails
 - Planner produces plans/specs only. Do not write repo files.
 - Always include `verify` commands for each work_item.
+- Never select already completed work_items when run history marks them succeeded.

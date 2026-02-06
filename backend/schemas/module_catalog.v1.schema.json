@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xyence.io/schemas/module_catalog.v1.schema.json",
+  "title": "Module Catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "modules"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "module_catalog.v1"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "modules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/definitions/moduleEntry"}
+    }
+  },
+  "definitions": {
+    "moduleEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "capabilities", "repo"],
+      "properties": {
+        "id": {"type": "string"},
+        "version": {"type": "string"},
+        "capabilities": {"type": "array", "items": {"type": "string"}},
+        "repo": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "url", "ref", "path_root"],
+          "properties": {
+            "name": {"type": "string"},
+            "url": {"type": "string"},
+            "ref": {"type": "string"},
+            "path_root": {"type": "string"}
+          }
+        },
+        "templates": {"type": "array", "items": {"type": "string"}},
+        "default_work_items": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

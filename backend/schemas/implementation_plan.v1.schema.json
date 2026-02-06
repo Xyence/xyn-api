@@ -48,6 +48,15 @@
     "notes": {
       "type": "string"
     },
+    "plan_rationale": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gaps_detected": {"type": "array", "items": {"type": "string"}},
+        "modules_selected": {"type": "array", "items": {"type": "string"}},
+        "why_next": {"type": "array", "items": {"type": "string"}}
+      }
+    },
     "tasks": {
       "type": "array",
       "items": {
@@ -148,6 +157,22 @@
           "type": "array",
           "items": {"type": "string"},
           "default": []
+        },
+        "capabilities_required": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "module_refs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "version"],
+            "properties": {
+              "id": {"type": "string"},
+              "version": {"type": "string"}
+            }
+          }
         },
         "context_purpose_override": {
           "type": "string",
