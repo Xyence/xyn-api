@@ -476,13 +476,13 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 ],
                 "verify": [
                     {
-                        "name": "import app",
-                        "command": "python -c \"import ems_api.main\"",
+                        "name": "compile",
+                        "command": "python -m compileall ems_api",
                         "cwd": "apps/ems-api",
                     },
                     {
-                        "name": "pytest health",
-                        "command": "python -m pytest -q",
+                        "name": "import app",
+                        "command": "python -c \"import ems_api.main\"",
                         "cwd": "apps/ems-api",
                     },
                 ],

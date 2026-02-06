@@ -11,6 +11,8 @@ django-allauth>=0.61,<1.0
 requests>=2.32,<3.0
 # JSON schema validation
 jsonschema>=4.22,<5.0
+# EMS scaffold verification
+fastapi==0.110.0
 # Google Speech-to-Text
 google-cloud-speech>=2.26,<3.0
 # Redis queue
