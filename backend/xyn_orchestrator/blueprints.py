@@ -606,7 +606,11 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                     "UI app renders basic layout and navigation.",
                 ],
                 "verify": [
-                    {"name": "ui-structure", "command": "test -f src/App.tsx && test -f src/main.tsx", "cwd": "apps/ems-ui"},
+                    {
+                        "name": "ui-structure",
+                        "command": "test -f src/App.tsx && test -f src/main.tsx && test -f src/routes.tsx && test -f src/auth/Login.tsx && test -f src/devices/DeviceList.tsx && test -f src/reports/Reports.tsx",
+                        "cwd": "apps/ems-ui",
+                    },
                 ],
                 "depends_on": [],
                 "labels": ["scaffold", "ui"],

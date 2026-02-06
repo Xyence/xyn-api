@@ -449,7 +449,8 @@ Scaffold for EMS UI.
     "typescript": "^5.4.5",
     "vite": "^5.4.0"
   }
-}""",
+}
+""",
         )
         _write_file(
             p("tsconfig.json"),
@@ -462,7 +463,8 @@ Scaffold for EMS UI.
     "strict": true,
     "skipLibCheck": true
   }
-}""",
+}
+""",
         )
         _write_file(
             p("vite.config.ts"),
@@ -537,6 +539,54 @@ export default function RoutesView() {
 """,
         )
         _write_file(
+            p("src/auth/Login.tsx"),
+            """import { Link } from "react-router-dom";
+
+export default function Login() {
+  return (
+    <main>
+      <h1>Login (OIDC stub)</h1>
+      <p>This is a placeholder login view.</p>
+      <Link to="/devices">Continue to Devices</Link>
+    </main>
+  );
+}
+""",
+        )
+        _write_file(
+            p("src/devices/DeviceList.tsx"),
+            """import { Link } from "react-router-dom";
+
+export default function DeviceList() {
+  return (
+    <main>
+      <h1>Devices</h1>
+      <ul>
+        <li>device-1</li>
+        <li>device-2</li>
+      </ul>
+      <Link to="/reports">View Reports</Link>
+    </main>
+  );
+}
+""",
+        )
+        _write_file(
+            p("src/reports/Reports.tsx"),
+            """import { Link } from "react-router-dom";
+
+export default function Reports() {
+  return (
+    <main>
+      <h1>Reports</h1>
+      <p>Placeholder report data.</p>
+      <Link to="/devices">Back to Devices</Link>
+    </main>
+  );
+}
+""",
+        )
+        _write_file(
             p("src/styles.css"),
             """body { font-family: sans-serif; margin: 0; padding: 0; }
 """,
@@ -551,6 +601,9 @@ export default function RoutesView() {
                 "src/main.tsx",
                 "src/App.tsx",
                 "src/routes.tsx",
+                "src/auth/Login.tsx",
+                "src/devices/DeviceList.tsx",
+                "src/reports/Reports.tsx",
                 "src/styles.css",
             ]
         )

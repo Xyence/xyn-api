@@ -182,3 +182,31 @@ class PipelineSchemaTests(TestCase):
         success = _mark_noop_codegen(False, "noop-item", errors)
         self.assertFalse(success)
         self.assertEqual(errors[0]["code"], "no_changes")
+
+    def test_ui_scaffold_writes_imports(self):
+        work_item = {
+            "id": "ems-ui-scaffold",
+            "repo_targets": [
+                {
+                    "name": "xyn-ui",
+                    "url": "https://example.com/xyn-ui",
+                    "ref": "main",
+                    "path_root": "apps/ems-ui",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(work_item, repo_dir)
+            app_root = Path(repo_dir, "apps/ems-ui/src")
+            expected = [
+                "App.tsx",
+                "main.tsx",
+                "routes.tsx",
+                "auth/Login.tsx",
+                "devices/DeviceList.tsx",
+                "reports/Reports.tsx",
+            ]
+            for rel in expected:
+                self.assertTrue((app_root / rel).exists(), rel)
