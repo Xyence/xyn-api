@@ -190,7 +190,9 @@ def provision_instance(payload: Dict[str, Any], user) -> ProvisionedInstance:
             params["IamInstanceProfile"] = {"Name": instance_profile_name}
 
         resp = client.run_instances(**params)
-        instance_id = resp["Instances"][0]["InstanceId"]
+        instance_id = resp.get("Instances", [{}])[0].get("InstanceId")
+        if not instance_id:
+            raise ValueError("EC2 did not return an InstanceId.")
         instance.instance_id = instance_id
         instance.save(update_fields=["instance_id", "updated_at"])
     except (ClientError, BotoCoreError, ValueError) as exc:
@@ -203,6 +205,11 @@ def provision_instance(payload: Dict[str, Any], user) -> ProvisionedInstance:
 
 
 def refresh_instance(instance: ProvisionedInstance) -> ProvisionedInstance:
+    if not instance.instance_id:
+        instance.status = "error"
+        instance.last_error = "InstanceId missing; instance was not provisioned."
+        instance.save(update_fields=["status", "last_error", "updated_at"])
+        return instance
     client = _ec2(instance.aws_region)
     try:
         resp = client.describe_instances(InstanceIds=[instance.instance_id])
