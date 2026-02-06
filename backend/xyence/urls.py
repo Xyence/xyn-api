@@ -75,6 +75,7 @@ from articles.provisioning_views import (
     destroy_instance_view,
     get_instance,
     list_instances,
+    retry_instance_view,
 )
 from articles.public_views import public_article_detail, public_articles
 from articles.xyn_api import (
@@ -199,6 +200,7 @@ urlpatterns = [
     path("xyn/api/provision/instances", list_instances),
     path("xyn/api/provision/instances/<uuid:instance_id>", get_instance),
     path("xyn/api/provision/instances/<uuid:instance_id>/destroy", destroy_instance_view),
+    path("xyn/api/provision/instances/<uuid:instance_id>/retry", retry_instance_view),
     path("xyn/api/provision/instances/<uuid:instance_id>/bootstrap-log", bootstrap_log_view),
     path("xyn/internal/voice-notes/<uuid:voice_note_id>", internal_voice_note),
     path("xyn/internal/voice-notes/<uuid:voice_note_id>/audio", internal_voice_note_audio),

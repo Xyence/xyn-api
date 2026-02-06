@@ -9,6 +9,7 @@ from django.contrib.auth.decorators import login_required
 from .models import ProvisionedInstance
 from .provisioning import (
     provision_instance,
+    retry_provision_instance,
     refresh_instance,
     destroy_instance,
     fetch_bootstrap_log,
@@ -83,6 +84,21 @@ def destroy_instance_view(request: HttpRequest, instance_id: str) -> JsonRespons
         return JsonResponse({"error": "POST required"}, status=405)
     instance = get_object_or_404(ProvisionedInstance, id=instance_id)
     instance = destroy_instance(instance)
+    return JsonResponse(_instance_payload(instance))
+
+
+@csrf_exempt
+@login_required
+def retry_instance_view(request: HttpRequest, instance_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    try:
+        instance = retry_provision_instance(instance, request.user)
+    except Exception as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
     return JsonResponse(_instance_payload(instance))
 
 

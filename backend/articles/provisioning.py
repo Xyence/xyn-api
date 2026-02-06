@@ -204,6 +204,88 @@ def provision_instance(payload: Dict[str, Any], user) -> ProvisionedInstance:
     return instance
 
 
+def retry_provision_instance(instance: ProvisionedInstance, user) -> ProvisionedInstance:
+    region = instance.aws_region or DEFAULT_REGION
+    if not region:
+        raise ValueError("AWS region required (AWS_REGION or instance.aws_region)")
+    ami_id = instance.ami_id or DEFAULT_AMI
+    if not ami_id:
+        raise ValueError("AMI ID required (XYENCE_PROVISION_AMI or instance.ami_id)")
+    instance_type = instance.instance_type or DEFAULT_INSTANCE_TYPE
+    name = instance.name or f"xyn-seed-{dt.datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    subnet_id = instance.subnet_id or ""
+    vpc_id = instance.vpc_id or ""
+    key_name = None
+    repo_url = DEFAULT_REPO_URL
+    instance_profile_arn = DEFAULT_INSTANCE_PROFILE_ARN
+    instance_profile_name = None
+
+    sg_id = instance.security_group_id or _ensure_security_group(region, vpc_id or None)
+    user_data = _build_user_data(repo_url)
+
+    instance.aws_region = region
+    instance.ami_id = ami_id
+    instance.instance_type = instance_type
+    instance.security_group_id = sg_id
+    instance.status = "provisioning"
+    instance.last_error = ""
+    instance.updated_by = user
+    instance.save(
+        update_fields=[
+            "aws_region",
+            "ami_id",
+            "instance_type",
+            "security_group_id",
+            "status",
+            "last_error",
+            "updated_by",
+            "updated_at",
+        ]
+    )
+
+    try:
+        client = _ec2(region)
+        params: Dict[str, Any] = {
+            "ImageId": ami_id,
+            "InstanceType": instance_type,
+            "MinCount": 1,
+            "MaxCount": 1,
+            "SecurityGroupIds": [sg_id],
+            "UserData": user_data,
+            "TagSpecifications": [
+                {
+                    "ResourceType": "instance",
+                    "Tags": [
+                        {"Key": "Name", "Value": name},
+                        {"Key": "xyn-instance", "Value": name},
+                    ],
+                }
+            ],
+        }
+        if subnet_id:
+            params["SubnetId"] = subnet_id
+        if key_name:
+            params["KeyName"] = key_name
+        if instance_profile_arn:
+            params["IamInstanceProfile"] = {"Arn": instance_profile_arn}
+        elif instance_profile_name:
+            params["IamInstanceProfile"] = {"Name": instance_profile_name}
+
+        resp = client.run_instances(**params)
+        instance_id = resp.get("Instances", [{}])[0].get("InstanceId")
+        if not instance_id:
+            raise ValueError("EC2 did not return an InstanceId.")
+        instance.instance_id = instance_id
+        instance.save(update_fields=["instance_id", "updated_at"])
+    except (ClientError, BotoCoreError, ValueError) as exc:
+        instance.status = "error"
+        instance.last_error = str(exc)
+        instance.save(update_fields=["status", "last_error", "updated_at"])
+        raise
+
+    return instance
+
+
 def refresh_instance(instance: ProvisionedInstance) -> ProvisionedInstance:
     if not instance.instance_id:
         instance.status = "error"
