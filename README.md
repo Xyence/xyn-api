@@ -78,6 +78,23 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml exec backend pyt
 - Access AI Studio at `http://localhost:8000/admin/ai-studio/` to generate drafts.
 - Each AI draft is stored as an `ArticleVersion` and applied to the article as a draft.
 
+## Blueprint Pipeline (Local)
+1. Seed context packs:
+```
+docker compose exec backend python manage.py seed_context_packs
+```
+2. Create or update a blueprint in xyn-ui, then click `Submit & Queue DevTasks`.
+3. Ensure the worker is running:
+```
+docker compose up -d worker
+```
+4. The pipeline will generate `implementation_plan.json`, queue work-item dev tasks, and emit `codegen_result.json` artifacts with patches.
+
+Optional codegen flags:
+- `XYENCE_CODEGEN_GIT_TOKEN` for cloning private repos
+- `XYENCE_CODEGEN_COMMIT=1` to commit patches
+- `XYENCE_CODEGEN_PUSH=1` to push the codegen branch
+
 ## Xyn Seed (service management)
 - Manage long-running releases at `http://localhost:8000/admin/xyn-seed/`.
 - Configure the control plane with env vars:

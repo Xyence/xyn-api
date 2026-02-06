@@ -17,6 +17,11 @@ INTERNAL_BASE_URL = os.environ.get("XYENCE_INTERNAL_BASE_URL", "http://backend:8
 INTERNAL_TOKEN = os.environ.get("XYENCE_INTERNAL_TOKEN", "").strip()
 CONTRACTS_ROOT = os.environ.get("XYNSEED_CONTRACTS_ROOT", "/xyn-contracts")
 MEDIA_ROOT = os.environ.get("XYENCE_MEDIA_ROOT", "/app/media")
+SCHEMA_ROOT = os.environ.get("XYENCE_SCHEMA_ROOT", "/app/schemas")
+CODEGEN_WORKDIR = os.environ.get("XYENCE_CODEGEN_WORKDIR", "/tmp/xyn-codegen")
+CODEGEN_GIT_TOKEN = os.environ.get("XYENCE_CODEGEN_GIT_TOKEN", "").strip()
+CODEGEN_COMMIT = os.environ.get("XYENCE_CODEGEN_COMMIT", "").strip() == "1"
+CODEGEN_PUSH = os.environ.get("XYENCE_CODEGEN_PUSH", "").strip() == "1"
 
 
 def _headers() -> Dict[str, str]:
@@ -72,6 +77,225 @@ def _download_artifact_json(run_id: str, name: str) -> Optional[Dict[str, Any]]:
         return response.json()
     content = _download_file(url)
     return json.loads(content.decode("utf-8"))
+
+
+def _load_schema(filename: str) -> Dict[str, Any]:
+    path = os.path.join(SCHEMA_ROOT, filename)
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _validate_schema(payload: Dict[str, Any], filename: str) -> List[str]:
+    schema = _load_schema(filename)
+    validator = Draft202012Validator(schema)
+    errors = []
+    for err in validator.iter_errors(payload):
+        errors.append(f"{'.'.join(str(p) for p in err.path)}: {err.message}")
+    return errors
+
+
+def _ensure_repo_workspace(repo: Dict[str, Any], workspace_root: str) -> str:
+    os.makedirs(workspace_root, exist_ok=True)
+    repo_name = repo["name"]
+    repo_dir = os.path.join(workspace_root, repo_name)
+    if os.path.exists(repo_dir) and os.path.isdir(os.path.join(repo_dir, ".git")):
+        return repo_dir
+    url = repo["url"]
+    if repo.get("auth") == "https_token" and CODEGEN_GIT_TOKEN and url.startswith("https://"):
+        url = url.replace("https://", f"https://{CODEGEN_GIT_TOKEN}@")
+    os.system(f"rm -rf {repo_dir}")
+    os.system(f"git clone --depth 1 --branch {repo.get('ref', 'main')} {url} {repo_dir}")
+    return repo_dir
+
+
+def _git_cmd(repo_dir: str, cmd: str) -> int:
+    return os.system(f"cd {repo_dir} && {cmd}")
+
+
+def _write_file(path: str, content: str, executable: bool = False) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    if executable:
+        os.chmod(path, 0o755)
+
+
+def _collect_git_diff(repo_dir: str) -> str:
+    _git_cmd(repo_dir, "git add -A")
+    return os.popen(f"cd {repo_dir} && git diff --cached --patch").read()
+
+
+def _list_changed_files(repo_dir: str) -> List[str]:
+    output = os.popen(f"cd {repo_dir} && git diff --cached --name-only").read()
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _apply_scaffold_for_work_item(work_item: Dict[str, Any], repo_dir: str) -> List[str]:
+    path_root = work_item["repo_targets"][0].get("path_root", "").strip("/")
+    changed: List[str] = []
+
+    def p(rel: str) -> str:
+        return os.path.join(repo_dir, path_root, rel)
+
+    if work_item["id"] == "ems-api-scaffold":
+        _write_file(
+            p("README.md"),
+            """# EMS API
+
+Scaffold for EMS API.
+""",
+        )
+        _write_file(
+            p("main.py"),
+            """from fastapi import FastAPI
+
+app = FastAPI(title="EMS API")
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+""",
+        )
+        changed.extend(["README.md", "main.py"])
+    if work_item["id"] == "ems-api-authn-oidc":
+        _write_file(
+            p("auth/oidc.py"),
+            """def oidc_config():
+    return {
+        'issuer': '<OIDC_ISSUER>',
+        'client_id': '<OIDC_CLIENT_ID>',
+    }
+
+
+def login():
+    return {"token": "<jwt>"}
+""",
+        )
+        changed.append("auth/oidc.py")
+    if work_item["id"] == "ems-api-rbac":
+        _write_file(
+            p("auth/rbac.py"),
+            """ROLES = ['admin', 'operator', 'viewer']
+
+
+def can(role: str, action: str) -> bool:
+    if role == 'admin':
+        return True
+    if role == 'viewer' and action in {'read'}:
+        return True
+    if role == 'operator' and action in {'read', 'write'}:
+        return True
+    return False
+""",
+        )
+        changed.append("auth/rbac.py")
+    if work_item["id"] == "ems-api-devices":
+        _write_file(
+            p("routes/devices.py"),
+            """from fastapi import APIRouter
+
+router = APIRouter(prefix="/devices")
+
+@router.get("/")
+def list_devices():
+    return []
+
+@router.post("/")
+def create_device():
+    return {"id": "device-1"}
+""",
+        )
+        changed.append("routes/devices.py")
+    if work_item["id"] == "ems-api-reports":
+        _write_file(
+            p("routes/reports.py"),
+            """from fastapi import APIRouter
+
+router = APIRouter(prefix="/reports")
+
+@router.get("/")
+def get_reports():
+    return {"summary": "placeholder"}
+""",
+        )
+        changed.append("routes/reports.py")
+    if work_item["id"] == "ems-dns-route53":
+        _write_file(
+            p("integrations/route53.py"),
+            """def ensure_record(subdomain: str, target: str) -> None:
+    # TODO: implement Route53 record management
+    return None
+""",
+        )
+        changed.append("integrations/route53.py")
+    if work_item["id"] == "ems-deploy-compose":
+        _write_file(
+            p("deploy/docker-compose.yml"),
+            """version: '3.9'
+services:
+  ems-api:
+    image: ems-api:latest
+    ports:
+      - '8000:8000'
+  ems-ui:
+    image: ems-ui:latest
+    ports:
+      - '3000:80'
+""",
+        )
+        _write_file(
+            p("deploy/nginx.conf"),
+            """server {
+  listen 80;
+  server_name _;
+}
+""",
+        )
+        changed.extend(["deploy/docker-compose.yml", "deploy/nginx.conf"])
+    if work_item["id"] == "ems-ui-scaffold":
+        _write_file(
+            p("README.md"),
+            """# EMS UI
+
+Scaffold for EMS UI.
+""",
+        )
+        _write_file(
+            p("src/App.tsx"),
+            """export default function App() {
+  return <div>EMS UI</div>;
+}
+""",
+        )
+        changed.extend(["README.md", "src/App.tsx"])
+    if work_item["id"] == "ems-ui-auth":
+        _write_file(
+            p("src/auth/Login.tsx"),
+            """export default function Login() {
+  return <div>Login</div>;
+}
+""",
+        )
+        changed.append("src/auth/Login.tsx")
+    if work_item["id"] == "ems-ui-devices":
+        _write_file(
+            p("src/devices/DeviceList.tsx"),
+            """export default function DeviceList() {
+  return <div>Devices</div>;
+}
+""",
+        )
+        changed.append("src/devices/DeviceList.tsx")
+    if work_item["id"] == "ems-ui-reports":
+        _write_file(
+            p("src/reports/Reports.tsx"),
+            """export default function Reports() {
+  return <div>Reports</div>;
+}
+""",
+        )
+        changed.append("src/reports/Reports.tsx")
+    return changed
 
 
 def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dict[str, Any]:
@@ -505,24 +729,155 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             {"append_log": f"Task type: {task.get('task_type')}\n"},
         )
         if task_type == "codegen":
-            payload = {
+            started_at = datetime.utcnow().isoformat() + "Z"
+            plan_json = None
+            if source_run:
+                plan_json = _download_artifact_json(source_run, input_artifact_key)
+            if not plan_json:
+                raise RuntimeError("implementation_plan.json not found for codegen task")
+            work_item_id = task.get("work_item_id") or ""
+            work_item = None
+            for item in plan_json.get("work_items", []):
+                if item.get("id") == work_item_id:
+                    work_item = item
+                    break
+            if not work_item:
+                raise RuntimeError(f"work_item_id not found in plan: {work_item_id}")
+            workspace_root = os.path.join(CODEGEN_WORKDIR, task_id)
+            os.system(f"rm -rf {workspace_root}")
+            os.makedirs(workspace_root, exist_ok=True)
+            repo_results = []
+            artifacts = []
+            errors = []
+            success = True
+            for repo in work_item.get("repo_targets", []):
+                repo_dir = _ensure_repo_workspace(repo, workspace_root)
+                _apply_scaffold_for_work_item(work_item, repo_dir)
+                diff = _collect_git_diff(repo_dir)
+                files_changed = _list_changed_files(repo_dir)
+                patches = []
+                if diff.strip():
+                    patch_name = f"codegen_patch_{repo['name']}.diff"
+                    patch_url = _write_artifact(run_id, patch_name, diff)
+                    artifacts.append(
+                        {
+                            "key": patch_name,
+                            "content_type": "text/x-diff",
+                            "description": f"Codegen diff for {repo['name']}",
+                        }
+                    )
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": patch_name, "kind": "codegen", "url": patch_url},
+                    )
+                    patches.append({"path_hint": repo.get("path_root", ""), "diff_unified": diff})
+                commands_executed = []
+                for verify in work_item.get("verify", []):
+                    cmd = verify.get("command")
+                    cwd = verify.get("cwd") or "."
+                    full_cwd = os.path.join(repo_dir, cwd)
+                    proc = os.popen(f"cd {full_cwd} && {cmd} 2>&1")
+                    output = proc.read()
+                    exit_status = proc.close()
+                    if exit_status is None:
+                        exit_code = 0
+                    else:
+                        try:
+                            exit_code = os.waitstatus_to_exitcode(exit_status)
+                        except AttributeError:
+                            exit_code = int(exit_status)
+                    stdout_key = f"verify_{repo['name']}_{len(commands_executed)}.log"
+                    stdout_url = _write_artifact(run_id, stdout_key, output)
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": stdout_key, "kind": "verify", "url": stdout_url},
+                    )
+                    commands_executed.append(
+                        {
+                            "command": cmd,
+                            "cwd": cwd,
+                            "exit_code": int(exit_code),
+                            "stdout_artifact": stdout_key,
+                            "stderr_artifact": "",
+                        }
+                    )
+                    expected = verify.get("expect_exit_code", 0)
+                    if int(exit_code) != int(expected):
+                        success = False
+                        errors.append(
+                            {
+                                "code": "verify_failed",
+                                "message": f"Verify failed: {cmd}",
+                                "detail": {"exit_code": exit_code, "expected": expected},
+                            }
+                        )
+                commit_info = None
+                if diff.strip() and CODEGEN_COMMIT:
+                    branch = f"codegen/{task_id}"
+                    _git_cmd(repo_dir, f"git checkout -b {branch}")
+                    _git_cmd(repo_dir, f\"git commit -am \\\"codegen: {work_item_id}\\\"\")
+                    sha = os.popen(f\"cd {repo_dir} && git rev-parse HEAD\").read().strip()
+                    pushed = False
+                    if CODEGEN_PUSH:
+                        _git_cmd(repo_dir, f\"git push -u origin {branch}\")
+                        pushed = True
+                    commit_info = {
+                        "sha": sha,
+                        "message": f"codegen: {work_item_id}",
+                        "branch": branch,
+                        "pushed": pushed,
+                    }
+                repo_results.append(
+                    {
+                        "repo": {
+                            "name": repo.get("name"),
+                            "url": repo.get("url"),
+                            "ref": repo.get("ref"),
+                            "path_root": repo.get("path_root"),
+                        },
+                        "files_changed": files_changed,
+                        "patches": patches,
+                        "commands_executed": commands_executed,
+                        "commit": commit_info,
+                    }
+                )
+            result = {
+                "schema_version": "codegen_result.v1",
                 "task_id": task_id,
-                "task_type": "codegen",
-                "status": "succeeded",
-                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "work_item_id": work_item_id,
+                "blueprint_id": plan_json.get("blueprint_id"),
+                "summary": {
+                    "outcome": "succeeded" if success else "failed",
+                    "changes": f"{len(repo_results)} repo(s) updated",
+                    "risks": "Scaffolds only; requires implementation.",
+                    "next_steps": "Review patches and iterate.",
+                },
+                "repo_results": repo_results,
+                "artifacts": artifacts,
+                "success": success,
+                "started_at": started_at,
+                "finished_at": datetime.utcnow().isoformat() + "Z",
+                "errors": errors,
             }
-            url = _write_artifact(run_id, "codegen_result.json", json.dumps(payload, indent=2))
+            validation_errors = _validate_schema(result, "codegen_result.v1.schema.json")
+            if validation_errors:
+                success = False
+                result["success"] = False
+                result["errors"].append(
+                    {"code": "schema_validation", "message": "Invalid codegen_result", "detail": validation_errors}
+                )
+            url = _write_artifact(run_id, "codegen_result.json", json.dumps(result, indent=2))
             _post_json(
                 f"/xyn/internal/runs/{run_id}/artifacts",
                 {"name": "codegen_result.json", "kind": "codegen", "url": url},
             )
             _post_json(
                 f"/xyn/internal/runs/{run_id}",
-                {"status": "succeeded", "append_log": "Codegen task completed.\n"},
+                {"status": "succeeded" if success else "failed", "append_log": "Codegen task completed.\n"},
             )
             _post_json(
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
-                {"status": "succeeded"},
+                {"status": "succeeded" if success else "failed"},
             )
             return
 
@@ -531,7 +886,12 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             if source_run:
                 plan_json = _download_artifact_json(source_run, input_artifact_key)
             blueprint_id = plan_json.get("blueprint_id") if plan_json else source_entity_id
-            blueprint_fqn = plan_json.get("blueprint") if plan_json else "unknown"
+            blueprint_fqn = (
+                plan_json.get("blueprint_name")
+                or plan_json.get("blueprint")
+                if plan_json
+                else "unknown"
+            )
             release_spec = {
                 "blueprint_id": blueprint_id,
                 "blueprint": blueprint_fqn,
@@ -580,35 +940,44 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             if not plan_json:
                 plan_json = {
                     "blueprint_id": source_entity_id,
-                    "blueprint": "unknown",
+                    "blueprint_name": "unknown",
                     "generated_at": datetime.utcnow().isoformat() + "Z",
-                    "tasks": [],
+                    "work_items": [],
                 }
+            blueprint_name = plan_json.get("blueprint_name") or plan_json.get("blueprint") or "unknown"
             release_plan_payload = {
                 "blueprint_id": plan_json.get("blueprint_id"),
                 "target_kind": "blueprint",
-                "target_fqn": plan_json.get("blueprint", ""),
-                "name": f"Release plan for {plan_json.get('blueprint', 'blueprint')}",
+                "target_fqn": blueprint_name,
+                "name": f"Release plan for {blueprint_name}",
                 "to_version": "0.1.0",
                 "from_version": "",
-                "milestones_json": {"tasks": plan_json.get("tasks", [])},
+                "milestones_json": {"work_items": plan_json.get("work_items", [])},
                 "last_run_id": run_id,
             }
             release_plan = _post_json("/xyn/internal/release-plans/upsert", release_plan_payload)
             release_plan_id = release_plan.get("id")
+            smoke_test = bool(plan_json.get("smoke_test"))
+            steps = [
+                {
+                    "name": "prepare",
+                    "commands": ["mkdir -p /var/lib/xyn/ems"],
+                },
+                {
+                    "name": "deploy",
+                    "commands": ["docker compose -f /var/lib/xyn/ems/docker-compose.yml up -d"],
+                },
+            ]
+            if smoke_test:
+                steps.append({"name": "smoke-test", "commands": ["uname -a"]})
             release_plan_json = {
                 "release_plan_id": release_plan_id,
                 "name": release_plan_payload["name"],
                 "blueprint_id": plan_json.get("blueprint_id"),
-                "blueprint": plan_json.get("blueprint"),
+                "blueprint": blueprint_name,
                 "generated_at": datetime.utcnow().isoformat() + "Z",
-                "tasks": plan_json.get("tasks", []),
-                "steps": [
-                    {
-                        "name": "deploy",
-                        "commands": ["uname -a"],
-                    }
-                ],
+                "tasks": plan_json.get("work_items", []),
+                "steps": steps,
             }
             url_json = _write_artifact(run_id, "release_plan.json", json.dumps(release_plan_json, indent=2))
             md = (
@@ -618,7 +987,9 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "## Tasks\n"
             )
             for task_entry in release_plan_json.get("tasks", []):
-                md += f"- {task_entry.get('task_type')}: {task_entry.get('title')}\n"
+                title = task_entry.get("title") or task_entry.get("id") or "work-item"
+                task_type = task_entry.get("task_type") or task_entry.get("type") or "work-item"
+                md += f"- {task_type}: {title}\n"
             url_md = _write_artifact(run_id, "release_plan.md", md)
             _post_json(
                 f"/xyn/internal/runs/{run_id}/artifacts",

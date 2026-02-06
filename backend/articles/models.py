@@ -701,6 +701,7 @@ class DevTask(models.Model):
         Run, null=True, blank=True, on_delete=models.SET_NULL, related_name="dev_tasks_source"
     )
     input_artifact_key = models.CharField(max_length=200, blank=True)
+    work_item_id = models.CharField(max_length=120, blank=True)
     result_run = models.ForeignKey(
         Run, null=True, blank=True, on_delete=models.SET_NULL, related_name="dev_tasks_result"
     )

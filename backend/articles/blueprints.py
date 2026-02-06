@@ -405,6 +405,296 @@ def _write_run_summary(run: Run) -> None:
     _write_run_artifact(run, "run_summary.json", summary, "summary")
 
 
+def _load_schema(name: str) -> Dict[str, Any]:
+    base_dir = Path(__file__).resolve().parents[2]
+    path = base_dir / "schemas" / name
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _validate_schema(payload: Dict[str, Any], name: str) -> List[str]:
+    schema = _load_schema(name)
+    validator = Draft202012Validator(schema)
+    errors = []
+    for error in validator.iter_errors(payload):
+        path = ".".join(str(p) for p in error.path) if error.path else "root"
+        errors.append(f"{path}: {error.message}")
+    return errors
+
+
+def _default_repo_targets() -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": "xyn-api",
+            "url": "https://github.com/Xyence/xyn-api",
+            "ref": "main",
+            "path_root": "apps/ems-api",
+            "auth": "https_token",
+            "allow_write": True,
+        },
+        {
+            "name": "xyn-ui",
+            "url": "https://github.com/Xyence/xyn-ui",
+            "ref": "main",
+            "path_root": "apps/ems-ui",
+            "auth": "https_token",
+            "allow_write": True,
+        },
+    ]
+
+
+def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
+    blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
+    repo_targets = _default_repo_targets()
+    work_items: List[Dict[str, Any]] = []
+    if blueprint_fqn == "core.ems.platform":
+        work_items = [
+            {
+                "id": "ems-api-scaffold",
+                "title": "Scaffold EMS API service",
+                "description": "Create FastAPI scaffolding and base project structure.",
+                "type": "scaffold",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"], "context": ["ems-platform-blueprint"]},
+                "outputs": {"paths": ["apps/ems-api/README.md", "apps/ems-api/main.py"]},
+                "acceptance_criteria": [
+                    "FastAPI app boots with /health endpoint.",
+                    "Project README describes local run steps.",
+                ],
+                "verify": [
+                    {"name": "api-structure", "command": "test -f apps/ems-api/main.py"},
+                ],
+                "depends_on": [],
+                "labels": ["scaffold", "api"],
+            },
+            {
+                "id": "ems-api-authn-oidc",
+                "title": "Add OIDC authn scaffolding",
+                "description": "Add OIDC config placeholders and login flow stubs.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"], "context": ["xyn-planner-canon"]},
+                "outputs": {"paths": ["apps/ems-api/auth/oidc.py"]},
+                "acceptance_criteria": [
+                    "OIDC settings present with placeholders.",
+                    "Login endpoint returns placeholder JWT.",
+                ],
+                "verify": [
+                    {"name": "auth-file", "command": "test -f apps/ems-api/auth/oidc.py"},
+                ],
+                "depends_on": ["ems-api-scaffold"],
+                "labels": ["auth", "api"],
+            },
+            {
+                "id": "ems-api-rbac",
+                "title": "Add RBAC primitives",
+                "description": "Define roles, policies, and middleware checks.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-api/auth/rbac.py"]},
+                "acceptance_criteria": [
+                    "Roles Admin/Operator/Viewer defined.",
+                    "RBAC check utility available.",
+                ],
+                "verify": [
+                    {"name": "rbac-file", "command": "test -f apps/ems-api/auth/rbac.py"},
+                ],
+                "depends_on": ["ems-api-authn-oidc"],
+                "labels": ["rbac", "api"],
+            },
+            {
+                "id": "ems-api-devices",
+                "title": "Device CRUD endpoints",
+                "description": "Stub device CRUD endpoints with RBAC guards.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-api/routes/devices.py"]},
+                "acceptance_criteria": [
+                    "CRUD endpoints exist for devices.",
+                    "Viewer role can only read.",
+                ],
+                "verify": [
+                    {"name": "devices-file", "command": "test -f apps/ems-api/routes/devices.py"},
+                ],
+                "depends_on": ["ems-api-rbac"],
+                "labels": ["api", "devices"],
+            },
+            {
+                "id": "ems-api-reports",
+                "title": "Reports endpoint",
+                "description": "Stub reports endpoint with viewer access.",
+                "type": "feature",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-api/routes/reports.py"]},
+                "acceptance_criteria": [
+                    "Reports endpoint returns placeholder report data.",
+                ],
+                "verify": [
+                    {"name": "reports-file", "command": "test -f apps/ems-api/routes/reports.py"},
+                ],
+                "depends_on": ["ems-api-rbac"],
+                "labels": ["api", "reports"],
+            },
+            {
+                "id": "ems-ui-scaffold",
+                "title": "Scaffold EMS UI",
+                "description": "Create React app shell for EMS UI.",
+                "type": "scaffold",
+                "repo_targets": [repo_targets[1]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-ui/README.md", "apps/ems-ui/src/App.tsx"]},
+                "acceptance_criteria": [
+                    "UI app renders basic layout and navigation.",
+                ],
+                "verify": [
+                    {"name": "ui-structure", "command": "test -f apps/ems-ui/src/App.tsx"},
+                ],
+                "depends_on": [],
+                "labels": ["scaffold", "ui"],
+            },
+            {
+                "id": "ems-ui-auth",
+                "title": "UI OIDC login view",
+                "description": "Add login page and token handling stubs.",
+                "type": "feature",
+                "repo_targets": [repo_targets[1]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-ui/src/auth/Login.tsx"]},
+                "acceptance_criteria": [
+                    "Login page exists with placeholder flow.",
+                ],
+                "verify": [
+                    {"name": "login-view", "command": "test -f apps/ems-ui/src/auth/Login.tsx"},
+                ],
+                "depends_on": ["ems-ui-scaffold"],
+                "labels": ["ui", "auth"],
+            },
+            {
+                "id": "ems-ui-devices",
+                "title": "UI device CRUD skeleton",
+                "description": "Add device list and detail pages.",
+                "type": "feature",
+                "repo_targets": [repo_targets[1]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-ui/src/devices/DeviceList.tsx"]},
+                "acceptance_criteria": [
+                    "Device list page renders mock data.",
+                ],
+                "verify": [
+                    {"name": "device-ui", "command": "test -f apps/ems-ui/src/devices/DeviceList.tsx"},
+                ],
+                "depends_on": ["ems-ui-scaffold"],
+                "labels": ["ui", "devices"],
+            },
+            {
+                "id": "ems-ui-reports",
+                "title": "UI reports skeleton",
+                "description": "Add reports page with placeholder charts.",
+                "type": "feature",
+                "repo_targets": [repo_targets[1]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-ui/src/reports/Reports.tsx"]},
+                "acceptance_criteria": [
+                    "Reports page exists and renders placeholder content.",
+                ],
+                "verify": [
+                    {"name": "reports-ui", "command": "test -f apps/ems-ui/src/reports/Reports.tsx"},
+                ],
+                "depends_on": ["ems-ui-scaffold"],
+                "labels": ["ui", "reports"],
+            },
+            {
+                "id": "ems-deploy-compose",
+                "title": "Docker compose + nginx/acme scaffold",
+                "description": "Add docker-compose and nginx/acme placeholders for EMS.",
+                "type": "deploy",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-api/deploy/docker-compose.yml", "apps/ems-api/deploy/nginx.conf"]},
+                "acceptance_criteria": [
+                    "Compose file defines api + ui services.",
+                ],
+                "verify": [
+                    {"name": "compose-file", "command": "test -f apps/ems-api/deploy/docker-compose.yml"},
+                ],
+                "depends_on": ["ems-api-scaffold", "ems-ui-scaffold"],
+                "labels": ["deploy", "infra"],
+            },
+            {
+                "id": "ems-dns-route53",
+                "title": "Route53 DNS stub",
+                "description": "Add Route53 integration placeholder for subdomain creation.",
+                "type": "integration",
+                "repo_targets": [repo_targets[0]],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-api/integrations/route53.py"]},
+                "acceptance_criteria": [
+                    "Route53 module stub exists with create/update function signatures.",
+                ],
+                "verify": [
+                    {"name": "route53-file", "command": "test -f apps/ems-api/integrations/route53.py"},
+                ],
+                "depends_on": ["ems-api-scaffold"],
+                "labels": ["dns", "integration"],
+            },
+        ]
+    else:
+        work_items = [
+            {
+                "id": f"{blueprint.name}-scaffold",
+                "title": f"Scaffold {blueprint_fqn}",
+                "description": "Create initial scaffold for blueprint.",
+                "type": "scaffold",
+                "repo_targets": repo_targets[:1],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["apps/ems-api/README.md"]},
+                "acceptance_criteria": ["Scaffold created."],
+                "verify": [{"name": "scaffold-file", "command": "test -f apps/ems-api/README.md"}],
+                "depends_on": [],
+                "labels": ["scaffold"],
+            }
+        ]
+
+    tasks = []
+    for item in work_items:
+        tasks.append(
+            {
+                "task_type": "codegen",
+                "title": f"Codegen: {item['title']}",
+                "context_purpose": item.get("context_purpose_override") or "coder",
+                "work_item_id": item["id"],
+            }
+        )
+    tasks.extend(
+        [
+            {
+                "task_type": "release_plan_generate",
+                "title": f"Release plan for {blueprint_fqn}",
+                "context_purpose": "planner",
+            },
+            {
+                "task_type": "release_spec_generate",
+                "title": f"Release spec for {blueprint_fqn}",
+                "context_purpose": "planner",
+            },
+        ]
+    )
+
+    return {
+        "schema_version": "implementation_plan.v1",
+        "blueprint_id": str(blueprint.id),
+        "blueprint_name": blueprint_fqn,
+        "generated_at": timezone.now().isoformat(),
+        "stack": {"api": "fastapi", "ui": "react"},
+        "global_repo_targets": repo_targets,
+        "work_items": work_items,
+        "tasks": tasks,
+    }
+
+
 def _prune_run_artifacts() -> None:
     retention_days = int(os.environ.get("XYENCE_RUN_ARTIFACT_RETENTION_DAYS", "30"))
     cutoff = timezone.now() - timezone.timedelta(days=retention_days)
@@ -442,10 +732,22 @@ def _queue_dev_tasks_for_plan(
     run: Run,
     plan: Dict[str, Any],
     namespace: Optional[str],
+    project_key: Optional[str],
     enqueue_jobs: bool = False,
 ) -> List[DevTask]:
     tasks = []
-    for item in plan.get("tasks", []):
+    plan_tasks = plan.get("tasks", [])
+    if not plan_tasks and plan.get("work_items"):
+        for work_item in plan.get("work_items", []):
+            plan_tasks.append(
+                {
+                    "task_type": "codegen",
+                    "title": f"Codegen: {work_item.get('title')}",
+                    "context_purpose": work_item.get("context_purpose_override") or "coder",
+                    "work_item_id": work_item.get("id"),
+                }
+            )
+    for item in plan_tasks:
         task_type = item.get("task_type") or "codegen"
         title = item.get("title") or f"{task_type} for {plan.get('blueprint')}"
         context_purpose = item.get("context_purpose") or "coder"
@@ -458,11 +760,12 @@ def _queue_dev_tasks_for_plan(
             source_entity_id=plan.get("blueprint_id") or blueprint.id,
             source_run=run,
             input_artifact_key="implementation_plan.json",
+            work_item_id=item.get("work_item_id", ""),
             context_purpose=context_purpose,
             created_by=run.created_by,
             updated_by=run.created_by,
         )
-        packs = _select_context_packs_for_dev_task(context_purpose, namespace, None, task_type)
+        packs = _select_context_packs_for_dev_task(context_purpose, namespace, project_key, task_type)
         if packs:
             dev_task.context_packs.add(*packs)
         tasks.append(dev_task)
@@ -905,7 +1208,7 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
         selected_ids=None,
         purpose="planner",
         namespace=blueprint.namespace,
-        project_key=None,
+        project_key=f"{blueprint.namespace}.{blueprint.name}",
     )
     run.context_pack_refs_json = context_resolved.get("refs", [])
     run.context_hash = context_resolved.get("hash", "")
@@ -939,38 +1242,21 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
         else:
             instance.status = "planned"
             run.status = "succeeded"
-        implementation_plan = {
-            "blueprint_id": str(blueprint.id),
-            "blueprint": f"{blueprint.namespace}.{blueprint.name}",
-            "generated_at": timezone.now().isoformat(),
-            "tasks": [
-                {
-                    "task_type": "codegen",
-                    "title": f"Codegen for {blueprint.namespace}.{blueprint.name}",
-                    "context_purpose": "coder",
-                }
-                ,
-                {
-                    "task_type": "release_plan_generate",
-                    "title": f"Release plan for {blueprint.namespace}.{blueprint.name}",
-                    "context_purpose": "planner",
-                },
-                {
-                    "task_type": "release_spec_generate",
-                    "title": f"Release spec for {blueprint.namespace}.{blueprint.name}",
-                    "context_purpose": "planner",
-                }
-            ],
-        }
+        implementation_plan = _generate_implementation_plan(blueprint)
+        plan_errors = _validate_schema(implementation_plan, "implementation_plan.v1.schema.json")
+        if plan_errors:
+            run.log_text += "Implementation plan schema errors:\n"
+            for err in plan_errors:
+                run.log_text += f"- {err}\n"
         _write_run_artifact(run, "implementation_plan.json", implementation_plan, "implementation_plan")
         plan_md = (
             f"# Implementation Plan\n\n"
-            f"- Blueprint: {blueprint.namespace}.{blueprint.name}\n"
+            f"- Blueprint: {implementation_plan['blueprint_name']}\n"
             f"- Generated: {implementation_plan['generated_at']}\n\n"
-            "## Tasks\n"
+            "## Work Items\n"
         )
-        for task in implementation_plan["tasks"]:
-            plan_md += f"- {task['task_type']}: {task['title']}\n"
+        for item in implementation_plan["work_items"]:
+            plan_md += f"- {item['id']}: {item['title']}\n"
         _write_run_artifact(run, "implementation_plan.md", plan_md, "implementation_plan")
         run.log_text += "Implementation plan generated\n"
         if queue_dev_tasks:
@@ -979,6 +1265,7 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
                 run=run,
                 plan=implementation_plan,
                 namespace=blueprint.namespace,
+                project_key=f"{blueprint.namespace}.{blueprint.name}",
                 enqueue_jobs=True,
             )
             run.log_text += f"Queued {len(dev_tasks)} dev tasks\n"
@@ -2209,6 +2496,7 @@ def internal_dev_task_detail(request: HttpRequest, task_id: str) -> JsonResponse
             "title": task.title,
             "task_type": task.task_type,
             "status": task.status,
+            "work_item_id": task.work_item_id,
             "result_run": str(task.result_run_id) if task.result_run_id else None,
             "source_run": str(task.source_run_id) if task.source_run_id else None,
             "input_artifact_key": task.input_artifact_key,
@@ -2257,6 +2545,7 @@ def internal_dev_task_claim(request: HttpRequest, task_id: str) -> JsonResponse:
             "id": str(task.id),
             "task_type": task.task_type,
             "status": task.status,
+            "work_item_id": task.work_item_id,
             "result_run": str(task.result_run_id) if task.result_run_id else None,
             "source_run": str(task.source_run_id) if task.source_run_id else None,
             "source_entity_type": task.source_entity_type,

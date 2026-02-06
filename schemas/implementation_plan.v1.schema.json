@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xyence.io/schemas/implementation_plan.v1.schema.json",
+  "title": "ImplementationPlan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "blueprint_id",
+    "blueprint_name",
+    "generated_at",
+    "stack",
+    "work_items"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "implementation_plan.v1"
+    },
+    "blueprint_id": {
+      "type": "string"
+    },
+    "blueprint_name": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "stack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api", "ui"],
+      "properties": {
+        "api": {"type": "string", "enum": ["fastapi", "django"]},
+        "ui": {"type": "string", "enum": ["react"]}
+      }
+    },
+    "work_items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/definitions/workItem"}
+    },
+    "global_repo_targets": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/repoTarget"}
+    },
+    "notes": {
+      "type": "string"
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["task_type", "title"],
+        "properties": {
+          "task_type": {"type": "string"},
+          "title": {"type": "string"},
+          "context_purpose": {"type": "string"},
+          "work_item_id": {"type": "string"}
+        }
+      }
+    }
+  },
+  "definitions": {
+    "repoTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "url", "ref", "path_root", "auth", "allow_write"],
+      "properties": {
+        "name": {"type": "string"},
+        "url": {"type": "string"},
+        "ref": {"type": "string"},
+        "path_root": {"type": "string"},
+        "auth": {"type": "string", "enum": ["ssh", "https_token", "local"]},
+        "allow_write": {"type": "boolean"}
+      }
+    },
+    "workItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "description",
+        "type",
+        "repo_targets",
+        "inputs",
+        "outputs",
+        "acceptance_criteria",
+        "verify"
+      ],
+      "properties": {
+        "id": {"type": "string"},
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "type": {
+          "type": "string",
+          "enum": ["scaffold", "feature", "integration", "deploy", "docs", "test"]
+        },
+        "repo_targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/definitions/repoTarget"}
+        },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "artifacts": {"type": "array", "items": {"type": "string"}},
+            "context": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "outputs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["paths"],
+          "properties": {
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "artifacts": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "verify": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "command"],
+            "properties": {
+              "name": {"type": "string"},
+              "command": {"type": "string"},
+              "cwd": {"type": "string"},
+              "expect_exit_code": {"type": "integer"}
+            }
+          }
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {"type": "string"},
+          "default": []
+        },
+        "labels": {
+          "type": "array",
+          "items": {"type": "string"},
+          "default": []
+        },
+        "context_purpose_override": {
+          "type": "string",
+          "enum": ["coder", "planner"]
+        }
+      }
+    }
+  }
+}
