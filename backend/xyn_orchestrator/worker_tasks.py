@@ -20,9 +20,10 @@ CONTRACTS_ROOT = os.environ.get("XYNSEED_CONTRACTS_ROOT", "/xyn-contracts")
 MEDIA_ROOT = os.environ.get("XYENCE_MEDIA_ROOT", "/app/media")
 SCHEMA_ROOT = os.environ.get("XYENCE_SCHEMA_ROOT", "/app/schemas")
 CODEGEN_WORKDIR = os.environ.get("XYENCE_CODEGEN_WORKDIR", "/tmp/xyn-codegen")
+CODEGEN_GIT_NAME = os.environ.get("XYN_CODEGEN_GIT_NAME", "xyn-codegen")
+CODEGEN_GIT_EMAIL = os.environ.get("XYN_CODEGEN_GIT_EMAIL", "codegen@xyn.local")
 CODEGEN_GIT_TOKEN = os.environ.get("XYENCE_CODEGEN_GIT_TOKEN", "").strip()
-CODEGEN_COMMIT = os.environ.get("XYENCE_CODEGEN_COMMIT", "").strip() == "1"
-CODEGEN_PUSH = os.environ.get("XYENCE_CODEGEN_PUSH", "").strip() == "1"
+CODEGEN_PUSH = os.environ.get("XYN_CODEGEN_PUSH", os.environ.get("XYENCE_CODEGEN_PUSH", "")).strip() == "1"
 
 
 def _headers() -> Dict[str, str]:
@@ -111,6 +112,21 @@ def _ensure_repo_workspace(repo: Dict[str, Any], workspace_root: str) -> str:
 
 def _git_cmd(repo_dir: str, cmd: str) -> int:
     return os.system(f"cd {repo_dir} && {cmd}")
+
+
+def _stage_all(repo_dir: str) -> int:
+    return _git_cmd(repo_dir, "git add -A")
+
+
+def _ensure_git_identity(repo_dir: str) -> bool:
+    email = os.popen(f"cd {repo_dir} && git config --get user.email").read().strip()
+    name = os.popen(f"cd {repo_dir} && git config --get user.name").read().strip()
+    ok = True
+    if not name:
+        ok = _git_cmd(repo_dir, f"git config user.name \"{CODEGEN_GIT_NAME}\"") == 0
+    if not email:
+        ok = ok and _git_cmd(repo_dir, f"git config user.email \"{CODEGEN_GIT_EMAIL}\"") == 0
+    return ok
 
 
 def _write_file(path: str, content: str, executable: bool = False) -> None:
@@ -501,8 +517,8 @@ XYN_UI_PATH=../../xyn-ui/apps/ems-ui
 
   ems-api:
     build:
-      context: ../
-      dockerfile: apps/ems-api/Dockerfile
+      context: ../../apps/ems-api
+      dockerfile: Dockerfile
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}
     depends_on:
@@ -572,15 +588,34 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 
+if [ "${VERIFY_DOCKER:-}" != "1" ]; then
+  echo "VERIFY_DOCKER not set; skipping Docker verification."
+  exit 0
+fi
+
+cleanup() {
+  docker compose -f "$ROOT_DIR/docker-compose.yml" down -v
+}
+
+trap cleanup EXIT
+
 docker compose -f "$ROOT_DIR/docker-compose.yml" up -d --build
+healthy=0
 for i in {1..30}; do
   if curl -fsS http://localhost:8080/health >/dev/null; then
+    healthy=1
     break
   fi
   sleep 1
 done
+
+if [ "$healthy" -ne 1 ]; then
+  echo "Health check failed: /health did not become ready in time."
+  exit 1
+fi
+
+curl -fsS http://localhost:8080/api/health >/dev/null
 curl -fsS -o /dev/null -w "%{http_code}\n" http://localhost:8080/ | grep -E "^(200|302)$"
-docker compose -f "$ROOT_DIR/docker-compose.yml" down -v
 """,
         )
         os.chmod(p("scripts/verify.sh"), 0o755)
@@ -716,13 +751,39 @@ export default function RoutesView() {
         )
         _write_file(
             p("src/auth/Login.tsx"),
-            """import { Link } from "react-router-dom";
+            """import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
 export default function Login() {
+  const [status, setStatus] = useState<"ok" | "down" | "checking">("checking");
+
+  const checkHealth = useCallback(async () => {
+    setStatus("checking");
+    try {
+      const response = await fetch("/api/health");
+      if (!response.ok) {
+        setStatus("down");
+        return;
+      }
+      const payload = (await response.json()) as { status?: string };
+      setStatus(payload.status === "ok" ? "ok" : "down");
+    } catch {
+      setStatus("down");
+    }
+  }, []);
+
+  useEffect(() => {
+    checkHealth();
+  }, [checkHealth]);
+
   return (
     <main>
       <h1>Login (OIDC stub)</h1>
       <p>This is a placeholder login view.</p>
+      <p>API: {status === "ok" ? "OK" : status === "down" ? "DOWN" : "CHECKING"}</p>
+      <button type="button" onClick={checkHealth}>
+        Retry
+      </button>
       <Link to="/devices">Continue to Devices</Link>
     </main>
   );
@@ -1278,10 +1339,15 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             os.system(f"rm -rf {workspace_root}")
             os.makedirs(workspace_root, exist_ok=True)
             repo_results = []
+            repo_result_index = {}
+            repo_states = []
             artifacts = []
             errors = []
             success = True
             changes_made = False
+            work_item_title = work_item.get("title") or work_item_id
+            blueprint_id = plan_json.get("blueprint_id")
+            blueprint_name = plan_json.get("blueprint_name") or plan_json.get("blueprint")
             for repo in work_item.get("repo_targets", []):
                 repo_dir = _ensure_repo_workspace(repo, workspace_root)
                 _apply_scaffold_for_work_item(work_item, repo_dir)
@@ -1406,36 +1472,118 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                 "detail": {"exit_code": exit_code, "expected": expected},
                             }
                         )
-                commit_info = None
-                if diff.strip() and CODEGEN_COMMIT:
-                    branch = f"codegen/{task_id}"
-                    _git_cmd(repo_dir, f"git checkout -b {branch}")
-                    _git_cmd(repo_dir, f"git commit -am \"codegen: {work_item_id}\"")
+                repo_entry = {
+                    "repo": {
+                        "name": repo.get("name"),
+                        "url": repo.get("url"),
+                        "ref": repo.get("ref"),
+                        "path_root": repo.get("path_root"),
+                    },
+                    "files_changed": files_changed,
+                    "patches": patches,
+                    "commands_executed": commands_executed,
+                    "commit": None,
+                }
+                repo_results.append(repo_entry)
+                repo_key = repo.get("name") or repo.get("url") or str(len(repo_results) - 1)
+                repo_result_index[repo_key] = repo_entry
+                repo_states.append(
+                    {
+                        "repo_dir": repo_dir,
+                        "repo_name": repo.get("name"),
+                        "repo_key": repo_key,
+                        "has_changes": bool(diff.strip()),
+                    }
+                )
+
+            if success and changes_made:
+                branch_suffix = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                branch = f"codegen/{work_item_id}/{branch_suffix}"
+                commit_message = f"codegen({work_item_id}): {work_item_title}".replace("\"", "'")
+                commit_body = None
+                if blueprint_id or blueprint_name:
+                    commit_body = f"Blueprint: {blueprint_id or ''} {blueprint_name or ''}".strip().replace("\"", "'")
+                for state in repo_states:
+                    if not state["has_changes"]:
+                        continue
+                    repo_dir = state["repo_dir"]
+                    if _git_cmd(repo_dir, f"git checkout -b {branch}") != 0:
+                        success = False
+                        errors.append(
+                            {
+                                "code": "commit_failed",
+                                "message": "Failed to create codegen branch.",
+                                "detail": {"repo": state["repo_name"], "branch": branch},
+                            }
+                        )
+                        break
+                    if not _ensure_git_identity(repo_dir):
+                        success = False
+                        errors.append(
+                            {
+                                "code": "commit_failed",
+                                "message": "Failed to set git identity for codegen commit.",
+                                "detail": {"repo": state["repo_name"], "branch": branch},
+                            }
+                        )
+                        break
+                    if _stage_all(repo_dir) != 0:
+                        success = False
+                        errors.append(
+                            {
+                                "code": "commit_failed",
+                                "message": "Failed to stage changes for commit.",
+                                "detail": {"repo": state["repo_name"], "branch": branch},
+                            }
+                        )
+                        break
+                    if commit_body:
+                        commit_cmd = f"git commit -m \"{commit_message}\" -m \"{commit_body}\""
+                    else:
+                        commit_cmd = f"git commit -m \"{commit_message}\""
+                    commit_rc = _git_cmd(repo_dir, commit_cmd)
+                    if commit_rc != 0:
+                        success = False
+                        errors.append(
+                            {
+                                "code": "commit_failed",
+                                "message": "Failed to create codegen commit.",
+                                "detail": {"repo": state["repo_name"], "branch": branch},
+                            }
+                        )
+                        break
                     sha = os.popen(f"cd {repo_dir} && git rev-parse HEAD").read().strip()
                     pushed = False
                     if CODEGEN_PUSH:
-                        _git_cmd(repo_dir, f"git push -u origin {branch}")
-                        pushed = True
-                    commit_info = {
+                        push_rc = _git_cmd(repo_dir, f"git push -u origin {branch}")
+                        if push_rc != 0:
+                            success = False
+                            errors.append(
+                                {
+                                    "code": "push_failed",
+                                    "message": "Failed to push codegen branch.",
+                                    "detail": {"repo": state["repo_name"], "branch": branch},
+                                }
+                            )
+                        else:
+                            pushed = True
+                    repo_entry = repo_result_index.get(state["repo_key"])
+                    if repo_entry is None:
+                        success = False
+                        errors.append(
+                            {
+                                "code": "commit_failed",
+                                "message": "Failed to locate repo_result entry for commit metadata.",
+                                "detail": {"repo": state["repo_name"], "branch": branch},
+                            }
+                        )
+                        break
+                    repo_entry["commit"] = {
                         "sha": sha,
-                        "message": f"codegen: {work_item_id}",
+                        "message": commit_message,
                         "branch": branch,
                         "pushed": pushed,
                     }
-                repo_results.append(
-                    {
-                        "repo": {
-                            "name": repo.get("name"),
-                            "url": repo.get("url"),
-                            "ref": repo.get("ref"),
-                            "path_root": repo.get("path_root"),
-                        },
-                        "files_changed": files_changed,
-                        "patches": patches,
-                        "commands_executed": commands_executed,
-                        "commit": commit_info,
-                    }
-                )
             success = success and _mark_noop_codegen(changes_made, work_item_id, errors)
             result = {
                 "schema_version": "codegen_result.v1",

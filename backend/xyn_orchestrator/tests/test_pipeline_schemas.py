@@ -10,7 +10,12 @@ from jsonschema import Draft202012Validator
 import yaml
 
 from xyn_orchestrator.blueprints import _generate_implementation_plan, _select_context_packs_for_dev_task
-from xyn_orchestrator.worker_tasks import _apply_scaffold_for_work_item, _collect_git_diff, _mark_noop_codegen
+from xyn_orchestrator.worker_tasks import (
+    _apply_scaffold_for_work_item,
+    _collect_git_diff,
+    _mark_noop_codegen,
+    _stage_all,
+)
 from xyn_orchestrator.models import Blueprint, ContextPack
 
 
@@ -26,6 +31,10 @@ class PipelineSchemaTests(TestCase):
         errors = list(Draft202012Validator(schema).iter_errors(plan))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
         self.assertGreaterEqual(len(plan.get("work_items", [])), 8)
+        chassis = next((w for w in plan.get("work_items", []) if w.get("id") == "ems-compose-local-chassis"), None)
+        self.assertIsNotNone(chassis)
+        verify_cmds = [entry.get("command", "") for entry in chassis.get("verify", [])]
+        self.assertTrue(any("scripts/verify.sh" in cmd for cmd in verify_cmds))
 
     def test_codegen_result_schema(self):
         schema = self._load_schema("codegen_result.v1.schema.json")
@@ -231,13 +240,56 @@ class PipelineSchemaTests(TestCase):
             root = Path(repo_dir, "apps/ems-stack")
             compose_path = root / "docker-compose.yml"
             nginx_path = root / "nginx/nginx.conf"
+            verify_path = root / "scripts/verify.sh"
             self.assertTrue(compose_path.exists())
             self.assertTrue(nginx_path.exists())
+            self.assertTrue(verify_path.exists())
             data = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
             self.assertIn("services", data)
             for service in ["ems-api", "ems-ui", "postgres", "nginx"]:
                 self.assertIn(service, data["services"])
             self.assertIn("XYN_UI_PATH", compose_path.read_text(encoding="utf-8"))
+            verify_contents = verify_path.read_text(encoding="utf-8")
+            self.assertIn("/health", verify_contents)
+            self.assertIn("/api/health", verify_contents)
+            self.assertIn("Health check failed", verify_contents)
+
+    def test_ui_login_uses_api_health(self):
+        work_item = {
+            "id": "ems-ui-scaffold",
+            "repo_targets": [
+                {
+                    "name": "xyn-ui",
+                    "url": "https://example.com/xyn-ui",
+                    "ref": "main",
+                    "path_root": "apps/ems-ui",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(work_item, repo_dir)
+            login_path = Path(repo_dir, "apps/ems-ui/src/auth/Login.tsx")
+            self.assertTrue(login_path.exists())
+            self.assertIn("/api/health", login_path.read_text(encoding="utf-8"))
+
+    def test_stage_all_stages_untracked_files(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            subprocess.run(["git", "init"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True)
+            Path(repo_dir, "new-file.txt").write_text("hello", encoding="utf-8")
+            self.assertEqual(_stage_all(repo_dir), 0)
+            subprocess.run(["git", "commit", "-m", "test"], cwd=repo_dir, check=True)
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_dir,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            self.assertEqual(status, "")
 
     def test_api_scaffold_writes_dockerfile(self):
         work_item = {

@@ -609,7 +609,7 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                 "verify": [
                     {
                         "name": "ui-structure",
-                        "command": "test -f src/App.tsx && test -f src/main.tsx && test -f src/routes.tsx && test -f src/auth/Login.tsx && test -f src/devices/DeviceList.tsx && test -f src/reports/Reports.tsx",
+                        "command": "test -f src/App.tsx && test -f src/main.tsx && test -f src/routes.tsx && test -f src/auth/Login.tsx && test -f src/devices/DeviceList.tsx && test -f src/reports/Reports.tsx && grep -q \"/api/health\" src/auth/Login.tsx",
                         "cwd": "apps/ems-ui",
                     },
                 ],
@@ -737,23 +737,8 @@ def _generate_implementation_plan(blueprint: Blueprint) -> Dict[str, Any]:
                         "cwd": ".",
                     },
                     {
-                        "name": "stack-up",
-                        "command": "if [ \"${VERIFY_DOCKER}\" = \"1\" ]; then docker compose -f apps/ems-stack/docker-compose.yml up -d --build; else echo \"VERIFY_DOCKER not set\"; fi",
-                        "cwd": ".",
-                    },
-                    {
-                        "name": "health-check",
-                        "command": "if [ \"${VERIFY_DOCKER}\" = \"1\" ]; then bash -lc \"for i in {1..30}; do curl -fsS http://localhost:8080/health && exit 0; sleep 1; done; exit 1\"; else echo \"VERIFY_DOCKER not set\"; fi",
-                        "cwd": ".",
-                    },
-                    {
-                        "name": "ui-check",
-                        "command": "if [ \"${VERIFY_DOCKER}\" = \"1\" ]; then curl -fsS -o /dev/null -w \"%{http_code}\\n\" http://localhost:8080/ | grep -E \"^(200|302)$\"; else echo \"VERIFY_DOCKER not set\"; fi",
-                        "cwd": ".",
-                    },
-                    {
-                        "name": "stack-down",
-                        "command": "if [ \"${VERIFY_DOCKER}\" = \"1\" ]; then docker compose -f apps/ems-stack/docker-compose.yml down -v; else echo \"VERIFY_DOCKER not set\"; fi",
+                        "name": "stack-verify",
+                        "command": "bash apps/ems-stack/scripts/verify.sh",
                         "cwd": ".",
                     },
                 ],

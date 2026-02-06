@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ems}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ems}
+      POSTGRES_DB: ${POSTGRES_DB:-ems}
+    volumes:
+      - ems_pgdata:/var/lib/postgresql/data
+
+  ems-api:
+    build:
+      context: ../../apps/ems-api
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}
+    depends_on:
+      - postgres
+    expose:
+      - "8000"
+
+  ems-ui:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}:/app
+    command: sh -lc "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    expose:
+      - "5173"
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - ems-api
+      - ems-ui
+
+volumes:
+  ems_pgdata: {}
