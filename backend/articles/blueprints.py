@@ -586,14 +586,145 @@ def _update_session_from_draft(
     session.validation_errors_json = validation_errors or []
     session.suggested_fixes_json = suggested_fixes or []
     session.status = "ready" if not validation_errors else "ready_with_errors"
-    session.save(update_fields=[
-        "current_draft_json",
-        "requirements_summary",
-        "validation_errors_json",
-        "suggested_fixes_json",
-        "status",
-        "updated_at",
-    ])
+    session.save(
+        update_fields=[
+            "current_draft_json",
+            "requirements_summary",
+            "validation_errors_json",
+            "suggested_fixes_json",
+            "status",
+            "updated_at",
+        ]
+    )
+
+
+def _publish_draft_session(session: BlueprintDraftSession, user) -> Dict[str, Any]:
+    draft = session.current_draft_json
+    if not draft:
+        return {"ok": False, "error": "No draft to publish.", "validation_errors": []}
+    errors = _validate_blueprint_spec(draft, session.blueprint_kind)
+    if errors:
+        return {
+            "ok": False,
+            "error": "Draft has validation errors; fix before publishing.",
+            "validation_errors": errors,
+        }
+    kind = session.blueprint_kind
+    if kind == "solution":
+        blueprint, created = Blueprint.objects.get_or_create(
+            name=draft["metadata"]["name"],
+            namespace=draft["metadata"].get("namespace", "core"),
+            defaults={
+                "description": draft.get("description", ""),
+                "created_by": user,
+                "updated_by": user,
+            },
+        )
+        if not created:
+            blueprint.description = draft.get("description", blueprint.description)
+            blueprint.updated_by = user
+            blueprint.save(update_fields=["description", "updated_by", "updated_at"])
+        next_rev = (blueprint.revisions.aggregate(max_rev=models.Max("revision")).get("max_rev") or 0) + 1
+        BlueprintRevision.objects.create(
+            blueprint=blueprint,
+            revision=next_rev,
+            spec_json=draft,
+            blueprint_kind=kind,
+            created_by=user,
+        )
+        session.linked_blueprint = blueprint
+        session.status = "published"
+        session.save(update_fields=["linked_blueprint", "status", "updated_at"])
+        return {
+            "ok": True,
+            "entity_type": "blueprint",
+            "entity_id": str(blueprint.id),
+            "revision": next_rev,
+        }
+    if kind == "module":
+        metadata = draft.get("metadata", {})
+        module_spec = draft.get("module", {})
+        namespace = metadata.get("namespace", "core")
+        name = metadata.get("name", "module")
+        fqn = module_spec.get("fqn") or f"{namespace}.{module_spec.get('type','module')}.{name}"
+        module, created = Module.objects.get_or_create(
+            fqn=fqn,
+            defaults={
+                "namespace": namespace,
+                "name": name,
+                "type": module_spec.get("type", "service"),
+                "current_version": metadata.get("version", "0.1.0"),
+                "latest_module_spec_json": draft,
+                "capabilities_provided_json": module_spec.get("capabilitiesProvided", []),
+                "interfaces_json": module_spec.get("interfaces", {}),
+                "dependencies_json": module_spec.get("dependencies", {}),
+                "created_by": user,
+                "updated_by": user,
+            },
+        )
+        if not created:
+            module.namespace = namespace
+            module.name = name
+            module.type = module_spec.get("type", module.type)
+            module.current_version = metadata.get("version", module.current_version)
+            module.latest_module_spec_json = draft
+            module.capabilities_provided_json = module_spec.get("capabilitiesProvided", [])
+            module.interfaces_json = module_spec.get("interfaces", {})
+            module.dependencies_json = module_spec.get("dependencies", {})
+            module.updated_by = user
+            module.save(
+                update_fields=[
+                    "namespace",
+                    "name",
+                    "type",
+                    "current_version",
+                    "latest_module_spec_json",
+                    "capabilities_provided_json",
+                    "interfaces_json",
+                    "dependencies_json",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+        session.status = "published"
+        session.save(update_fields=["status", "updated_at"])
+        return {"ok": True, "entity_type": "module", "entity_id": str(module.id)}
+    if kind == "bundle":
+        metadata = draft.get("metadata", {})
+        namespace = metadata.get("namespace", "core")
+        name = metadata.get("name", "bundle")
+        fqn = draft.get("bundleFqn") or f"{namespace}.bundle.{name}"
+        bundle, created = Bundle.objects.get_or_create(
+            fqn=fqn,
+            defaults={
+                "namespace": namespace,
+                "name": name,
+                "current_version": metadata.get("version", "0.1.0"),
+                "bundle_spec_json": draft,
+                "created_by": user,
+                "updated_by": user,
+            },
+        )
+        if not created:
+            bundle.namespace = namespace
+            bundle.name = name
+            bundle.current_version = metadata.get("version", bundle.current_version)
+            bundle.bundle_spec_json = draft
+            bundle.updated_by = user
+            bundle.save(
+                update_fields=[
+                    "namespace",
+                    "name",
+                    "current_version",
+                    "bundle_spec_json",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+        session.status = "published"
+        session.save(update_fields=["status", "updated_at"])
+        return {"ok": True, "entity_type": "bundle", "entity_id": str(bundle.id)}
+    return {"ok": False, "error": f"Unsupported draft kind: {kind}", "validation_errors": []}
 
 
 @login_required
@@ -919,127 +1050,19 @@ def blueprint_studio_view(request: HttpRequest, session_id: str) -> HttpResponse
                 )
                 messages.success(request, "Draft saved.")
         elif action == "publish":
-            draft = session.current_draft_json
-            if not draft:
-                messages.error(request, "No draft to publish.")
+            result = _publish_draft_session(session, request.user)
+            if not result.get("ok"):
+                messages.error(request, result.get("error", "Publish failed"))
             else:
-                errors = _validate_blueprint_spec(draft, session.blueprint_kind)
-                if errors:
-                    messages.error(request, "Draft has validation errors; fix before publishing.")
-                else:
-                    kind = session.blueprint_kind
-                    if kind == "solution":
-                        blueprint, created = Blueprint.objects.get_or_create(
-                            name=draft["metadata"]["name"],
-                            namespace=draft["metadata"].get("namespace", "core"),
-                            defaults={
-                                "description": draft.get("description", ""),
-                                "created_by": request.user,
-                                "updated_by": request.user,
-                            },
-                        )
-                        if not created:
-                            blueprint.description = draft.get("description", blueprint.description)
-                            blueprint.updated_by = request.user
-                            blueprint.save(update_fields=["description", "updated_by", "updated_at"])
-                        next_rev = (blueprint.revisions.aggregate(max_rev=models.Max("revision")).get("max_rev") or 0) + 1
-                        BlueprintRevision.objects.create(
-                            blueprint=blueprint,
-                            revision=next_rev,
-                            spec_json=draft,
-                            blueprint_kind=kind,
-                            created_by=request.user,
-                        )
-                        session.linked_blueprint = blueprint
-                        session.status = "published"
-                        session.save(update_fields=["linked_blueprint", "status", "updated_at"])
-                        messages.success(request, "Blueprint published.")
-                        return redirect("blueprint-detail", blueprint_id=blueprint.id)
-                    if kind == "module":
-                        metadata = draft.get("metadata", {})
-                        module_spec = draft.get("module", {})
-                        namespace = metadata.get("namespace", "core")
-                        name = metadata.get("name", "module")
-                        fqn = module_spec.get("fqn") or f"{namespace}.{module_spec.get('type','module')}.{name}"
-                        module, created = Module.objects.get_or_create(
-                            fqn=fqn,
-                            defaults={
-                                "namespace": namespace,
-                                "name": name,
-                                "type": module_spec.get("type", "service"),
-                                "current_version": metadata.get("version", "0.1.0"),
-                                "latest_module_spec_json": draft,
-                                "capabilities_provided_json": module_spec.get("capabilitiesProvided", []),
-                                "interfaces_json": module_spec.get("interfaces", {}),
-                                "dependencies_json": module_spec.get("dependencies", {}),
-                                "created_by": request.user,
-                                "updated_by": request.user,
-                            },
-                        )
-                        if not created:
-                            module.namespace = namespace
-                            module.name = name
-                            module.type = module_spec.get("type", module.type)
-                            module.current_version = metadata.get("version", module.current_version)
-                            module.latest_module_spec_json = draft
-                            module.capabilities_provided_json = module_spec.get("capabilitiesProvided", [])
-                            module.interfaces_json = module_spec.get("interfaces", {})
-                            module.dependencies_json = module_spec.get("dependencies", {})
-                            module.updated_by = request.user
-                            module.save(
-                                update_fields=[
-                                    "namespace",
-                                    "name",
-                                    "type",
-                                    "current_version",
-                                    "latest_module_spec_json",
-                                    "capabilities_provided_json",
-                                    "interfaces_json",
-                                    "dependencies_json",
-                                    "updated_by",
-                                    "updated_at",
-                                ]
-                            )
-                        session.status = "published"
-                        session.save(update_fields=["status", "updated_at"])
-                        messages.success(request, "Module published to registry.")
-                        return redirect("module-detail", module_id=module.id)
-                    if kind == "bundle":
-                        metadata = draft.get("metadata", {})
-                        namespace = metadata.get("namespace", "core")
-                        name = metadata.get("name", "bundle")
-                        fqn = draft.get("bundleFqn") or f"{namespace}.bundle.{name}"
-                        bundle, created = Bundle.objects.get_or_create(
-                            fqn=fqn,
-                            defaults={
-                                "namespace": namespace,
-                                "name": name,
-                                "current_version": metadata.get("version", "0.1.0"),
-                                "bundle_spec_json": draft,
-                                "created_by": request.user,
-                                "updated_by": request.user,
-                            },
-                        )
-                        if not created:
-                            bundle.namespace = namespace
-                            bundle.name = name
-                            bundle.current_version = metadata.get("version", bundle.current_version)
-                            bundle.bundle_spec_json = draft
-                            bundle.updated_by = request.user
-                            bundle.save(
-                                update_fields=[
-                                    "namespace",
-                                    "name",
-                                    "current_version",
-                                    "bundle_spec_json",
-                                    "updated_by",
-                                    "updated_at",
-                                ]
-                            )
-                        session.status = "published"
-                        session.save(update_fields=["status", "updated_at"])
-                        messages.success(request, "Bundle published to registry.")
-                        return redirect("bundle-detail", bundle_id=bundle.id)
+                if result.get("entity_type") == "blueprint":
+                    messages.success(request, "Blueprint published.")
+                    return redirect("blueprint-detail", blueprint_id=result.get("entity_id"))
+                if result.get("entity_type") == "module":
+                    messages.success(request, "Module published to registry.")
+                    return redirect("module-detail", module_id=result.get("entity_id"))
+                if result.get("entity_type") == "bundle":
+                    messages.success(request, "Bundle published to registry.")
+                    return redirect("bundle-detail", bundle_id=result.get("entity_id"))
 
     context = {
         "session": session,
@@ -1492,6 +1515,88 @@ def enqueue_draft_revision(request: HttpRequest, session_id: str) -> JsonRespons
     return JsonResponse({"status": session.status, "job_id": job_id})
 
 
+@csrf_exempt
+@login_required
+def resolve_draft_session_context(request: HttpRequest, session_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    context_pack_ids = payload.get("context_pack_ids")
+    if context_pack_ids is not None:
+        if not isinstance(context_pack_ids, list):
+            return JsonResponse({"error": "context_pack_ids must be a list"}, status=400)
+        session.context_pack_ids = context_pack_ids
+    resolved = _resolve_context_packs(session, context_pack_ids)
+    session.context_pack_refs_json = resolved["refs"]
+    session.effective_context_hash = resolved["hash"]
+    session.effective_context_preview = resolved["preview"]
+    session.save(
+        update_fields=[
+            "context_pack_ids",
+            "context_pack_refs_json",
+            "effective_context_hash",
+            "effective_context_preview",
+            "updated_at",
+        ]
+    )
+    return JsonResponse(
+        {
+            "context_pack_refs": resolved["refs"],
+            "effective_context_hash": resolved["hash"],
+            "effective_context_preview": resolved["preview"],
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def save_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    draft_json = payload.get("draft_json")
+    if draft_json is None:
+        return JsonResponse({"error": "draft_json required"}, status=400)
+    if isinstance(draft_json, str):
+        try:
+            draft_json = json.loads(draft_json)
+        except json.JSONDecodeError as exc:
+            return JsonResponse({"error": f"draft_json invalid: {exc}"}, status=400)
+    if not isinstance(draft_json, dict):
+        return JsonResponse({"error": "draft_json must be an object"}, status=400)
+    errors = _validate_blueprint_spec(draft_json, session.blueprint_kind)
+    _update_session_from_draft(
+        session,
+        draft_json,
+        session.requirements_summary,
+        errors,
+        suggested_fixes=[],
+    )
+    return JsonResponse(
+        {"status": session.status, "validation_errors": session.validation_errors_json or []}
+    )
+
+
+@csrf_exempt
+@login_required
+def publish_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    result = _publish_draft_session(session, request.user)
+    if not result.get("ok"):
+        return JsonResponse(
+            {"error": result.get("error", "Publish failed"), "validation_errors": result.get("validation_errors", [])},
+            status=400,
+        )
+    return JsonResponse(result)
+
 @login_required
 def get_voice_note(request: HttpRequest, voice_note_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
@@ -1527,6 +1632,7 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             "last_error": session.last_error,
             "diff_summary": session.diff_summary,
             "context_pack_refs": session.context_pack_refs_json or [],
+            "context_pack_ids": session.context_pack_ids or [],
             "effective_context_hash": session.effective_context_hash,
             "effective_context_preview": session.effective_context_preview,
         }
