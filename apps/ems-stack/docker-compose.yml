@@ -28,6 +28,10 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${EMS_PUBLIC_PORT:-8080}:8080"
+      - "${EMS_PUBLIC_TLS_PORT:-8443}:8443"
+    volumes:
+      - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme
+      - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro
     depends_on:
       - ems-api
 

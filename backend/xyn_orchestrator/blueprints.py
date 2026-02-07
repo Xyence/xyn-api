@@ -585,6 +585,7 @@ def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str
     if isinstance(acceptance, dict):
         return {key: list(value) for key, value in acceptance.items()}
     deploy_meta = metadata.get("deploy") or {}
+    tls_meta = metadata.get("tls") or {}
     deploy_target = deploy_meta.get("target_instance_id") or deploy_meta.get("target_instance") or deploy_meta.get(
         "target_instance_name"
     )
@@ -595,6 +596,7 @@ def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str
             env = environments[0] if isinstance(environments[0], dict) else {}
             deploy_fqdn = env.get("fqdn")
     remote_enabled = bool(deploy_target and deploy_fqdn)
+    tls_enabled = str(tls_meta.get("mode") or "").lower() in {"nginx+acme", "acme", "letsencrypt"}
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     if blueprint_fqn == "core.ems.platform":
         checks = {
@@ -609,6 +611,12 @@ def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str
                 "remote-deploy-compose-ssm",
                 "remote-deploy-verify-public",
             ]
+        if remote_enabled and tls_enabled:
+            checks["remote_https_health"] = [
+                "tls-acme-bootstrap",
+                "tls-nginx-configure",
+                "remote-deploy-verify-https",
+            ]
         return checks
     return {}
 
@@ -617,6 +625,7 @@ def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
     completed: List[Dict[str, Any]] = []
     completed_ids: set[str] = set()
     remote_verify_ok = False
+    remote_https_ok = False
     tasks = DevTask.objects.filter(
         source_entity_type="blueprint", source_entity_id=blueprint.id
     ).select_related("result_run")
@@ -666,6 +675,8 @@ def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
             checks = verify_result.get("checks") or []
             health_ok = False
             api_ok = False
+            https_health_ok = False
+            https_api_ok = False
             for check in checks:
                 if check.get("name") in {"public_health", "http://ems.xyence.io/health", "health"} and check.get("ok"):
                     health_ok = True
@@ -675,14 +686,22 @@ def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
                     "api_health",
                 } and check.get("ok"):
                     api_ok = True
+                if check.get("name") in {"public_https_health"} and check.get("ok"):
+                    https_health_ok = True
+                if check.get("name") in {"public_https_api_health"} and check.get("ok"):
+                    https_api_ok = True
             if health_ok and api_ok:
                 remote_verify_ok = True
+            if https_health_ok and https_api_ok:
+                remote_https_ok = True
 
     acceptance_map = _acceptance_checks_for_blueprint(blueprint)
     acceptance_status = []
     for check_id, work_items in acceptance_map.items():
         if check_id == "remote_http_health":
             status = "pass" if remote_verify_ok else "fail"
+        elif check_id == "remote_https_health":
+            status = "pass" if remote_https_ok else "fail"
         else:
             status = "pass" if all(item in completed_ids for item in work_items) else "fail"
         acceptance_status.append({"id": check_id, "status": status})
@@ -702,6 +721,7 @@ def _select_next_slice(
     run_history_summary: Dict[str, Any],
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     priority = [
+        "remote_https_health",
         "remote_http_health",
         "local_chassis",
         "jwt_required",
@@ -740,6 +760,11 @@ def _select_next_slice(
             "dns-route53-ensure-record",
             "remote-deploy-compose-ssm",
             "remote-deploy-verify-public",
+        ],
+        "remote_https_health": [
+            "tls-acme-bootstrap",
+            "tls-nginx-configure",
+            "remote-deploy-verify-https",
         ],
     }
     if not next_gap:
@@ -792,6 +817,9 @@ def _annotate_work_items(
         "dns-route53-ensure-record": ["dns.route53.records"],
         "remote-deploy-compose-ssm": ["deploy.compose.remote", "deploy.ssm"],
         "remote-deploy-verify-public": ["deploy.compose.remote.verify"],
+        "tls-acme-bootstrap": ["tls.acme.http01"],
+        "tls-nginx-configure": ["runtime.reverse_proxy.http", "runtime.web.static"],
+        "remote-deploy-verify-https": ["deploy.compose.remote.verify", "tls.acme.http01"],
     }
     work_item_modules = {
         "ems-api-scaffold": ["ems-api"],
@@ -815,6 +843,9 @@ def _annotate_work_items(
         "dns-route53-ensure-record": ["dns-route53"],
         "remote-deploy-compose-ssm": ["ems-stack"],
         "remote-deploy-verify-public": ["ems-stack"],
+        "tls-acme-bootstrap": ["runtime-web-static-nginx"],
+        "tls-nginx-configure": ["runtime-web-static-nginx"],
+        "remote-deploy-verify-https": ["runtime-web-static-nginx"],
     }
     for item in work_items:
         item_id = item.get("id")
@@ -1584,6 +1615,72 @@ def _generate_implementation_plan(
                 "depends_on": ["remote-deploy-compose-ssm"],
                 "labels": ["deploy", "verify", "remote"],
             },
+            {
+                "id": "tls-acme-bootstrap",
+                "title": "ACME TLS bootstrap",
+                "description": "Issue or renew TLS certificates via ACME (Let's Encrypt).",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
+                "outputs": {"paths": [], "artifacts": ["acme_result.json", "deploy_execution_tls.log"]},
+                "acceptance_criteria": ["TLS certificate exists and is valid."],
+                "verify": [{"name": "acme-verify", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": ["dns-route53-ensure-record", "remote-deploy-compose-ssm"],
+                "labels": ["deploy", "tls", "acme"],
+            },
+            {
+                "id": "tls-nginx-configure",
+                "title": "Configure nginx for TLS",
+                "description": "Enable TLS in nginx and reload stack.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
+                "outputs": {"paths": [], "artifacts": ["deploy_execution_tls.log"]},
+                "acceptance_criteria": ["nginx serves HTTPS using ACME cert."],
+                "verify": [{"name": "tls-nginx", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": ["tls-acme-bootstrap"],
+                "labels": ["deploy", "tls", "nginx"],
+            },
+            {
+                "id": "remote-deploy-verify-https",
+                "title": "Verify public HTTPS health",
+                "description": "Verify public HTTPS endpoints on EMS FQDN.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
+                "outputs": {"paths": [], "artifacts": ["deploy_verify.json"]},
+                "acceptance_criteria": ["Public HTTPS /health and /api/health return 200."],
+                "verify": [{"name": "public-verify-https", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": ["tls-nginx-configure"],
+                "labels": ["deploy", "verify", "https"],
+            },
         ]
     else:
         work_items = [
@@ -1797,6 +1894,9 @@ def _queue_dev_tasks_for_plan(
             "dns-route53-ensure-record",
             "remote-deploy-compose-ssm",
             "remote-deploy-verify-public",
+            "tls-acme-bootstrap",
+            "tls-nginx-configure",
+            "remote-deploy-verify-https",
         }
         dev_task = DevTask.objects.create(
             title=title,

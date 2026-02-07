@@ -171,6 +171,21 @@ class PipelineSchemaTests(TestCase):
         errors = list(Draft202012Validator(schema).iter_errors(payload))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
 
+    def test_acme_result_schema(self):
+        payload = {
+            "schema_version": "acme_result.v1",
+            "fqdn": "ems.xyence.io",
+            "email": "admin@xyence.io",
+            "method": "http-01",
+            "outcome": "succeeded",
+            "issued_at": "2026-02-07T00:00:00Z",
+            "expiry_not_after": "2026-05-01T00:00:00Z",
+            "errors": [],
+        }
+        schema = self._load_schema("acme_result.v1.schema.json")
+        errors = list(Draft202012Validator(schema).iter_errors(payload))
+        self.assertEqual(errors, [], f"Schema errors: {errors}")
+
     def test_planner_selects_persistence_slice(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
         for work_item_id in [
@@ -258,6 +273,28 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("remote-deploy-compose-ssm", ids)
         self.assertIn("remote-deploy-verify-public", ids)
 
+    def test_planner_selects_tls_slice_when_tls_enabled(self):
+        blueprint = Blueprint.objects.create(
+            name="ems.platform",
+            namespace="core",
+            metadata_json={
+                "dns_provider": "route53",
+                "deploy": {"target_instance_id": str(uuid.uuid4()), "primary_fqdn": "ems.xyence.io"},
+                "tls": {"mode": "nginx+acme", "acme_email": "admin@xyence.io"},
+            },
+        )
+        module_catalog = _build_module_catalog()
+        run_history = _build_run_history_summary(blueprint)
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=module_catalog,
+            run_history_summary=run_history,
+        )
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("tls-acme-bootstrap", ids)
+        self.assertIn("tls-nginx-configure", ids)
+        self.assertIn("remote-deploy-verify-https", ids)
+
     def test_dns_noop_when_record_matches(self):
         with mock.patch("xyn_orchestrator.worker_tasks._ensure_route53_record") as ensure_record:
             with mock.patch("xyn_orchestrator.worker_tasks._verify_route53_record", return_value=True):
@@ -317,6 +354,8 @@ class PipelineSchemaTests(TestCase):
             self.assertIn("ems-web", compose)
             self.assertNotIn("5173", compose)
             self.assertNotIn("npm run dev", compose)
+            self.assertIn("EMS_PUBLIC_TLS_PORT", compose)
+            self.assertIn("acme-webroot", compose)
 
     def test_ui_dockerfile_builds_static_assets(self):
         work_item = {
@@ -337,6 +376,9 @@ class PipelineSchemaTests(TestCase):
             dockerfile = Path(repo_dir, "apps/ems-ui/Dockerfile").read_text(encoding="utf-8")
             self.assertIn("npm ci", dockerfile)
             self.assertIn("npm run build", dockerfile)
+            nginx_conf = Path(repo_dir, "apps/ems-ui/nginx.conf").read_text(encoding="utf-8")
+            self.assertIn("listen 8443 ssl", nginx_conf)
+            self.assertIn(".well-known/acme-challenge", nginx_conf)
 
     def test_codegen_patch_can_apply_to_clean_repo(self):
         if shutil.which("git") is None:

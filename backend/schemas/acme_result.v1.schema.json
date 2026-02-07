@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "fqdn",
+    "email",
+    "method",
+    "outcome",
+    "issued_at",
+    "expiry_not_after",
+    "errors"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "acme_result.v1"
+    },
+    "fqdn": {
+      "type": "string"
+    },
+    "email": {
+      "type": "string"
+    },
+    "method": {
+      "type": "string"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["succeeded", "failed", "noop"]
+    },
+    "issued_at": {
+      "type": "string"
+    },
+    "expiry_not_after": {
+      "type": "string"
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  }
+}

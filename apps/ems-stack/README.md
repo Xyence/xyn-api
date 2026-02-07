@@ -28,6 +28,14 @@ JWT secret (required for /api/me):
 export EMS_JWT_SECRET=dev-secret-change-me
 ```
 
+TLS assets (optional for local runs):
+
+```bash
+export EMS_CERTS_PATH=./certs
+export EMS_ACME_WEBROOT_PATH=./acme-webroot
+export EMS_PUBLIC_TLS_PORT=8443
+```
+
 To run with verification checks (Docker required):
 
 ```bash

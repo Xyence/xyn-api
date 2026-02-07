@@ -651,6 +651,9 @@ POSTGRES_PASSWORD=ems
 POSTGRES_DB=ems
 XYN_UI_PATH=../../xyn-ui/apps/ems-ui
 EMS_JWT_SECRET=dev-secret-change-me
+EMS_CERTS_PATH=./certs
+EMS_ACME_WEBROOT_PATH=./acme-webroot
+EMS_PUBLIC_TLS_PORT=8443
 """,
         )
         _write_file(
@@ -685,6 +688,10 @@ EMS_JWT_SECRET=dev-secret-change-me
       dockerfile: Dockerfile
     ports:
       - "${EMS_PUBLIC_PORT:-8080}:8080"
+      - "${EMS_PUBLIC_TLS_PORT:-8443}:8443"
+    volumes:
+      - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme
+      - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro
     depends_on:
       - ems-api
 
@@ -699,6 +706,35 @@ volumes:
 http {
   server {
     listen 8080;
+
+    location ^~ /.well-known/acme-challenge/ {
+      root /var/www/acme;
+    }
+
+    location /health {
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_pass http://ems-api:8000/health;
+    }
+
+    location /api/ {
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_pass http://ems-api:8000/;
+    }
+
+    location / {
+      return 308 https://$host$request_uri;
+    }
+  }
+
+  server {
+    listen 8443 ssl;
+
+    ssl_certificate /etc/nginx/certs/current/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/current/privkey.pem;
 
     location /health {
       proxy_set_header Host $host;
@@ -1615,6 +1651,9 @@ POSTGRES_PASSWORD=ems
 POSTGRES_DB=ems
 XYN_UI_PATH=../../xyn-ui/apps/ems-ui
 EMS_JWT_SECRET=dev-secret-change-me
+EMS_CERTS_PATH=./certs
+EMS_ACME_WEBROOT_PATH=./acme-webroot
+EMS_PUBLIC_TLS_PORT=8443
 """,
         )
         _write_file(
@@ -1649,6 +1688,10 @@ EMS_JWT_SECRET=dev-secret-change-me
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
+      - "${EMS_PUBLIC_TLS_PORT:-8443}:8443"
+    volumes:
+      - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme
+      - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro
     depends_on:
       - ems-api
 
@@ -1780,6 +1823,35 @@ COPY --from=build /app/dist /usr/share/nginx/html
             p("nginx.conf"),
             """server {
   listen 8080;
+
+  location ^~ /.well-known/acme-challenge/ {
+    root /var/www/acme;
+  }
+
+  location /health {
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass http://ems-api:8000/health;
+  }
+
+  location /api/ {
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass http://ems-api:8000/;
+  }
+
+  location / {
+    return 308 https://$host$request_uri;
+  }
+}
+
+server {
+  listen 8443 ssl;
+
+  ssl_certificate /etc/nginx/certs/current/fullchain.pem;
+  ssl_certificate_key /etc/nginx/certs/current/privkey.pem;
 
   location /health {
     proxy_set_header Host $host;
@@ -2294,15 +2366,78 @@ def _build_remote_deploy_commands(root_dir: str, jwt_secret: str) -> List[str]:
         f"export XYN_UI_PATH=\"{root_dir}/xyn-ui/apps/ems-ui\"",
         f"export EMS_JWT_SECRET=\"{jwt_secret}\"",
         "export EMS_PUBLIC_PORT=80",
+        "export EMS_PUBLIC_TLS_PORT=443",
+        f"export EMS_CERTS_PATH=\"{root_dir}/certs/current\"",
+        f"export EMS_ACME_WEBROOT_PATH=\"{root_dir}/acme-webroot\"",
+        f"mkdir -p \"{root_dir}/certs/current\" \"{root_dir}/acme-webroot\"",
         f"cd \"{root_dir}/xyn-api\"",
         (
             "XYN_UI_PATH=\"$XYN_UI_PATH\" EMS_JWT_SECRET=\"$EMS_JWT_SECRET\" "
-            "docker compose -f apps/ems-stack/docker-compose.yml up -d --build"
+            "EMS_PUBLIC_PORT=\"$EMS_PUBLIC_PORT\" EMS_PUBLIC_TLS_PORT=\"$EMS_PUBLIC_TLS_PORT\" "
+            "EMS_CERTS_PATH=\"$EMS_CERTS_PATH\" EMS_ACME_WEBROOT_PATH=\"$EMS_ACME_WEBROOT_PATH\" "
+            "docker compose -f apps/ems-stack/docker-compose.yml down -v --remove-orphans"
+        ),
+        (
+            "XYN_UI_PATH=\"$XYN_UI_PATH\" EMS_JWT_SECRET=\"$EMS_JWT_SECRET\" "
+            "EMS_PUBLIC_PORT=\"$EMS_PUBLIC_PORT\" EMS_PUBLIC_TLS_PORT=\"$EMS_PUBLIC_TLS_PORT\" "
+            "EMS_CERTS_PATH=\"$EMS_CERTS_PATH\" EMS_ACME_WEBROOT_PATH=\"$EMS_ACME_WEBROOT_PATH\" "
+            "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans"
         ),
         "for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 2; done",
         "for i in $(seq 1 30); do curl -fsS http://localhost:8080/api/health && break; sleep 2; done",
     ]
 
+
+def _build_tls_acme_commands(root_dir: str, fqdn: str, email: str) -> List[str]:
+    return [
+        "set -euo pipefail",
+        "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
+        "command -v curl >/dev/null 2>&1 || { echo \"missing_curl\"; exit 13; }",
+        f"ROOT={root_dir}",
+        f"FQDN=\"{fqdn}\"",
+        f"EMAIL=\"{email}\"",
+        "ACME_WEBROOT=\"$ROOT/acme-webroot\"",
+        "LEGO_DIR=\"$ROOT/lego\"",
+        "CERT_DIR=\"$ROOT/certs/current\"",
+        "mkdir -p \"$ACME_WEBROOT\" \"$LEGO_DIR\" \"$CERT_DIR\"",
+        "if command -v openssl >/dev/null 2>&1; then "
+        "if [ -f \"$CERT_DIR/fullchain.pem\" ]; then "
+        "openssl x509 -checkend 1209600 -noout -in \"$CERT_DIR/fullchain.pem\" && echo \"acme_noop\" && exit 0; "
+        "fi; fi",
+        (
+            "docker run --rm "
+            "-v \"$LEGO_DIR\":/lego "
+            "-v \"$ACME_WEBROOT\":/webroot "
+            "goacme/lego:v4.12.3 "
+            "--email \"$EMAIL\" --domains \"$FQDN\" --path /lego "
+            "--http --http.webroot /webroot run"
+        ),
+        "if [ ! -f \"$LEGO_DIR/certificates/$FQDN.crt\" ]; then echo \"missing_cert\"; exit 20; fi",
+        "cp \"$LEGO_DIR/certificates/$FQDN.crt\" \"$CERT_DIR/fullchain.pem\"",
+        "cp \"$LEGO_DIR/certificates/$FQDN.key\" \"$CERT_DIR/privkey.pem\"",
+        "chmod 600 \"$CERT_DIR/privkey.pem\"",
+    ]
+
+
+def _build_tls_nginx_commands(root_dir: str) -> List[str]:
+    return [
+        "set -euo pipefail",
+        "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
+        f"ROOT={root_dir}",
+        f"export XYN_UI_PATH=\"{root_dir}/xyn-ui/apps/ems-ui\"",
+        "export EMS_PUBLIC_PORT=80",
+        "export EMS_PUBLIC_TLS_PORT=443",
+        f"export EMS_CERTS_PATH=\"{root_dir}/certs/current\"",
+        f"export EMS_ACME_WEBROOT_PATH=\"{root_dir}/acme-webroot\"",
+        f"mkdir -p \"{root_dir}/certs/current\" \"{root_dir}/acme-webroot\"",
+        f"cd \"{root_dir}/xyn-api\"",
+        (
+            "XYN_UI_PATH=\"$XYN_UI_PATH\" "
+            "EMS_CERTS_PATH=\"$EMS_CERTS_PATH\" EMS_ACME_WEBROOT_PATH=\"$EMS_ACME_WEBROOT_PATH\" "
+            "EMS_PUBLIC_PORT=\"$EMS_PUBLIC_PORT\" EMS_PUBLIC_TLS_PORT=\"$EMS_PUBLIC_TLS_PORT\" "
+            "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans"
+        ),
+    ]
 
 def _resolve_fqdn(metadata: Dict[str, Any]) -> str:
     deploy = metadata.get("deploy") or {}
@@ -2345,10 +2480,34 @@ def _public_verify_with_wait(fqdn: str, attempts: int = 12, delay: int = 10) -> 
     return False, last_checks
 
 
-def _public_verify_with_wait(fqdn: str, attempts: int = 12, delay: int = 10) -> tuple[bool, List[Dict[str, Any]]]:
+def _https_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
+    checks: List[Dict[str, Any]] = []
+    ok = True
+    for path, name in [("/health", "public_https_health"), ("/api/health", "public_https_api_health")]:
+        url = f"https://{fqdn}{path}"
+        try:
+            response = requests.get(url, timeout=10, verify=True)
+            status_ok = response.status_code == 200
+            checks.append({"name": name, "ok": status_ok, "detail": str(response.status_code)})
+            ok = ok and status_ok
+        except Exception as exc:
+            checks.append({"name": name, "ok": False, "detail": str(exc)})
+            ok = False
+    try:
+        http_response = requests.get(f"http://{fqdn}/health", timeout=10, allow_redirects=False)
+        redirect_ok = http_response.status_code in {301, 308}
+        checks.append({"name": "http_redirect", "ok": redirect_ok, "detail": str(http_response.status_code)})
+    except Exception as exc:
+        checks.append({"name": "http_redirect", "ok": False, "detail": str(exc)})
+    return ok, checks
+
+
+def _https_verify_with_wait(
+    fqdn: str, attempts: int = 12, delay: int = 10
+) -> tuple[bool, List[Dict[str, Any]]]:
     last_checks: List[Dict[str, Any]] = []
     for _ in range(attempts):
-        ok, checks = _public_verify(fqdn)
+        ok, checks = _https_verify(fqdn)
         last_checks = checks
         if ok:
             return True, checks
@@ -3190,6 +3349,164 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         {
                             "code": "public_verify_failed",
                             "message": "Public HTTP verification failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                    )
+
+            if work_item_id == "tls-acme-bootstrap":
+                try:
+                    if not fqdn:
+                        raise RuntimeError("FQDN missing in blueprint metadata")
+                    tls_meta = blueprint_metadata.get("tls") or {}
+                    acme_email = tls_meta.get("acme_email") or deploy_meta.get("acme_email")
+                    if not acme_email:
+                        raise RuntimeError("tls.acme_email missing in blueprint metadata")
+                    if not target_instance or not target_instance.get("instance_id"):
+                        raise RuntimeError("Target instance missing for TLS bootstrap")
+                    exec_result = _run_ssm_commands(
+                        target_instance.get("instance_id"),
+                        target_instance.get("aws_region"),
+                        _build_tls_acme_commands("/opt/xyn/apps/ems", fqdn, acme_email),
+                    )
+                    stdout = exec_result.get("stdout", "")
+                    noop = "acme_noop" in stdout
+                    outcome = "noop" if noop else (
+                        "succeeded" if exec_result.get("invocation_status") == "Success" else "failed"
+                    )
+                    acme_result = {
+                        "schema_version": "acme_result.v1",
+                        "fqdn": fqdn,
+                        "email": acme_email,
+                        "method": "http-01",
+                        "outcome": outcome,
+                        "issued_at": datetime.utcnow().isoformat() + "Z",
+                        "expiry_not_after": "",
+                        "errors": [],
+                    }
+                    log_url = _write_artifact(
+                        run_id,
+                        "deploy_execution_tls.log",
+                        json.dumps({"stdout": stdout, "stderr": exec_result.get("stderr", "")}, indent=2),
+                    )
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "deploy_execution_tls.log", "kind": "deploy", "url": log_url},
+                    )
+                    acme_url = _write_artifact(
+                        run_id, "acme_result.json", json.dumps(acme_result, indent=2)
+                    )
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "acme_result.json", "kind": "deploy", "url": acme_url},
+                    )
+                    artifacts.append(
+                        {
+                            "key": "acme_result.json",
+                            "content_type": "application/json",
+                            "description": "ACME issuance result",
+                        }
+                    )
+                    artifacts.append(
+                        {
+                            "key": "deploy_execution_tls.log",
+                            "content_type": "application/json",
+                            "description": "TLS bootstrap execution log",
+                        }
+                    )
+                    if outcome == "failed":
+                        success = False
+                        errors.append(
+                            {
+                                "code": "acme_failed",
+                                "message": "ACME issuance failed.",
+                                "detail": exec_result.get("stderr", ""),
+                            }
+                        )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "acme_failed",
+                            "message": "ACME bootstrap failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                    )
+
+            if work_item_id == "tls-nginx-configure":
+                try:
+                    if not target_instance or not target_instance.get("instance_id"):
+                        raise RuntimeError("Target instance missing for TLS nginx configure")
+                    exec_result = _run_ssm_commands(
+                        target_instance.get("instance_id"),
+                        target_instance.get("aws_region"),
+                        _build_tls_nginx_commands("/opt/xyn/apps/ems"),
+                    )
+                    stdout = exec_result.get("stdout", "")
+                    outcome = "noop" if "up-to-date" in stdout.lower() else (
+                        "succeeded" if exec_result.get("invocation_status") == "Success" else "failed"
+                    )
+                    log_url = _write_artifact(
+                        run_id,
+                        "deploy_execution_tls.log",
+                        json.dumps({"stdout": stdout, "stderr": exec_result.get("stderr", "")}, indent=2),
+                    )
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "deploy_execution_tls.log", "kind": "deploy", "url": log_url},
+                    )
+                    artifacts.append(
+                        {
+                            "key": "deploy_execution_tls.log",
+                            "content_type": "application/json",
+                            "description": "TLS nginx execution log",
+                        }
+                    )
+                    if outcome == "failed":
+                        success = False
+                        errors.append(
+                            {
+                                "code": "tls_nginx_failed",
+                                "message": "TLS nginx configuration failed.",
+                                "detail": exec_result.get("stderr", ""),
+                            }
+                        )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "tls_nginx_failed",
+                            "message": "TLS nginx configure failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                    )
+
+            if work_item_id == "remote-deploy-verify-https":
+                try:
+                    if not fqdn:
+                        raise RuntimeError("FQDN missing in blueprint metadata")
+                    ok, verify_results = _https_verify_with_wait(fqdn)
+                    if not ok:
+                        raise RuntimeError("Public HTTPS checks failed")
+                    verify_url = _write_artifact(
+                        run_id, "deploy_verify.json", json.dumps({"checks": verify_results}, indent=2)
+                    )
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "deploy_verify.json", "kind": "deploy", "url": verify_url},
+                    )
+                    artifacts.append(
+                        {
+                            "key": "deploy_verify.json",
+                            "content_type": "application/json",
+                            "description": "Public HTTPS verify checks",
+                        }
+                    )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "https_verify_failed",
+                            "message": "Public HTTPS verification failed.",
                             "detail": {"error": str(exc)},
                         }
                     )
