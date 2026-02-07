@@ -61,6 +61,11 @@ def list_instances(request: HttpRequest) -> JsonResponse:
     instances = ProvisionedInstance.objects.all().order_by("-created_at")
     if env_id := request.GET.get("environment_id"):
         instances = instances.filter(environment_id=env_id)
+    status = request.GET.get("status")
+    if status and status != "all":
+        instances = instances.filter(status=status)
+    elif not status:
+        instances = instances.exclude(status__in=["terminated", "error"])
     data = [_instance_payload(inst) for inst in instances]
     return JsonResponse({"instances": data})
 
