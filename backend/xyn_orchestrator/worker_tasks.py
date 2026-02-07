@@ -2671,7 +2671,9 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "blueprint_id": plan_json.get("blueprint_id"),
                 "summary": {
                     "outcome": "noop" if noop else ("succeeded" if success else "failed"),
-                    "changes": "No changes (noop)" if noop else (f\"{len(repo_results)} repo(s) updated\" if success else "No changes"),
+                    "changes": "No changes (noop)"
+                    if noop
+                    else (f"{len(repo_results)} repo(s) updated" if success else "No changes"),
                     "risks": "Scaffolds only; requires implementation.",
                     "next_steps": "Review patches and iterate.",
                 },
