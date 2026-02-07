@@ -2466,6 +2466,37 @@ def _resolve_fqdn(metadata: Dict[str, Any]) -> str:
     return ""
 
 
+def _work_item_capabilities(work_item: Dict[str, Any], work_item_id: str) -> set[str]:
+    caps = work_item.get("capabilities_required") or []
+    if isinstance(caps, str):
+        caps = [caps]
+    if not caps:
+        legacy_caps = {
+            "dns-route53-ensure-record": ["dns.route53.records"],
+            "remote-deploy-compose-ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
+            "remote-deploy-verify-public": ["deploy.verify.public_http"],
+            "tls-acme-bootstrap": ["ingress.tls.acme_http01"],
+            "tls-nginx-configure": ["ingress.nginx.tls_configure"],
+            "remote-deploy-verify-https": ["deploy.verify.public_https"],
+        }
+        caps = legacy_caps.get(work_item_id, [])
+    return {cap for cap in caps if isinstance(cap, str)}
+
+
+def _work_item_matches(
+    work_item: Dict[str, Any],
+    work_item_id: str,
+    caps: set[str],
+    ids: set[str],
+    capability: str,
+) -> bool:
+    if work_item_id in ids:
+        return True
+    if capability in caps and work_item.get("type") == "deploy":
+        return True
+    return False
+
+
 def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
     checks = []
     ok = True
@@ -2970,6 +3001,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             work_item_title = work_item.get("title") or work_item_id
             blueprint_id = plan_json.get("blueprint_id")
             blueprint_name = plan_json.get("blueprint_name") or plan_json.get("blueprint")
+            caps = _work_item_capabilities(work_item, work_item_id)
             for repo in work_item.get("repo_targets", []):
                 repo_dir = _ensure_repo_workspace(repo, workspace_root)
                 _apply_scaffold_for_work_item(work_item, repo_dir)
@@ -3118,7 +3150,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     }
                 )
 
-            if work_item_id == "dns-route53-ensure-record":
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"dns-route53-ensure-record", "dns.ensure_record.route53"},
+                "dns.route53.records",
+            ):
                 try:
                     if dns_provider and str(dns_provider).lower() != "route53":
                         raise RuntimeError("dns_provider is not route53")
@@ -3163,7 +3201,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         }
                     )
 
-            if work_item_id == "remote-deploy-compose-ssm":
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"remote-deploy-compose-ssm", "deploy.apply_remote_compose.ssm"},
+                "runtime.compose.apply_remote",
+            ):
                 deploy_started = datetime.utcnow().isoformat() + "Z"
                 try:
                     if not target_instance or not target_instance.get("instance_id"):
@@ -3335,7 +3379,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         }
                     )
 
-            if work_item_id == "remote-deploy-verify-public":
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"remote-deploy-verify-public", "verify.public_http"},
+                "deploy.verify.public_http",
+            ):
                 try:
                     if not fqdn:
                         raise RuntimeError("FQDN missing in blueprint metadata")
@@ -3366,7 +3416,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         }
                     )
 
-            if work_item_id == "tls-acme-bootstrap":
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"tls-acme-bootstrap", "tls.acme_http01"},
+                "ingress.tls.acme_http01",
+            ):
                 try:
                     if not fqdn:
                         raise RuntimeError("FQDN missing in blueprint metadata")
@@ -3445,7 +3501,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         }
                     )
 
-            if work_item_id == "tls-nginx-configure":
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"tls-nginx-configure", "ingress.nginx_tls_configure"},
+                "ingress.nginx.tls_configure",
+            ):
                 try:
                     if not target_instance or not target_instance.get("instance_id"):
                         raise RuntimeError("Target instance missing for TLS nginx configure")
@@ -3493,7 +3555,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         }
                     )
 
-            if work_item_id == "remote-deploy-verify-https":
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"remote-deploy-verify-https", "verify.public_https"},
+                "deploy.verify.public_https",
+            ):
                 try:
                     if not fqdn:
                         raise RuntimeError("FQDN missing in blueprint metadata")

@@ -26,6 +26,7 @@ from xyn_orchestrator.worker_tasks import (
     _stage_all,
     _route53_ensure_with_noop,
     _run_remote_deploy,
+    _work_item_capabilities,
 )
 from xyn_orchestrator.models import Blueprint, ContextPack, DevTask, Run
 
@@ -269,9 +270,17 @@ class PipelineSchemaTests(TestCase):
             run_history_summary=run_history,
         )
         ids = {item.get("id") for item in plan.get("work_items", [])}
-        self.assertIn("dns-route53-ensure-record", ids)
-        self.assertIn("remote-deploy-compose-ssm", ids)
-        self.assertIn("remote-deploy-verify-public", ids)
+        self.assertIn("dns.ensure_record.route53", ids)
+        self.assertIn("deploy.apply_remote_compose.ssm", ids)
+        self.assertIn("verify.public_http", ids)
+        module_ids = {
+            ref.get("id")
+            for item in plan.get("work_items", [])
+            for ref in item.get("module_refs", [])
+            if isinstance(ref, dict)
+        }
+        self.assertIn("dns-route53", module_ids)
+        self.assertIn("deploy-ssm-compose", module_ids)
 
     def test_planner_selects_tls_slice_when_tls_enabled(self):
         blueprint = Blueprint.objects.create(
@@ -291,9 +300,16 @@ class PipelineSchemaTests(TestCase):
             run_history_summary=run_history,
         )
         ids = {item.get("id") for item in plan.get("work_items", [])}
-        self.assertIn("tls-acme-bootstrap", ids)
-        self.assertIn("tls-nginx-configure", ids)
-        self.assertIn("remote-deploy-verify-https", ids)
+        self.assertIn("tls.acme_http01", ids)
+        self.assertIn("ingress.nginx_tls_configure", ids)
+        self.assertIn("verify.public_https", ids)
+        module_ids = {
+            ref.get("id")
+            for item in plan.get("work_items", [])
+            for ref in item.get("module_refs", [])
+            if isinstance(ref, dict)
+        }
+        self.assertIn("ingress-nginx-acme", module_ids)
 
     def test_dns_noop_when_record_matches(self):
         with mock.patch("xyn_orchestrator.worker_tasks._ensure_route53_record") as ensure_record:
@@ -333,6 +349,31 @@ class PipelineSchemaTests(TestCase):
         module_spec = data.get("module", {})
         self.assertIn("runtime.web.static", module_spec.get("capabilitiesProvided", []))
         self.assertIn("runtime.reverse_proxy.http", module_spec.get("capabilitiesProvided", []))
+
+    def test_deploy_ssm_compose_module_spec_fields(self):
+        spec_path = (
+            Path(__file__).resolve().parents[2] / "registry" / "modules" / "deploy-ssm-compose.json"
+        )
+        data = json.loads(spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("kind"), "Module")
+        metadata = data.get("metadata", {})
+        self.assertEqual(metadata.get("name"), "deploy-ssm-compose")
+        self.assertEqual(metadata.get("namespace"), "core")
+        module_spec = data.get("module", {})
+        self.assertIn("runtime.compose.apply_remote", module_spec.get("capabilitiesProvided", []))
+
+    def test_ingress_nginx_acme_module_spec_fields(self):
+        spec_path = (
+            Path(__file__).resolve().parents[2] / "registry" / "modules" / "ingress-nginx-acme.json"
+        )
+        data = json.loads(spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("kind"), "Module")
+        metadata = data.get("metadata", {})
+        self.assertEqual(metadata.get("name"), "ingress-nginx-acme")
+        self.assertEqual(metadata.get("namespace"), "core")
+        module_spec = data.get("module", {})
+        self.assertIn("ingress.tls.acme_http01", module_spec.get("capabilitiesProvided", []))
+        self.assertIn("ingress.nginx.reverse_proxy", module_spec.get("capabilitiesProvided", []))
 
     def test_prod_web_scaffold_outputs(self):
         work_item = {
@@ -753,3 +794,9 @@ class PipelineSchemaTests(TestCase):
             _apply_scaffold_for_work_item(work_item, repo_dir)
             dockerfile = Path(repo_dir, "apps/ems-api/Dockerfile")
             self.assertTrue(dockerfile.exists())
+
+    def test_legacy_work_item_capabilities_fallback(self):
+        work_item = {"id": "remote-deploy-compose-ssm"}
+        caps = _work_item_capabilities(work_item, "remote-deploy-compose-ssm")
+        self.assertIn("runtime.compose.apply_remote", caps)
+        self.assertIn("deploy.ssm.run_shell", caps)

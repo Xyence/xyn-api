@@ -1,0 +1,42 @@
+{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "ingress-nginx-acme",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "ingress.tls.acme_http01"
+    }
+  },
+  "description": "Nginx reverse proxy with ACME HTTP-01 TLS provisioning.",
+  "module": {
+    "type": "lib",
+    "fqn": "core.ingress-nginx-acme",
+    "capabilitiesProvided": [
+      "ingress.tls.acme_http01",
+      "ingress.nginx.reverse_proxy",
+      "ingress.nginx.tls_configure"
+    ],
+    "interfaces": {
+      "config": {
+        "fqdns": "List of FQDNs to provision certificates for.",
+        "acme_email": "Email for Let's Encrypt registration.",
+        "webroot_path": "ACME webroot path on instance (default: /opt/xyn/acme-webroot).",
+        "cert_root": "Certificate root path on instance (default: /opt/xyn/certs).",
+        "nginx_service": "Nginx container/service name in compose (default: ems-web).",
+        "listen_ports": "HTTP/HTTPS port mapping (default 80/443).",
+        "redirect_http_to_https": "Whether to redirect HTTP to HTTPS."
+      },
+      "operations": {
+        "ensure_acme_cert": "Issue or renew certificates via ACME HTTP-01.",
+        "configure_nginx_tls": "Enable TLS in nginx and reload.",
+        "verify_https": "Verify HTTPS endpoints after deploy."
+      }
+    },
+    "constraints": {
+      "secrets": "No inline secrets; use environment or secret refs.",
+      "tls": "HTTP-01 challenge requires inbound port 80 reachable."
+    }
+  }
+}

@@ -607,15 +607,15 @@ def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str
         }
         if remote_enabled:
             checks["remote_http_health"] = [
-                "dns-route53-ensure-record",
-                "remote-deploy-compose-ssm",
-                "remote-deploy-verify-public",
+                "dns.ensure_record.route53",
+                "deploy.apply_remote_compose.ssm",
+                "verify.public_http",
             ]
         if remote_enabled and tls_enabled:
             checks["remote_https_health"] = [
-                "tls-acme-bootstrap",
-                "tls-nginx-configure",
-                "remote-deploy-verify-https",
+                "tls.acme_http01",
+                "ingress.nginx_tls_configure",
+                "verify.public_https",
             ]
         return checks
     return {}
@@ -757,14 +757,14 @@ def _select_next_slice(
         "oidc": ["ems-api-authn-oidc", "ems-ui-auth"],
         "route53_acme_ssm": ["ems-api-route53", "ems-api-acme", "ems-ssm-deploy"],
         "remote_http_health": [
-            "dns-route53-ensure-record",
-            "remote-deploy-compose-ssm",
-            "remote-deploy-verify-public",
+            "dns.ensure_record.route53",
+            "deploy.apply_remote_compose.ssm",
+            "verify.public_http",
         ],
         "remote_https_health": [
-            "tls-acme-bootstrap",
-            "tls-nginx-configure",
-            "remote-deploy-verify-https",
+            "tls.acme_http01",
+            "ingress.nginx_tls_configure",
+            "verify.public_https",
         ],
     }
     if not next_gap:
@@ -814,12 +814,20 @@ def _annotate_work_items(
         "ems-ui-token-input-me-call": ["app.ui.react", "authn.jwt.validate"],
         "ems-ui-devices-role-aware": ["app.ui.react", "authz.rbac.enforce"],
         "dns-route53-module": ["dns.route53.records"],
+        "deploy-ssm-compose-module": ["runtime.compose.apply_remote"],
+        "ingress-nginx-acme-module": ["ingress.tls.acme_http01"],
         "dns-route53-ensure-record": ["dns.route53.records"],
-        "remote-deploy-compose-ssm": ["deploy.compose.remote", "deploy.ssm"],
-        "remote-deploy-verify-public": ["deploy.compose.remote.verify"],
-        "tls-acme-bootstrap": ["tls.acme.http01"],
-        "tls-nginx-configure": ["runtime.reverse_proxy.http", "runtime.web.static"],
-        "remote-deploy-verify-https": ["deploy.compose.remote.verify", "tls.acme.http01"],
+        "dns.ensure_record.route53": ["dns.route53.records"],
+        "remote-deploy-compose-ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
+        "deploy.apply_remote_compose.ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
+        "remote-deploy-verify-public": ["deploy.verify.public_http"],
+        "verify.public_http": ["deploy.verify.public_http"],
+        "tls-acme-bootstrap": ["ingress.tls.acme_http01"],
+        "tls.acme_http01": ["ingress.tls.acme_http01"],
+        "tls-nginx-configure": ["ingress.nginx.tls_configure", "ingress.nginx.reverse_proxy"],
+        "ingress.nginx_tls_configure": ["ingress.nginx.tls_configure", "ingress.nginx.reverse_proxy"],
+        "remote-deploy-verify-https": ["deploy.verify.public_https", "ingress.tls.acme_http01"],
+        "verify.public_https": ["deploy.verify.public_https", "ingress.tls.acme_http01"],
     }
     work_item_modules = {
         "ems-api-scaffold": ["ems-api"],
@@ -840,12 +848,20 @@ def _annotate_work_items(
         "ems-ui-token-input-me-call": ["ems-ui"],
         "ems-ui-devices-role-aware": ["ems-ui"],
         "dns-route53-module": ["dns-route53"],
+        "deploy-ssm-compose-module": ["deploy-ssm-compose"],
+        "ingress-nginx-acme-module": ["ingress-nginx-acme"],
         "dns-route53-ensure-record": ["dns-route53"],
-        "remote-deploy-compose-ssm": ["ems-stack"],
-        "remote-deploy-verify-public": ["ems-stack"],
-        "tls-acme-bootstrap": ["runtime-web-static-nginx"],
-        "tls-nginx-configure": ["runtime-web-static-nginx"],
-        "remote-deploy-verify-https": ["runtime-web-static-nginx"],
+        "dns.ensure_record.route53": ["dns-route53"],
+        "remote-deploy-compose-ssm": ["deploy-ssm-compose"],
+        "deploy.apply_remote_compose.ssm": ["deploy-ssm-compose"],
+        "remote-deploy-verify-public": ["deploy-ssm-compose"],
+        "verify.public_http": ["deploy-ssm-compose"],
+        "tls-acme-bootstrap": ["ingress-nginx-acme"],
+        "tls.acme_http01": ["ingress-nginx-acme"],
+        "tls-nginx-configure": ["ingress-nginx-acme"],
+        "ingress.nginx_tls_configure": ["ingress-nginx-acme"],
+        "remote-deploy-verify-https": ["ingress-nginx-acme"],
+        "verify.public_https": ["ingress-nginx-acme"],
     }
     for item in work_items:
         item_id = item.get("id")
@@ -1550,7 +1566,7 @@ def _generate_implementation_plan(
                 "labels": ["dns", "integration"],
             },
             {
-                "id": "dns-route53-ensure-record",
+                "id": "dns.ensure_record.route53",
                 "title": "Ensure Route53 DNS record",
                 "description": "Create/ensure Route53 DNS A record for EMS public FQDN.",
                 "type": "deploy",
@@ -1572,7 +1588,7 @@ def _generate_implementation_plan(
                 "labels": ["module", "dns", "module:dns-route53", "capability:dns.route53.records"],
             },
             {
-                "id": "remote-deploy-compose-ssm",
+                "id": "deploy.apply_remote_compose.ssm",
                 "title": "Remote deploy via SSM",
                 "description": "Deploy EMS stack to target instance using SSM and docker-compose.",
                 "type": "deploy",
@@ -1590,11 +1606,11 @@ def _generate_implementation_plan(
                 "outputs": {"paths": [], "artifacts": ["deploy_result.json", "deploy_manifest.json"]},
                 "acceptance_criteria": ["EMS stack deployed and healthy on target instance."],
                 "verify": [{"name": "remote-deploy", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["dns-route53-ensure-record"],
+                "depends_on": ["dns.ensure_record.route53"],
                 "labels": ["deploy", "ssm", "remote"],
             },
             {
-                "id": "remote-deploy-verify-public",
+                "id": "verify.public_http",
                 "title": "Verify public EMS health",
                 "description": "Verify public HTTP health endpoints on EMS FQDN.",
                 "type": "deploy",
@@ -1612,11 +1628,11 @@ def _generate_implementation_plan(
                 "outputs": {"paths": [], "artifacts": ["deploy_verify.json"]},
                 "acceptance_criteria": ["Public /health and /api/health return 200."],
                 "verify": [{"name": "public-verify", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["remote-deploy-compose-ssm"],
+                "depends_on": ["deploy.apply_remote_compose.ssm"],
                 "labels": ["deploy", "verify", "remote"],
             },
             {
-                "id": "tls-acme-bootstrap",
+                "id": "tls.acme_http01",
                 "title": "ACME TLS bootstrap",
                 "description": "Issue or renew TLS certificates via ACME (Let's Encrypt).",
                 "type": "deploy",
@@ -1634,11 +1650,11 @@ def _generate_implementation_plan(
                 "outputs": {"paths": [], "artifacts": ["acme_result.json", "deploy_execution_tls.log"]},
                 "acceptance_criteria": ["TLS certificate exists and is valid."],
                 "verify": [{"name": "acme-verify", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["dns-route53-ensure-record", "remote-deploy-compose-ssm"],
+                "depends_on": ["dns.ensure_record.route53", "deploy.apply_remote_compose.ssm"],
                 "labels": ["deploy", "tls", "acme"],
             },
             {
-                "id": "tls-nginx-configure",
+                "id": "ingress.nginx_tls_configure",
                 "title": "Configure nginx for TLS",
                 "description": "Enable TLS in nginx and reload stack.",
                 "type": "deploy",
@@ -1656,11 +1672,11 @@ def _generate_implementation_plan(
                 "outputs": {"paths": [], "artifacts": ["deploy_execution_tls.log"]},
                 "acceptance_criteria": ["nginx serves HTTPS using ACME cert."],
                 "verify": [{"name": "tls-nginx", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["tls-acme-bootstrap"],
+                "depends_on": ["tls.acme_http01"],
                 "labels": ["deploy", "tls", "nginx"],
             },
             {
-                "id": "remote-deploy-verify-https",
+                "id": "verify.public_https",
                 "title": "Verify public HTTPS health",
                 "description": "Verify public HTTPS endpoints on EMS FQDN.",
                 "type": "deploy",
@@ -1678,7 +1694,7 @@ def _generate_implementation_plan(
                 "outputs": {"paths": [], "artifacts": ["deploy_verify.json"]},
                 "acceptance_criteria": ["Public HTTPS /health and /api/health return 200."],
                 "verify": [{"name": "public-verify-https", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["tls-nginx-configure"],
+                "depends_on": ["ingress.nginx_tls_configure"],
                 "labels": ["deploy", "verify", "https"],
             },
         ]
@@ -1711,6 +1727,8 @@ def _generate_implementation_plan(
         modules_required = [modules_required]
     dns_provider = metadata.get("dns_provider")
     route53_requested = dns_provider == "route53" or "dns-route53" in modules_required
+    deploy_ssm_requested = "deploy-ssm-compose" in modules_required
+    tls_acme_requested = "ingress-nginx-acme" in modules_required
     runtime_requested = "runtime-web-static-nginx" in modules_required
     if not runtime_requested:
         try:
@@ -1722,6 +1740,19 @@ def _generate_implementation_plan(
             and "nginx" in metadata_blob
             and ("react" in metadata_blob or "vite" in metadata_blob)
         )
+    if not deploy_ssm_requested:
+        deploy_meta = metadata.get("deploy") or {}
+        deploy_ssm_requested = bool(deploy_meta.get("target_instance") or deploy_meta.get("target_instance_id"))
+        if not deploy_ssm_requested:
+            try:
+                metadata_blob = json.dumps(metadata).lower()
+            except TypeError:
+                metadata_blob = str(metadata).lower()
+            deploy_ssm_requested = "ssm" in metadata_blob
+    if not tls_acme_requested:
+        tls_meta = metadata.get("tls") or {}
+        tls_mode = str(tls_meta.get("mode") or "").lower()
+        tls_acme_requested = tls_mode in {"nginx+acme", "acme", "letsencrypt"}
     if route53_requested and "dns-route53" not in module_ids:
         if not any(item.get("id") == "dns-route53-module" for item in work_items):
             work_items.insert(
@@ -1755,6 +1786,82 @@ def _generate_implementation_plan(
                     "labels": ["module", "dns", "module:dns-route53", "capability:dns.route53.records"],
                 },
             )
+    if deploy_ssm_requested and "deploy-ssm-compose" not in module_ids:
+        if not any(item.get("id") == "deploy-ssm-compose-module" for item in work_items):
+            work_items.insert(
+                0,
+                {
+                    "id": "deploy-ssm-compose-module",
+                    "title": "SSM compose deploy module scaffold",
+                    "description": "Register SSM docker-compose deploy module spec in the local registry.",
+                    "type": "scaffold",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": "backend/registry/modules",
+                            "auth": "https_token",
+                            "allow_write": True,
+                        }
+                    ],
+                    "inputs": {"artifacts": ["implementation_plan.json"]},
+                    "outputs": {"paths": ["backend/registry/modules/deploy-ssm-compose.json"]},
+                    "acceptance_criteria": ["Deploy SSM compose module spec exists in module registry."],
+                    "verify": [
+                        {
+                            "name": "module-spec",
+                            "command": "test -f backend/registry/modules/deploy-ssm-compose.json",
+                            "cwd": ".",
+                        }
+                    ],
+                    "depends_on": [],
+                    "labels": [
+                        "module",
+                        "deploy",
+                        "module:deploy-ssm-compose",
+                        "capability:runtime.compose.apply_remote",
+                    ],
+                },
+            )
+    if tls_acme_requested and "ingress-nginx-acme" not in module_ids:
+        if not any(item.get("id") == "ingress-nginx-acme-module" for item in work_items):
+            work_items.insert(
+                0,
+                {
+                    "id": "ingress-nginx-acme-module",
+                    "title": "Ingress nginx ACME module scaffold",
+                    "description": "Register nginx+ACME ingress module spec in the local registry.",
+                    "type": "scaffold",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": "backend/registry/modules",
+                            "auth": "https_token",
+                            "allow_write": True,
+                        }
+                    ],
+                    "inputs": {"artifacts": ["implementation_plan.json"]},
+                    "outputs": {"paths": ["backend/registry/modules/ingress-nginx-acme.json"]},
+                    "acceptance_criteria": ["Ingress nginx ACME module spec exists in module registry."],
+                    "verify": [
+                        {
+                            "name": "module-spec",
+                            "command": "test -f backend/registry/modules/ingress-nginx-acme.json",
+                            "cwd": ".",
+                        }
+                    ],
+                    "depends_on": [],
+                    "labels": [
+                        "module",
+                        "ingress",
+                        "module:ingress-nginx-acme",
+                        "capability:ingress.tls.acme_http01",
+                    ],
+                },
+            )
 
     for item in work_items:
         inputs = item.setdefault("inputs", {})
@@ -1780,6 +1887,10 @@ def _generate_implementation_plan(
         plan_rationale["modules_selected"] = modules_selected
     if route53_requested and "dns-route53" not in plan_rationale.get("modules_selected", []):
         plan_rationale.setdefault("modules_selected", []).append("dns-route53")
+    if deploy_ssm_requested and "deploy-ssm-compose" not in plan_rationale.get("modules_selected", []):
+        plan_rationale.setdefault("modules_selected", []).append("deploy-ssm-compose")
+    if tls_acme_requested and "ingress-nginx-acme" not in plan_rationale.get("modules_selected", []):
+        plan_rationale.setdefault("modules_selected", []).append("ingress-nginx-acme")
     if runtime_requested and "runtime-web-static-nginx" not in plan_rationale.get("modules_selected", []):
         plan_rationale.setdefault("modules_selected", []).append("runtime-web-static-nginx")
 
@@ -1897,6 +2008,12 @@ def _queue_dev_tasks_for_plan(
             "tls-acme-bootstrap",
             "tls-nginx-configure",
             "remote-deploy-verify-https",
+            "dns.ensure_record.route53",
+            "deploy.apply_remote_compose.ssm",
+            "verify.public_http",
+            "tls.acme_http01",
+            "ingress.nginx_tls_configure",
+            "verify.public_https",
         }
         dev_task = DevTask.objects.create(
             title=title,

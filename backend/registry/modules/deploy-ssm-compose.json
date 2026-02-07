@@ -1,0 +1,40 @@
+{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "deploy-ssm-compose",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "runtime.compose.apply_remote"
+    }
+  },
+  "description": "Remote docker-compose deployment via AWS SSM RunCommand.",
+  "module": {
+    "type": "lib",
+    "fqn": "core.deploy-ssm-compose",
+    "capabilitiesProvided": [
+      "deploy.ssm.run_shell",
+      "runtime.compose.apply_remote"
+    ],
+    "interfaces": {
+      "config": {
+        "target_instance_id": "Xyn ProvisionedInstance UUID or AWS instance ID.",
+        "aws_region": "AWS region for SSM/EC2 queries (default from instance).",
+        "remote_root": "Remote root path on instance (default: /opt/xyn/apps/<app>).",
+        "repo_sources": "List of repos to clone/pull (name/url/ref).",
+        "compose_file_path": "Path to docker-compose.yml inside repo.",
+        "env": "Key/value environment variables passed to compose.",
+        "secret_refs": "Optional secret references (no inline secrets).",
+        "health_endpoints": "List of local health paths to verify via SSM."
+      },
+      "operations": {
+        "ensure_remote_runtime": "Clone/pull repos, set env, docker compose up -d --build.",
+        "verify_remote_local": "Curl localhost endpoints on instance to verify." 
+      }
+    },
+    "constraints": {
+      "aws_auth": "Ambient AWS creds for runner + instance role; no inline secrets."
+    }
+  }
+}
