@@ -2271,8 +2271,8 @@ def _build_remote_deploy_commands(root_dir: str, jwt_secret: str) -> List[str]:
             "XYN_UI_PATH=\"$XYN_UI_PATH\" EMS_JWT_SECRET=\"$EMS_JWT_SECRET\" "
             "docker compose -f apps/ems-stack/docker-compose.yml up -d --build"
         ),
-        "curl -fsS http://localhost:8080/health",
-        "curl -fsS http://localhost:8080/api/health",
+        "for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 2; done",
+        "for i in $(seq 1 30); do curl -fsS http://localhost:8080/api/health && break; sleep 2; done",
     ]
 
 
