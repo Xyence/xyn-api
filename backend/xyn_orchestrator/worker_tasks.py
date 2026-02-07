@@ -547,262 +547,6 @@ def get_reports(user=Depends(require_roles("admin", "viewer"))):
             """def ensure_record(subdomain: str, target: str) -> None:
     # TODO: implement Route53 record management
     return None
-
-
-def _load_blueprint_metadata(source_run: Optional[str]) -> Dict[str, Any]:
-    if not source_run:
-        return {}
-    payload = _download_artifact_json(source_run, "blueprint_metadata.json")
-    if isinstance(payload, dict):
-        return payload
-    return {}
-
-
-def _resolve_route53_zone_id(fqdn: str, zone_id: str, zone_name: str) -> str:
-    if zone_id:
-        return zone_id
-    candidate = zone_name
-    if not candidate and fqdn:
-        parts = fqdn.rstrip(".").split(".")
-        if len(parts) >= 2:
-            candidate = ".".join(parts[-2:])
-    if not candidate:
-        raise RuntimeError("Route53 zone_id or zone_name required")
-    if not candidate.endswith("."):
-        candidate = f"{candidate}."
-    client = boto3.client("route53")
-    resp = client.list_hosted_zones_by_name(DNSName=candidate, MaxItems="1")
-    zones = resp.get("HostedZones", [])
-    if not zones:
-        raise RuntimeError(f"No hosted zone found for {candidate}")
-    zone = zones[0]
-    zone_id_full = zone.get("Id", "")
-    return zone_id_full.split("/")[-1]
-
-
-def _resolve_instance_public_ip(instance_id: str, region: str) -> str:
-    ec2 = boto3.client("ec2", region_name=region)
-    resp = ec2.describe_instances(InstanceIds=[instance_id])
-    for reservation in resp.get("Reservations", []):
-        for instance in reservation.get("Instances", []):
-            public_ip = instance.get("PublicIpAddress")
-            if public_ip:
-                return public_ip
-    raise RuntimeError("Public IP not found for instance")
-
-
-def _ensure_route53_record(fqdn: str, zone_id: str, target_ip: str, ttl: int = 300) -> Dict[str, Any]:
-    client = boto3.client("route53")
-    change = client.change_resource_record_sets(
-        HostedZoneId=zone_id,
-        ChangeBatch={
-            "Comment": "Xyn EMS DNS ensure",
-            "Changes": [
-                {
-                    "Action": "UPSERT",
-                    "ResourceRecordSet": {
-                        "Name": fqdn,
-                        "Type": "A",
-                        "TTL": ttl,
-                        "ResourceRecords": [{"Value": target_ip}],
-                    },
-                }
-            ],
-        },
-    )
-    return {
-        "change_id": change.get("ChangeInfo", {}).get("Id", ""),
-        "status": change.get("ChangeInfo", {}).get("Status", ""),
-    }
-
-
-def _verify_route53_record(fqdn: str, zone_id: str, target_ip: str) -> bool:
-    client = boto3.client("route53")
-    resp = client.list_resource_record_sets(
-        HostedZoneId=zone_id,
-        StartRecordName=fqdn,
-        StartRecordType="A",
-        MaxItems="1",
-    )
-    records = resp.get("ResourceRecordSets", [])
-    if not records:
-        return False
-    record = records[0]
-    if record.get("Name", "").rstrip(".") != fqdn.rstrip("."):
-        return False
-    values = [item.get("Value") for item in record.get("ResourceRecords", [])]
-    return target_ip in values
-
-
-def _build_remote_deploy_commands(root_dir: str, jwt_secret: str) -> List[str]:
-    return [
-        "set -euo pipefail",
-        "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
-        "docker compose version >/dev/null 2>&1 || { echo \"missing_compose\"; exit 11; }",
-        "command -v git >/dev/null 2>&1 || { echo \"missing_git\"; exit 12; }",
-        "command -v curl >/dev/null 2>&1 || { echo \"missing_curl\"; exit 13; }",
-        f"ROOT={root_dir}",
-        "mkdir -p \"$ROOT\"",
-        "if [ ! -d \"$ROOT/xyn-api/.git\" ]; then git clone https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"; fi",
-        "if [ ! -d \"$ROOT/xyn-ui/.git\" ]; then git clone https://github.com/Xyence/xyn-ui \"$ROOT/xyn-ui\"; fi",
-        "git -C \"$ROOT/xyn-api\" fetch --all",
-        "git -C \"$ROOT/xyn-api\" checkout main",
-        "git -C \"$ROOT/xyn-api\" pull --ff-only",
-        "git -C \"$ROOT/xyn-ui\" fetch --all",
-        "git -C \"$ROOT/xyn-ui\" checkout main",
-        "git -C \"$ROOT/xyn-ui\" pull --ff-only",
-        "docker compose version",
-        "docker version",
-        f"export XYN_UI_PATH=\"{root_dir}/xyn-ui/apps/ems-ui\"",
-        f"export EMS_JWT_SECRET=\"{jwt_secret}\"",
-        f"cd \"{root_dir}/xyn-api\"",
-        (
-            "XYN_UI_PATH=\"$XYN_UI_PATH\" EMS_JWT_SECRET=\"$EMS_JWT_SECRET\" "
-            "docker compose -f apps/ems-stack/docker-compose.yml up -d --build"
-        ),
-        "curl -fsS http://localhost:8080/health",
-        "curl -fsS http://localhost:8080/api/health",
-    ]
-
-
-def _resolve_fqdn(metadata: Dict[str, Any]) -> str:
-    deploy = metadata.get("deploy") or {}
-    fqdn = deploy.get("primary_fqdn") or deploy.get("fqdn")
-    if fqdn:
-        return str(fqdn)
-    environments = metadata.get("environments") or []
-    if isinstance(environments, list) and environments:
-        env = environments[0] if isinstance(environments[0], dict) else {}
-        fqdn = env.get("fqdn")
-        if fqdn:
-            return str(fqdn)
-    return ""
-
-
-def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
-    checks = []
-    ok = True
-    for path, name in [("/health", "public_health"), ("/api/health", "public_api_health")]:
-        url = f"http://{fqdn}{path}"
-        try:
-            response = requests.get(url, timeout=10)
-            status_ok = response.status_code == 200
-            checks.append({"name": name, "ok": status_ok, "detail": str(response.status_code)})
-            ok = ok and status_ok
-        except Exception as exc:
-            checks.append({"name": name, "ok": False, "detail": str(exc)})
-            ok = False
-    return ok, checks
-
-
-def _route53_noop(fqdn: str, zone_id: str, target_ip: str) -> bool:
-    return _verify_route53_record(fqdn, zone_id, target_ip)
-
-
-def _route53_ensure_with_noop(fqdn: str, zone_id: str, target_ip: str) -> Dict[str, Any]:
-    already_ok = _route53_noop(fqdn, zone_id, target_ip)
-    change_result: Dict[str, Any] = {}
-    if not already_ok:
-        change_result = _ensure_route53_record(fqdn, zone_id, target_ip)
-    verified = _verify_route53_record(fqdn, zone_id, target_ip)
-    return {
-        "fqdn": fqdn,
-        "zone_id": zone_id,
-        "public_ip": target_ip,
-        "change": change_result,
-        "verified": verified,
-        "outcome": "noop" if already_ok else "succeeded",
-    }
-
-
-def _run_remote_deploy(
-    run_id: str,
-    fqdn: str,
-    target_instance: Dict[str, Any],
-    jwt_secret: str,
-) -> Dict[str, Any]:
-    started_at = datetime.utcnow().isoformat() + "Z"
-    public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
-    if public_ok:
-        finished_at = datetime.utcnow().isoformat() + "Z"
-        return {
-            "deploy_result": {
-                "schema_version": "deploy_result.v1",
-                "target_instance": target_instance,
-                "fqdn": fqdn,
-                "ssm_command_id": "",
-                "outcome": "noop",
-                "changes": "No changes (already healthy)",
-                "verification": public_checks,
-                "started_at": started_at,
-                "finished_at": finished_at,
-                "errors": [],
-            },
-            "public_checks": public_checks,
-            "ssm_invoked": False,
-            "exec_result": {},
-        }
-    commands = _build_remote_deploy_commands("/opt/xyn/apps/ems", jwt_secret)
-    exec_result = _run_ssm_commands(
-        target_instance.get("instance_id"),
-        target_instance.get("aws_region"),
-        commands,
-    )
-    finished_at = datetime.utcnow().isoformat() + "Z"
-    ssm_ok = exec_result.get("invocation_status") == "Success"
-    public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
-    return {
-        "deploy_result": {
-            "schema_version": "deploy_result.v1",
-            "target_instance": target_instance,
-            "fqdn": fqdn,
-            "ssm_command_id": exec_result.get("ssm_command_id", ""),
-            "outcome": "succeeded" if ssm_ok else "failed",
-            "changes": "docker compose up -d --build",
-            "verification": public_checks,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "errors": [],
-        },
-        "public_checks": public_checks,
-        "ssm_invoked": True,
-        "exec_result": exec_result,
-    }
-
-
-def _ssm_preflight_check(exec_result: Dict[str, Any]) -> tuple[bool, str, Optional[str]]:
-    output = f"{exec_result.get('stdout', '')}\n{exec_result.get('stderr', '')}"
-    for token, code in [
-        ("missing_docker", "missing_docker"),
-        ("missing_compose", "missing_compose"),
-        ("missing_git", "missing_git"),
-        ("missing_curl", "missing_curl"),
-    ]:
-        if token in output:
-            return False, token, code
-    ok = exec_result.get("invocation_status") == "Success"
-    return ok, "ok" if ok else "failed", None
-
-
-def _build_deploy_verification(
-    fqdn: str,
-    public_checks: List[Dict[str, Any]],
-    dns_ok: Optional[bool],
-    exec_result: Dict[str, Any],
-    ssm_invoked: bool,
-) -> List[Dict[str, Any]]:
-    checks = list(public_checks)
-    if dns_ok is not None:
-        checks.append({"name": "dns_record", "ok": dns_ok, "detail": "match" if dns_ok else "mismatch"})
-    if not ssm_invoked:
-        checks.append({"name": "ssm_preflight", "ok": True, "detail": "skipped"})
-        checks.append({"name": "ssm_local_health", "ok": True, "detail": "skipped"})
-        return checks
-    preflight_ok, preflight_detail, _ = _ssm_preflight_check(exec_result)
-    checks.append({"name": "ssm_preflight", "ok": preflight_ok, "detail": preflight_detail})
-    ssm_local_ok = exec_result.get("invocation_status") == "Success"
-    checks.append({"name": "ssm_local_health", "ok": ssm_local_ok, "detail": exec_result.get("invocation_status", "")})
-    return checks
 """,
         )
         _write_file(
@@ -2414,6 +2158,262 @@ def _openai_generate_blueprint(transcript: str, kind: str, context_text: str) ->
         return json.loads(response.output_text)
     except json.JSONDecodeError:
         return None
+
+
+def _load_blueprint_metadata(source_run: Optional[str]) -> Dict[str, Any]:
+    if not source_run:
+        return {}
+    payload = _download_artifact_json(source_run, "blueprint_metadata.json")
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _resolve_route53_zone_id(fqdn: str, zone_id: str, zone_name: str) -> str:
+    if zone_id:
+        return zone_id
+    candidate = zone_name
+    if not candidate and fqdn:
+        parts = fqdn.rstrip(".").split(".")
+        if len(parts) >= 2:
+            candidate = ".".join(parts[-2:])
+    if not candidate:
+        raise RuntimeError("Route53 zone_id or zone_name required")
+    if not candidate.endswith("."):
+        candidate = f"{candidate}."
+    client = boto3.client("route53")
+    resp = client.list_hosted_zones_by_name(DNSName=candidate, MaxItems="1")
+    zones = resp.get("HostedZones", [])
+    if not zones:
+        raise RuntimeError(f"No hosted zone found for {candidate}")
+    zone = zones[0]
+    zone_id_full = zone.get("Id", "")
+    return zone_id_full.split("/")[-1]
+
+
+def _resolve_instance_public_ip(instance_id: str, region: str) -> str:
+    ec2 = boto3.client("ec2", region_name=region)
+    resp = ec2.describe_instances(InstanceIds=[instance_id])
+    for reservation in resp.get("Reservations", []):
+        for instance in reservation.get("Instances", []):
+            public_ip = instance.get("PublicIpAddress")
+            if public_ip:
+                return public_ip
+    raise RuntimeError("Public IP not found for instance")
+
+
+def _ensure_route53_record(fqdn: str, zone_id: str, target_ip: str, ttl: int = 300) -> Dict[str, Any]:
+    client = boto3.client("route53")
+    change = client.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Comment": "Xyn EMS DNS ensure",
+            "Changes": [
+                {
+                    "Action": "UPSERT",
+                    "ResourceRecordSet": {
+                        "Name": fqdn,
+                        "Type": "A",
+                        "TTL": ttl,
+                        "ResourceRecords": [{"Value": target_ip}],
+                    },
+                }
+            ],
+        },
+    )
+    return {
+        "change_id": change.get("ChangeInfo", {}).get("Id", ""),
+        "status": change.get("ChangeInfo", {}).get("Status", ""),
+    }
+
+
+def _verify_route53_record(fqdn: str, zone_id: str, target_ip: str) -> bool:
+    client = boto3.client("route53")
+    resp = client.list_resource_record_sets(
+        HostedZoneId=zone_id,
+        StartRecordName=fqdn,
+        StartRecordType="A",
+        MaxItems="1",
+    )
+    records = resp.get("ResourceRecordSets", [])
+    if not records:
+        return False
+    record = records[0]
+    if record.get("Name", "").rstrip(".") != fqdn.rstrip("."):
+        return False
+    values = [item.get("Value") for item in record.get("ResourceRecords", [])]
+    return target_ip in values
+
+
+def _build_remote_deploy_commands(root_dir: str, jwt_secret: str) -> List[str]:
+    return [
+        "set -euo pipefail",
+        "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
+        "docker compose version >/dev/null 2>&1 || { echo \"missing_compose\"; exit 11; }",
+        "command -v git >/dev/null 2>&1 || { echo \"missing_git\"; exit 12; }",
+        "command -v curl >/dev/null 2>&1 || { echo \"missing_curl\"; exit 13; }",
+        f"ROOT={root_dir}",
+        "mkdir -p \"$ROOT\"",
+        "if [ ! -d \"$ROOT/xyn-api/.git\" ]; then git clone https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"; fi",
+        "if [ ! -d \"$ROOT/xyn-ui/.git\" ]; then git clone https://github.com/Xyence/xyn-ui \"$ROOT/xyn-ui\"; fi",
+        "git -C \"$ROOT/xyn-api\" fetch --all",
+        "git -C \"$ROOT/xyn-api\" checkout main",
+        "git -C \"$ROOT/xyn-api\" pull --ff-only",
+        "git -C \"$ROOT/xyn-ui\" fetch --all",
+        "git -C \"$ROOT/xyn-ui\" checkout main",
+        "git -C \"$ROOT/xyn-ui\" pull --ff-only",
+        "docker compose version",
+        "docker version",
+        f"export XYN_UI_PATH=\"{root_dir}/xyn-ui/apps/ems-ui\"",
+        f"export EMS_JWT_SECRET=\"{jwt_secret}\"",
+        f"cd \"{root_dir}/xyn-api\"",
+        (
+            "XYN_UI_PATH=\"$XYN_UI_PATH\" EMS_JWT_SECRET=\"$EMS_JWT_SECRET\" "
+            "docker compose -f apps/ems-stack/docker-compose.yml up -d --build"
+        ),
+        "curl -fsS http://localhost:8080/health",
+        "curl -fsS http://localhost:8080/api/health",
+    ]
+
+
+def _resolve_fqdn(metadata: Dict[str, Any]) -> str:
+    deploy = metadata.get("deploy") or {}
+    fqdn = deploy.get("primary_fqdn") or deploy.get("fqdn")
+    if fqdn:
+        return str(fqdn)
+    environments = metadata.get("environments") or []
+    if isinstance(environments, list) and environments:
+        env = environments[0] if isinstance(environments[0], dict) else {}
+        fqdn = env.get("fqdn")
+        if fqdn:
+            return str(fqdn)
+    return ""
+
+
+def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
+    checks = []
+    ok = True
+    for path, name in [("/health", "public_health"), ("/api/health", "public_api_health")]:
+        url = f"http://{fqdn}{path}"
+        try:
+            response = requests.get(url, timeout=10)
+            status_ok = response.status_code == 200
+            checks.append({"name": name, "ok": status_ok, "detail": str(response.status_code)})
+            ok = ok and status_ok
+        except Exception as exc:
+            checks.append({"name": name, "ok": False, "detail": str(exc)})
+            ok = False
+    return ok, checks
+
+
+def _route53_noop(fqdn: str, zone_id: str, target_ip: str) -> bool:
+    return _verify_route53_record(fqdn, zone_id, target_ip)
+
+
+def _route53_ensure_with_noop(fqdn: str, zone_id: str, target_ip: str) -> Dict[str, Any]:
+    already_ok = _route53_noop(fqdn, zone_id, target_ip)
+    change_result: Dict[str, Any] = {}
+    if not already_ok:
+        change_result = _ensure_route53_record(fqdn, zone_id, target_ip)
+    verified = _verify_route53_record(fqdn, zone_id, target_ip)
+    return {
+        "fqdn": fqdn,
+        "zone_id": zone_id,
+        "public_ip": target_ip,
+        "change": change_result,
+        "verified": verified,
+        "outcome": "noop" if already_ok else "succeeded",
+    }
+
+
+def _run_remote_deploy(
+    run_id: str,
+    fqdn: str,
+    target_instance: Dict[str, Any],
+    jwt_secret: str,
+) -> Dict[str, Any]:
+    started_at = datetime.utcnow().isoformat() + "Z"
+    public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
+    if public_ok:
+        finished_at = datetime.utcnow().isoformat() + "Z"
+        return {
+            "deploy_result": {
+                "schema_version": "deploy_result.v1",
+                "target_instance": target_instance,
+                "fqdn": fqdn,
+                "ssm_command_id": "",
+                "outcome": "noop",
+                "changes": "No changes (already healthy)",
+                "verification": public_checks,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "errors": [],
+            },
+            "public_checks": public_checks,
+            "ssm_invoked": False,
+            "exec_result": {},
+        }
+    commands = _build_remote_deploy_commands("/opt/xyn/apps/ems", jwt_secret)
+    exec_result = _run_ssm_commands(
+        target_instance.get("instance_id"),
+        target_instance.get("aws_region"),
+        commands,
+    )
+    finished_at = datetime.utcnow().isoformat() + "Z"
+    ssm_ok = exec_result.get("invocation_status") == "Success"
+    public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
+    return {
+        "deploy_result": {
+            "schema_version": "deploy_result.v1",
+            "target_instance": target_instance,
+            "fqdn": fqdn,
+            "ssm_command_id": exec_result.get("ssm_command_id", ""),
+            "outcome": "succeeded" if ssm_ok else "failed",
+            "changes": "docker compose up -d --build",
+            "verification": public_checks,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "errors": [],
+        },
+        "public_checks": public_checks,
+        "ssm_invoked": True,
+        "exec_result": exec_result,
+    }
+
+
+def _ssm_preflight_check(exec_result: Dict[str, Any]) -> tuple[bool, str, Optional[str]]:
+    output = f"{exec_result.get('stdout', '')}\n{exec_result.get('stderr', '')}"
+    for token, code in [
+        ("missing_docker", "missing_docker"),
+        ("missing_compose", "missing_compose"),
+        ("missing_git", "missing_git"),
+        ("missing_curl", "missing_curl"),
+    ]:
+        if token in output:
+            return False, token, code
+    ok = exec_result.get("invocation_status") == "Success"
+    return ok, "ok" if ok else "failed", None
+
+
+def _build_deploy_verification(
+    fqdn: str,
+    public_checks: List[Dict[str, Any]],
+    dns_ok: Optional[bool],
+    exec_result: Dict[str, Any],
+    ssm_invoked: bool,
+) -> List[Dict[str, Any]]:
+    checks = list(public_checks)
+    if dns_ok is not None:
+        checks.append({"name": "dns_record", "ok": dns_ok, "detail": "match" if dns_ok else "mismatch"})
+    if not ssm_invoked:
+        checks.append({"name": "ssm_preflight", "ok": True, "detail": "skipped"})
+        checks.append({"name": "ssm_local_health", "ok": True, "detail": "skipped"})
+        return checks
+    preflight_ok, preflight_detail, _ = _ssm_preflight_check(exec_result)
+    checks.append({"name": "ssm_preflight", "ok": preflight_ok, "detail": preflight_detail})
+    ssm_local_ok = exec_result.get("invocation_status") == "Success"
+    checks.append({"name": "ssm_local_health", "ok": ssm_local_ok, "detail": exec_result.get("invocation_status", "")})
+    return checks
 
 
 def transcribe_voice_note(voice_note_id: str) -> None:
