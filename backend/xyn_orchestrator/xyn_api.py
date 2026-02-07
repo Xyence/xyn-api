@@ -1062,6 +1062,47 @@ def dev_task_detail(request: HttpRequest, task_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
     task = get_object_or_404(DevTask, id=task_id)
+    result_run = task.result_run
+    run_payload = None
+    artifacts_payload = []
+    commands_payload = []
+    if result_run:
+        run_payload = {
+            "id": str(result_run.id),
+            "status": result_run.status,
+            "summary": result_run.summary,
+            "error": result_run.error,
+            "log_text": result_run.log_text,
+            "started_at": result_run.started_at,
+            "finished_at": result_run.finished_at,
+        }
+        artifacts_payload = [
+            {
+                "id": str(artifact.id),
+                "name": artifact.name,
+                "kind": artifact.kind,
+                "url": artifact.url,
+                "metadata": artifact.metadata_json,
+                "created_at": artifact.created_at,
+            }
+            for artifact in result_run.artifacts.all().order_by("created_at")
+        ]
+        commands_payload = [
+            {
+                "id": str(cmd.id),
+                "step_name": cmd.step_name,
+                "command_index": cmd.command_index,
+                "shell": cmd.shell,
+                "status": cmd.status,
+                "exit_code": cmd.exit_code,
+                "started_at": cmd.started_at,
+                "finished_at": cmd.finished_at,
+                "ssm_command_id": cmd.ssm_command_id,
+                "stdout": cmd.stdout,
+                "stderr": cmd.stderr,
+            }
+            for cmd in result_run.command_executions.all().order_by("created_at")
+        ]
     return JsonResponse(
         {
             "id": str(task.id),
@@ -1093,6 +1134,9 @@ def dev_task_detail(request: HttpRequest, task_id: str) -> JsonResponse:
                 }
                 for pack in task.context_packs.all()
             ],
+            "result_run_detail": run_payload,
+            "result_run_artifacts": artifacts_payload,
+            "result_run_commands": commands_payload,
             "created_at": task.created_at,
             "updated_at": task.updated_at,
         }
