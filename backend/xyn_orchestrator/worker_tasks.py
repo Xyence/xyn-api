@@ -2389,55 +2389,68 @@ def _build_remote_deploy_commands(root_dir: str, jwt_secret: str) -> List[str]:
 
 
 def _build_tls_acme_commands(root_dir: str, fqdn: str, email: str) -> List[str]:
-    return [
-        "set -euo pipefail",
-        "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
-        "command -v curl >/dev/null 2>&1 || { echo \"missing_curl\"; exit 13; }",
-        f"ROOT={root_dir}",
-        f"FQDN=\"{fqdn}\"",
-        f"EMAIL=\"{email}\"",
-        "ACME_WEBROOT=\"$ROOT/acme-webroot\"",
-        "LEGO_DIR=\"$ROOT/lego\"",
-        "CERT_DIR=\"$ROOT/certs/current\"",
-        "mkdir -p \"$ACME_WEBROOT\" \"$LEGO_DIR\" \"$CERT_DIR\"",
+    acme_webroot = f"{root_dir}/acme-webroot"
+    lego_dir = f"{root_dir}/lego-data"
+    cert_dir = f"{root_dir}/certs/current"
+    command = (
+        "bash -lc \""
+        "set -euo pipefail; "
+        "command -v docker >/dev/null 2>&1 || { echo \\\"missing_docker\\\"; exit 10; }; "
+        "command -v curl >/dev/null 2>&1 || { echo \\\"missing_curl\\\"; exit 13; }; "
+        f"mkdir -p {acme_webroot} {lego_dir} {cert_dir}; "
+        f"if command -v openssl >/dev/null 2>&1; then "
+        f"if [ -f {cert_dir}/fullchain.pem ]; then "
+        f"openssl x509 -checkend 1209600 -noout -in {cert_dir}/fullchain.pem "
+        "&& echo \\\"acme_noop\\\" && exit 0; "
+        "fi; fi; "
+        f"git -C {root_dir}/xyn-api fetch --all; "
+        f"git -C {root_dir}/xyn-api checkout main; "
+        f"git -C {root_dir}/xyn-api pull --ff-only; "
+        f"git -C {root_dir}/xyn-ui fetch --all; "
+        f"git -C {root_dir}/xyn-ui checkout main; "
+        f"git -C {root_dir}/xyn-ui pull --ff-only; "
+        f"cd {root_dir}/xyn-api; "
+        f"XYN_UI_PATH={root_dir}/xyn-ui/apps/ems-ui EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
+        f"EMS_CERTS_PATH={cert_dir} EMS_ACME_WEBROOT_PATH={acme_webroot} "
+        "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans; "
         "if command -v openssl >/dev/null 2>&1; then "
-        "if [ -f \"$CERT_DIR/fullchain.pem\" ]; then "
-        "openssl x509 -checkend 1209600 -noout -in \"$CERT_DIR/fullchain.pem\" && echo \"acme_noop\" && exit 0; "
-        "fi; fi",
-        (
-            "docker run --rm "
-            "-v \"$LEGO_DIR\":/lego "
-            "-v \"$ACME_WEBROOT\":/webroot "
-            "goacme/lego:v4.12.3 "
-            "--email \"$EMAIL\" --domains \"$FQDN\" --path /lego "
-            "--http --http.webroot /webroot run"
-        ),
-        "if [ ! -f \"$LEGO_DIR/certificates/$FQDN.crt\" ]; then echo \"missing_cert\"; exit 20; fi",
-        "cp \"$LEGO_DIR/certificates/$FQDN.crt\" \"$CERT_DIR/fullchain.pem\"",
-        "cp \"$LEGO_DIR/certificates/$FQDN.key\" \"$CERT_DIR/privkey.pem\"",
-        "chmod 600 \"$CERT_DIR/privkey.pem\"",
-    ]
+        f"if [ ! -f {cert_dir}/fullchain.pem ] || [ ! -f {cert_dir}/privkey.pem ]; then "
+        f"openssl req -x509 -nodes -newkey rsa:2048 -keyout {cert_dir}/privkey.pem "
+        f"-out {cert_dir}/fullchain.pem -days 1 -subj \\\"/CN={fqdn}\\\"; "
+        "fi; fi; "
+        "docker run --rm "
+        f"-v {lego_dir}:/data "
+        f"-v {acme_webroot}:/webroot "
+        "goacme/lego:v4.12.3 "
+        f"--email \\\"{email}\\\" --domains \\\"{fqdn}\\\" --path /data --accept-tos "
+        "--http --http.webroot /webroot run; "
+        f"if [ ! -f {lego_dir}/certificates/{fqdn}.crt ]; then echo \\\"missing_cert\\\"; exit 20; fi; "
+        f"cp {lego_dir}/certificates/{fqdn}.crt {cert_dir}/fullchain.pem; "
+        f"cp {lego_dir}/certificates/{fqdn}.key {cert_dir}/privkey.pem; "
+        f"chmod 600 {cert_dir}/privkey.pem; "
+        f"XYN_UI_PATH={root_dir}/xyn-ui/apps/ems-ui EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
+        f"EMS_CERTS_PATH={cert_dir} EMS_ACME_WEBROOT_PATH={acme_webroot} "
+        "docker compose -f apps/ems-stack/docker-compose.yml restart ems-web"
+        "\""
+    )
+    return [command]
 
 
 def _build_tls_nginx_commands(root_dir: str) -> List[str]:
-    return [
-        "set -euo pipefail",
-        "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
-        f"ROOT={root_dir}",
-        f"export XYN_UI_PATH=\"{root_dir}/xyn-ui/apps/ems-ui\"",
-        "export EMS_PUBLIC_PORT=80",
-        "export EMS_PUBLIC_TLS_PORT=443",
-        f"export EMS_CERTS_PATH=\"{root_dir}/certs/current\"",
-        f"export EMS_ACME_WEBROOT_PATH=\"{root_dir}/acme-webroot\"",
-        f"mkdir -p \"{root_dir}/certs/current\" \"{root_dir}/acme-webroot\"",
-        f"cd \"{root_dir}/xyn-api\"",
-        (
-            "XYN_UI_PATH=\"$XYN_UI_PATH\" "
-            "EMS_CERTS_PATH=\"$EMS_CERTS_PATH\" EMS_ACME_WEBROOT_PATH=\"$EMS_ACME_WEBROOT_PATH\" "
-            "EMS_PUBLIC_PORT=\"$EMS_PUBLIC_PORT\" EMS_PUBLIC_TLS_PORT=\"$EMS_PUBLIC_TLS_PORT\" "
-            "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans"
-        ),
-    ]
+    cert_dir = f"{root_dir}/certs/current"
+    acme_webroot = f"{root_dir}/acme-webroot"
+    command = (
+        "bash -lc \""
+        "set -euo pipefail; "
+        "command -v docker >/dev/null 2>&1 || { echo \\\"missing_docker\\\"; exit 10; }; "
+        f"mkdir -p {cert_dir} {acme_webroot}; "
+        f"cd {root_dir}/xyn-api; "
+        f"XYN_UI_PATH={root_dir}/xyn-ui/apps/ems-ui EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
+        f"EMS_CERTS_PATH={cert_dir} EMS_ACME_WEBROOT_PATH={acme_webroot} "
+        "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans"
+        "\""
+    )
+    return [command]
 
 def _resolve_fqdn(metadata: Dict[str, Any]) -> str:
     deploy = metadata.get("deploy") or {}
