@@ -2306,6 +2306,28 @@ def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
     return ok, checks
 
 
+def _public_verify_with_wait(fqdn: str, attempts: int = 12, delay: int = 10) -> tuple[bool, List[Dict[str, Any]]]:
+    last_checks: List[Dict[str, Any]] = []
+    for _ in range(attempts):
+        ok, checks = _public_verify(fqdn)
+        last_checks = checks
+        if ok:
+            return True, checks
+        time.sleep(delay)
+    return False, last_checks
+
+
+def _public_verify_with_wait(fqdn: str, attempts: int = 12, delay: int = 10) -> tuple[bool, List[Dict[str, Any]]]:
+    last_checks: List[Dict[str, Any]] = []
+    for _ in range(attempts):
+        ok, checks = _public_verify(fqdn)
+        last_checks = checks
+        if ok:
+            return True, checks
+        time.sleep(delay)
+    return False, last_checks
+
+
 def _route53_noop(fqdn: str, zone_id: str, target_ip: str) -> bool:
     return _verify_route53_record(fqdn, zone_id, target_ip)
 
@@ -3117,7 +3139,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 try:
                     if not fqdn:
                         raise RuntimeError("FQDN missing in blueprint metadata")
-                    ok, verify_results = _public_verify(fqdn)
+                    ok, verify_results = _public_verify_with_wait(fqdn)
                     if not ok:
                         raise RuntimeError("Public health checks failed")
                     verify_url = _write_artifact(
