@@ -145,6 +145,23 @@ class PipelineSchemaTests(TestCase):
         errors = list(Draft202012Validator(schema).iter_errors(summary))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
 
+    def test_deploy_result_schema(self):
+        payload = {
+            "schema_version": "deploy_result.v1",
+            "target_instance": {"id": "inst-1", "name": "xyn-seed-dev-1"},
+            "fqdn": "ems.xyence.io",
+            "ssm_command_id": "cmd-123",
+            "outcome": "succeeded",
+            "changes": "docker compose up -d --build",
+            "verification": [{"name": "health", "ok": True, "detail": "200"}],
+            "started_at": "2024-01-01T00:00:00Z",
+            "finished_at": "2024-01-01T00:00:10Z",
+            "errors": [],
+        }
+        schema = self._load_schema("deploy_result.v1.schema.json")
+        errors = list(Draft202012Validator(schema).iter_errors(payload))
+        self.assertEqual(errors, [], f"Schema errors: {errors}")
+
     def test_planner_selects_persistence_slice(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
         for work_item_id in [
@@ -209,6 +226,27 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("dns-route53-module", ids)
         rationale = plan.get("plan_rationale", {})
         self.assertIn("dns-route53", rationale.get("modules_selected", []))
+
+    def test_planner_selects_remote_deploy_slice(self):
+        blueprint = Blueprint.objects.create(
+            name="ems.platform",
+            namespace="core",
+            metadata_json={
+                "dns_provider": "route53",
+                "deploy": {"target_instance_id": str(uuid.uuid4()), "primary_fqdn": "ems.xyence.io"},
+            },
+        )
+        module_catalog = _build_module_catalog()
+        run_history = _build_run_history_summary(blueprint)
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=module_catalog,
+            run_history_summary=run_history,
+        )
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("dns-route53-ensure-record", ids)
+        self.assertIn("remote-deploy-compose-ssm", ids)
+        self.assertIn("remote-deploy-verify-public", ids)
 
     def test_dns_route53_module_spec_fields(self):
         spec_path = Path(__file__).resolve().parents[2] / "registry" / "modules" / "dns-route53.json"

@@ -584,14 +584,32 @@ def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str
     acceptance = metadata.get("acceptance_checks")
     if isinstance(acceptance, dict):
         return {key: list(value) for key, value in acceptance.items()}
+    deploy_meta = metadata.get("deploy") or {}
+    deploy_target = deploy_meta.get("target_instance_id") or deploy_meta.get("target_instance") or deploy_meta.get(
+        "target_instance_name"
+    )
+    deploy_fqdn = deploy_meta.get("primary_fqdn") or deploy_meta.get("fqdn")
+    if not deploy_fqdn:
+        environments = metadata.get("environments") or []
+        if isinstance(environments, list) and environments:
+            env = environments[0] if isinstance(environments[0], dict) else {}
+            deploy_fqdn = env.get("fqdn")
+    remote_enabled = bool(deploy_target and deploy_fqdn)
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     if blueprint_fqn == "core.ems.platform":
-        return {
+        checks = {
             "local_chassis": ["ems-compose-local-chassis"],
             "jwt_required": ["ems-api-jwt-protect-me", "ems-stack-pass-jwt-secret-and-verify-me"],
             "rbac_devices": ["ems-api-devices-rbac", "ems-stack-verify-rbac"],
             "persistence_devices": ["ems-api-devices-postgres", "ems-stack-verify-persistence"],
         }
+        if remote_enabled:
+            checks["remote_http_health"] = [
+                "dns-route53-ensure-record",
+                "remote-deploy-compose-ssm",
+                "remote-deploy-verify-public",
+            ]
+        return checks
     return {}
 
 
@@ -652,10 +670,20 @@ def _select_next_slice(
     work_items: List[Dict[str, Any]],
     run_history_summary: Dict[str, Any],
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    priority = ["local_chassis", "jwt_required", "rbac_devices", "persistence_devices", "oidc", "route53_acme_ssm"]
+    priority = [
+        "remote_http_health",
+        "local_chassis",
+        "jwt_required",
+        "rbac_devices",
+        "persistence_devices",
+        "oidc",
+        "route53_acme_ssm",
+    ]
     status_map = {entry["id"]: entry["status"] for entry in run_history_summary.get("acceptance_checks_status", [])}
     next_gap = None
     for gap in priority:
+        if gap not in status_map:
+            continue
         if status_map.get(gap) != "pass":
             next_gap = gap
             break
@@ -677,6 +705,11 @@ def _select_next_slice(
         ],
         "oidc": ["ems-api-authn-oidc", "ems-ui-auth"],
         "route53_acme_ssm": ["ems-api-route53", "ems-api-acme", "ems-ssm-deploy"],
+        "remote_http_health": [
+            "dns-route53-ensure-record",
+            "remote-deploy-compose-ssm",
+            "remote-deploy-verify-public",
+        ],
     }
     if not next_gap:
         return work_items, {"gaps_detected": [], "modules_selected": [], "why_next": ["All known gaps satisfied."]}
@@ -713,6 +746,9 @@ def _annotate_work_items(
         "ems-ui-token-input-me-call": ["app.ui.react", "authn.jwt.validate"],
         "ems-ui-devices-role-aware": ["app.ui.react", "authz.rbac.enforce"],
         "dns-route53-module": ["dns.route53.records"],
+        "dns-route53-ensure-record": ["dns.route53.records"],
+        "remote-deploy-compose-ssm": ["deploy.compose.remote", "deploy.ssm"],
+        "remote-deploy-verify-public": ["deploy.compose.remote.verify"],
     }
     work_item_modules = {
         "ems-api-scaffold": ["ems-api"],
@@ -732,6 +768,9 @@ def _annotate_work_items(
         "ems-ui-token-input-me-call": ["ems-ui"],
         "ems-ui-devices-role-aware": ["ems-ui"],
         "dns-route53-module": ["dns-route53"],
+        "dns-route53-ensure-record": ["dns-route53"],
+        "remote-deploy-compose-ssm": ["ems-stack"],
+        "remote-deploy-verify-public": ["ems-stack"],
     }
     for item in work_items:
         item_id = item.get("id")
@@ -1433,6 +1472,72 @@ def _generate_implementation_plan(
                 "depends_on": ["ems-api-scaffold"],
                 "labels": ["dns", "integration"],
             },
+            {
+                "id": "dns-route53-ensure-record",
+                "title": "Ensure Route53 DNS record",
+                "description": "Create/ensure Route53 DNS A record for EMS public FQDN.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
+                "outputs": {"paths": [], "artifacts": ["dns_change_result.json"]},
+                "acceptance_criteria": ["Route53 record exists for EMS FQDN."],
+                "verify": [{"name": "dns-ensure", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": [],
+                "labels": ["module", "dns", "module:dns-route53", "capability:dns.route53.records"],
+            },
+            {
+                "id": "remote-deploy-compose-ssm",
+                "title": "Remote deploy via SSM",
+                "description": "Deploy EMS stack to target instance using SSM and docker-compose.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
+                "outputs": {"paths": [], "artifacts": ["deploy_result.json", "deploy_manifest.json"]},
+                "acceptance_criteria": ["EMS stack deployed and healthy on target instance."],
+                "verify": [{"name": "remote-deploy", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": ["dns-route53-ensure-record"],
+                "labels": ["deploy", "ssm", "remote"],
+            },
+            {
+                "id": "remote-deploy-verify-public",
+                "title": "Verify public EMS health",
+                "description": "Verify public HTTP health endpoints on EMS FQDN.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
+                "outputs": {"paths": [], "artifacts": ["deploy_verify.json"]},
+                "acceptance_criteria": ["Public /health and /api/health return 200."],
+                "verify": [{"name": "public-verify", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": ["remote-deploy-compose-ssm"],
+                "labels": ["deploy", "verify", "remote"],
+            },
         ]
     else:
         work_items = [
@@ -1601,6 +1706,19 @@ def _queue_dev_tasks_for_plan(
 ) -> List[DevTask]:
     tasks = []
     plan_tasks = plan.get("tasks", [])
+    metadata = blueprint.metadata_json or {}
+    deploy_meta = metadata.get("deploy") or {}
+    target_instance = None
+    target_instance_id = deploy_meta.get("target_instance_id")
+    target_instance_name = deploy_meta.get("target_instance_name")
+    target_instance_ref = deploy_meta.get("target_instance") or {}
+    if isinstance(target_instance_ref, dict):
+        target_instance_id = target_instance_id or target_instance_ref.get("id")
+        target_instance_name = target_instance_name or target_instance_ref.get("name")
+    if target_instance_id:
+        target_instance = ProvisionedInstance.objects.filter(id=target_instance_id).first()
+    if not target_instance and target_instance_name:
+        target_instance = ProvisionedInstance.objects.filter(name=target_instance_name).first()
     if not plan_tasks and plan.get("work_items"):
         for work_item in plan.get("work_items", []):
             plan_tasks.append(
@@ -1615,6 +1733,12 @@ def _queue_dev_tasks_for_plan(
         task_type = item.get("task_type") or "codegen"
         title = item.get("title") or f"{task_type} for {plan.get('blueprint')}"
         context_purpose = item.get("context_purpose") or "coder"
+        work_item_id = item.get("work_item_id", "")
+        attach_instance = work_item_id in {
+            "dns-route53-ensure-record",
+            "remote-deploy-compose-ssm",
+            "remote-deploy-verify-public",
+        }
         dev_task = DevTask.objects.create(
             title=title,
             task_type=task_type,
@@ -1624,8 +1748,9 @@ def _queue_dev_tasks_for_plan(
             source_entity_id=plan.get("blueprint_id") or blueprint.id,
             source_run=run,
             input_artifact_key="implementation_plan.json",
-            work_item_id=item.get("work_item_id", ""),
+            work_item_id=work_item_id,
             context_purpose=context_purpose,
+            target_instance=target_instance if attach_instance else None,
             created_by=run.created_by,
             updated_by=run.created_by,
         )
@@ -2108,6 +2233,7 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
             run.status = "succeeded"
         module_catalog = _build_module_catalog()
         _write_run_artifact(run, "module_catalog.v1.json", module_catalog, "module_catalog")
+        _write_run_artifact(run, "blueprint_metadata.json", blueprint.metadata_json or {}, "blueprint")
         run_history_summary = _build_run_history_summary(blueprint)
         _write_run_artifact(run, "run_history_summary.v1.json", run_history_summary, "run_history_summary")
         implementation_plan = _generate_implementation_plan(
