@@ -147,17 +147,21 @@ def _list_changed_files(repo_dir: str) -> List[str]:
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
-def _mark_noop_codegen(changes_made: bool, work_item_id: str, errors: List[Dict[str, Any]]) -> bool:
+def _mark_noop_codegen(
+    changes_made: bool, work_item_id: str, errors: List[Dict[str, Any]], verify_ok: bool
+) -> tuple[bool, bool]:
     if changes_made:
-        return True
+        return True, False
     errors.append(
         {
             "code": "no_changes",
-            "message": "Codegen produced no patches or files.",
-            "detail": {"work_item_id": work_item_id},
+            "message": "Codegen produced no patches or files (noop).",
+            "detail": {"work_item_id": work_item_id, "noop": True},
         }
     )
-    return False
+    if verify_ok:
+        return True, True
+    return False, False
 
 
 def _apply_scaffold_for_work_item(work_item: Dict[str, Any], repo_dir: str) -> List[str]:
@@ -2659,15 +2663,15 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         "branch": branch,
                         "pushed": pushed,
                     }
-            success = success and _mark_noop_codegen(changes_made, work_item_id, errors)
+            success, noop = _mark_noop_codegen(changes_made, work_item_id, errors, success)
             result = {
                 "schema_version": "codegen_result.v1",
                 "task_id": task_id,
                 "work_item_id": work_item_id,
                 "blueprint_id": plan_json.get("blueprint_id"),
                 "summary": {
-                    "outcome": "succeeded" if success else "failed",
-                    "changes": f"{len(repo_results)} repo(s) updated" if success else "No changes",
+                    "outcome": "noop" if noop else ("succeeded" if success else "failed"),
+                    "changes": "No changes (noop)" if noop else (f\"{len(repo_results)} repo(s) updated\" if success else "No changes"),
                     "risks": "Scaffolds only; requires implementation.",
                     "next_steps": "Review patches and iterate.",
                 },
