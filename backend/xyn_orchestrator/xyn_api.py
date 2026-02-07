@@ -889,6 +889,12 @@ def runs_collection(request: HttpRequest) -> JsonResponse:
         qs = qs.filter(entity_id=entity_id)
     if status := request.GET.get("status"):
         qs = qs.filter(status=status)
+    if query := request.GET.get("q"):
+        qs = qs.filter(
+            models.Q(summary__icontains=query)
+            | models.Q(entity_type__icontains=query)
+            | models.Q(entity_id__icontains=query)
+        )
     data = [
         {
             "id": str(run.id),
@@ -1033,6 +1039,13 @@ def dev_tasks_collection(request: HttpRequest) -> JsonResponse:
         qs = qs.filter(source_entity_id=source_entity_id)
     if target_instance_id := request.GET.get("target_instance_id"):
         qs = qs.filter(target_instance_id=target_instance_id)
+    if query := request.GET.get("q"):
+        qs = qs.filter(
+            models.Q(title__icontains=query)
+            | models.Q(task_type__icontains=query)
+            | models.Q(work_item_id__icontains=query)
+            | models.Q(last_error__icontains=query)
+        )
     data = [
         {
             "id": str(task.id),
