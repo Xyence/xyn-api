@@ -921,6 +921,9 @@ def run_detail(request: HttpRequest, run_id: str) -> JsonResponse:
             "started_at": run.started_at,
             "finished_at": run.finished_at,
             "error": run.error,
+            "log_text": run.log_text,
+            "metadata": run.metadata_json,
+            "context_pack_refs": run.context_pack_refs_json,
         }
     )
 
