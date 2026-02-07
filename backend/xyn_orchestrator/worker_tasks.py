@@ -3373,11 +3373,18 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     "work_items": [],
                 }
             blueprint_name = plan_json.get("blueprint_name") or plan_json.get("blueprint") or "unknown"
+            if blueprint_name == "unknown":
+                title = task.get("title") or ""
+                prefix = "Release plan for "
+                if title.startswith(prefix):
+                    blueprint_name = title[len(prefix) :].strip() or blueprint_name
+            if blueprint_name == "unknown" and plan_json.get("blueprint_id"):
+                blueprint_name = f"blueprint {str(plan_json.get('blueprint_id'))[:8]}"
             release_plan_payload = {
                 "blueprint_id": plan_json.get("blueprint_id"),
                 "target_kind": "blueprint",
                 "target_fqn": blueprint_name,
-                "name": f"Release plan for {blueprint_name}",
+                "name": f"Release plan for {blueprint_name}" if blueprint_name != "unknown" else "Release plan",
                 "to_version": "0.1.0",
                 "from_version": "",
                 "milestones_json": {"work_items": plan_json.get("work_items", [])},

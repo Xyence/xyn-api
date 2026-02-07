@@ -3332,7 +3332,11 @@ def internal_release_plan_upsert(request: HttpRequest) -> JsonResponse:
     blueprint_id = payload.get("blueprint_id")
     target_kind = payload.get("target_kind", "blueprint")
     target_fqn = payload.get("target_fqn", "")
-    name = payload.get("name") or (f"Release plan for {target_fqn}" if target_fqn else "Release plan")
+    if target_fqn and target_fqn != "unknown":
+        default_name = f"Release plan for {target_fqn}"
+    else:
+        default_name = "Release plan"
+    name = payload.get("name") or default_name
     to_version = payload.get("to_version") or "0.1.0"
     from_version = payload.get("from_version") or ""
     milestones_json = payload.get("milestones_json")
