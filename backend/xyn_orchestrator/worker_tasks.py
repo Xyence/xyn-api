@@ -2728,7 +2728,12 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             fqdn = _resolve_fqdn(blueprint_metadata)
             dns_provider = blueprint_metadata.get("dns_provider") or deploy_meta.get("dns_provider")
             dns_zone_id = deploy_meta.get("dns_zone_id") or blueprint_metadata.get("dns_zone_id") or ""
-            dns_zone_name = deploy_meta.get("dns_zone_name") or blueprint_metadata.get("base_domain") or ""
+            dns_zone_name = (
+                deploy_meta.get("dns_zone_name")
+                or (deploy_meta.get("dns") or {}).get("zone")
+                or blueprint_metadata.get("base_domain")
+                or ""
+            )
             jwt_secret = deploy_meta.get("ems_jwt_secret") or os.environ.get("EMS_JWT_SECRET", "dev-secret-change-me")
             workspace_root = os.path.join(CODEGEN_WORKDIR, task_id)
             os.system(f"rm -rf {workspace_root}")
