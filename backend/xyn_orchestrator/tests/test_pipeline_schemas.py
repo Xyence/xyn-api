@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from django.test import TestCase
 from jsonschema import Draft202012Validator
@@ -23,6 +24,8 @@ from xyn_orchestrator.worker_tasks import (
     _collect_git_diff,
     _mark_noop_codegen,
     _stage_all,
+    _route53_ensure_with_noop,
+    _run_remote_deploy,
 )
 from xyn_orchestrator.models import Blueprint, ContextPack, DevTask, Run
 
@@ -151,9 +154,15 @@ class PipelineSchemaTests(TestCase):
             "target_instance": {"id": "inst-1", "name": "xyn-seed-dev-1"},
             "fqdn": "ems.xyence.io",
             "ssm_command_id": "cmd-123",
-            "outcome": "succeeded",
-            "changes": "docker compose up -d --build",
-            "verification": [{"name": "health", "ok": True, "detail": "200"}],
+            "outcome": "noop",
+            "changes": "No changes (already healthy)",
+            "verification": [
+                {"name": "public_health", "ok": True, "detail": "200"},
+                {"name": "public_api_health", "ok": True, "detail": "200"},
+                {"name": "dns_record", "ok": True, "detail": "match"},
+                {"name": "ssm_preflight", "ok": True, "detail": "skipped"},
+                {"name": "ssm_local_health", "ok": True, "detail": "skipped"},
+            ],
             "started_at": "2024-01-01T00:00:00Z",
             "finished_at": "2024-01-01T00:00:10Z",
             "errors": [],
@@ -247,6 +256,22 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("dns-route53-ensure-record", ids)
         self.assertIn("remote-deploy-compose-ssm", ids)
         self.assertIn("remote-deploy-verify-public", ids)
+
+    def test_dns_noop_when_record_matches(self):
+        with mock.patch("xyn_orchestrator.worker_tasks._ensure_route53_record") as ensure_record:
+            with mock.patch("xyn_orchestrator.worker_tasks._verify_route53_record", return_value=True):
+                result = _route53_ensure_with_noop("ems.xyence.io", "Z123", "1.2.3.4")
+        self.assertEqual(result.get("outcome"), "noop")
+        ensure_record.assert_not_called()
+
+    def test_remote_deploy_noop_when_public_verify_passes(self):
+        target_instance = {"id": "inst-1", "name": "xyn-seed-dev-1", "instance_id": "i-123", "aws_region": "us-west-2"}
+        with mock.patch("xyn_orchestrator.worker_tasks._public_verify", return_value=(True, [])):
+            with mock.patch("xyn_orchestrator.worker_tasks._run_ssm_commands") as run_ssm:
+                payload = _run_remote_deploy("run-1", "ems.xyence.io", target_instance, "secret")
+        self.assertEqual(payload.get("deploy_result", {}).get("outcome"), "noop")
+        self.assertFalse(payload.get("ssm_invoked"))
+        run_ssm.assert_not_called()
 
     def test_dns_route53_module_spec_fields(self):
         spec_path = Path(__file__).resolve().parents[2] / "registry" / "modules" / "dns-route53.json"

@@ -616,6 +616,7 @@ def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str
 def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
     completed: List[Dict[str, Any]] = []
     completed_ids: set[str] = set()
+    remote_verify_ok = False
     tasks = DevTask.objects.filter(
         source_entity_type="blueprint", source_entity_id=blueprint.id
     ).select_related("result_run")
@@ -624,10 +625,17 @@ def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
             continue
         artifacts = list(task.result_run.artifacts.all())
         result = None
+        deploy_result = None
+        verify_result = None
         for artifact in artifacts:
             if artifact.name == "codegen_result.json":
                 result = _read_run_artifact_json(artifact)
                 break
+        for artifact in artifacts:
+            if artifact.name == "deploy_result.json":
+                deploy_result = _read_run_artifact_json(artifact)
+            if artifact.name == "deploy_verify.json":
+                verify_result = _read_run_artifact_json(artifact)
         success = False
         commit_sha = ""
         if result:
@@ -638,6 +646,11 @@ def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
                 if commit.get("sha"):
                     commit_sha = commit.get("sha")
                     break
+        elif deploy_result:
+            outcome = deploy_result.get("outcome")
+            success = outcome in {"succeeded", "noop"}
+        else:
+            success = task.status == "succeeded"
         outcome = "succeeded" if task.status == "succeeded" and success else "failed"
         completed.append(
             {
@@ -649,11 +662,29 @@ def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
         )
         if task.work_item_id and outcome == "succeeded":
             completed_ids.add(task.work_item_id)
+        if verify_result and isinstance(verify_result, dict):
+            checks = verify_result.get("checks") or []
+            health_ok = False
+            api_ok = False
+            for check in checks:
+                if check.get("name") in {"public_health", "http://ems.xyence.io/health", "health"} and check.get("ok"):
+                    health_ok = True
+                if check.get("name") in {
+                    "public_api_health",
+                    "http://ems.xyence.io/api/health",
+                    "api_health",
+                } and check.get("ok"):
+                    api_ok = True
+            if health_ok and api_ok:
+                remote_verify_ok = True
 
     acceptance_map = _acceptance_checks_for_blueprint(blueprint)
     acceptance_status = []
     for check_id, work_items in acceptance_map.items():
-        status = "pass" if all(item in completed_ids for item in work_items) else "fail"
+        if check_id == "remote_http_health":
+            status = "pass" if remote_verify_ok else "fail"
+        else:
+            status = "pass" if all(item in completed_ids for item in work_items) else "fail"
         acceptance_status.append({"id": check_id, "status": status})
 
     return {

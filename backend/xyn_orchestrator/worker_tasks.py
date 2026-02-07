@@ -636,7 +636,11 @@ def _verify_route53_record(fqdn: str, zone_id: str, target_ip: str) -> bool:
 
 def _build_remote_deploy_commands(root_dir: str, jwt_secret: str) -> List[str]:
     return [
-        "set -e",
+        "set -euo pipefail",
+        "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
+        "docker compose version >/dev/null 2>&1 || { echo \"missing_compose\"; exit 11; }",
+        "command -v git >/dev/null 2>&1 || { echo \"missing_git\"; exit 12; }",
+        "command -v curl >/dev/null 2>&1 || { echo \"missing_curl\"; exit 13; }",
         f"ROOT={root_dir}",
         "mkdir -p \"$ROOT\"",
         "if [ ! -d \"$ROOT/xyn-api/.git\" ]; then git clone https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"; fi",
@@ -673,6 +677,132 @@ def _resolve_fqdn(metadata: Dict[str, Any]) -> str:
         if fqdn:
             return str(fqdn)
     return ""
+
+
+def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
+    checks = []
+    ok = True
+    for path, name in [("/health", "public_health"), ("/api/health", "public_api_health")]:
+        url = f"http://{fqdn}{path}"
+        try:
+            response = requests.get(url, timeout=10)
+            status_ok = response.status_code == 200
+            checks.append({"name": name, "ok": status_ok, "detail": str(response.status_code)})
+            ok = ok and status_ok
+        except Exception as exc:
+            checks.append({"name": name, "ok": False, "detail": str(exc)})
+            ok = False
+    return ok, checks
+
+
+def _route53_noop(fqdn: str, zone_id: str, target_ip: str) -> bool:
+    return _verify_route53_record(fqdn, zone_id, target_ip)
+
+
+def _route53_ensure_with_noop(fqdn: str, zone_id: str, target_ip: str) -> Dict[str, Any]:
+    already_ok = _route53_noop(fqdn, zone_id, target_ip)
+    change_result: Dict[str, Any] = {}
+    if not already_ok:
+        change_result = _ensure_route53_record(fqdn, zone_id, target_ip)
+    verified = _verify_route53_record(fqdn, zone_id, target_ip)
+    return {
+        "fqdn": fqdn,
+        "zone_id": zone_id,
+        "public_ip": target_ip,
+        "change": change_result,
+        "verified": verified,
+        "outcome": "noop" if already_ok else "succeeded",
+    }
+
+
+def _run_remote_deploy(
+    run_id: str,
+    fqdn: str,
+    target_instance: Dict[str, Any],
+    jwt_secret: str,
+) -> Dict[str, Any]:
+    started_at = datetime.utcnow().isoformat() + "Z"
+    public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
+    if public_ok:
+        finished_at = datetime.utcnow().isoformat() + "Z"
+        return {
+            "deploy_result": {
+                "schema_version": "deploy_result.v1",
+                "target_instance": target_instance,
+                "fqdn": fqdn,
+                "ssm_command_id": "",
+                "outcome": "noop",
+                "changes": "No changes (already healthy)",
+                "verification": public_checks,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "errors": [],
+            },
+            "public_checks": public_checks,
+            "ssm_invoked": False,
+            "exec_result": {},
+        }
+    commands = _build_remote_deploy_commands("/opt/xyn/apps/ems", jwt_secret)
+    exec_result = _run_ssm_commands(
+        target_instance.get("instance_id"),
+        target_instance.get("aws_region"),
+        commands,
+    )
+    finished_at = datetime.utcnow().isoformat() + "Z"
+    ssm_ok = exec_result.get("invocation_status") == "Success"
+    public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
+    return {
+        "deploy_result": {
+            "schema_version": "deploy_result.v1",
+            "target_instance": target_instance,
+            "fqdn": fqdn,
+            "ssm_command_id": exec_result.get("ssm_command_id", ""),
+            "outcome": "succeeded" if ssm_ok else "failed",
+            "changes": "docker compose up -d --build",
+            "verification": public_checks,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "errors": [],
+        },
+        "public_checks": public_checks,
+        "ssm_invoked": True,
+        "exec_result": exec_result,
+    }
+
+
+def _ssm_preflight_check(exec_result: Dict[str, Any]) -> tuple[bool, str, Optional[str]]:
+    output = f"{exec_result.get('stdout', '')}\n{exec_result.get('stderr', '')}"
+    for token, code in [
+        ("missing_docker", "missing_docker"),
+        ("missing_compose", "missing_compose"),
+        ("missing_git", "missing_git"),
+        ("missing_curl", "missing_curl"),
+    ]:
+        if token in output:
+            return False, token, code
+    ok = exec_result.get("invocation_status") == "Success"
+    return ok, "ok" if ok else "failed", None
+
+
+def _build_deploy_verification(
+    fqdn: str,
+    public_checks: List[Dict[str, Any]],
+    dns_ok: Optional[bool],
+    exec_result: Dict[str, Any],
+    ssm_invoked: bool,
+) -> List[Dict[str, Any]]:
+    checks = list(public_checks)
+    if dns_ok is not None:
+        checks.append({"name": "dns_record", "ok": dns_ok, "detail": "match" if dns_ok else "mismatch"})
+    if not ssm_invoked:
+        checks.append({"name": "ssm_preflight", "ok": True, "detail": "skipped"})
+        checks.append({"name": "ssm_local_health", "ok": True, "detail": "skipped"})
+        return checks
+    preflight_ok, preflight_detail, _ = _ssm_preflight_check(exec_result)
+    checks.append({"name": "ssm_preflight", "ok": preflight_ok, "detail": preflight_detail})
+    ssm_local_ok = exec_result.get("invocation_status") == "Success"
+    checks.append({"name": "ssm_local_health", "ok": ssm_local_ok, "detail": exec_result.get("invocation_status", "")})
+    return checks
 """,
         )
         _write_file(
@@ -2773,15 +2903,8 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     public_ip = _resolve_instance_public_ip(
                         target_instance.get("instance_id"), target_instance.get("aws_region")
                     )
-                    change_result = _ensure_route53_record(fqdn, zone_id, public_ip)
-                    ok = _verify_route53_record(fqdn, zone_id, public_ip)
-                    dns_result = {
-                        "fqdn": fqdn,
-                        "zone_id": zone_id,
-                        "public_ip": public_ip,
-                        "change": change_result,
-                        "verified": ok,
-                    }
+                    dns_result = _route53_ensure_with_noop(fqdn, zone_id, public_ip)
+                    ok = bool(dns_result.get("verified"))
                     dns_url = _write_artifact(run_id, "dns_change_result.json", json.dumps(dns_result, indent=2))
                     _post_json(
                         f"/xyn/internal/runs/{run_id}/artifacts",
@@ -2807,7 +2930,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     success = False
                     errors.append(
                         {
-                            "code": "dns_route53_failed",
+                            "code": "route53_failed",
                             "message": "Route53 ensure failed.",
                             "detail": {"error": str(exc)},
                         }
@@ -2818,74 +2941,163 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 try:
                     if not target_instance or not target_instance.get("instance_id"):
                         raise RuntimeError("Target instance missing for remote deploy")
-                    commands = _build_remote_deploy_commands("/opt/xyn/apps/ems", jwt_secret)
-                    deploy_manifest = {
-                        "fqdn": fqdn,
-                        "target_instance": target_instance,
-                        "root_dir": "/opt/xyn/apps/ems",
-                        "compose_file": "apps/ems-stack/docker-compose.yml",
-                    }
-                    manifest_url = _write_artifact(
-                        run_id, "deploy_manifest.json", json.dumps(deploy_manifest, indent=2)
-                    )
-                    _post_json(
-                        f"/xyn/internal/runs/{run_id}/artifacts",
-                        {"name": "deploy_manifest.json", "kind": "deploy", "url": manifest_url},
-                    )
-                    exec_result = _run_ssm_commands(
-                        target_instance.get("instance_id"),
-                        target_instance.get("aws_region"),
-                        commands,
-                    )
-                    log_payload = {
-                        "stdout": exec_result.get("stdout", ""),
-                        "stderr": exec_result.get("stderr", ""),
-                        "invocation_status": exec_result.get("invocation_status"),
-                        "response_code": exec_result.get("response_code"),
-                    }
-                    log_url = _write_artifact(run_id, "deploy_execution.log", json.dumps(log_payload, indent=2))
-                    _post_json(
-                        f"/xyn/internal/runs/{run_id}/artifacts",
-                        {"name": "deploy_execution.log", "kind": "deploy", "url": log_url},
-                    )
-                    deploy_finished = datetime.utcnow().isoformat() + "Z"
-                    deploy_result = {
-                        "schema_version": "deploy_result.v1",
-                        "target_instance": target_instance,
-                        "fqdn": fqdn,
-                        "ssm_command_id": exec_result.get("ssm_command_id", ""),
-                        "outcome": "succeeded"
-                        if exec_result.get("invocation_status") == "Success"
-                        else "failed",
-                        "changes": "docker compose up -d --build",
-                        "verification": [],
-                        "started_at": deploy_started,
-                        "finished_at": deploy_finished,
-                        "errors": [],
-                    }
-                    if exec_result.get("invocation_status") != "Success":
-                        success = False
-                        deploy_result["errors"].append(
+                    dns_ok = None
+                    try:
+                        if fqdn:
+                            zone_id = _resolve_route53_zone_id(fqdn, dns_zone_id, dns_zone_name)
+                            public_ip = _resolve_instance_public_ip(
+                                target_instance.get("instance_id"), target_instance.get("aws_region")
+                            )
+                            dns_ok = _verify_route53_record(fqdn, zone_id, public_ip)
+                    except Exception:
+                        dns_ok = None
+                    if fqdn:
+                        public_ok, public_checks = _public_verify(fqdn)
+                    else:
+                        public_ok, public_checks = False, []
+                    if public_ok:
+                        deploy_finished = datetime.utcnow().isoformat() + "Z"
+                        verification = _build_deploy_verification(
+                            fqdn, public_checks, dns_ok, {}, False
+                        )
+                        log_url = _write_artifact(
+                            run_id,
+                            "deploy_execution.log",
+                            json.dumps({"skipped": True, "reason": "already healthy"}, indent=2),
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_execution.log", "kind": "deploy", "url": log_url},
+                        )
+                        deploy_result = {
+                            "schema_version": "deploy_result.v1",
+                            "target_instance": target_instance,
+                            "fqdn": fqdn,
+                            "ssm_command_id": "",
+                            "outcome": "noop",
+                            "changes": "No changes (already healthy)",
+                            "verification": verification,
+                            "started_at": deploy_started,
+                            "finished_at": deploy_finished,
+                            "errors": [],
+                        }
+                        deploy_url = _write_artifact(
+                            run_id, "deploy_result.json", json.dumps(deploy_result, indent=2)
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_result.json", "kind": "deploy", "url": deploy_url},
+                        )
+                        verify_url = _write_artifact(
+                            run_id, "deploy_verify.json", json.dumps({"checks": public_checks}, indent=2)
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_verify.json", "kind": "deploy", "url": verify_url},
+                        )
+                        artifacts.append(
                             {
-                                "code": "ssm_failed",
-                                "message": "SSM command failed",
-                                "detail": exec_result.get("stderr", ""),
+                                "key": "deploy_result.json",
+                                "content_type": "application/json",
+                                "description": "Remote deploy result",
                             }
                         )
-                    deploy_url = _write_artifact(
-                        run_id, "deploy_result.json", json.dumps(deploy_result, indent=2)
-                    )
-                    _post_json(
-                        f"/xyn/internal/runs/{run_id}/artifacts",
-                        {"name": "deploy_result.json", "kind": "deploy", "url": deploy_url},
-                    )
-                    artifacts.append(
-                        {
-                            "key": "deploy_result.json",
-                            "content_type": "application/json",
-                            "description": "Remote deploy result",
+                        artifacts.append(
+                            {
+                                "key": "deploy_verify.json",
+                                "content_type": "application/json",
+                                "description": "Public verify checks",
+                            }
+                        )
+                        success = True
+                    else:
+                        deploy_manifest = {
+                            "fqdn": fqdn,
+                            "target_instance": target_instance,
+                            "root_dir": "/opt/xyn/apps/ems",
+                            "compose_file": "apps/ems-stack/docker-compose.yml",
                         }
-                    )
+                        manifest_url = _write_artifact(
+                            run_id, "deploy_manifest.json", json.dumps(deploy_manifest, indent=2)
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_manifest.json", "kind": "deploy", "url": manifest_url},
+                        )
+                        deploy_payload = _run_remote_deploy(run_id, fqdn, target_instance, jwt_secret)
+                        exec_result = deploy_payload.get("exec_result", {})
+                        verification = _build_deploy_verification(
+                            fqdn, deploy_payload.get("public_checks", []), dns_ok, exec_result, True
+                        )
+                        log_payload = {
+                            "stdout": exec_result.get("stdout", ""),
+                            "stderr": exec_result.get("stderr", ""),
+                            "invocation_status": exec_result.get("invocation_status"),
+                            "response_code": exec_result.get("response_code"),
+                        }
+                        log_url = _write_artifact(run_id, "deploy_execution.log", json.dumps(log_payload, indent=2))
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_execution.log", "kind": "deploy", "url": log_url},
+                        )
+                        deploy_result = deploy_payload.get("deploy_result", {})
+                        public_checks = deploy_payload.get("public_checks", [])
+                        deploy_result["verification"] = verification
+                        ssm_ok = deploy_result.get("outcome") == "succeeded"
+                        if not ssm_ok:
+                            success = False
+                            preflight_ok, _, preflight_code = _ssm_preflight_check(exec_result)
+                            if preflight_code:
+                                deploy_result.setdefault("errors", []).append(
+                                    {
+                                        "code": preflight_code,
+                                        "message": "SSM preflight failed",
+                                        "detail": exec_result.get("stderr", ""),
+                                    }
+                                )
+                            elif not preflight_ok:
+                                deploy_result.setdefault("errors", []).append(
+                                    {
+                                        "code": "ssm_preflight_failed",
+                                        "message": "SSM preflight failed",
+                                        "detail": exec_result.get("stderr", ""),
+                                    }
+                                )
+                            deploy_result.setdefault("errors", []).append(
+                                {
+                                    "code": "ssm_failed",
+                                    "message": "SSM command failed",
+                                    "detail": exec_result.get("stderr", ""),
+                                }
+                            )
+                        deploy_url = _write_artifact(
+                            run_id, "deploy_result.json", json.dumps(deploy_result, indent=2)
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_result.json", "kind": "deploy", "url": deploy_url},
+                        )
+                        artifacts.append(
+                            {
+                                "key": "deploy_result.json",
+                                "content_type": "application/json",
+                                "description": "Remote deploy result",
+                            }
+                        )
+                        verify_url = _write_artifact(
+                            run_id, "deploy_verify.json", json.dumps({"checks": public_checks}, indent=2)
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_verify.json", "kind": "deploy", "url": verify_url},
+                        )
+                        artifacts.append(
+                            {
+                                "key": "deploy_verify.json",
+                                "content_type": "application/json",
+                                "description": "Public verify checks",
+                            }
+                        )
                 except Exception as exc:
                     success = False
                     errors.append(
@@ -2900,14 +3112,9 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 try:
                     if not fqdn:
                         raise RuntimeError("FQDN missing in blueprint metadata")
-                    verify_results = []
-                    for path in ["/health", "/api/health"]:
-                        url = f"http://{fqdn}{path}"
-                        resp = requests.get(url, timeout=10)
-                        ok = resp.status_code == 200
-                        verify_results.append({"name": url, "ok": ok, "detail": str(resp.status_code)})
-                        if not ok:
-                            raise RuntimeError(f"{url} returned {resp.status_code}")
+                    ok, verify_results = _public_verify(fqdn)
+                    if not ok:
+                        raise RuntimeError("Public health checks failed")
                     verify_url = _write_artifact(
                         run_id, "deploy_verify.json", json.dumps({"checks": verify_results}, indent=2)
                     )
