@@ -16,6 +16,7 @@ from xyn_orchestrator.blueprints import (
     _build_module_catalog,
     _build_run_history_summary,
     _generate_implementation_plan,
+    _release_target_payload,
     _select_context_packs_for_dev_task,
     _write_run_artifact,
 )
@@ -28,7 +29,7 @@ from xyn_orchestrator.worker_tasks import (
     _run_remote_deploy,
     _work_item_capabilities,
 )
-from xyn_orchestrator.models import Blueprint, ContextPack, DevTask, Run
+from xyn_orchestrator.models import Blueprint, ContextPack, DevTask, Run, ReleaseTarget
 
 
 class PipelineSchemaTests(TestCase):
@@ -187,6 +188,27 @@ class PipelineSchemaTests(TestCase):
         errors = list(Draft202012Validator(schema).iter_errors(payload))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
 
+    def test_release_target_schema_validates(self):
+        payload = {
+            "schema_version": "release_target.v1",
+            "id": str(uuid.uuid4()),
+            "blueprint_id": str(uuid.uuid4()),
+            "name": "manager-demo",
+            "environment": "manager-demo",
+            "target_instance_id": str(uuid.uuid4()),
+            "fqdn": "ems.xyence.io",
+            "dns": {"provider": "route53", "zone_name": "xyence.io", "record_type": "A", "ttl": 60},
+            "runtime": {"type": "docker-compose", "transport": "ssm", "remote_root": "/opt/xyn/apps/ems"},
+            "tls": {"mode": "nginx+acme", "acme_email": "admin@xyence.io", "redirect_http_to_https": True},
+            "env": {"EMS_JWT_SECRET": "dev-secret"},
+            "secret_refs": [],
+            "created_at": "2026-02-07T00:00:00Z",
+            "updated_at": "2026-02-07T00:00:00Z",
+        }
+        schema = self._load_schema("release_target.v1.schema.json")
+        errors = list(Draft202012Validator(schema).iter_errors(payload))
+        self.assertEqual(errors, [], f"Schema errors: {errors}")
+
     def test_planner_selects_persistence_slice(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
         for work_item_id in [
@@ -311,6 +333,60 @@ class PipelineSchemaTests(TestCase):
         }
         self.assertIn("ingress-nginx-acme", module_ids)
 
+    def test_planner_uses_release_target_for_remote_slices(self):
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="manager-demo",
+            environment="manager-demo",
+            target_instance_ref=str(uuid.uuid4()),
+            fqdn="ems.xyence.io",
+            dns_json={"provider": "route53", "zone_name": "xyence.io"},
+            runtime_json={"type": "docker-compose", "transport": "ssm"},
+            tls_json={"mode": "nginx+acme", "acme_email": "admin@xyence.io"},
+            env_json={},
+            secret_refs_json=[],
+        )
+        release_payload = _release_target_payload(target)
+        module_catalog = _build_module_catalog()
+        run_history = _build_run_history_summary(blueprint, release_payload)
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=module_catalog,
+            run_history_summary=run_history,
+            release_target=release_payload,
+        )
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("dns.ensure_record.route53", ids)
+        self.assertIn("deploy.apply_remote_compose.ssm", ids)
+        self.assertIn("tls.acme_http01", ids)
+        self.assertIn("ingress.nginx_tls_configure", ids)
+        self.assertIn("verify.public_https", ids)
+        self.assertEqual(plan.get("release_target_id"), str(target.id))
+
+    def test_planner_does_not_require_blueprint_metadata_deploy(self):
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="manager-demo",
+            target_instance_ref=str(uuid.uuid4()),
+            fqdn="ems.xyence.io",
+            dns_json={"provider": "route53", "zone_name": "xyence.io"},
+            runtime_json={"type": "docker-compose", "transport": "ssm"},
+            tls_json={"mode": "none"},
+        )
+        release_payload = _release_target_payload(target)
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=_build_module_catalog(),
+            run_history_summary=_build_run_history_summary(blueprint, release_payload),
+            release_target=release_payload,
+        )
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("dns.ensure_record.route53", ids)
+        self.assertIn("deploy.apply_remote_compose.ssm", ids)
+        self.assertIn("verify.public_http", ids)
+
     def test_dns_noop_when_record_matches(self):
         with mock.patch("xyn_orchestrator.worker_tasks._ensure_route53_record") as ensure_record:
             with mock.patch("xyn_orchestrator.worker_tasks._verify_route53_record", return_value=True):
@@ -322,7 +398,7 @@ class PipelineSchemaTests(TestCase):
         target_instance = {"id": "inst-1", "name": "xyn-seed-dev-1", "instance_id": "i-123", "aws_region": "us-west-2"}
         with mock.patch("xyn_orchestrator.worker_tasks._public_verify", return_value=(True, [])):
             with mock.patch("xyn_orchestrator.worker_tasks._run_ssm_commands") as run_ssm:
-                payload = _run_remote_deploy("run-1", "ems.xyence.io", target_instance, "secret")
+                payload = _run_remote_deploy("run-1", "ems.xyence.io", target_instance, "secret", None)
         self.assertEqual(payload.get("deploy_result", {}).get("outcome"), "noop")
         self.assertFalse(payload.get("ssm_invoked"))
         run_ssm.assert_not_called()

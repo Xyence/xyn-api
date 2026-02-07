@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReleaseTarget v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "blueprint_id",
+    "name",
+    "target_instance_id",
+    "fqdn",
+    "dns",
+    "runtime",
+    "tls",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "release_target.v1" },
+    "id": { "type": "string", "format": "uuid" },
+    "blueprint_id": { "type": "string", "format": "uuid" },
+    "name": { "type": "string", "minLength": 1 },
+    "environment": { "type": "string" },
+    "target_instance_id": { "type": "string", "minLength": 1 },
+    "fqdn": { "type": "string", "minLength": 1 },
+    "dns": {
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": { "type": "string", "enum": ["route53"] },
+        "zone_name": { "type": "string" },
+        "zone_id": { "type": "string" },
+        "record_type": { "type": "string", "default": "A" },
+        "ttl": { "type": "integer", "default": 60 }
+      },
+      "additionalProperties": true
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["type", "transport"],
+      "properties": {
+        "type": { "type": "string", "enum": ["docker-compose"] },
+        "transport": { "type": "string", "enum": ["ssm"] },
+        "remote_root": { "type": "string" },
+        "compose_file_path": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "tls": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["none", "nginx+acme"] },
+        "acme_email": { "type": "string" },
+        "redirect_http_to_https": { "type": "boolean", "default": true }
+      },
+      "additionalProperties": true
+    },
+    "env": { "type": "object", "additionalProperties": { "type": "string" } },
+    "secret_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "ref"],
+        "properties": {
+          "name": { "type": "string" },
+          "ref": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}

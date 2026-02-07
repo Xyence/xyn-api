@@ -2,6 +2,7 @@ import json
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -13,6 +14,7 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth import get_user_model
+from jsonschema import Draft202012Validator
 
 from xyence.middleware import _get_or_create_user_from_claims, _verify_oidc_token
 
@@ -43,6 +45,7 @@ from .models import (
     Run,
     RunArtifact,
     RunCommandExecution,
+    ReleaseTarget,
 )
 from .module_registry import maybe_sync_modules_from_registry
 
@@ -54,6 +57,96 @@ def _parse_json(request: HttpRequest) -> Dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _load_schema_local(name: str) -> Dict[str, Any]:
+    base_dir = Path(__file__).resolve().parents[1]
+    path = base_dir / "schemas" / name
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _validate_release_target_payload(payload: Dict[str, Any]) -> list[str]:
+    schema = _load_schema_local("release_target.v1.schema.json")
+    validator = Draft202012Validator(schema)
+    errors = []
+    for error in sorted(validator.iter_errors(payload), key=lambda e: e.path):
+        path = ".".join(str(p) for p in error.path) if error.path else "root"
+        errors.append(f"{path}: {error.message}")
+    tls_mode = (payload.get("tls") or {}).get("mode")
+    if tls_mode == "nginx+acme" and not (payload.get("tls") or {}).get("acme_email"):
+        errors.append("tls.acme_email: required when tls.mode is nginx+acme")
+    fqdn = payload.get("fqdn") or ""
+    if " " in fqdn or "." not in fqdn:
+        errors.append("fqdn: must be a valid hostname")
+    return errors
+
+
+def _normalize_release_target_payload(
+    payload: Dict[str, Any], blueprint_id: str, target_id: Optional[str] = None
+) -> Dict[str, Any]:
+    dns = payload.get("dns") or {}
+    runtime = payload.get("runtime") or {}
+    tls = payload.get("tls") or {}
+    normalized = {
+        "schema_version": "release_target.v1",
+        "id": target_id or payload.get("id") or str(uuid.uuid4()),
+        "blueprint_id": str(blueprint_id),
+        "name": payload.get("name") or "",
+        "environment": payload.get("environment") or "",
+        "target_instance_id": payload.get("target_instance_id") or "",
+        "fqdn": payload.get("fqdn") or "",
+        "dns": {
+            "provider": dns.get("provider") or "route53",
+            "zone_name": dns.get("zone_name") or "",
+            "zone_id": dns.get("zone_id") or "",
+            "record_type": dns.get("record_type") or "A",
+            "ttl": dns.get("ttl") or 60,
+        },
+        "runtime": {
+            "type": runtime.get("type") or "docker-compose",
+            "transport": runtime.get("transport") or "ssm",
+            "remote_root": runtime.get("remote_root") or "",
+            "compose_file_path": runtime.get("compose_file_path") or "",
+        },
+        "tls": {
+            "mode": tls.get("mode") or "none",
+            "acme_email": tls.get("acme_email") or "",
+            "redirect_http_to_https": bool(tls.get("redirect_http_to_https", True)),
+        },
+        "env": payload.get("env") or {},
+        "secret_refs": payload.get("secret_refs") or [],
+        "created_at": payload.get("created_at") or timezone.now().isoformat(),
+        "updated_at": payload.get("updated_at") or timezone.now().isoformat(),
+    }
+    return normalized
+
+
+def _serialize_release_target(target: ReleaseTarget) -> Dict[str, Any]:
+    payload = target.config_json or {}
+    if not payload:
+        target_instance_id = ""
+        if target.target_instance_id:
+            target_instance_id = str(target.target_instance_id)
+        elif target.target_instance_ref:
+            target_instance_id = target.target_instance_ref
+        payload = {
+            "schema_version": "release_target.v1",
+            "id": str(target.id),
+            "blueprint_id": str(target.blueprint_id),
+            "name": target.name,
+            "environment": target.environment or "",
+            "target_instance_id": target_instance_id,
+            "fqdn": target.fqdn,
+            "dns": target.dns_json or {},
+            "runtime": target.runtime_json or {},
+            "tls": target.tls_json or {},
+            "env": target.env_json or {},
+            "secret_refs": target.secret_refs_json or [],
+            "created_at": target.created_at.isoformat() if target.created_at else "",
+            "updated_at": target.updated_at.isoformat() if target.updated_at else "",
+        }
+    return payload
 
 
 @login_required
@@ -533,6 +626,94 @@ def bundle_detail(request: HttpRequest, bundle_ref: str) -> JsonResponse:
             "updated_at": bundle.updated_at,
         }
     )
+
+
+@csrf_exempt
+@login_required
+def release_targets_collection(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "POST":
+        payload = _parse_json(request)
+        blueprint_id = payload.get("blueprint_id")
+        if not blueprint_id:
+            return JsonResponse({"error": "blueprint_id is required"}, status=400)
+        blueprint = get_object_or_404(Blueprint, id=blueprint_id)
+        normalized = _normalize_release_target_payload(payload, str(blueprint.id))
+        errors = _validate_release_target_payload(normalized)
+        if errors:
+            return JsonResponse({"error": "Invalid ReleaseTarget", "details": errors}, status=400)
+        target_instance = None
+        if normalized.get("target_instance_id"):
+            target_instance = ProvisionedInstance.objects.filter(id=normalized["target_instance_id"]).first()
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name=normalized["name"],
+            environment=normalized.get("environment", ""),
+            target_instance_ref=normalized.get("target_instance_id", ""),
+            target_instance=target_instance,
+            fqdn=normalized["fqdn"],
+            dns_json=normalized.get("dns"),
+            runtime_json=normalized.get("runtime"),
+            tls_json=normalized.get("tls"),
+            env_json=normalized.get("env"),
+            secret_refs_json=normalized.get("secret_refs"),
+            config_json=normalized,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        return JsonResponse({"id": str(target.id)})
+    qs = ReleaseTarget.objects.all()
+    if blueprint_id := request.GET.get("blueprint_id"):
+        qs = qs.filter(blueprint_id=blueprint_id)
+    data = [_serialize_release_target(target) for target in qs.order_by("-created_at")]
+    return JsonResponse({"release_targets": data})
+
+
+@csrf_exempt
+@login_required
+def release_target_detail(request: HttpRequest, target_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    target = get_object_or_404(ReleaseTarget, id=target_id)
+    if request.method == "GET":
+        return JsonResponse(_serialize_release_target(target))
+    if request.method == "DELETE":
+        target.delete()
+        return JsonResponse({}, status=204)
+    if request.method != "PATCH":
+        return JsonResponse({"error": "PATCH required"}, status=405)
+    payload = _parse_json(request)
+    base = _serialize_release_target(target)
+    for key, value in payload.items():
+        if key in {"dns", "runtime", "tls", "env"} and isinstance(value, dict):
+            merged = dict(base.get(key) or {})
+            merged.update(value)
+            base[key] = merged
+        else:
+            base[key] = value
+    normalized = _normalize_release_target_payload(base, str(target.blueprint_id), str(target.id))
+    normalized["updated_at"] = timezone.now().isoformat()
+    errors = _validate_release_target_payload(normalized)
+    if errors:
+        return JsonResponse({"error": "Invalid ReleaseTarget", "details": errors}, status=400)
+    target_instance = None
+    if normalized.get("target_instance_id"):
+        target_instance = ProvisionedInstance.objects.filter(id=normalized["target_instance_id"]).first()
+    target.name = normalized["name"]
+    target.environment = normalized.get("environment", "")
+    target.target_instance_ref = normalized.get("target_instance_id", "")
+    target.target_instance = target_instance
+    target.fqdn = normalized["fqdn"]
+    target.dns_json = normalized.get("dns")
+    target.runtime_json = normalized.get("runtime")
+    target.tls_json = normalized.get("tls")
+    target.env_json = normalized.get("env")
+    target.secret_refs_json = normalized.get("secret_refs")
+    target.config_json = normalized
+    target.updated_by = request.user
+    target.save()
+    return JsonResponse({"id": str(target.id)})
 
 
 @csrf_exempt

@@ -300,6 +300,39 @@ class BlueprintInstance(models.Model):
         return f"{self.blueprint} -> {self.release_id or self.id}"
 
 
+class ReleaseTarget(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    blueprint = models.ForeignKey(Blueprint, on_delete=models.CASCADE, related_name="release_targets")
+    name = models.CharField(max_length=200)
+    environment = models.CharField(max_length=120, blank=True)
+    target_instance_ref = models.CharField(max_length=120, blank=True)
+    target_instance = models.ForeignKey(
+        "ProvisionedInstance", null=True, blank=True, on_delete=models.SET_NULL, related_name="release_targets"
+    )
+    fqdn = models.CharField(max_length=200)
+    dns_json = models.JSONField(null=True, blank=True)
+    runtime_json = models.JSONField(null=True, blank=True)
+    tls_json = models.JSONField(null=True, blank=True)
+    env_json = models.JSONField(null=True, blank=True)
+    secret_refs_json = models.JSONField(null=True, blank=True)
+    config_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="release_targets_created"
+    )
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="release_targets_updated"
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        unique_together = ("blueprint", "name")
+
+    def __str__(self) -> str:
+        return f"{self.blueprint} target {self.name}"
+
+
 class Module(models.Model):
     STATUS_CHOICES = [
         ("active", "Active"),

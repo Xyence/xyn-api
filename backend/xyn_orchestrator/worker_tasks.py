@@ -2268,6 +2268,15 @@ def _load_blueprint_metadata(source_run: Optional[str]) -> Dict[str, Any]:
     return {}
 
 
+def _load_release_target(source_run: Optional[str]) -> Dict[str, Any]:
+    if not source_run:
+        return {}
+    payload = _download_artifact_json(source_run, "release_target.json")
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
 def _resolve_route53_zone_id(fqdn: str, zone_id: str, zone_name: str) -> str:
     if zone_id:
         return zone_id
@@ -2344,7 +2353,15 @@ def _verify_route53_record(fqdn: str, zone_id: str, target_ip: str) -> bool:
     return target_ip in values
 
 
-def _build_remote_deploy_commands(root_dir: str, jwt_secret: str) -> List[str]:
+def _build_remote_deploy_commands(
+    root_dir: str, jwt_secret: str, compose_file: str, extra_env: Dict[str, str]
+) -> List[str]:
+    env_exports = []
+    for key, value in extra_env.items():
+        if not key:
+            continue
+        safe_value = str(value).replace("\"", "\\\"")
+        env_exports.append(f"export {key}=\"{safe_value}\"")
     return [
         "set -euo pipefail",
         "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
@@ -2371,24 +2388,25 @@ def _build_remote_deploy_commands(root_dir: str, jwt_secret: str) -> List[str]:
         f"export EMS_ACME_WEBROOT_PATH=\"{root_dir}/acme-webroot\"",
         f"mkdir -p \"{root_dir}/certs/current\" \"{root_dir}/acme-webroot\"",
         f"cd \"{root_dir}/xyn-api\"",
+        *env_exports,
         (
             "XYN_UI_PATH=\"$XYN_UI_PATH\" EMS_JWT_SECRET=\"$EMS_JWT_SECRET\" "
             "EMS_PUBLIC_PORT=\"$EMS_PUBLIC_PORT\" EMS_PUBLIC_TLS_PORT=\"$EMS_PUBLIC_TLS_PORT\" "
             "EMS_CERTS_PATH=\"$EMS_CERTS_PATH\" EMS_ACME_WEBROOT_PATH=\"$EMS_ACME_WEBROOT_PATH\" "
-            "docker compose -f apps/ems-stack/docker-compose.yml down -v --remove-orphans"
+            f"docker compose -f {compose_file} down -v --remove-orphans"
         ),
         (
             "XYN_UI_PATH=\"$XYN_UI_PATH\" EMS_JWT_SECRET=\"$EMS_JWT_SECRET\" "
             "EMS_PUBLIC_PORT=\"$EMS_PUBLIC_PORT\" EMS_PUBLIC_TLS_PORT=\"$EMS_PUBLIC_TLS_PORT\" "
             "EMS_CERTS_PATH=\"$EMS_CERTS_PATH\" EMS_ACME_WEBROOT_PATH=\"$EMS_ACME_WEBROOT_PATH\" "
-            "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans"
+            f"docker compose -f {compose_file} up -d --build --remove-orphans"
         ),
         "for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 2; done",
         "for i in $(seq 1 30); do curl -fsS http://localhost:8080/api/health && break; sleep 2; done",
     ]
 
 
-def _build_tls_acme_commands(root_dir: str, fqdn: str, email: str) -> List[str]:
+def _build_tls_acme_commands(root_dir: str, fqdn: str, email: str, compose_file: str) -> List[str]:
     acme_webroot = f"{root_dir}/acme-webroot"
     lego_dir = f"{root_dir}/lego-data"
     cert_dir = f"{root_dir}/certs/current"
@@ -2412,7 +2430,7 @@ def _build_tls_acme_commands(root_dir: str, fqdn: str, email: str) -> List[str]:
         f"cd {root_dir}/xyn-api; "
         f"XYN_UI_PATH={root_dir}/xyn-ui/apps/ems-ui EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
         f"EMS_CERTS_PATH={cert_dir} EMS_ACME_WEBROOT_PATH={acme_webroot} "
-        "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans; "
+        f"docker compose -f {compose_file} up -d --build --remove-orphans; "
         "if command -v openssl >/dev/null 2>&1; then "
         f"if [ ! -f {cert_dir}/fullchain.pem ] || [ ! -f {cert_dir}/privkey.pem ]; then "
         f"openssl req -x509 -nodes -newkey rsa:2048 -keyout {cert_dir}/privkey.pem "
@@ -2430,13 +2448,13 @@ def _build_tls_acme_commands(root_dir: str, fqdn: str, email: str) -> List[str]:
         f"chmod 600 {cert_dir}/privkey.pem; "
         f"XYN_UI_PATH={root_dir}/xyn-ui/apps/ems-ui EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
         f"EMS_CERTS_PATH={cert_dir} EMS_ACME_WEBROOT_PATH={acme_webroot} "
-        "docker compose -f apps/ems-stack/docker-compose.yml restart ems-web"
+        f"docker compose -f {compose_file} restart ems-web"
         "\""
     )
     return [command]
 
 
-def _build_tls_nginx_commands(root_dir: str) -> List[str]:
+def _build_tls_nginx_commands(root_dir: str, compose_file: str) -> List[str]:
     cert_dir = f"{root_dir}/certs/current"
     acme_webroot = f"{root_dir}/acme-webroot"
     command = (
@@ -2447,7 +2465,7 @@ def _build_tls_nginx_commands(root_dir: str) -> List[str]:
         f"cd {root_dir}/xyn-api; "
         f"XYN_UI_PATH={root_dir}/xyn-ui/apps/ems-ui EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
         f"EMS_CERTS_PATH={cert_dir} EMS_ACME_WEBROOT_PATH={acme_webroot} "
-        "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans"
+        f"docker compose -f {compose_file} up -d --build --remove-orphans"
         "\""
     )
     return [command]
@@ -2584,6 +2602,7 @@ def _run_remote_deploy(
     fqdn: str,
     target_instance: Dict[str, Any],
     jwt_secret: str,
+    release_target: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     started_at = datetime.utcnow().isoformat() + "Z"
     public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
@@ -2606,7 +2625,11 @@ def _run_remote_deploy(
             "ssm_invoked": False,
             "exec_result": {},
         }
-    commands = _build_remote_deploy_commands("/opt/xyn/apps/ems", jwt_secret)
+    runtime = (release_target or {}).get("runtime") or {}
+    remote_root = runtime.get("remote_root") or "/opt/xyn/apps/ems"
+    compose_file = runtime.get("compose_file_path") or "apps/ems-stack/docker-compose.yml"
+    extra_env = (release_target or {}).get("env") or {}
+    commands = _build_remote_deploy_commands(remote_root, jwt_secret, compose_file, extra_env)
     exec_result = _run_ssm_commands(
         target_instance.get("instance_id"),
         target_instance.get("aws_region"),
@@ -2977,6 +3000,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             if not work_item:
                 raise RuntimeError(f"work_item_id not found in plan: {work_item_id}")
             blueprint_metadata = _load_blueprint_metadata(source_run)
+            release_target = _load_release_target(source_run)
             deploy_meta = blueprint_metadata.get("deploy") or {}
             fqdn = _resolve_fqdn(blueprint_metadata)
             dns_provider = blueprint_metadata.get("dns_provider") or deploy_meta.get("dns_provider")
@@ -2988,6 +3012,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 or ""
             )
             jwt_secret = deploy_meta.get("ems_jwt_secret") or os.environ.get("EMS_JWT_SECRET", "dev-secret-change-me")
+            if release_target:
+                fqdn = release_target.get("fqdn") or fqdn
+                release_dns = release_target.get("dns") or {}
+                dns_provider = release_dns.get("provider") or dns_provider
+                dns_zone_id = release_dns.get("zone_id") or dns_zone_id
+                dns_zone_name = release_dns.get("zone_name") or dns_zone_name
+                release_env = release_target.get("env") or {}
+                jwt_secret = release_env.get("EMS_JWT_SECRET") or jwt_secret
             workspace_root = os.path.join(CODEGEN_WORKDIR, task_id)
             os.system(f"rm -rf {workspace_root}")
             os.makedirs(workspace_root, exist_ok=True)
@@ -3295,7 +3327,9 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             f"/xyn/internal/runs/{run_id}/artifacts",
                             {"name": "deploy_manifest.json", "kind": "deploy", "url": manifest_url},
                         )
-                        deploy_payload = _run_remote_deploy(run_id, fqdn, target_instance, jwt_secret)
+                        deploy_payload = _run_remote_deploy(
+                            run_id, fqdn, target_instance, jwt_secret, release_target
+                        )
                         exec_result = deploy_payload.get("exec_result", {})
                         verification = _build_deploy_verification(
                             fqdn, deploy_payload.get("public_checks", []), dns_ok, exec_result, True
@@ -3427,15 +3461,20 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     if not fqdn:
                         raise RuntimeError("FQDN missing in blueprint metadata")
                     tls_meta = blueprint_metadata.get("tls") or {}
+                    if release_target:
+                        tls_meta = release_target.get("tls") or tls_meta
                     acme_email = tls_meta.get("acme_email") or deploy_meta.get("acme_email")
                     if not acme_email:
                         raise RuntimeError("tls.acme_email missing in blueprint metadata")
                     if not target_instance or not target_instance.get("instance_id"):
                         raise RuntimeError("Target instance missing for TLS bootstrap")
+                    runtime = (release_target or {}).get("runtime") or {}
+                    root_dir = runtime.get("remote_root") or "/opt/xyn/apps/ems"
+                    compose_file = runtime.get("compose_file_path") or "apps/ems-stack/docker-compose.yml"
                     exec_result = _run_ssm_commands(
                         target_instance.get("instance_id"),
                         target_instance.get("aws_region"),
-                        _build_tls_acme_commands("/opt/xyn/apps/ems", fqdn, acme_email),
+                        _build_tls_acme_commands(root_dir, fqdn, acme_email, compose_file),
                     )
                     stdout = exec_result.get("stdout", "")
                     noop = "acme_noop" in stdout
@@ -3511,10 +3550,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 try:
                     if not target_instance or not target_instance.get("instance_id"):
                         raise RuntimeError("Target instance missing for TLS nginx configure")
+                    runtime = (release_target or {}).get("runtime") or {}
+                    root_dir = runtime.get("remote_root") or "/opt/xyn/apps/ems"
+                    compose_file = runtime.get("compose_file_path") or "apps/ems-stack/docker-compose.yml"
                     exec_result = _run_ssm_commands(
                         target_instance.get("instance_id"),
                         target_instance.get("aws_region"),
-                        _build_tls_nginx_commands("/opt/xyn/apps/ems"),
+                        _build_tls_nginx_commands(root_dir, compose_file),
                     )
                     stdout = exec_result.get("stdout", "")
                     outcome = "noop" if "up-to-date" in stdout.lower() else (

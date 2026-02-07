@@ -42,6 +42,7 @@ from .models import (
     ReleasePlanDeployState,
     ReleasePlanDeployment,
     Release,
+    ReleaseTarget,
     ProvisionedInstance,
     Run,
     RunCommandExecution,
@@ -435,6 +436,58 @@ def _validate_schema(payload: Dict[str, Any], name: str) -> List[str]:
     return errors
 
 
+def _release_target_payload(target: ReleaseTarget) -> Dict[str, Any]:
+    now = timezone.now().isoformat()
+    dns = target.dns_json or {}
+    runtime = target.runtime_json or {}
+    tls = target.tls_json or {}
+    env = target.env_json or {}
+    secret_refs = target.secret_refs_json or []
+    payload = {
+        "schema_version": "release_target.v1",
+        "id": str(target.id),
+        "blueprint_id": str(target.blueprint_id),
+        "name": target.name,
+        "environment": target.environment or "",
+        "target_instance_id": (
+            str(target.target_instance_id)
+            if target.target_instance_id
+            else (target.target_instance_ref or "")
+        ),
+        "fqdn": target.fqdn,
+        "dns": dns,
+        "runtime": runtime,
+        "tls": tls,
+        "env": env,
+        "secret_refs": secret_refs,
+        "created_at": target.created_at.isoformat() if target.created_at else now,
+        "updated_at": target.updated_at.isoformat() if target.updated_at else now,
+    }
+    return payload
+
+
+def _select_release_target_for_blueprint(
+    blueprint: Blueprint,
+    release_target_id: Optional[str] = None,
+) -> Optional[ReleaseTarget]:
+    qs = ReleaseTarget.objects.filter(blueprint=blueprint).order_by("-created_at")
+    if release_target_id:
+        try:
+            return qs.filter(id=release_target_id).first()
+        except (ValueError, TypeError):
+            return None
+    metadata = blueprint.metadata_json or {}
+    default_id = metadata.get("default_release_target_id")
+    if default_id:
+        try:
+            target = qs.filter(id=default_id).first()
+            if target:
+                return target
+        except (ValueError, TypeError):
+            pass
+    return qs.first()
+
+
 def _default_repo_targets() -> List[Dict[str, Any]]:
     return [
         {
@@ -579,17 +632,24 @@ def _build_module_catalog() -> Dict[str, Any]:
     }
 
 
-def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str]]:
+def _acceptance_checks_for_blueprint(
+    blueprint: Blueprint, release_target: Optional[Dict[str, Any]] = None
+) -> Dict[str, List[str]]:
     metadata = blueprint.metadata_json or {}
     acceptance = metadata.get("acceptance_checks")
     if isinstance(acceptance, dict):
         return {key: list(value) for key, value in acceptance.items()}
     deploy_meta = metadata.get("deploy") or {}
     tls_meta = metadata.get("tls") or {}
-    deploy_target = deploy_meta.get("target_instance_id") or deploy_meta.get("target_instance") or deploy_meta.get(
-        "target_instance_name"
-    )
-    deploy_fqdn = deploy_meta.get("primary_fqdn") or deploy_meta.get("fqdn")
+    if release_target:
+        deploy_target = release_target.get("target_instance_id")
+        deploy_fqdn = release_target.get("fqdn")
+        tls_meta = release_target.get("tls") or {}
+    else:
+        deploy_target = deploy_meta.get("target_instance_id") or deploy_meta.get("target_instance") or deploy_meta.get(
+            "target_instance_name"
+        )
+        deploy_fqdn = deploy_meta.get("primary_fqdn") or deploy_meta.get("fqdn")
     if not deploy_fqdn:
         environments = metadata.get("environments") or []
         if isinstance(environments, list) and environments:
@@ -621,7 +681,9 @@ def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str
     return {}
 
 
-def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
+def _build_run_history_summary(
+    blueprint: Blueprint, release_target: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     completed: List[Dict[str, Any]] = []
     completed_ids: set[str] = set()
     remote_verify_ok = False
@@ -695,7 +757,7 @@ def _build_run_history_summary(blueprint: Blueprint) -> Dict[str, Any]:
             if https_health_ok and https_api_ok:
                 remote_https_ok = True
 
-    acceptance_map = _acceptance_checks_for_blueprint(blueprint)
+    acceptance_map = _acceptance_checks_for_blueprint(blueprint, release_target)
     acceptance_status = []
     for check_id, work_items in acceptance_map.items():
         if check_id == "remote_http_health":
@@ -762,6 +824,9 @@ def _select_next_slice(
             "verify.public_http",
         ],
         "remote_https_health": [
+            "dns.ensure_record.route53",
+            "deploy.apply_remote_compose.ssm",
+            "verify.public_http",
             "tls.acme_http01",
             "ingress.nginx_tls_configure",
             "verify.public_https",
@@ -884,6 +949,7 @@ def _generate_implementation_plan(
     blueprint: Blueprint,
     module_catalog: Optional[Dict[str, Any]] = None,
     run_history_summary: Optional[Dict[str, Any]] = None,
+    release_target: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     repo_targets = _default_repo_targets()
@@ -1718,7 +1784,7 @@ def _generate_implementation_plan(
     if module_catalog is None:
         module_catalog = _build_module_catalog()
     if run_history_summary is None:
-        run_history_summary = _build_run_history_summary(blueprint)
+        run_history_summary = _build_run_history_summary(blueprint, release_target)
 
     module_ids = {entry.get("id") for entry in module_catalog.get("modules", [])}
     metadata = blueprint.metadata_json or {}
@@ -1726,6 +1792,11 @@ def _generate_implementation_plan(
     if isinstance(modules_required, str):
         modules_required = [modules_required]
     dns_provider = metadata.get("dns_provider")
+    release_dns = release_target.get("dns") if isinstance(release_target, dict) else {}
+    release_runtime = release_target.get("runtime") if isinstance(release_target, dict) else {}
+    release_tls = release_target.get("tls") if isinstance(release_target, dict) else {}
+    if release_dns:
+        dns_provider = release_dns.get("provider") or dns_provider
     route53_requested = dns_provider == "route53" or "dns-route53" in modules_required
     deploy_ssm_requested = "deploy-ssm-compose" in modules_required
     tls_acme_requested = "ingress-nginx-acme" in modules_required
@@ -1742,7 +1813,10 @@ def _generate_implementation_plan(
         )
     if not deploy_ssm_requested:
         deploy_meta = metadata.get("deploy") or {}
-        deploy_ssm_requested = bool(deploy_meta.get("target_instance") or deploy_meta.get("target_instance_id"))
+        if release_target:
+            deploy_ssm_requested = bool(release_target.get("target_instance_id") and release_target.get("fqdn"))
+        else:
+            deploy_ssm_requested = bool(deploy_meta.get("target_instance") or deploy_meta.get("target_instance_id"))
         if not deploy_ssm_requested:
             try:
                 metadata_blob = json.dumps(metadata).lower()
@@ -1750,7 +1824,7 @@ def _generate_implementation_plan(
                 metadata_blob = str(metadata).lower()
             deploy_ssm_requested = "ssm" in metadata_blob
     if not tls_acme_requested:
-        tls_meta = metadata.get("tls") or {}
+        tls_meta = release_tls or (metadata.get("tls") or {})
         tls_mode = str(tls_meta.get("mode") or "").lower()
         tls_acme_requested = tls_mode in {"nginx+acme", "acme", "letsencrypt"}
     if route53_requested and "dns-route53" not in module_ids:
@@ -1869,6 +1943,8 @@ def _generate_implementation_plan(
         for artifact_name in ("module_catalog.v1.json", "run_history_summary.v1.json"):
             if artifact_name not in artifacts:
                 artifacts.append(artifact_name)
+        if release_target and "release_target.json" not in artifacts:
+            artifacts.append("release_target.json")
 
     plan_rationale = {"gaps_detected": [], "modules_selected": [], "why_next": ["Default plan generated."]}
     if run_history_summary.get("acceptance_checks_status"):
@@ -1918,7 +1994,7 @@ def _generate_implementation_plan(
         ]
     )
 
-    return {
+    plan = {
         "schema_version": "implementation_plan.v1",
         "blueprint_id": str(blueprint.id),
         "blueprint_name": blueprint_fqn,
@@ -1929,6 +2005,10 @@ def _generate_implementation_plan(
         "tasks": tasks,
         "plan_rationale": plan_rationale,
     }
+    if release_target:
+        plan["release_target_id"] = release_target.get("id")
+        plan["release_target_name"] = release_target.get("name")
+    return plan
 
 
 def _prune_run_artifacts() -> None:
@@ -1969,6 +2049,7 @@ def _queue_dev_tasks_for_plan(
     plan: Dict[str, Any],
     namespace: Optional[str],
     project_key: Optional[str],
+    release_target: Optional[Dict[str, Any]] = None,
     enqueue_jobs: bool = False,
 ) -> List[DevTask]:
     tasks = []
@@ -1979,6 +2060,8 @@ def _queue_dev_tasks_for_plan(
     target_instance_id = deploy_meta.get("target_instance_id")
     target_instance_name = deploy_meta.get("target_instance_name")
     target_instance_ref = deploy_meta.get("target_instance") or {}
+    if release_target:
+        target_instance_id = release_target.get("target_instance_id") or target_instance_id
     if isinstance(target_instance_ref, dict):
         target_instance_id = target_instance_id or target_instance_ref.get("id")
         target_instance_name = target_instance_name or target_instance_ref.get("name")
@@ -2454,7 +2537,9 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
     if not payload:
         payload = request.POST
     mode = payload.get("mode", "apply")
+    release_target_id = payload.get("release_target_id")
     queue_dev_tasks = request.GET.get("queue_dev_tasks") == "1"
+    selected_release_target = _select_release_target_for_blueprint(blueprint, release_target_id)
     instance = BlueprintInstance.objects.create(
         blueprint=blueprint,
         revision=latest_revision.revision,
@@ -2510,12 +2595,16 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
         module_catalog = _build_module_catalog()
         _write_run_artifact(run, "module_catalog.v1.json", module_catalog, "module_catalog")
         _write_run_artifact(run, "blueprint_metadata.json", blueprint.metadata_json or {}, "blueprint")
+        if selected_release_target:
+            release_payload = _release_target_payload(selected_release_target)
+            _write_run_artifact(run, "release_target.json", release_payload, "release_target")
         run_history_summary = _build_run_history_summary(blueprint)
         _write_run_artifact(run, "run_history_summary.v1.json", run_history_summary, "run_history_summary")
         implementation_plan = _generate_implementation_plan(
             blueprint,
             module_catalog=module_catalog,
             run_history_summary=run_history_summary,
+            release_target=_release_target_payload(selected_release_target) if selected_release_target else None,
         )
         plan_errors = _validate_schema(implementation_plan, "implementation_plan.v1.schema.json")
         if plan_errors:
@@ -2543,6 +2632,7 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
                 plan=implementation_plan,
                 namespace=blueprint.namespace,
                 project_key=f"{blueprint.namespace}.{blueprint.name}",
+                release_target=_release_target_payload(selected_release_target) if selected_release_target else None,
                 enqueue_jobs=True,
             )
             run.log_text += f"Queued {len(dev_tasks)} dev tasks\n"

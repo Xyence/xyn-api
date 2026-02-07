@@ -38,6 +38,7 @@ from .models import (
     Release,
     ReleasePlanDeployState,
     ReleasePlanDeployment,
+    ReleaseTarget,
     VoiceNote,
     VoiceTranscript,
 )
@@ -189,6 +190,13 @@ class ReleasePlanAdmin(admin.ModelAdmin):
     )
     search_fields = ("name", "target_fqn")
     list_filter = ("target_kind", "environment")
+
+
+@admin.register(ReleaseTarget)
+class ReleaseTargetAdmin(admin.ModelAdmin):
+    list_display = ("name", "blueprint", "fqdn", "target_instance", "target_instance_ref", "created_at")
+    list_filter = ("blueprint",)
+    search_fields = ("name", "fqdn", "blueprint__name")
 
 
 @admin.register(Release)
