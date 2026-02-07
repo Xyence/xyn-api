@@ -690,7 +690,7 @@ EMS_JWT_SECRET=dev-secret-change-me
   nginx:
     image: nginx:1.27-alpine
     ports:
-      - "8080:8080"
+      - "${EMS_PUBLIC_PORT:-8080}:8080"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
@@ -2266,6 +2266,7 @@ def _build_remote_deploy_commands(root_dir: str, jwt_secret: str) -> List[str]:
         "docker version",
         f"export XYN_UI_PATH=\"{root_dir}/xyn-ui/apps/ems-ui\"",
         f"export EMS_JWT_SECRET=\"{jwt_secret}\"",
+        "export EMS_PUBLIC_PORT=80",
         f"cd \"{root_dir}/xyn-api\"",
         (
             "XYN_UI_PATH=\"$XYN_UI_PATH\" EMS_JWT_SECRET=\"$EMS_JWT_SECRET\" "
