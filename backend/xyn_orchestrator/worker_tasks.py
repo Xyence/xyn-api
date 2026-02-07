@@ -593,12 +593,13 @@ This folder contains docker-compose and nginx scaffolds.
 """,
         )
         changed.extend(["deploy/README.md", "deploy/docker-compose.yml", "deploy/nginx.conf"])
-    if work_item["id"] == "ems-compose-local-chassis":
+    if work_item["id"] in {"ems-compose-local-chassis", "ems-stack-prod-web"}:
         _write_file(
             p("README.md"),
             """# EMS Local Chassis
 
-This stack runs the EMS API + UI locally using Docker Compose.
+This stack runs the EMS API + UI locally using Docker Compose. The UI is built
+as static assets and served via nginx.
 
 ## Repo Layout
 This compose file assumes you have these repos side-by-side:
@@ -678,24 +679,14 @@ EMS_JWT_SECRET=dev-secret-change-me
     expose:
       - "8000"
 
-  ems-ui:
-    image: node:20-alpine
-    working_dir: /app
-    volumes:
-      - ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}:/app
-    command: sh -lc "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
-    expose:
-      - "5173"
-
-  nginx:
-    image: nginx:1.27-alpine
+  ems-web:
+    build:
+      context: ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}
+      dockerfile: Dockerfile
     ports:
       - "${EMS_PUBLIC_PORT:-8080}:8080"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - ems-api
-      - ems-ui
 
 volumes:
   ems_pgdata: {}
@@ -727,7 +718,7 @@ http {
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-      proxy_pass http://ems-ui:5173/;
+      proxy_pass http://ems-web:8080/;
     }
   }
 }
@@ -766,8 +757,7 @@ done
 if [ "$healthy" -ne 1 ]; then
   echo "Health check failed: /health did not become ready in time."
   docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-api || true
-  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 nginx || true
-  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-ui || true
+  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-web || true
   exit 1
 fi
 
@@ -784,7 +774,7 @@ done
 if [ "$api_healthy" -ne 1 ]; then
   echo "API health check failed: /api/health did not become ready in time."
   docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-api || true
-  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 nginx || true
+  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-web || true
   exit 1
 fi
 sleep 2
@@ -850,6 +840,10 @@ if [ "$ui_code" != "200" ] && [ "$ui_code" != "302" ]; then
   echo "Expected UI root to return 200/302, got ${ui_code}"
   exit 1
 fi
+curl -fsS http://localhost:8080/ | grep -q '<div id="root">' || {
+  echo "Expected UI HTML to include root mount element."
+  exit 1
+}
 """,
         )
         os.chmod(p("scripts/verify.sh"), 0o755)
@@ -1649,24 +1643,14 @@ EMS_JWT_SECRET=dev-secret-change-me
     expose:
       - "8000"
 
-  ems-ui:
-    image: node:20-alpine
-    working_dir: /app
-    volumes:
-      - ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}:/app
-    command: sh -lc "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
-    expose:
-      - "5173"
-
-  nginx:
-    image: nginx:1.27-alpine
+  ems-web:
+    build:
+      context: ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}
+      dockerfile: Dockerfile
     ports:
       - "8080:8080"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - ems-api
-      - ems-ui
 
 volumes:
   ems_pgdata: {}
@@ -1775,6 +1759,47 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
 });
+""",
+        )
+        _write_file(
+            p("Dockerfile"),
+            """FROM node:20-alpine AS build
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/dist /usr/share/nginx/html
+""",
+        )
+        _write_file(
+            p("nginx.conf"),
+            """server {
+  listen 8080;
+
+  location /health {
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass http://ems-api:8000/health;
+  }
+
+  location /api/ {
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass http://ems-api:8000/;
+  }
+
+  location / {
+    root /usr/share/nginx/html;
+    try_files $uri /index.html;
+  }
+}
 """,
         )
         _write_file(
@@ -1963,6 +1988,8 @@ export default function Reports() {
         changed.extend(
             [
                 "README.md",
+                "Dockerfile",
+                "nginx.conf",
                 "package.json",
                 "tsconfig.json",
                 "vite.config.ts",

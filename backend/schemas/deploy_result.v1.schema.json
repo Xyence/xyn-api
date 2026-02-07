@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeployResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "target_instance", "fqdn", "outcome", "started_at", "finished_at"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "deploy_result.v1"
+    },
+    "target_instance": {
+      "type": "object",
+      "required": ["id", "name"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "instance_id": { "type": "string" },
+        "aws_region": { "type": "string" }
+      }
+    },
+    "fqdn": { "type": "string" },
+    "ssm_command_id": { "type": "string" },
+    "outcome": { "type": "string", "enum": ["succeeded", "failed", "noop"] },
+    "changes": { "type": "string" },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "ok"],
+        "additionalProperties": true,
+        "properties": {
+          "name": { "type": "string" },
+          "ok": { "type": "boolean" },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+    "started_at": { "type": "string" },
+    "finished_at": { "type": "string" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

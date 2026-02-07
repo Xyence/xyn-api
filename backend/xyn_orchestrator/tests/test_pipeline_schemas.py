@@ -42,7 +42,7 @@ class PipelineSchemaTests(TestCase):
         errors = list(Draft202012Validator(schema).iter_errors(plan))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
         self.assertGreaterEqual(len(plan.get("work_items", [])), 1)
-        chassis = next((w for w in plan.get("work_items", []) if w.get("id") == "ems-compose-local-chassis"), None)
+        chassis = next((w for w in plan.get("work_items", []) if w.get("id") == "ems-stack-prod-web"), None)
         self.assertIsNotNone(chassis)
         verify_cmds = [entry.get("command", "") for entry in chassis.get("verify", [])]
         self.assertTrue(any("scripts/verify.sh" in cmd for cmd in verify_cmds))
@@ -174,6 +174,7 @@ class PipelineSchemaTests(TestCase):
     def test_planner_selects_persistence_slice(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
         for work_item_id in [
+            "ems-stack-prod-web",
             "ems-api-jwt-protect-me",
             "ems-stack-pass-jwt-secret-and-verify-me",
             "ems-api-devices-rbac",
@@ -283,6 +284,60 @@ class PipelineSchemaTests(TestCase):
         module_spec = data.get("module", {})
         self.assertIn("dns.route53.records", module_spec.get("capabilitiesProvided", []))
 
+    def test_runtime_web_static_module_spec_fields(self):
+        spec_path = (
+            Path(__file__).resolve().parents[2] / "registry" / "modules" / "runtime-web-static-nginx.json"
+        )
+        data = json.loads(spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("kind"), "Module")
+        metadata = data.get("metadata", {})
+        self.assertEqual(metadata.get("name"), "runtime-web-static-nginx")
+        self.assertEqual(metadata.get("namespace"), "core")
+        module_spec = data.get("module", {})
+        self.assertIn("runtime.web.static", module_spec.get("capabilitiesProvided", []))
+        self.assertIn("runtime.reverse_proxy.http", module_spec.get("capabilitiesProvided", []))
+
+    def test_prod_web_scaffold_outputs(self):
+        work_item = {
+            "id": "ems-stack-prod-web",
+            "repo_targets": [
+                {
+                    "name": "xyn-api",
+                    "url": "https://example.com/xyn-api",
+                    "ref": "main",
+                    "path_root": "apps/ems-stack",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(work_item, repo_dir)
+            compose = Path(repo_dir, "apps/ems-stack/docker-compose.yml").read_text(encoding="utf-8")
+            self.assertIn("ems-web", compose)
+            self.assertNotIn("5173", compose)
+            self.assertNotIn("npm run dev", compose)
+
+    def test_ui_dockerfile_builds_static_assets(self):
+        work_item = {
+            "id": "ems-ui-scaffold",
+            "repo_targets": [
+                {
+                    "name": "xyn-ui",
+                    "url": "https://example.com/xyn-ui",
+                    "ref": "main",
+                    "path_root": "apps/ems-ui",
+                    "auth": "local",
+                    "allow_write": True,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _apply_scaffold_for_work_item(work_item, repo_dir)
+            dockerfile = Path(repo_dir, "apps/ems-ui/Dockerfile").read_text(encoding="utf-8")
+            self.assertIn("npm ci", dockerfile)
+            self.assertIn("npm run build", dockerfile)
+
     def test_codegen_patch_can_apply_to_clean_repo(self):
         if shutil.which("git") is None:
             self.skipTest("git not available")
@@ -366,8 +421,9 @@ class PipelineSchemaTests(TestCase):
 
     def test_codegen_no_changes_marks_failure(self):
         errors = []
-        success = _mark_noop_codegen(False, "noop-item", errors)
+        success, noop = _mark_noop_codegen(False, "noop-item", errors, verify_ok=False)
         self.assertFalse(success)
+        self.assertFalse(noop)
         self.assertEqual(errors[0]["code"], "no_changes")
 
     def test_ui_scaffold_writes_imports(self):
@@ -400,7 +456,7 @@ class PipelineSchemaTests(TestCase):
 
     def test_compose_chassis_outputs(self):
         work_item = {
-            "id": "ems-compose-local-chassis",
+            "id": "ems-stack-prod-web",
             "repo_targets": [
                 {
                     "name": "xyn-api",
@@ -423,7 +479,7 @@ class PipelineSchemaTests(TestCase):
             self.assertTrue(verify_path.exists())
             data = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
             self.assertIn("services", data)
-            for service in ["ems-api", "ems-ui", "postgres", "nginx"]:
+            for service in ["ems-api", "ems-web", "postgres"]:
                 self.assertIn(service, data["services"])
             self.assertIn("XYN_UI_PATH", compose_path.read_text(encoding="utf-8"))
             verify_contents = verify_path.read_text(encoding="utf-8")
@@ -567,6 +623,10 @@ class PipelineSchemaTests(TestCase):
             self.assertEqual(require_admin(user=admin_user), admin_user)
 
     def test_devices_sqlite_persistence(self):
+        try:
+            import sqlalchemy  # noqa: F401,WPS433
+        except ImportError:
+            self.skipTest("sqlalchemy not installed")
         scaffold = {
             "id": "ems-api-scaffold",
             "repo_targets": [

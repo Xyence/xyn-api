@@ -29,8 +29,7 @@ done
 if [ "$healthy" -ne 1 ]; then
   echo "Health check failed: /health did not become ready in time."
   docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-api || true
-  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 nginx || true
-  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-ui || true
+  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-web || true
   exit 1
 fi
 
@@ -47,7 +46,7 @@ done
 if [ "$api_healthy" -ne 1 ]; then
   echo "API health check failed: /api/health did not become ready in time."
   docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-api || true
-  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 nginx || true
+  docker compose -f "$ROOT_DIR/docker-compose.yml" logs --tail=200 ems-web || true
   exit 1
 fi
 sleep 2
@@ -115,5 +114,9 @@ if [ "$ui_code" != "200" ] && [ "$ui_code" != "302" ]; then
   echo "Expected UI root to return 200/302, got ${ui_code}"
   exit 1
 fi
+curl -fsS http://localhost:8080/ | grep -q '<div id="root">' || {
+  echo "Expected UI HTML to include root mount element."
+  exit 1
+}
 
 sleep 2

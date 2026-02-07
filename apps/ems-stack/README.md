@@ -1,6 +1,7 @@
 # EMS Local Chassis
 
-This stack runs the EMS API + UI locally using Docker Compose.
+This stack runs the EMS API + UI locally using Docker Compose. The UI is built
+as static assets and served via nginx (no Vite dev server).
 
 ## Repo Layout
 This compose file assumes you have these repos side-by-side:

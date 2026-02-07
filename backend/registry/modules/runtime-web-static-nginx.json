@@ -1,0 +1,34 @@
+{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "runtime-web-static-nginx",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "runtime.web.static"
+    }
+  },
+  "description": "Static web runtime served by nginx with HTTP reverse proxy for API routes.",
+  "module": {
+    "type": "runtime",
+    "fqn": "core.runtime-web-static-nginx",
+    "capabilitiesProvided": [
+      "runtime.web.static",
+      "runtime.reverse_proxy.http"
+    ],
+    "interfaces": {
+      "config": {
+        "upstream_api_url": "Base URL for API upstream (e.g., http://ems-api:8000).",
+        "base_path": "API base path to proxy (default: /api).",
+        "spa_fallback": "Whether to serve index.html for missing paths.",
+        "listen_port": "Port nginx listens on (default: 8080)."
+      },
+      "operations": {
+        "serve_static": "Serve built static assets via nginx.",
+        "proxy_api": "Proxy API requests to upstream."
+      }
+    },
+    "dependencies": {}
+  }
+}

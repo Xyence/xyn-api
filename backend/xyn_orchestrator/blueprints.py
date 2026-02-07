@@ -537,7 +537,7 @@ def _build_module_catalog() -> Dict[str, Any]:
                 "path_root": "apps/ems-stack",
             },
             "templates": ["compose-chassis", "verify-stack"],
-            "default_work_items": ["ems-compose-local-chassis"],
+            "default_work_items": ["ems-stack-prod-web"],
         },
         {
             "id": "storage-postgres",
@@ -598,7 +598,7 @@ def _acceptance_checks_for_blueprint(blueprint: Blueprint) -> Dict[str, List[str
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     if blueprint_fqn == "core.ems.platform":
         checks = {
-            "local_chassis": ["ems-compose-local-chassis"],
+            "local_chassis": ["ems-stack-prod-web"],
             "jwt_required": ["ems-api-jwt-protect-me", "ems-stack-pass-jwt-secret-and-verify-me"],
             "rbac_devices": ["ems-api-devices-rbac", "ems-stack-verify-rbac"],
             "persistence_devices": ["ems-api-devices-postgres", "ems-stack-verify-persistence"],
@@ -724,7 +724,7 @@ def _select_next_slice(
         if entry.get("outcome") == "succeeded"
     }
     gap_to_items = {
-        "local_chassis": ["ems-compose-local-chassis"],
+        "local_chassis": ["ems-stack-prod-web"],
         "jwt_required": ["ems-authn-jwt-module", "ems-api-jwt-protect-me", "ems-ui-token-input-me-call", "ems-stack-pass-jwt-secret-and-verify-me"],
         "rbac_devices": ["ems-authz-rbac-module", "ems-api-devices-rbac", "ems-ui-devices-role-aware", "ems-stack-verify-rbac"],
         "persistence_devices": [
@@ -746,6 +746,17 @@ def _select_next_slice(
         return work_items, {"gaps_detected": [], "modules_selected": [], "why_next": ["All known gaps satisfied."]}
     selected_ids = gap_to_items.get(next_gap, [])
     selected = [item for item in work_items if item["id"] in selected_ids and item["id"] not in completed_ids]
+    module_scaffolds = [
+        item
+        for item in work_items
+        if item.get("type") == "scaffold"
+        and isinstance(item.get("id"), str)
+        and item["id"].endswith("-module")
+        and item["id"] not in completed_ids
+    ]
+    for item in module_scaffolds:
+        if item not in selected:
+            selected.append(item)
     rationale = {
         "gaps_detected": [next_gap],
         "modules_selected": [],
@@ -763,6 +774,7 @@ def _annotate_work_items(
         "ems-api-scaffold": ["app.api.fastapi"],
         "ems-ui-scaffold": ["app.ui.react"],
         "ems-compose-local-chassis": ["deploy.compose.local"],
+        "ems-stack-prod-web": ["deploy.compose.local", "runtime.web.static", "runtime.reverse_proxy.http"],
         "ems-authn-jwt-module": ["authn.jwt.validate"],
         "ems-authz-rbac-module": ["authz.rbac.enforce"],
         "ems-api-jwt-protect-me": ["authn.jwt.validate"],
@@ -785,6 +797,7 @@ def _annotate_work_items(
         "ems-api-scaffold": ["ems-api"],
         "ems-ui-scaffold": ["ems-ui"],
         "ems-compose-local-chassis": ["ems-stack"],
+        "ems-stack-prod-web": ["ems-stack", "runtime-web-static-nginx"],
         "ems-authn-jwt-module": ["authn-jwt"],
         "ems-authz-rbac-module": ["authz-rbac"],
         "ems-api-jwt-protect-me": ["authn-jwt", "ems-api"],
@@ -974,6 +987,8 @@ def _generate_implementation_plan(
                 "outputs": {
                     "paths": [
                         "apps/ems-ui/README.md",
+                        "apps/ems-ui/Dockerfile",
+                        "apps/ems-ui/nginx.conf",
                         "apps/ems-ui/package.json",
                         "apps/ems-ui/tsconfig.json",
                         "apps/ems-ui/vite.config.ts",
@@ -990,7 +1005,7 @@ def _generate_implementation_plan(
                 "verify": [
                     {
                         "name": "ui-structure",
-                        "command": "test -f src/App.tsx && test -f src/main.tsx && test -f src/routes.tsx && test -f src/auth/Login.tsx && test -f src/devices/DeviceList.tsx && test -f src/reports/Reports.tsx && grep -q \"/api/health\" src/auth/Login.tsx && grep -q \"/api/me\" src/auth/Login.tsx",
+                        "command": "test -f Dockerfile && test -f nginx.conf && test -f src/App.tsx && test -f src/main.tsx && test -f src/routes.tsx && test -f src/auth/Login.tsx && test -f src/devices/DeviceList.tsx && test -f src/reports/Reports.tsx && grep -q \"/api/health\" src/auth/Login.tsx && grep -q \"/api/me\" src/auth/Login.tsx",
                         "cwd": "apps/ems-ui",
                     },
                 ],
@@ -1294,7 +1309,7 @@ def _generate_implementation_plan(
                         "cwd": ".",
                     }
                 ],
-                "depends_on": ["ems-compose-local-chassis", "ems-api-jwt-protect-me"],
+                "depends_on": ["ems-stack-prod-web", "ems-api-jwt-protect-me"],
                 "labels": ["deploy", "auth"],
             },
             {
@@ -1436,9 +1451,9 @@ def _generate_implementation_plan(
                 "labels": ["deploy", "infra"],
             },
             {
-                "id": "ems-compose-local-chassis",
-                "title": "Local docker-compose chassis",
-                "description": "Local EMS stack with ems-api, ems-ui, postgres, nginx.",
+                "id": "ems-stack-prod-web",
+                "title": "Local docker-compose chassis (prod web)",
+                "description": "Local EMS stack with ems-api, ems-web (static nginx), postgres.",
                 "type": "deploy",
                 "repo_targets": [
                     {
@@ -1463,7 +1478,7 @@ def _generate_implementation_plan(
                 "acceptance_criteria": [
                     "Local stack can be brought up via docker-compose.",
                     "/health returns 200 via nginx.",
-                    "UI root serves HTML.",
+                    "UI root serves static HTML.",
                 ],
                 "verify": [
                     {
@@ -1599,6 +1614,17 @@ def _generate_implementation_plan(
         modules_required = [modules_required]
     dns_provider = metadata.get("dns_provider")
     route53_requested = dns_provider == "route53" or "dns-route53" in modules_required
+    runtime_requested = "runtime-web-static-nginx" in modules_required
+    if not runtime_requested:
+        try:
+            metadata_blob = json.dumps(metadata).lower()
+        except TypeError:
+            metadata_blob = str(metadata).lower()
+        runtime_requested = (
+            ("docker-compose" in metadata_blob or "compose" in metadata_blob)
+            and "nginx" in metadata_blob
+            and ("react" in metadata_blob or "vite" in metadata_blob)
+        )
     if route53_requested and "dns-route53" not in module_ids:
         if not any(item.get("id") == "dns-route53-module" for item in work_items):
             work_items.insert(
@@ -1657,6 +1683,8 @@ def _generate_implementation_plan(
         plan_rationale["modules_selected"] = modules_selected
     if route53_requested and "dns-route53" not in plan_rationale.get("modules_selected", []):
         plan_rationale.setdefault("modules_selected", []).append("dns-route53")
+    if runtime_requested and "runtime-web-static-nginx" not in plan_rationale.get("modules_selected", []):
+        plan_rationale.setdefault("modules_selected", []).append("runtime-web-static-nginx")
 
     tasks = [
         {
