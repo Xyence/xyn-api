@@ -112,6 +112,7 @@ from xyn_orchestrator.xyn_api import (
     dev_task_retry,
     blueprint_dev_tasks,
     oidc_exchange,
+    whoami,
 )
 from web.public_views import (
     public_home,
@@ -139,6 +140,7 @@ urlpatterns = [
     path("xyn/api/public/articles", public_articles),
     path("xyn/api/public/articles/<slug:slug>", public_article_detail),
     path("xyn/api/auth/oidc/exchange", oidc_exchange),
+    path("xyn/api/auth/whoami", whoami),
     path("xyn/blueprints/", blueprint_list_view, name="blueprint-list"),
     path("xyn/studio/blueprints/new", new_draft_session_view, name="blueprint-session-new"),
     path("xyn/blueprints/<uuid:blueprint_id>/", blueprint_detail_view, name="blueprint-detail"),

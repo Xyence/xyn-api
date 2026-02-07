@@ -12,6 +12,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
+from django.contrib.auth import get_user_model
 
 from xyence.middleware import _get_or_create_user_from_claims, _verify_oidc_token
 
@@ -54,6 +55,20 @@ def _parse_json(request: HttpRequest) -> Dict[str, Any]:
             return {}
     return {}
 
+
+@login_required
+def whoami(request: HttpRequest) -> JsonResponse:
+    if not request.user.is_authenticated:
+        return JsonResponse({"authenticated": False}, status=401)
+    return JsonResponse(
+        {
+            "authenticated": True,
+            "username": request.user.get_username(),
+            "email": getattr(request.user, "email", ""),
+            "is_staff": bool(request.user.is_staff),
+            "is_superuser": bool(getattr(request.user, "is_superuser", False)),
+        }
+    )
 
 def _paginate(request: HttpRequest, qs, key: str) -> JsonResponse:
     page_size = int(request.GET.get("page_size", 20))
