@@ -191,6 +191,35 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("capabilities_required", sample)
         self.assertIn("module_refs", sample)
 
+    def test_planner_selects_route53_module_scaffold(self):
+        blueprint = Blueprint.objects.create(
+            name="ems.platform",
+            namespace="core",
+            metadata_json={"dns_provider": "route53"},
+        )
+        module_catalog = _build_module_catalog()
+        module_catalog["modules"] = [m for m in module_catalog.get("modules", []) if m.get("id") != "dns-route53"]
+        run_history = _build_run_history_summary(blueprint)
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=module_catalog,
+            run_history_summary=run_history,
+        )
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("dns-route53-module", ids)
+        rationale = plan.get("plan_rationale", {})
+        self.assertIn("dns-route53", rationale.get("modules_selected", []))
+
+    def test_dns_route53_module_spec_fields(self):
+        spec_path = Path(__file__).resolve().parents[2] / "registry" / "modules" / "dns-route53.json"
+        data = json.loads(spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("kind"), "Module")
+        metadata = data.get("metadata", {})
+        self.assertEqual(metadata.get("name"), "dns-route53")
+        self.assertEqual(metadata.get("namespace"), "core")
+        module_spec = data.get("module", {})
+        self.assertIn("dns.route53.records", module_spec.get("capabilitiesProvided", []))
+
     def test_codegen_patch_can_apply_to_clean_repo(self):
         if shutil.which("git") is None:
             self.skipTest("git not available")

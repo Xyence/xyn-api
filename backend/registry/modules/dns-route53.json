@@ -1,0 +1,36 @@
+{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "dns-route53",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "dns.route53.records"
+    }
+  },
+  "description": "Route53 DNS record management module (ensure/delete record sets).",
+  "module": {
+    "type": "lib",
+    "fqn": "core.dns-route53",
+    "capabilitiesProvided": [
+      "dns.route53.records"
+    ],
+    "interfaces": {
+      "config": {
+        "zone_id": "Hosted zone ID (preferred).",
+        "zone_name": "Hosted zone name (alternative to zone_id).",
+        "record_name": "DNS record name to manage.",
+        "record_type": "Record type (A, AAAA, CNAME, TXT, etc.).",
+        "ttl": "Record TTL seconds (default: 300).",
+        "targets": "List of record targets/values.",
+        "aws_auth": "Assume instance role or ambient AWS creds; no inline secrets."
+      },
+      "operations": {
+        "ensure_record": "Create or update a record set to desired targets.",
+        "delete_record": "Remove the record set if present."
+      }
+    },
+    "dependencies": {}
+  }
+}

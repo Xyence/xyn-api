@@ -950,6 +950,59 @@ This directory holds local module specs that can be seeded into the registry.
 """,
         )
         changed.extend(["README.md", "authz-rbac.json"])
+    if work_item["id"] == "dns-route53-module":
+        _write_file(
+            p("README.md"),
+            """# Module Registry (Local)
+
+This directory holds local module specs that can be seeded into the registry.
+
+- `authn-jwt.json`: JWT verification capability scaffold for EMS.
+- `authz-rbac.json`: RBAC enforcement capability scaffold for EMS.
+- `dns-route53.json`: Route53 DNS record management capability scaffold.
+""",
+        )
+        _write_file(
+            p("dns-route53.json"),
+            """{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "dns-route53",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "dns.route53.records"
+    }
+  },
+  "description": "Route53 DNS record management module (ensure/delete record sets).",
+  "module": {
+    "type": "lib",
+    "fqn": "core.dns-route53",
+    "capabilitiesProvided": [
+      "dns.route53.records"
+    ],
+    "interfaces": {
+      "config": {
+        "zone_id": "Hosted zone ID (preferred).",
+        "zone_name": "Hosted zone name (alternative to zone_id).",
+        "record_name": "DNS record name to manage.",
+        "record_type": "Record type (A, AAAA, CNAME, TXT, etc.).",
+        "ttl": "Record TTL seconds (default: 300).",
+        "targets": "List of record targets/values.",
+        "aws_auth": "Assume instance role or ambient AWS creds; no inline secrets."
+      },
+      "operations": {
+        "ensure_record": "Create or update a record set to desired targets.",
+        "delete_record": "Remove the record set if present."
+      }
+    },
+    "dependencies": {}
+  }
+}
+""",
+        )
+        changed.extend(["README.md", "dns-route53.json"])
     if work_item["id"] == "ems-api-jwt-protect-me":
         _write_file(
             p("requirements.txt"),

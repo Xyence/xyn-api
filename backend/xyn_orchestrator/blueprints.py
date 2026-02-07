@@ -712,6 +712,7 @@ def _annotate_work_items(
         "ems-stack-pass-jwt-secret-and-verify-me": ["deploy.compose.local.verify"],
         "ems-ui-token-input-me-call": ["app.ui.react", "authn.jwt.validate"],
         "ems-ui-devices-role-aware": ["app.ui.react", "authz.rbac.enforce"],
+        "dns-route53-module": ["dns.route53.records"],
     }
     work_item_modules = {
         "ems-api-scaffold": ["ems-api"],
@@ -730,6 +731,7 @@ def _annotate_work_items(
         "ems-stack-pass-jwt-secret-and-verify-me": ["ems-stack"],
         "ems-ui-token-input-me-call": ["ems-ui"],
         "ems-ui-devices-role-aware": ["ems-ui"],
+        "dns-route53-module": ["dns-route53"],
     }
     for item in work_items:
         item_id = item.get("id")
@@ -1454,6 +1456,47 @@ def _generate_implementation_plan(
     if run_history_summary is None:
         run_history_summary = _build_run_history_summary(blueprint)
 
+    module_ids = {entry.get("id") for entry in module_catalog.get("modules", [])}
+    metadata = blueprint.metadata_json or {}
+    modules_required = metadata.get("modules_required") or []
+    if isinstance(modules_required, str):
+        modules_required = [modules_required]
+    dns_provider = metadata.get("dns_provider")
+    route53_requested = dns_provider == "route53" or "dns-route53" in modules_required
+    if route53_requested and "dns-route53" not in module_ids:
+        if not any(item.get("id") == "dns-route53-module" for item in work_items):
+            work_items.insert(
+                0,
+                {
+                    "id": "dns-route53-module",
+                    "title": "Route53 module scaffold",
+                    "description": "Register Route53 DNS module spec in the local registry.",
+                    "type": "scaffold",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": "backend/registry/modules",
+                            "auth": "https_token",
+                            "allow_write": True,
+                        }
+                    ],
+                    "inputs": {"artifacts": ["implementation_plan.json"]},
+                    "outputs": {"paths": ["backend/registry/modules/dns-route53.json"]},
+                    "acceptance_criteria": ["Route53 module spec exists in module registry."],
+                    "verify": [
+                        {
+                            "name": "module-spec",
+                            "command": "test -f backend/registry/modules/dns-route53.json",
+                            "cwd": ".",
+                        }
+                    ],
+                    "depends_on": [],
+                    "labels": ["module", "dns", "module:dns-route53", "capability:dns.route53.records"],
+                },
+            )
+
     for item in work_items:
         inputs = item.setdefault("inputs", {})
         artifacts = inputs.setdefault("artifacts", [])
@@ -1476,6 +1519,8 @@ def _generate_implementation_plan(
     )
     if modules_selected:
         plan_rationale["modules_selected"] = modules_selected
+    if route53_requested and "dns-route53" not in plan_rationale.get("modules_selected", []):
+        plan_rationale.setdefault("modules_selected", []).append("dns-route53")
 
     tasks = [
         {
