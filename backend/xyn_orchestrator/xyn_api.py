@@ -253,12 +253,42 @@ def _resolve_environment(request: HttpRequest) -> Optional[Environment]:
         env_id = request.GET.get("environment_id")
         if env_id:
             return Environment.objects.filter(id=env_id).first()
-    return Environment.objects.first()
+    env = Environment.objects.first()
+    if env:
+        return env
+    # Bootstrap a default environment when none exist.
+    env_name = os.environ.get("DJANGO_SITE_NAME", "Default")
+    slug = "default"
+    base_domain = os.environ.get("DJANGO_SITE_DOMAIN", host or "")
+    oidc_config = _get_oidc_env_config(Environment(name=env_name, slug=slug)) or {}
+    metadata = {"hosts": [host] if host else [], "oidc": oidc_config}
+    return Environment.objects.create(
+        name=env_name,
+        slug=slug,
+        base_domain=base_domain,
+        aws_region=os.environ.get("AWS_REGION", ""),
+        metadata_json=metadata,
+    )
 
 
 def _get_oidc_env_config(env: Environment) -> Optional[Dict[str, Any]]:
     config = (env.metadata_json or {}).get("oidc") or {}
     if not config.get("issuer_url") or not config.get("client_id"):
+        issuer = os.environ.get("OIDC_ISSUER", "").strip()
+        client_id = os.environ.get("OIDC_CLIENT_ID", "").strip()
+        if issuer and client_id:
+            return {
+                "issuer_url": issuer,
+                "client_id": client_id,
+                "client_secret_ref": {"ref": "env:OIDC_CLIENT_SECRET"},
+                "redirect_uri": os.environ.get("OIDC_REDIRECT_URI", "").strip(),
+                "scopes": os.environ.get("OIDC_SCOPES", "openid profile email"),
+                "allowed_email_domains": [
+                    domain.strip()
+                    for domain in os.environ.get("OIDC_ALLOWED_DOMAINS", "").split(",")
+                    if domain.strip()
+                ],
+            }
         return None
     return config
 
@@ -267,6 +297,9 @@ def _resolve_secret_ref(ref: Dict[str, Any]) -> Optional[str]:
     value = (ref or {}).get("ref") or ""
     if not value:
         return None
+    if value.startswith("env:"):
+        name = value[len("env:") :]
+        return os.environ.get(name)
     if value.startswith("ssm:"):
         name = value[len("ssm:") :]
         client = boto3.client("ssm")
