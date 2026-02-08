@@ -2778,9 +2778,9 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]]) -> str:
     api_digest = images.get("ems-api", {}).get("digest")
     web_digest = images.get("ems-web", {}).get("digest")
     if api_digest and api_image:
-        api_image = f"{api_image.split(':')[0]}@{api_digest}"
+        api_image = f"{api_image.rsplit(':', 1)[0]}@{api_digest}"
     if web_digest and web_image:
-        web_image = f"{web_image.split(':')[0]}@{web_digest}"
+        web_image = f"{web_image.rsplit(':', 1)[0]}@{web_digest}"
     return (
         "services:\n"
         "  postgres:\n"
