@@ -50,6 +50,8 @@ from .models import (
     VoiceNote,
     VoiceTranscript,
 )
+from .services import get_release_target_deploy_state
+from .worker_tasks import _ssm_fetch_runtime_marker
 
 _executor = ThreadPoolExecutor(max_workers=2)
 
@@ -4183,6 +4185,57 @@ def internal_release_target_deploy_release(request: HttpRequest, target_id: str)
 
 
 @csrf_exempt
+def internal_release_target_current_release(request: HttpRequest, target_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    state = get_release_target_deploy_state(target_id)
+    if not state:
+        return JsonResponse({"current_release": None})
+    return JsonResponse(
+        {
+            "release_uuid": state.get("release_uuid"),
+            "release_version": state.get("release_version"),
+            "deployed_at": state.get("deployed_at"),
+            "outcome": state.get("deploy_outcome"),
+            "run_id": state.get("run_id"),
+            "manifest_sha": (state.get("manifest") or {}).get("content_hash"),
+            "compose_sha": (state.get("compose") or {}).get("content_hash"),
+        }
+    )
+
+
+@csrf_exempt
+def internal_release_target_check_drift(request: HttpRequest, target_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    release_target = get_object_or_404(ReleaseTarget, id=target_id)
+    instance = ProvisionedInstance.objects.filter(id=release_target.target_instance_id).first()
+    if not instance or not instance.instance_id:
+        return JsonResponse({"error": "target instance missing"}, status=400)
+    state = get_release_target_deploy_state(target_id)
+    expected = {
+        "release_uuid": state.get("release_uuid") if state else "",
+        "manifest_sha256": (state.get("manifest") or {}).get("content_hash") if state else "",
+        "compose_sha256": (state.get("compose") or {}).get("content_hash") if state else "",
+    }
+    runtime = (release_target.config_json or {}).get("runtime") if hasattr(release_target, "config_json") else {}
+    remote_root = (runtime or {}).get("remote_root") or "/opt/xyn/apps/ems"
+    actual = _ssm_fetch_runtime_marker(instance.instance_id, instance.aws_region or "", remote_root)
+    drift = False
+    if expected.get("release_uuid") and expected.get("release_uuid") != actual.get("release_uuid"):
+        drift = True
+    if expected.get("manifest_sha256") and expected.get("manifest_sha256") != actual.get("manifest_sha256"):
+        drift = True
+    if expected.get("compose_sha256") and expected.get("compose_sha256") != actual.get("compose_sha256"):
+        drift = True
+    return JsonResponse({"drift": drift, "expected": expected, "actual": actual})
+
+
+@csrf_exempt
 def internal_release_create(request: HttpRequest) -> JsonResponse:
     if token_error := _require_internal_token(request):
         return token_error
@@ -4220,6 +4273,16 @@ def internal_release_upsert(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "blueprint_id and version required"}, status=400)
     release = Release.objects.filter(blueprint_id=blueprint_id, version=version).first()
     if release:
+        allow_overwrite = bool(payload.get("allow_overwrite"))
+        if release.status == "published" and not allow_overwrite:
+            incoming = payload.get("artifacts_json") or {}
+            existing = release.artifacts_json or {}
+            def _hash(obj: Dict[str, Any]) -> str:
+                return str((obj or {}).get("sha256") or "")
+            if _hash(incoming.get("release_manifest")) and _hash(incoming.get("release_manifest")) != _hash(existing.get("release_manifest")):
+                return JsonResponse({"error": "release is immutable"}, status=409)
+            if _hash(incoming.get("compose_file")) and _hash(incoming.get("compose_file")) != _hash(existing.get("compose_file")):
+                return JsonResponse({"error": "release is immutable"}, status=409)
         release.status = payload.get("status", release.status)
         release.artifacts_json = payload.get("artifacts_json") or release.artifacts_json
         if payload.get("release_plan_id"):

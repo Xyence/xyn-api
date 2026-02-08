@@ -4221,12 +4221,22 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         )
                 except Exception as exc:
                     success = False
-                    errors.append(
-                        {
-                            "code": "remote_deploy_failed",
-                            "message": "Remote deploy via SSM failed.",
-                            "detail": {"error": str(exc)},
-                        }
+                    message = str(exc)
+                    if "release_artifact_hash_mismatch" in message:
+                        errors.append(
+                            {
+                                "code": "release_artifact_hash_mismatch",
+                                "message": "Release artifact hash mismatch.",
+                                "detail": {"error": message},
+                            }
+                        )
+                    else:
+                        errors.append(
+                            {
+                                "code": "remote_deploy_failed",
+                                "message": "Remote deploy via SSM failed.",
+                                "detail": {"error": message},
+                            }
                         )
 
             if _work_item_matches(
@@ -4282,6 +4292,17 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                 release_manifest = _download_url_json(manifest_info["url"])
                             if compose_info.get("url"):
                                 compose_content = _download_url_text(compose_info["url"])
+                            if release_manifest is not None and compose_content is not None:
+                                manifest_expected = str(manifest_info.get("sha256") or "")
+                                compose_expected = str(compose_info.get("sha256") or "")
+                                if not manifest_expected or not compose_expected:
+                                    raise RuntimeError("release_artifact_hash_mismatch: missing hash")
+                                manifest_actual = _sha256_hex(_canonicalize_manifest_json(release_manifest))
+                                compose_actual = _sha256_hex(_canonicalize_compose_content(compose_content))
+                                if manifest_actual != manifest_expected:
+                                    raise RuntimeError("release_artifact_hash_mismatch: manifest")
+                                if compose_actual != compose_expected:
+                                    raise RuntimeError("release_artifact_hash_mismatch: compose")
                     if not release_manifest and source_run:
                         release_manifest = _download_artifact_json(source_run, "release_manifest.json")
                     if not release_manifest:

@@ -21,6 +21,8 @@ from xyn_orchestrator.blueprints import (
     _select_next_slice,
     internal_release_resolve,
     internal_release_upsert,
+    internal_release_target_current_release,
+    internal_release_target_check_drift,
     _write_run_artifact,
 )
 from xyn_orchestrator.xyn_api import _validate_release_target_payload
@@ -41,7 +43,7 @@ from xyn_orchestrator.worker_tasks import (
     _run_remote_deploy,
     _work_item_capabilities,
 )
-from xyn_orchestrator.models import Blueprint, ContextPack, DevTask, Run, ReleaseTarget
+from xyn_orchestrator.models import Blueprint, ContextPack, DevTask, Run, ReleaseTarget, ProvisionedInstance
 from xyn_orchestrator.models import Release
 
 
@@ -548,6 +550,83 @@ class PipelineSchemaTests(TestCase):
         )
         resolve_response = internal_release_resolve(resolve_request)
         self.assertEqual(resolve_response.status_code, 200)
+
+    def test_release_upsert_rejects_published_overwrite(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        Release.objects.create(
+            blueprint_id=blueprint.id,
+            version="rel-2",
+            status="published",
+            artifacts_json={
+                "release_manifest": {"sha256": "aaa"},
+                "compose_file": {"sha256": "bbb"},
+            },
+        )
+        payload = {
+            "blueprint_id": str(blueprint.id),
+            "version": "rel-2",
+            "status": "published",
+            "artifacts_json": {
+                "release_manifest": {"sha256": "ccc"},
+                "compose_file": {"sha256": "ddd"},
+            },
+        }
+        request = factory.post(
+            "/xyn/internal/releases/upsert",
+            data=json.dumps(payload),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_release_upsert(request)
+        self.assertEqual(response.status_code, 409)
+
+    @mock.patch("xyn_orchestrator.blueprints._ssm_fetch_runtime_marker")
+    def test_current_release_and_drift(self, mock_marker):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        instance = ProvisionedInstance.objects.create(
+            name="seed-1",
+            status="running",
+            instance_id="i-123",
+            aws_region="us-west-2",
+        )
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="demo",
+            target_instance=instance,
+            fqdn="ems.xyence.io",
+            config_json={},
+        )
+        Run.objects.create(
+            entity_type="blueprint",
+            entity_id=blueprint.id,
+            status="succeeded",
+            metadata_json={
+                "release_target_id": str(target.id),
+                "release_uuid": "rel-uuid",
+                "release_version": "rel-1",
+                "deploy_outcome": "succeeded",
+                "manifest": {"content_hash": "aaa"},
+                "compose": {"content_hash": "bbb"},
+                "deployed_at": "2026-02-07T00:00:00Z",
+            },
+        )
+        request = factory.get(
+            f"/xyn/internal/release-targets/{target.id}/current_release",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_release_target_current_release(request, str(target.id))
+        self.assertEqual(response.status_code, 200)
+        mock_marker.return_value = {"release_uuid": "rel-uuid", "manifest_sha256": "aaa", "compose_sha256": "bbb"}
+        drift_request = factory.get(
+            f"/xyn/internal/release-targets/{target.id}/check_drift",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        drift_response = internal_release_target_check_drift(drift_request, str(target.id))
+        self.assertEqual(drift_response.status_code, 200)
 
     def test_planner_selects_remote_deploy_slice(self):
         blueprint = Blueprint.objects.create(
