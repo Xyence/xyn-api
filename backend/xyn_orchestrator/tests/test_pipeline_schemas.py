@@ -32,6 +32,8 @@ from xyn_orchestrator.worker_tasks import (
     _build_deploy_manifest,
     _build_deploy_state_metadata,
     _build_remote_pull_apply_commands,
+    _build_ssm_service_digest_commands,
+    _parse_service_digest_lines,
     _merge_release_env,
     _mark_noop_codegen,
     _redact_secrets,
@@ -522,6 +524,18 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("release_manifest.json", joined)
         self.assertIn("release_manifest.sha256", joined)
         self.assertIn("release_id", joined)
+
+    def test_ssm_service_digest_commands_include_label_filter(self):
+        commands = _build_ssm_service_digest_commands(["api", "web"])
+        joined = "\n".join(commands)
+        self.assertIn("label=com.docker.compose.service=api", joined)
+        self.assertIn("label=com.docker.compose.service=web", joined)
+
+    def test_parse_service_digest_lines(self):
+        lines = ["api=sha256:" + "a" * 64, "web=SHA256:" + "B" * 64]
+        parsed = _parse_service_digest_lines(lines)
+        self.assertEqual(parsed["api"], "sha256:" + "a" * 64)
+        self.assertEqual(parsed["web"], "sha256:" + "b" * 64)
 
     def test_release_upsert_and_resolve(self):
         os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"

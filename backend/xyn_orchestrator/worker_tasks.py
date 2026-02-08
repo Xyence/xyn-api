@@ -2934,44 +2934,40 @@ def _build_remote_pull_apply_commands(
     ]
 
 
-def _ssm_fetch_running_image_digests(instance_id: str, aws_region: str) -> Dict[str, str]:
-    cmd = [
-        "set -euo pipefail",
-        "API_ID=$(docker ps -q --filter \"name=ems-api\" || true)",
-        "WEB_ID=$(docker ps -q --filter \"name=ems-web\" || true)",
-        "if [ -n \"$API_ID\" ]; then "
-        "IMG_REF=$(docker inspect --format '{{.Config.Image}}' $API_ID || true); "
-        "if echo \"$IMG_REF\" | grep -q '@sha256:'; then "
-        "DIGEST=$(echo \"$IMG_REF\" | awk -F'@' '{print $2}'); "
-        "echo \"ems-api=$DIGEST\"; "
-        "else "
-        "IMG_ID=$(docker inspect --format '{{.Image}}' $API_ID); "
-        "REPOS=$(docker image inspect --format '{{join .RepoDigests \"\\n\"}}' $IMG_ID || true); "
-        "if [ -n \"$REPOS\" ]; then "
-        "DIGEST=$(echo \"$REPOS\" | head -n1 | awk -F'@' '{print $2}'); "
-        "echo \"ems-api=$DIGEST\"; "
-        "fi; "
-        "fi; "
-        "fi",
-        "if [ -n \"$WEB_ID\" ]; then "
-        "IMG_REF=$(docker inspect --format '{{.Config.Image}}' $WEB_ID || true); "
-        "if echo \"$IMG_REF\" | grep -q '@sha256:'; then "
-        "DIGEST=$(echo \"$IMG_REF\" | awk -F'@' '{print $2}'); "
-        "echo \"ems-web=$DIGEST\"; "
-        "else "
-        "IMG_ID=$(docker inspect --format '{{.Image}}' $WEB_ID); "
-        "REPOS=$(docker image inspect --format '{{join .RepoDigests \"\\n\"}}' $IMG_ID || true); "
-        "if [ -n \"$REPOS\" ]; then "
-        "DIGEST=$(echo \"$REPOS\" | head -n1 | awk -F'@' '{print $2}'); "
-        "echo \"ems-web=$DIGEST\"; "
-        "fi; "
-        "fi; "
-        "fi",
-    ]
-    result = _run_ssm_commands(instance_id, aws_region, cmd)
-    if result.get("invocation_status") != "Success":
-        raise RuntimeError(result.get("stderr") or "SSM image inspect failed")
-    lines = [line.strip() for line in (result.get("stdout") or "").splitlines() if line.strip()]
+def _build_ssm_service_digest_commands(services: List[str]) -> List[str]:
+    commands = ["set -euo pipefail"]
+    for svc in services:
+        safe = svc.replace("\"", "")
+        commands.append(
+            "CID=$(docker ps -q --filter \"label=com.docker.compose.service="
+            + safe
+            + "\" || true); "
+            "if [ -z \"$CID\" ]; then CID=$(docker ps -q --filter \"name="
+            + safe
+            + "\" || true); fi; "
+            "if [ -n \"$CID\" ]; then "
+            "IMG_REF=$(docker inspect --format '{{.Config.Image}}' $CID || true); "
+            "if echo \"$IMG_REF\" | grep -q '@sha256:'; then "
+            "DIGEST=$(echo \"$IMG_REF\" | awk -F'@' '{print $2}'); "
+            "echo \""
+            + safe
+            + "=$DIGEST\"; "
+            "else "
+            "IMG_ID=$(docker inspect --format '{{.Image}}' $CID); "
+            "REPOS=$(docker image inspect --format '{{join .RepoDigests \"\\n\"}}' $IMG_ID || true); "
+            "if [ -n \"$REPOS\" ]; then "
+            "DIGEST=$(echo \"$REPOS\" | head -n1 | awk -F'@' '{print $2}'); "
+            "echo \""
+            + safe
+            + "=$DIGEST\"; "
+            "fi; "
+            "fi; "
+            "fi"
+        )
+    return commands
+
+
+def _parse_service_digest_lines(lines: List[str]) -> Dict[str, str]:
     image_ids: Dict[str, str] = {}
     for line in lines:
         if "=" not in line:
@@ -2986,6 +2982,17 @@ def _ssm_fetch_running_image_digests(instance_id: str, aws_region: str) -> Dict[
             continue
         image_ids[svc] = normalized
     return image_ids
+
+
+def _ssm_fetch_running_service_digests(
+    instance_id: str, aws_region: str, services: List[str]
+) -> Dict[str, str]:
+    cmd = _build_ssm_service_digest_commands(services)
+    result = _run_ssm_commands(instance_id, aws_region, cmd)
+    if result.get("invocation_status") != "Success":
+        raise RuntimeError(result.get("stderr") or "SSM image inspect failed")
+    lines = [line.strip() for line in (result.get("stdout") or "").splitlines() if line.strip()]
+    return _parse_service_digest_lines(lines)
 
 
 def _ssm_fetch_compose_hash(instance_id: str, aws_region: str, hash_path: str) -> str:
@@ -4338,8 +4345,9 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     noop_debug = ""
                     if public_ok and images_map:
                         try:
-                            image_ids = _ssm_fetch_running_image_digests(
-                                target_instance.get("instance_id"), target_instance.get("aws_region")
+                            services = list(images_map.keys())
+                            image_ids = _ssm_fetch_running_service_digests(
+                                target_instance.get("instance_id"), target_instance.get("aws_region"), services
                             )
                             match = True
                             for svc, meta in images_map.items():
