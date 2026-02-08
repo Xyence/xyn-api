@@ -58,6 +58,7 @@ from .models import (
     UserIdentity,
     Tenant,
     Contact,
+    TenantMembership,
 )
 from .module_registry import maybe_sync_modules_from_registry
 
@@ -320,6 +321,26 @@ def _get_roles(identity: UserIdentity) -> List[str]:
         RoleBinding.objects.filter(user_identity=identity)
         .values_list("role", flat=True)
     )
+
+
+def _is_platform_admin(identity: UserIdentity) -> bool:
+    return RoleBinding.objects.filter(user_identity=identity, role="platform_admin").exists()
+
+
+def _tenant_role_rank(role: str) -> int:
+    order = {"tenant_viewer": 1, "tenant_operator": 2, "tenant_admin": 3}
+    return order.get(role, 0)
+
+
+def _require_tenant_access(identity: UserIdentity, tenant_id: str, minimum_role: str) -> bool:
+    membership = TenantMembership.objects.filter(
+        tenant_id=tenant_id,
+        user_identity=identity,
+        status="active",
+    ).first()
+    if not membership:
+        return False
+    return _tenant_role_rank(membership.role) >= _tenant_role_rank(minimum_role)
 
 
 def require_role(role: str):
@@ -601,6 +622,18 @@ def _serialize_contact(contact: Contact) -> Dict[str, Any]:
     }
 
 
+def _serialize_membership(membership: TenantMembership) -> Dict[str, Any]:
+    return {
+        "id": str(membership.id),
+        "tenant_id": str(membership.tenant_id),
+        "user_identity_id": str(membership.user_identity_id),
+        "role": membership.role,
+        "status": membership.status,
+        "created_at": membership.created_at,
+        "updated_at": membership.updated_at,
+    }
+
+
 @csrf_exempt
 @require_role("platform_admin")
 def tenants_collection(request: HttpRequest) -> JsonResponse:
@@ -658,10 +691,18 @@ def tenant_detail(request: HttpRequest, tenant_id: str) -> JsonResponse:
 
 
 @csrf_exempt
-@require_role("platform_admin")
 def tenant_contacts_collection(request: HttpRequest, tenant_id: str) -> JsonResponse:
     tenant = get_object_or_404(Tenant, id=tenant_id)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_admin(identity):
+        if not _require_tenant_access(identity, tenant_id, "tenant_viewer"):
+            return JsonResponse({"error": "forbidden"}, status=403)
     if request.method == "POST":
+        if not _is_platform_admin(identity):
+            if not _require_tenant_access(identity, tenant_id, "tenant_operator"):
+                return JsonResponse({"error": "forbidden"}, status=403)
         payload = _parse_json(request)
         name = (payload.get("name") or "").strip()
         if not name:
@@ -686,12 +727,20 @@ def tenant_contacts_collection(request: HttpRequest, tenant_id: str) -> JsonResp
 
 
 @csrf_exempt
-@require_role("platform_admin")
 def contact_detail(request: HttpRequest, contact_id: str) -> JsonResponse:
     contact = get_object_or_404(Contact, id=contact_id)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_admin(identity):
+        if not _require_tenant_access(identity, str(contact.tenant_id), "tenant_viewer"):
+            return JsonResponse({"error": "forbidden"}, status=403)
     if request.method == "GET":
         return JsonResponse(_serialize_contact(contact))
     if request.method in ("PATCH", "PUT"):
+        if not _is_platform_admin(identity):
+            if not _require_tenant_access(identity, str(contact.tenant_id), "tenant_operator"):
+                return JsonResponse({"error": "forbidden"}, status=403)
         payload = _parse_json(request)
         if "name" in payload:
             contact.name = payload.get("name") or contact.name
@@ -713,6 +762,9 @@ def contact_detail(request: HttpRequest, contact_id: str) -> JsonResponse:
         )
         return JsonResponse({"id": str(contact.id)})
     if request.method == "DELETE":
+        if not _is_platform_admin(identity):
+            if not _require_tenant_access(identity, str(contact.tenant_id), "tenant_operator"):
+                return JsonResponse({"error": "forbidden"}, status=403)
         contact.status = "inactive"
         contact.save(update_fields=["status", "updated_at"])
         return JsonResponse({"status": "inactive"})
@@ -788,9 +840,95 @@ def tenants_public(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
-    if not RoleBinding.objects.filter(user_identity=identity, role="platform_admin").exists():
-        return JsonResponse({"tenants": []})
-    tenants = Tenant.objects.all().order_by("name")
+    if _is_platform_admin(identity):
+        tenants = Tenant.objects.all().order_by("name")
+        data = [_serialize_tenant(t) for t in tenants]
+        return JsonResponse({"tenants": data})
+    memberships = TenantMembership.objects.filter(user_identity=identity, status="active").select_related("tenant")
+    data = [
+        {
+            **_serialize_tenant(m.tenant),
+            "membership_role": m.role,
+        }
+        for m in memberships
+    ]
+    return JsonResponse({"tenants": data})
+
+
+def my_profile(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    roles = _get_roles(identity)
+    memberships = TenantMembership.objects.filter(user_identity=identity, status="active").select_related("tenant")
+    membership_data = [
+        {"tenant_id": str(m.tenant_id), "tenant_name": m.tenant.name, "role": m.role}
+        for m in memberships
+    ]
+    return JsonResponse(
+        {
+            "user": {
+                "issuer": identity.issuer,
+                "subject": identity.subject,
+                "email": identity.email,
+                "display_name": identity.display_name,
+            },
+            "roles": roles,
+            "memberships": membership_data,
+        }
+    )
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def tenant_memberships_collection(request: HttpRequest, tenant_id: str) -> JsonResponse:
+    tenant = get_object_or_404(Tenant, id=tenant_id)
+    if request.method == "POST":
+        payload = _parse_json(request)
+        identity_id = payload.get("user_identity_id")
+        role = payload.get("role") or "tenant_viewer"
+        if not identity_id:
+            return JsonResponse({"error": "user_identity_id required"}, status=400)
+        identity = get_object_or_404(UserIdentity, id=identity_id)
+        membership, created = TenantMembership.objects.get_or_create(
+            tenant=tenant,
+            user_identity=identity,
+            defaults={"role": role, "status": "active"},
+        )
+        if not created:
+            membership.role = role
+            membership.status = "active"
+            membership.save(update_fields=["role", "status", "updated_at"])
+        return JsonResponse({"id": str(membership.id)})
+    memberships = TenantMembership.objects.filter(tenant=tenant).select_related("user_identity").order_by("created_at")
+    data = [
+        {
+            **_serialize_membership(m),
+            "user_email": m.user_identity.email,
+            "user_display_name": m.user_identity.display_name,
+        }
+        for m in memberships
+    ]
+    return JsonResponse({"memberships": data})
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def tenant_membership_detail(request: HttpRequest, membership_id: str) -> JsonResponse:
+    membership = get_object_or_404(TenantMembership, id=membership_id)
+    if request.method in ("PATCH", "PUT"):
+        payload = _parse_json(request)
+        if "role" in payload:
+            membership.role = payload.get("role") or membership.role
+        if "status" in payload:
+            membership.status = payload.get("status") or membership.status
+        membership.save(update_fields=["role", "status", "updated_at"])
+        return JsonResponse({"id": str(membership.id)})
+    if request.method == "DELETE":
+        membership.status = "inactive"
+        membership.save(update_fields=["status", "updated_at"])
+        return JsonResponse({"status": "inactive"})
+    return JsonResponse({"error": "method not allowed"}, status=405)
     data = [_serialize_tenant(t) for t in tenants]
     return JsonResponse({"tenants": data})
 

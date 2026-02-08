@@ -68,6 +68,7 @@ from xyn_orchestrator.models import (
     Run,
     UserIdentity,
     Tenant,
+    TenantMembership,
 )
 
 
@@ -259,6 +260,71 @@ class PlatformAdminTests(TestCase):
         self.assertEqual(response.status_code, 200)
         contact_id = response.json().get("id")
         response = self.client.get(f"/xyn/internal/contacts/{contact_id}")
+        self.assertEqual(response.status_code, 200)
+
+    def test_my_tenants_requires_auth(self):
+        response = self.client.get("/xyn/api/tenants")
+        self.assertEqual(response.status_code, 401)
+
+    def test_non_platform_admin_cannot_access_other_tenants(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            issuer="https://issuer.example.com",
+            subject="sub-user",
+        )
+        TenantMembership.objects.create(tenant=tenant, user_identity=identity, role="tenant_viewer")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session.save()
+        other = Tenant.objects.create(name="Other", slug="other")
+        response = self.client.get(f"/xyn/internal/tenants/{other.id}/contacts")
+        self.assertEqual(response.status_code, 403)
+
+    def test_tenant_admin_can_manage_contacts(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            issuer="https://issuer.example.com",
+            subject="sub-user",
+        )
+        TenantMembership.objects.create(tenant=tenant, user_identity=identity, role="tenant_admin")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session.save()
+        response = self.client.post(
+            f"/xyn/internal/tenants/{tenant.id}/contacts",
+            data=json.dumps({"name": "Pat", "email": "pat@acme.io"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_tenant_viewer_cannot_modify_contacts(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            issuer="https://issuer.example.com",
+            subject="sub-user",
+        )
+        TenantMembership.objects.create(tenant=tenant, user_identity=identity, role="tenant_viewer")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session.save()
+        response = self.client.post(
+            f"/xyn/internal/tenants/{tenant.id}/contacts",
+            data=json.dumps({"name": "Pat", "email": "pat@acme.io"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_platform_admin_bypasses_membership_checks(self):
+        self._set_admin_session()
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        response = self.client.post(
+            f"/xyn/internal/tenants/{tenant.id}/contacts",
+            data=json.dumps({"name": "Admin", "email": "admin@acme.io"}),
+            content_type="application/json",
+        )
         self.assertEqual(response.status_code, 200)
 
     def test_role_binding_create_delete_requires_platform_admin(self):

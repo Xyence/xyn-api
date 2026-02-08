@@ -528,6 +528,33 @@ class Contact(models.Model):
         return f"{self.name} ({self.tenant.name})"
 
 
+class TenantMembership(models.Model):
+    ROLE_CHOICES = [
+        ("tenant_admin", "Tenant Admin"),
+        ("tenant_operator", "Tenant Operator"),
+        ("tenant_viewer", "Tenant Viewer"),
+    ]
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("inactive", "Inactive"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="memberships")
+    user_identity = models.ForeignKey(UserIdentity, on_delete=models.CASCADE, related_name="memberships")
+    role = models.CharField(max_length=40, choices=ROLE_CHOICES, default="tenant_viewer")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["tenant__name"]
+        unique_together = ("tenant", "user_identity")
+
+    def __str__(self) -> str:
+        return f"{self.tenant.name} - {self.user_identity.email or self.user_identity.subject}"
+
+
 class ReleasePlan(models.Model):
     TARGET_CHOICES = [
         ("module", "Module"),
