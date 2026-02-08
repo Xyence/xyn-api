@@ -2820,6 +2820,7 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]]) -> str:
 def _build_remote_pull_apply_commands(
     root_dir: str,
     compose_content: str,
+    compose_hash: str,
     registry_region: str,
     registry_host: str,
     extra_env: Dict[str, str],
@@ -2831,6 +2832,7 @@ def _build_remote_pull_apply_commands(
         safe_value = str(value).replace("\"", "\\\"")
         env_exports.append(f"export {key}=\"{safe_value}\"")
     compose_path = f"{root_dir}/compose.release.yml"
+    hash_path = f"{root_dir}/compose.release.sha256"
     return [
         "set -euo pipefail",
         "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
@@ -2840,6 +2842,7 @@ def _build_remote_pull_apply_commands(
         f"ROOT={root_dir}",
         "mkdir -p \"$ROOT\"",
         f"cat <<'EOF' > \"{compose_path}\"\n{compose_content}\nEOF",
+        f"echo \"{compose_hash}\" > \"{hash_path}\"",
         f"aws ecr get-login-password --region {registry_region} | docker login --username AWS --password-stdin {registry_host}",
         *env_exports,
         f"docker compose -f \"{compose_path}\" pull",
@@ -2868,6 +2871,45 @@ def _ssm_fetch_image_ids(instance_id: str, aws_region: str) -> Dict[str, str]:
         if len(lines) >= 2:
             image_ids["ems-web"] = lines[1]
     return image_ids
+
+
+def _ssm_fetch_compose_hash(instance_id: str, aws_region: str, hash_path: str) -> str:
+    result = _run_ssm_commands(
+        instance_id,
+        aws_region,
+        [
+            "set -euo pipefail",
+            f"test -f \"{hash_path}\" || exit 4",
+            f"cat \"{hash_path}\"",
+        ],
+    )
+    if result.get("invocation_status") != "Success":
+        raise RuntimeError(result.get("stderr") or "SSM compose hash read failed")
+    return (result.get("stdout") or "").strip()
+
+
+def _validate_release_manifest_pinned(manifest: Dict[str, Any]) -> tuple[bool, List[str]]:
+    errors: List[str] = []
+    images = manifest.get("images") or {}
+    if not isinstance(images, dict) or not images:
+        errors.append("release_manifest.images missing or empty")
+    for service, info in images.items():
+        image_uri = (info or {}).get("image_uri") or ""
+        digest = (info or {}).get("digest") or ""
+        if not image_uri:
+            errors.append(f"{service}: image_uri missing")
+        if not digest:
+            errors.append(f"{service}: digest missing")
+        elif not (digest.startswith("sha256:") and len(digest) >= 71):
+            errors.append(f"{service}: digest invalid")
+    compose = manifest.get("compose") or {}
+    content = compose.get("content") or ""
+    if content:
+        for service, info in images.items():
+            digest = (info or {}).get("digest") or ""
+            if digest and digest not in content:
+                errors.append(f"{service}: compose missing digest pin")
+    return len(errors) == 0, errors
 
 
 def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
@@ -3680,6 +3722,57 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 work_item,
                 work_item_id,
                 caps,
+                {"release.validate_manifest.pinned"},
+                "release.manifest.pinned",
+            ):
+                try:
+                    manifest = None
+                    if source_run:
+                        manifest = _download_artifact_json(source_run, "release_manifest.json")
+                    if not manifest:
+                        raise RuntimeError("release_manifest.json not found for validation")
+                    ok, validation_errors = _validate_release_manifest_pinned(manifest)
+                    validation_payload = {
+                        "ok": ok,
+                        "errors": validation_errors,
+                    }
+                    validation_url = _write_artifact(
+                        run_id, "validation_result.json", json.dumps(validation_payload, indent=2)
+                    )
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "validation_result.json", "kind": "release_manifest", "url": validation_url},
+                    )
+                    artifacts.append(
+                        {
+                            "key": "validation_result.json",
+                            "content_type": "application/json",
+                            "description": "Release manifest validation result",
+                        }
+                    )
+                    if not ok:
+                        success = False
+                        errors.append(
+                            {
+                                "code": "release_manifest_invalid",
+                                "message": "Release manifest failed digest validation.",
+                                "detail": {"errors": validation_errors},
+                            }
+                        )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "release_manifest_invalid",
+                            "message": "Release manifest validation failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                    )
+
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
                 {"remote-deploy-compose-ssm", "deploy.apply_remote_compose.ssm"},
                 "runtime.compose.apply_remote",
             ):
@@ -3956,6 +4049,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                     match = False
                                     break
                             if match:
+                                remote_hash = _ssm_fetch_compose_hash(
+                                    target_instance.get("instance_id"),
+                                    target_instance.get("aws_region"),
+                                    f"{(release_target or {}).get('runtime', {}).get('remote_root') or '/opt/xyn/apps/ems'}/compose.release.sha256",
+                                )
+                                if remote_hash.strip() != compose_hash:
+                                    match = False
+                            if match:
                                 deploy_finished = datetime.utcnow().isoformat() + "Z"
                                 verification = _build_deploy_verification(
                                     fqdn, public_checks, None, {}, False
@@ -4007,15 +4108,15 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         pass
                     else:
                         env_public = {k: v for k, v in effective_env.items() if k not in secret_keys}
-                        deploy_manifest = _build_deploy_manifest(
-                            fqdn,
-                            target_instance,
-                            (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
-                            "compose.release.yml",
-                            env_public,
-                            secret_keys,
-                        )
-                        deploy_manifest["compose_hash"] = compose_hash
+                    deploy_manifest = _build_deploy_manifest(
+                        fqdn,
+                        target_instance,
+                        (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
+                        "compose.release.yml",
+                        env_public,
+                        secret_keys,
+                    )
+                    deploy_manifest["compose_hash"] = compose_hash
                         manifest_url = _write_artifact(
                             run_id, "deploy_manifest.json", json.dumps(deploy_manifest, indent=2)
                         )
@@ -4023,13 +4124,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             f"/xyn/internal/runs/{run_id}/artifacts",
                             {"name": "deploy_manifest.json", "kind": "deploy", "url": manifest_url},
                         )
-                        commands = _build_remote_pull_apply_commands(
-                            (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
-                            compose_content,
-                            registry_region,
-                            registry_host,
-                            effective_env,
-                        )
+                    commands = _build_remote_pull_apply_commands(
+                        (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
+                        compose_content,
+                        compose_hash,
+                        registry_region,
+                        registry_host,
+                        effective_env,
+                    )
                         exec_result = _run_ssm_commands(
                             target_instance.get("instance_id"),
                             target_instance.get("aws_region"),

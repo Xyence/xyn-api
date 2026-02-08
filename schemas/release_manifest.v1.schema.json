@@ -35,7 +35,7 @@
       },
       "additionalProperties": true
     },
-    "created_at": { "type": "string" }
+    "created_at": { "type": "string", "format": "date-time" }
   },
   "additionalProperties": false
 }

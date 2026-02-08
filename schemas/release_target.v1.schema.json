@@ -43,7 +43,16 @@
         "transport": { "type": "string", "enum": ["ssm"] },
         "mode": { "type": "string", "enum": ["compose_build", "compose_images"] },
         "image_deploy": { "type": "boolean" },
-        "registry": { "type": "object" },
+        "registry": {
+          "type": "object",
+          "properties": {
+            "provider": { "type": "string", "enum": ["ecr"] },
+            "region": { "type": "string" },
+            "account_id": { "type": "string" },
+            "repository_prefix": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
         "remote_root": { "type": "string" },
         "compose_file_path": { "type": "string" }
       },
@@ -77,8 +86,28 @@
         "additionalProperties": false
       }
     },
-    "created_at": { "type": "string" },
-    "updated_at": { "type": "string" }
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
   },
-  "additionalProperties": true
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "type": { "const": "docker-compose" }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "runtime": {
+            "required": ["mode"]
+          }
+        }
+      }
+    }
+  ]
 }

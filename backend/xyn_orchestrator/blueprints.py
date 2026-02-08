@@ -647,9 +647,8 @@ def _acceptance_checks_for_blueprint(
         deploy_fqdn = release_target.get("fqdn")
         tls_meta = release_target.get("tls") or {}
         runtime_meta = release_target.get("runtime") or {}
-        image_deploy_enabled = (
-            runtime_meta.get("mode") == "compose_images" or bool(runtime_meta.get("image_deploy"))
-        )
+        mode = _normalize_runtime_mode(runtime_meta)
+        image_deploy_enabled = mode == "compose_images"
     else:
         deploy_target = deploy_meta.get("target_instance_id") or deploy_meta.get("target_instance") or deploy_meta.get(
             "target_instance_name"
@@ -801,6 +800,15 @@ def _build_run_history_summary(
     }
 
 
+def _normalize_runtime_mode(runtime_meta: Dict[str, Any]) -> str:
+    mode = runtime_meta.get("mode")
+    if mode in {"compose_build", "compose_images"}:
+        return mode
+    if runtime_meta.get("image_deploy"):
+        return "compose_images"
+    return "compose_build"
+
+
 def _select_next_slice(
     blueprint: Blueprint,
     work_items: List[Dict[str, Any]],
@@ -833,6 +841,7 @@ def _select_next_slice(
     remote_http_items = (
         [
             "build.publish_images.container",
+            "release.validate_manifest.pinned",
             "dns.ensure_record.route53",
             "deploy.apply_remote_compose.pull",
             "verify.public_http",
@@ -843,6 +852,7 @@ def _select_next_slice(
     remote_https_items = (
         [
             "build.publish_images.container",
+            "release.validate_manifest.pinned",
             "dns.ensure_record.route53",
             "deploy.apply_remote_compose.pull",
             "verify.public_http",
@@ -932,6 +942,7 @@ def _annotate_work_items(
         "remote-deploy-compose-ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
         "deploy.apply_remote_compose.ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
         "build.publish_images.container": ["build.container.image", "publish.container.registry"],
+        "release.validate_manifest.pinned": ["release.manifest.pinned"],
         "deploy.apply_remote_compose.pull": ["runtime.compose.pull_apply_remote"],
         "remote-deploy-verify-public": ["deploy.verify.public_http"],
         "verify.public_http": ["deploy.verify.public_http"],
@@ -970,6 +981,7 @@ def _annotate_work_items(
         "remote-deploy-compose-ssm": ["deploy-ssm-compose"],
         "deploy.apply_remote_compose.ssm": ["deploy-ssm-compose"],
         "build.publish_images.container": ["build-container-publish"],
+        "release.validate_manifest.pinned": ["build-container-publish"],
         "deploy.apply_remote_compose.pull": ["runtime-compose-pull-apply"],
         "remote-deploy-verify-public": ["deploy-ssm-compose"],
         "verify.public_http": ["deploy-ssm-compose"],
@@ -1847,9 +1859,7 @@ def _generate_implementation_plan(
     release_dns = release_target.get("dns") if isinstance(release_target, dict) else {}
     release_runtime = release_target.get("runtime") if isinstance(release_target, dict) else {}
     release_tls = release_target.get("tls") if isinstance(release_target, dict) else {}
-    image_deploy_enabled = bool(
-        release_runtime.get("mode") == "compose_images" or release_runtime.get("image_deploy")
-    )
+    image_deploy_enabled = _normalize_runtime_mode(release_runtime) == "compose_images"
     if release_dns:
         dns_provider = release_dns.get("provider") or dns_provider
     route53_requested = dns_provider == "route53" or "dns-route53" in modules_required
@@ -1906,7 +1916,15 @@ def _generate_implementation_plan(
                             "path_root": ".",
                             "auth": "https_token",
                             "allow_write": False,
-                        }
+                        },
+                        {
+                            "name": "xyn-ui",
+                            "url": "https://github.com/Xyence/xyn-ui",
+                            "ref": "main",
+                            "path_root": ".",
+                            "auth": "https_token",
+                            "allow_write": False,
+                        },
                     ],
                     "inputs": {"artifacts": ["implementation_plan.json", "release_target.json"]},
                     "outputs": {"paths": [], "artifacts": ["build_result.json", "release_manifest.json"]},
@@ -1934,6 +1952,31 @@ def _generate_implementation_plan(
                     },
                 }
             )
+        if not any(item.get("id") == "release.validate_manifest.pinned" for item in work_items):
+            work_items.append(
+                {
+                    "id": "release.validate_manifest.pinned",
+                    "title": "Validate release manifest pinning",
+                    "description": "Ensure release manifest images include pinned digests.",
+                    "type": "deploy",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": ".",
+                            "auth": "https_token",
+                            "allow_write": False,
+                        }
+                    ],
+                    "inputs": {"artifacts": ["release_manifest.json", "release_target.json"]},
+                    "outputs": {"paths": [], "artifacts": ["validation_result.json"]},
+                    "acceptance_criteria": ["Release manifest uses digest-pinned images."],
+                    "verify": [{"name": "validate-manifest", "command": "echo 'handled by runner'", "cwd": "."}],
+                    "depends_on": ["build.publish_images.container"],
+                    "labels": ["deploy", "validate", "release"],
+                }
+            )
         if not any(item.get("id") == "deploy.apply_remote_compose.pull" for item in work_items):
             work_items.append(
                 {
@@ -1957,7 +2000,7 @@ def _generate_implementation_plan(
                     "outputs": {"paths": [], "artifacts": ["deploy_result.json", "deploy_manifest.json"]},
                     "acceptance_criteria": ["EMS stack deployed via image pull."],
                     "verify": [{"name": "remote-deploy", "command": "echo 'handled by runner'", "cwd": "."}],
-                    "depends_on": ["dns.ensure_record.route53", "build.publish_images.container"],
+                    "depends_on": ["dns.ensure_record.route53", "release.validate_manifest.pinned"],
                     "labels": ["deploy", "ssm", "remote", "module:runtime-compose-pull-apply"],
                 }
             )

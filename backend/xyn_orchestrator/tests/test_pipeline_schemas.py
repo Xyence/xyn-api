@@ -18,6 +18,7 @@ from xyn_orchestrator.blueprints import (
     _generate_implementation_plan,
     _release_target_payload,
     _select_context_packs_for_dev_task,
+    _select_next_slice,
     _write_run_artifact,
 )
 from xyn_orchestrator.xyn_api import _validate_release_target_payload
@@ -29,6 +30,7 @@ from xyn_orchestrator.worker_tasks import (
     _mark_noop_codegen,
     _redact_secrets,
     _stage_all,
+    _validate_release_manifest_pinned,
     _route53_ensure_with_noop,
     _run_remote_deploy,
     _work_item_capabilities,
@@ -209,7 +211,7 @@ class PipelineSchemaTests(TestCase):
             "outcome": "succeeded",
             "started_at": "2026-02-07T00:00:00Z",
             "finished_at": "2026-02-07T00:00:10Z",
-            "errors": [],
+            "errors": [{"code": "none", "message": "ok"}],
         }
         schema = self._load_schema("build_result.v1.schema.json")
         errors = list(Draft202012Validator(schema).iter_errors(payload))
@@ -239,7 +241,12 @@ class PipelineSchemaTests(TestCase):
             "target_instance_id": str(uuid.uuid4()),
             "fqdn": "ems.xyence.io",
             "dns": {"provider": "route53", "zone_name": "xyence.io", "record_type": "A", "ttl": 60},
-            "runtime": {"type": "docker-compose", "transport": "ssm", "remote_root": "/opt/xyn/apps/ems"},
+            "runtime": {
+                "type": "docker-compose",
+                "transport": "ssm",
+                "mode": "compose_build",
+                "remote_root": "/opt/xyn/apps/ems",
+            },
             "tls": {"mode": "nginx+acme", "acme_email": "admin@xyence.io", "redirect_http_to_https": True},
             "env": {"EMS_JWT_SECRET": "dev-secret"},
             "secret_refs": [],
@@ -249,6 +256,24 @@ class PipelineSchemaTests(TestCase):
         schema = self._load_schema("release_target.v1.schema.json")
         errors = list(Draft202012Validator(schema).iter_errors(payload))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
+
+    def test_release_target_schema_requires_mode_for_docker_compose(self):
+        payload = {
+            "schema_version": "release_target.v1",
+            "id": str(uuid.uuid4()),
+            "blueprint_id": str(uuid.uuid4()),
+            "name": "manager-demo",
+            "target_instance_id": str(uuid.uuid4()),
+            "fqdn": "ems.xyence.io",
+            "dns": {"provider": "route53"},
+            "runtime": {"type": "docker-compose", "transport": "ssm"},
+            "tls": {"mode": "none"},
+            "created_at": "2026-02-07T00:00:00Z",
+            "updated_at": "2026-02-07T00:00:00Z",
+        }
+        schema = self._load_schema("release_target.v1.schema.json")
+        errors = list(Draft202012Validator(schema).iter_errors(payload))
+        self.assertTrue(errors)
 
     def test_release_target_secret_ref_validation(self):
         payload = {
@@ -386,6 +411,34 @@ class PipelineSchemaTests(TestCase):
         ids = {item.get("id") for item in plan.get("work_items", [])}
         self.assertIn("build.publish_images.container", ids)
         self.assertIn("deploy.apply_remote_compose.pull", ids)
+        self.assertIn("release.validate_manifest.pinned", ids)
+
+    def test_select_next_slice_includes_manifest_validation_when_image_deploy_present(self):
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        release_target = {
+            "schema_version": "release_target.v1",
+            "id": str(uuid.uuid4()),
+            "blueprint_id": str(blueprint.id),
+            "name": "manager-demo",
+            "target_instance_id": str(uuid.uuid4()),
+            "fqdn": "ems.xyence.io",
+            "dns": {"provider": "route53"},
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "tls": {"mode": "none"},
+            "created_at": "2026-02-07T00:00:00Z",
+            "updated_at": "2026-02-07T00:00:00Z",
+        }
+        plan = _generate_implementation_plan(blueprint, release_target=release_target)
+        run_history = _build_run_history_summary(blueprint)
+        selected, _ = _select_next_slice(blueprint, plan.get("work_items", []), run_history)
+        selected_ids = {item.get("id") for item in selected}
+        self.assertIn("release.validate_manifest.pinned", selected_ids)
+
+    def test_manifest_validation_fails_when_digest_missing(self):
+        manifest = {"images": {"ems-api": {"image_uri": "repo:tag"}}}
+        ok, errors = _validate_release_manifest_pinned(manifest)
+        self.assertFalse(ok)
+        self.assertTrue(errors)
         rationale = plan.get("plan_rationale", {})
         self.assertIn("dns-route53", rationale.get("modules_selected", []))
 
