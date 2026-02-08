@@ -4464,6 +4464,43 @@ def internal_ecr_gc_report(request: HttpRequest) -> JsonResponse:
 
 
 @csrf_exempt
+def internal_release_promote(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    release_uuid = payload.get("release_uuid")
+    to_environment_id = payload.get("to_environment_id")
+    allow_existing = bool(payload.get("allow_existing"))
+    if not release_uuid or not to_environment_id:
+        return JsonResponse({"error": "release_uuid and to_environment_id required"}, status=400)
+    source = Release.objects.filter(id=release_uuid).first()
+    if not source:
+        return JsonResponse({"error": "source release not found"}, status=404)
+    if source.status == "draft":
+        return JsonResponse({"error": "cannot promote draft release"}, status=400)
+    existing = Release.objects.filter(
+        blueprint_id=source.blueprint_id,
+        environment_id=to_environment_id,
+        version=source.version,
+    ).first()
+    if existing:
+        if allow_existing:
+            return JsonResponse({"id": str(existing.id), "version": existing.version})
+        return JsonResponse({"error": "release already exists"}, status=409)
+    promoted = Release.objects.create(
+        blueprint_id=source.blueprint_id,
+        environment_id=to_environment_id,
+        version=source.version,
+        status="published",
+        artifacts_json=source.artifacts_json,
+        created_from_run=None,
+    )
+    return JsonResponse({"id": str(promoted.id), "version": promoted.version})
+
+
+@csrf_exempt
 def internal_release_create(request: HttpRequest) -> JsonResponse:
     if token_error := _require_internal_token(request):
         return token_error

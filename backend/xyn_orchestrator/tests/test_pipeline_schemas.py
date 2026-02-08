@@ -28,6 +28,7 @@ from xyn_orchestrator.blueprints import (
     internal_release_target_rollback_last_success,
     internal_releases_retention_report,
     internal_release_target_deploy_manifest,
+    internal_release_promote,
     _write_run_artifact,
 )
 from xyn_orchestrator.xyn_api import _validate_release_target_payload
@@ -50,8 +51,16 @@ from xyn_orchestrator.worker_tasks import (
     _run_remote_deploy,
     _work_item_capabilities,
 )
-from xyn_orchestrator.models import Blueprint, ContextPack, DevTask, Run, ReleaseTarget, ProvisionedInstance
-from xyn_orchestrator.models import Release
+from xyn_orchestrator.models import (
+    Blueprint,
+    ContextPack,
+    DevTask,
+    Environment,
+    ProvisionedInstance,
+    Release,
+    ReleaseTarget,
+    Run,
+)
 
 
 class PipelineSchemaTests(TestCase):
@@ -758,6 +767,55 @@ class PipelineSchemaTests(TestCase):
         self.assertEqual(response.status_code, 200)
         payload = json.loads(response.content.decode("utf-8"))
         self.assertEqual(payload["totals"]["retained"], 1)
+
+    def test_release_promote_creates_new_release(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        env = Environment.objects.create(name="prod")
+        source = Release.objects.create(
+            blueprint_id=blueprint.id,
+            version="v1",
+            status="published",
+            artifacts_json={"release_manifest": {"sha256": "aaa"}},
+        )
+        request = factory.post(
+            "/xyn/internal/releases/promote",
+            data=json.dumps({"release_uuid": str(source.id), "to_environment_id": str(env.id)}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_release_promote(request)
+        self.assertEqual(response.status_code, 200)
+        promoted = Release.objects.filter(environment_id=env.id, version="v1").first()
+        self.assertIsNotNone(promoted)
+
+    def test_release_promote_conflict(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        env = Environment.objects.create(name="prod")
+        source = Release.objects.create(
+            blueprint_id=blueprint.id,
+            version="v1",
+            status="published",
+            artifacts_json={"release_manifest": {"sha256": "aaa"}},
+        )
+        Release.objects.create(
+            blueprint_id=blueprint.id,
+            environment_id=env.id,
+            version="v1",
+            status="published",
+            artifacts_json={"release_manifest": {"sha256": "aaa"}},
+        )
+        request = factory.post(
+            "/xyn/internal/releases/promote",
+            data=json.dumps({"release_uuid": str(source.id), "to_environment_id": str(env.id)}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_release_promote(request)
+        self.assertEqual(response.status_code, 409)
 
     def test_planner_selects_remote_deploy_slice(self):
         blueprint = Blueprint.objects.create(
