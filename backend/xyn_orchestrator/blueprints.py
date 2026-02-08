@@ -4337,6 +4337,133 @@ def internal_release_target_rollback_last_success(request: HttpRequest, target_i
 
 
 @csrf_exempt
+def internal_releases_retention_report(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    blueprint_id = request.GET.get("blueprint_id")
+    environment_id = request.GET.get("environment_id")
+    keep = int(request.GET.get("keep") or 20)
+    if not blueprint_id:
+        return JsonResponse({"error": "blueprint_id required"}, status=400)
+    qs = Release.objects.filter(blueprint_id=blueprint_id, status="published").order_by("-created_at")
+    if environment_id:
+        qs = qs.filter(environment_id=environment_id)
+    releases = list(qs)
+    retained = releases[:keep]
+    candidates = releases[keep:]
+    targets_qs = ReleaseTarget.objects.filter(blueprint_id=blueprint_id)
+    if environment_id:
+        targets_qs = targets_qs.filter(environment=environment_id)
+    referenced_ids = set()
+    for target in targets_qs:
+        state = get_release_target_deploy_state(str(target.id))
+        rel_uuid = (state or {}).get("release_uuid")
+        if rel_uuid:
+            referenced_ids.add(rel_uuid)
+    protected = [rel for rel in releases if str(rel.id) in referenced_ids and rel not in retained]
+    return JsonResponse(
+        {
+            "retained": [
+                {"id": str(rel.id), "version": rel.version, "created_at": rel.created_at.isoformat()}
+                for rel in retained
+            ],
+            "candidates": [
+                {"id": str(rel.id), "version": rel.version, "created_at": rel.created_at.isoformat()}
+                for rel in candidates
+            ],
+            "protected": [
+                {"id": str(rel.id), "version": rel.version, "created_at": rel.created_at.isoformat()}
+                for rel in protected
+            ],
+            "totals": {
+                "retained": len(retained),
+                "candidates": len(candidates),
+                "protected": len(protected),
+                "total": len(releases),
+            },
+        }
+    )
+
+
+@csrf_exempt
+def internal_artifacts_orphans_report(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    older_than_days = int(request.GET.get("older_than_days") or 30)
+    cutoff = timezone.now() - timezone.timedelta(days=older_than_days)
+    referenced_urls = set()
+    for rel in Release.objects.exclude(artifacts_json__isnull=True):
+        artifacts = rel.artifacts_json or {}
+        for key in ("release_manifest", "compose_file", "build_result"):
+            entry = artifacts.get(key) or {}
+            url = entry.get("url")
+            if url:
+                referenced_urls.add(url)
+    orphans = RunArtifact.objects.filter(created_at__lt=cutoff).exclude(url__in=referenced_urls)
+    sample = [
+        {"id": str(artifact.id), "name": artifact.name, "url": artifact.url}
+        for artifact in orphans[:50]
+    ]
+    return JsonResponse(
+        {
+            "older_than_days": older_than_days,
+            "orphans_count": orphans.count(),
+            "sample": sample,
+        }
+    )
+
+
+@csrf_exempt
+def internal_ecr_gc_report(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    blueprint_id = request.GET.get("blueprint_id")
+    environment_id = request.GET.get("environment_id")
+    keep = int(request.GET.get("keep") or 20)
+    if not blueprint_id:
+        return JsonResponse({"error": "blueprint_id required"}, status=400)
+    report = internal_releases_retention_report(request)
+    if report.status_code != 200:
+        return report
+    payload = json.loads(report.content.decode("utf-8"))
+    retained_ids = {entry["id"] for entry in payload.get("retained", [])}
+    protected_ids = {entry["id"] for entry in payload.get("protected", [])}
+    keep_ids = retained_ids | protected_ids
+    releases = Release.objects.filter(id__in=keep_ids)
+    referenced_digests = set()
+    for rel in releases:
+        artifacts = rel.artifacts_json or {}
+        manifest_info = artifacts.get("release_manifest") or {}
+        url = manifest_info.get("url")
+        if not url:
+            continue
+        try:
+            manifest = requests.get(url, timeout=30).json()
+        except Exception:
+            continue
+        images = manifest.get("images") or {}
+        for meta in images.values():
+            digest = (meta or {}).get("digest")
+            if digest:
+                referenced_digests.add(digest)
+    return JsonResponse(
+        {
+            "blueprint_id": blueprint_id,
+            "environment_id": environment_id,
+            "keep": keep,
+            "referenced_digests": sorted(referenced_digests),
+            "note": "ECR GC report is digest-only; no deletions performed.",
+        }
+    )
+
+
+@csrf_exempt
 def internal_release_create(request: HttpRequest) -> JsonResponse:
     if token_error := _require_internal_token(request):
         return token_error

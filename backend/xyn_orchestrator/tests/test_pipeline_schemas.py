@@ -26,6 +26,7 @@ from xyn_orchestrator.blueprints import (
     internal_releases_latest,
     internal_release_target_deploy_latest,
     internal_release_target_rollback_last_success,
+    internal_releases_retention_report,
     internal_release_target_deploy_manifest,
     _write_run_artifact,
 )
@@ -742,6 +743,21 @@ class PipelineSchemaTests(TestCase):
             deploy_release.return_value = JsonResponse({"run_id": "x"}, status=200)
             internal_release_target_rollback_last_success(rollback_request, str(target.id))
             deploy_release.assert_called()
+
+    def test_releases_retention_report(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        r1 = Release.objects.create(blueprint_id=blueprint.id, version="v1", status="published")
+        r2 = Release.objects.create(blueprint_id=blueprint.id, version="v2", status="published")
+        request = factory.get(
+            f"/xyn/internal/releases/retention_report?blueprint_id={blueprint.id}&keep=1",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_releases_retention_report(request)
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.content.decode("utf-8"))
+        self.assertEqual(payload["totals"]["retained"], 1)
 
     def test_planner_selects_remote_deploy_slice(self):
         blueprint = Blueprint.objects.create(
