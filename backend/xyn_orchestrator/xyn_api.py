@@ -21,7 +21,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
-from django.contrib.auth import get_user_model
+from django.contrib.auth import get_user_model, login
 from jsonschema import Draft202012Validator
 
 from xyence.middleware import _get_or_create_user_from_claims, _verify_oidc_token
@@ -599,6 +599,21 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
     roles = _get_roles(identity)
     if not roles:
         return JsonResponse({"error": "no roles assigned"}, status=403)
+    # Bridge session auth into Django auth so login_required works.
+    User = get_user_model()
+    username = email or str(claims.get("sub"))
+    user, created = User.objects.get_or_create(
+        username=username,
+        defaults={
+            "email": email,
+            "is_staff": "platform_admin" in roles,
+            "is_active": True,
+        },
+    )
+    if "platform_admin" in roles and not user.is_staff:
+        user.is_staff = True
+        user.save(update_fields=["is_staff"])
+    login(request, user, backend="django.contrib.auth.backends.ModelBackend")
     request.session["user_identity_id"] = str(identity.id)
     request.session["environment_id"] = str(env.id)
     redirect_to = request.session.get("post_login_redirect") or "/app/ems"
