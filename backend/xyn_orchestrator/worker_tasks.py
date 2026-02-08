@@ -2888,27 +2888,77 @@ def _ssm_fetch_compose_hash(instance_id: str, aws_region: str, hash_path: str) -
     return (result.get("stdout") or "").strip()
 
 
-def _validate_release_manifest_pinned(manifest: Dict[str, Any]) -> tuple[bool, List[str]]:
-    errors: List[str] = []
+def _normalize_sha256(value: str) -> Optional[str]:
+    if not value:
+        return None
+    lowered = value.strip().lower()
+    if lowered.startswith("sha256:"):
+        lowered = lowered[len("sha256:") :]
+    if len(lowered) != 64:
+        return None
+    try:
+        int(lowered, 16)
+    except ValueError:
+        return None
+    return lowered
+
+
+def _validate_release_manifest_pinned(manifest: Dict[str, Any]) -> tuple[bool, List[Dict[str, str]]]:
+    errors: List[Dict[str, str]] = []
     images = manifest.get("images") or {}
     if not isinstance(images, dict) or not images:
-        errors.append("release_manifest.images missing or empty")
+        errors.append({"code": "images_missing", "message": "release_manifest.images missing or empty", "path": "images"})
     for service, info in images.items():
         image_uri = (info or {}).get("image_uri") or ""
         digest = (info or {}).get("digest") or ""
         if not image_uri:
-            errors.append(f"{service}: image_uri missing")
+            errors.append(
+                {
+                    "code": "image_uri_missing",
+                    "message": f"{service}: image_uri missing",
+                    "path": f"images.{service}.image_uri",
+                }
+            )
+        normalized = _normalize_sha256(str(digest))
         if not digest:
-            errors.append(f"{service}: digest missing")
-        elif not (digest.startswith("sha256:") and len(digest) >= 71):
-            errors.append(f"{service}: digest invalid")
+            errors.append(
+                {
+                    "code": "digest_missing",
+                    "message": f"{service}: digest missing",
+                    "path": f"images.{service}.digest",
+                }
+            )
+        elif not normalized:
+            errors.append(
+                {
+                    "code": "digest_invalid",
+                    "message": f"{service}: digest invalid",
+                    "path": f"images.{service}.digest",
+                }
+            )
     compose = manifest.get("compose") or {}
+    compose_hash = _normalize_sha256(str(compose.get("content_hash") or ""))
+    if not compose_hash:
+        errors.append(
+            {
+                "code": "compose_hash_missing",
+                "message": "compose.content_hash missing or invalid",
+                "path": "compose.content_hash",
+            }
+        )
     content = compose.get("content") or ""
-    if content:
+    if content and isinstance(images, dict):
         for service, info in images.items():
             digest = (info or {}).get("digest") or ""
-            if digest and digest not in content:
-                errors.append(f"{service}: compose missing digest pin")
+            normalized = _normalize_sha256(str(digest))
+            if normalized and normalized not in content.lower():
+                errors.append(
+                    {
+                        "code": "compose_missing_digest",
+                        "message": f"{service}: compose missing digest pin",
+                        "path": f"compose.content",
+                    }
+                )
     return len(errors) == 0, errors
 
 
@@ -3741,7 +3791,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     )
                     _post_json(
                         f"/xyn/internal/runs/{run_id}/artifacts",
-                        {"name": "validation_result.json", "kind": "release_manifest", "url": validation_url},
+                        {"name": "validation_result.json", "kind": "validation", "url": validation_url},
                     )
                     artifacts.append(
                         {
@@ -4034,6 +4084,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     registry_host = image_uri.split("/")[0] if image_uri else ""
                     public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
                     noop_done = False
+                    noop_debug = ""
                     if public_ok and images_map:
                         try:
                             image_ids = _ssm_fetch_image_ids(
@@ -4041,20 +4092,23 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             )
                             match = True
                             for svc, meta in images_map.items():
-                                digest = meta.get("digest")
+                                digest = _normalize_sha256(str((meta or {}).get("digest") or ""))
                                 if not digest:
                                     match = False
                                     break
-                                if image_ids.get(svc) != digest:
+                                remote_digest = _normalize_sha256(str(image_ids.get(svc) or ""))
+                                if remote_digest != digest:
                                     match = False
                                     break
                             if match:
+                                if not compose_hash:
+                                    match = False
                                 remote_hash = _ssm_fetch_compose_hash(
                                     target_instance.get("instance_id"),
                                     target_instance.get("aws_region"),
                                     f"{(release_target or {}).get('runtime', {}).get('remote_root') or '/opt/xyn/apps/ems'}/compose.release.sha256",
                                 )
-                                if remote_hash.strip() != compose_hash:
+                                if _normalize_sha256(remote_hash or "") != _normalize_sha256(compose_hash):
                                     match = False
                             if match:
                                 deploy_finished = datetime.utcnow().isoformat() + "Z"
@@ -4102,21 +4156,19 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                     }
                                 )
                                 noop_done = True
-                        except Exception:
-                            pass
-                    if noop_done:
-                        pass
-                    else:
+                        except Exception as exc:
+                            noop_debug = f"noop_check_failed: {exc}"
+                    if not noop_done:
                         env_public = {k: v for k, v in effective_env.items() if k not in secret_keys}
-                    deploy_manifest = _build_deploy_manifest(
-                        fqdn,
-                        target_instance,
-                        (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
-                        "compose.release.yml",
-                        env_public,
-                        secret_keys,
-                    )
-                    deploy_manifest["compose_hash"] = compose_hash
+                        deploy_manifest = _build_deploy_manifest(
+                            fqdn,
+                            target_instance,
+                            (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
+                            "compose.release.yml",
+                            env_public,
+                            secret_keys,
+                        )
+                        deploy_manifest["compose_hash"] = compose_hash
                         manifest_url = _write_artifact(
                             run_id, "deploy_manifest.json", json.dumps(deploy_manifest, indent=2)
                         )
@@ -4124,14 +4176,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             f"/xyn/internal/runs/{run_id}/artifacts",
                             {"name": "deploy_manifest.json", "kind": "deploy", "url": manifest_url},
                         )
-                    commands = _build_remote_pull_apply_commands(
-                        (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
-                        compose_content,
-                        compose_hash,
-                        registry_region,
-                        registry_host,
-                        effective_env,
-                    )
+                        commands = _build_remote_pull_apply_commands(
+                            (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
+                            compose_content,
+                            compose_hash,
+                            registry_region,
+                            registry_host,
+                            effective_env,
+                        )
                         exec_result = _run_ssm_commands(
                             target_instance.get("instance_id"),
                             target_instance.get("aws_region"),
@@ -4164,6 +4216,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             "finished_at": datetime.utcnow().isoformat() + "Z",
                             "errors": [],
                         }
+                        if noop_debug:
+                            deploy_result.setdefault("errors", []).append(
+                                {
+                                    "code": "noop_check_failed",
+                                    "message": "NOOP check failed; proceeding with deploy.",
+                                    "detail": noop_debug,
+                                }
+                            )
                         if exec_result.get("invocation_status") != "Success":
                             success = False
                             deploy_result.setdefault("errors", []).append(

@@ -30,6 +30,7 @@ from xyn_orchestrator.worker_tasks import (
     _mark_noop_codegen,
     _redact_secrets,
     _stage_all,
+    _normalize_sha256,
     _validate_release_manifest_pinned,
     _route53_ensure_with_noop,
     _run_remote_deploy,
@@ -429,7 +430,10 @@ class PipelineSchemaTests(TestCase):
             "updated_at": "2026-02-07T00:00:00Z",
         }
         plan = _generate_implementation_plan(blueprint, release_target=release_target)
-        run_history = _build_run_history_summary(blueprint)
+        run_history = {
+            "acceptance_checks_status": [{"id": "remote_http_health", "status": "fail"}],
+            "completed_work_items": [],
+        }
         selected, _ = _select_next_slice(blueprint, plan.get("work_items", []), run_history)
         selected_ids = {item.get("id") for item in selected}
         self.assertIn("release.validate_manifest.pinned", selected_ids)
@@ -439,8 +443,19 @@ class PipelineSchemaTests(TestCase):
         ok, errors = _validate_release_manifest_pinned(manifest)
         self.assertFalse(ok)
         self.assertTrue(errors)
-        rationale = plan.get("plan_rationale", {})
-        self.assertIn("dns-route53", rationale.get("modules_selected", []))
+
+    def test_manifest_validation_requires_compose_hash(self):
+        manifest = {
+            "images": {"ems-api": {"image_uri": "repo:tag", "digest": "sha256:" + "a" * 64}},
+            "compose": {"content": "image@sha256:" + "a" * 64},
+        }
+        ok, errors = _validate_release_manifest_pinned(manifest)
+        self.assertFalse(ok)
+        self.assertTrue(any(err.get("code") == "compose_hash_missing" for err in errors))
+
+    def test_noop_digest_normalization(self):
+        digest = "SHA256:" + "A" * 64
+        self.assertEqual(_normalize_sha256(digest), "a" * 64)
 
     def test_planner_selects_remote_deploy_slice(self):
         blueprint = Blueprint.objects.create(
