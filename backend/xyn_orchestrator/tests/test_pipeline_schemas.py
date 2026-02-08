@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest import mock
 
 from django.test import TestCase, RequestFactory
+from django.contrib.sessions.middleware import SessionMiddleware
+from django.http import JsonResponse
 from jsonschema import Draft202012Validator
 import yaml
 
@@ -27,11 +29,14 @@ from xyn_orchestrator.blueprints import (
     internal_release_target_deploy_latest,
     internal_release_target_rollback_last_success,
     internal_releases_retention_report,
+    internal_releases_gc,
+    internal_artifacts_gc,
     internal_release_target_deploy_manifest,
     internal_release_promote,
     _write_run_artifact,
 )
 from xyn_orchestrator.xyn_api import _validate_release_target_payload
+from xyn_orchestrator import xyn_api as xyn_api_module
 from xyn_orchestrator.worker_tasks import (
     _apply_scaffold_for_work_item,
     _collect_git_diff,
@@ -59,8 +64,132 @@ from xyn_orchestrator.models import (
     ProvisionedInstance,
     Release,
     ReleaseTarget,
+    RoleBinding,
     Run,
+    UserIdentity,
 )
+
+
+class OIDCAuthTests(TestCase):
+    def _make_env(self):
+        return Environment.objects.create(
+            name="Dev",
+            slug="dev",
+            metadata_json={
+                "oidc": {
+                    "issuer_url": "https://issuer.example.com",
+                    "client_id": "client-123",
+                    "client_secret_ref": {"ref": "ssm:/oidc/secret"},
+                    "redirect_uri": "https://xyence.io/auth/callback",
+                    "scopes": "openid profile email",
+                    "allowed_email_domains": ["xyence.io"],
+                }
+            },
+        )
+
+    def _mock_token_post(self, *args, **kwargs):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self_inner):
+                return {"id_token": "token-abc"}
+
+        return FakeResponse()
+
+    def test_oidc_login_redirect_sets_state_nonce(self):
+        env = self._make_env()
+        with mock.patch.object(xyn_api_module, "_get_oidc_config") as get_config:
+            get_config.return_value = {"authorization_endpoint": "https://issuer.example.com/auth"}
+            response = self.client.get(f"/auth/login?environment_id={env.id}")
+        self.assertEqual(response.status_code, 302)
+        session = self.client.session
+        self.assertIn("oidc_state", session)
+        self.assertIn("oidc_nonce", session)
+
+    def test_oidc_callback_upserts_identity_and_session(self):
+        env = self._make_env()
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            issuer="https://issuer.example.com",
+            subject="sub-123",
+        )
+        RoleBinding.objects.create(user_identity=identity, scope_kind="platform", role="platform_admin")
+        session = self.client.session
+        session["oidc_state"] = "state-123"
+        session["oidc_nonce"] = "nonce-123"
+        session["environment_id"] = str(env.id)
+        session["post_login_redirect"] = "/app/ems"
+        session.save()
+        with (
+            mock.patch.object(xyn_api_module, "_get_oidc_config") as get_config,
+            mock.patch.object(xyn_api_module, "_resolve_secret_ref") as resolve_secret,
+            mock.patch.object(xyn_api_module, "_decode_id_token") as decode_token,
+            mock.patch.object(xyn_api_module.requests, "post") as post_request,
+        ):
+            get_config.return_value = {"token_endpoint": "https://issuer.example.com/token"}
+            resolve_secret.return_value = "secret"
+            decode_token.return_value = {
+                "sub": "sub-123",
+                "email": "dev@xyence.io",
+                "name": "Dev User",
+            }
+            post_request.side_effect = self._mock_token_post
+            response = self.client.get("/auth/callback?code=abc&state=state-123")
+        self.assertEqual(response.status_code, 302)
+        session = self.client.session
+        self.assertIn("user_identity_id", session)
+        identity.refresh_from_db()
+        self.assertEqual(identity.email, "dev@xyence.io")
+
+    def test_me_endpoint_requires_auth(self):
+        response = self.client.get("/xyn/api/me")
+        self.assertEqual(response.status_code, 401)
+
+    def test_role_required_denies_without_binding(self):
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            issuer="https://issuer.example.com",
+            subject="sub-123",
+        )
+        request = RequestFactory().get("/protected")
+        middleware = SessionMiddleware(lambda req: None)
+        middleware.process_request(request)
+        request.session["user_identity_id"] = str(identity.id)
+        request.session.save()
+
+        @xyn_api_module.require_role("platform_admin")
+        def _view(req):
+            return JsonResponse({"ok": True})
+
+        response = _view(request)
+        self.assertEqual(response.status_code, 403)
+
+    def test_first_admin_bootstrap_guarded(self):
+        env = self._make_env()
+        session = self.client.session
+        session["oidc_state"] = "state-123"
+        session["oidc_nonce"] = "nonce-123"
+        session["environment_id"] = str(env.id)
+        session.save()
+        with (
+            mock.patch.dict(os.environ, {"ALLOW_FIRST_ADMIN_BOOTSTRAP": "true"}),
+            mock.patch.object(xyn_api_module, "_get_oidc_config") as get_config,
+            mock.patch.object(xyn_api_module, "_resolve_secret_ref") as resolve_secret,
+            mock.patch.object(xyn_api_module, "_decode_id_token") as decode_token,
+            mock.patch.object(xyn_api_module.requests, "post") as post_request,
+        ):
+            get_config.return_value = {"token_endpoint": "https://issuer.example.com/token"}
+            resolve_secret.return_value = "secret"
+            decode_token.return_value = {
+                "sub": "sub-abc",
+                "email": "admin@xyence.io",
+                "name": "Admin User",
+            }
+            post_request.side_effect = self._mock_token_post
+            response = self.client.get("/auth/callback?code=abc&state=state-123")
+        self.assertEqual(response.status_code, 302)
+        identity = UserIdentity.objects.get(subject="sub-abc")
+        self.assertTrue(RoleBinding.objects.filter(user_identity=identity, role="platform_admin").exists())
 
 
 class PipelineSchemaTests(TestCase):
@@ -767,6 +896,52 @@ class PipelineSchemaTests(TestCase):
         self.assertEqual(response.status_code, 200)
         payload = json.loads(response.content.decode("utf-8"))
         self.assertEqual(payload["totals"]["retained"], 1)
+
+    def test_gc_requires_confirm(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        Release.objects.create(blueprint_id=blueprint.id, version="v1", status="published")
+        request = factory.post(
+            "/xyn/internal/releases/gc",
+            data=json.dumps({"blueprint_id": str(blueprint.id), "keep": 0, "dry_run": False}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_releases_gc(request)
+        self.assertEqual(response.status_code, 400)
+
+    def test_gc_dry_run_does_not_modify_releases(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        rel = Release.objects.create(blueprint_id=blueprint.id, version="v1", status="published")
+        request = factory.post(
+            "/xyn/internal/releases/gc",
+            data=json.dumps({"blueprint_id": str(blueprint.id), "keep": 0, "dry_run": True}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_releases_gc(request)
+        self.assertEqual(response.status_code, 200)
+        rel.refresh_from_db()
+        self.assertEqual(rel.status, "published")
+
+    def test_gc_marks_deprecated(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        rel = Release.objects.create(blueprint_id=blueprint.id, version="v1", status="published")
+        request = factory.post(
+            "/xyn/internal/releases/gc",
+            data=json.dumps({"blueprint_id": str(blueprint.id), "keep": 0, "dry_run": False, "confirm": True}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_releases_gc(request)
+        self.assertEqual(response.status_code, 200)
+        rel.refresh_from_db()
+        self.assertEqual(rel.status, "deprecated")
 
     def test_release_promote_creates_new_release(self):
         os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"

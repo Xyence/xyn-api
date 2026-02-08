@@ -333,6 +333,50 @@ class ReleaseTarget(models.Model):
         return f"{self.blueprint} target {self.name}"
 
 
+class UserIdentity(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    provider = models.CharField(max_length=50)
+    issuer = models.CharField(max_length=240)
+    subject = models.CharField(max_length=240)
+    email = models.CharField(max_length=240, blank=True)
+    display_name = models.CharField(max_length=240, blank=True)
+    claims_json = models.JSONField(null=True, blank=True)
+    last_login_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("issuer", "subject")
+        ordering = ["-updated_at"]
+
+    def __str__(self) -> str:
+        return f"{self.provider}:{self.subject}"
+
+
+class RoleBinding(models.Model):
+    SCOPE_CHOICES = [
+        ("platform", "Platform"),
+        ("tenant", "Tenant"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user_identity = models.ForeignKey(
+        UserIdentity, on_delete=models.CASCADE, related_name="role_bindings"
+    )
+    scope_kind = models.CharField(max_length=20, choices=SCOPE_CHOICES, default="platform")
+    scope_id = models.UUIDField(null=True, blank=True)
+    role = models.CharField(max_length=120)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user_identity", "scope_kind", "scope_id", "role")
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.user_identity_id} {self.role}"
+
+
 class Module(models.Model):
     STATUS_CHOICES = [
         ("active", "Active"),
@@ -428,6 +472,7 @@ class Environment(models.Model):
     slug = models.SlugField(max_length=120, unique=True)
     base_domain = models.CharField(max_length=200, blank=True)
     aws_region = models.CharField(max_length=50, blank=True)
+    metadata_json = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

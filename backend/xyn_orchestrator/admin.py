@@ -39,6 +39,8 @@ from .models import (
     ReleasePlanDeployState,
     ReleasePlanDeployment,
     ReleaseTarget,
+    RoleBinding,
+    UserIdentity,
     VoiceNote,
     VoiceTranscript,
 )
@@ -204,6 +206,20 @@ class ReleaseAdmin(admin.ModelAdmin):
     list_display = ("version", "status", "blueprint", "release_plan", "environment", "updated_at")
     list_filter = ("status", "environment")
     search_fields = ("version",)
+
+
+@admin.register(UserIdentity)
+class UserIdentityAdmin(admin.ModelAdmin):
+    list_display = ("provider", "issuer", "subject", "email", "last_login_at")
+    search_fields = ("issuer", "subject", "email")
+    ordering = ("-last_login_at",)
+
+
+@admin.register(RoleBinding)
+class RoleBindingAdmin(admin.ModelAdmin):
+    list_display = ("user_identity", "role", "scope_kind", "scope_id", "created_at")
+    list_filter = ("scope_kind", "role")
+    search_fields = ("user_identity__email", "role")
 
 
 @admin.register(ContextPack)

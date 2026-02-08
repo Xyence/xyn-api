@@ -1,16 +1,21 @@
 import json
 import os
 import re
+import secrets
 import time
 import uuid
+from functools import wraps
+from urllib.parse import urlencode
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import requests
+import boto3
+from authlib.jose import JsonWebKey, jwt
 from django.core.paginator import Paginator
 from django.db import models
-from django.http import HttpRequest, JsonResponse
-from django.shortcuts import get_object_or_404
+from django.http import HttpRequest, JsonResponse, HttpResponse
+from django.shortcuts import get_object_or_404, redirect
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
@@ -47,6 +52,8 @@ from .models import (
     RunArtifact,
     RunCommandExecution,
     ReleaseTarget,
+    RoleBinding,
+    UserIdentity,
 )
 from .module_registry import maybe_sync_modules_from_registry
 
@@ -214,6 +221,98 @@ def _get_oidc_config(issuer: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _resolve_environment(request: HttpRequest) -> Optional[Environment]:
+    env_id = request.GET.get("environment_id") or request.session.get("environment_id")
+    if env_id:
+        return Environment.objects.filter(id=env_id).first()
+    return Environment.objects.first()
+
+
+def _get_oidc_env_config(env: Environment) -> Optional[Dict[str, Any]]:
+    config = (env.metadata_json or {}).get("oidc") or {}
+    if not config.get("issuer_url") or not config.get("client_id"):
+        return None
+    return config
+
+
+def _resolve_secret_ref(ref: Dict[str, Any]) -> Optional[str]:
+    value = (ref or {}).get("ref") or ""
+    if not value:
+        return None
+    if value.startswith("ssm:"):
+        name = value[len("ssm:") :]
+        client = boto3.client("ssm")
+        response = client.get_parameter(Name=name, WithDecryption=True)
+        return response.get("Parameter", {}).get("Value")
+    if value.startswith("ssm-arn:"):
+        name = value[len("ssm-arn:") :]
+        client = boto3.client("ssm")
+        response = client.get_parameter(Name=name, WithDecryption=True)
+        return response.get("Parameter", {}).get("Value")
+    if value.startswith("secretsmanager:"):
+        name = value[len("secretsmanager:") :]
+        client = boto3.client("secretsmanager")
+        response = client.get_secret_value(SecretId=name)
+        return response.get("SecretString")
+    if value.startswith("secretsmanager-arn:"):
+        name = value[len("secretsmanager-arn:") :]
+        client = boto3.client("secretsmanager")
+        response = client.get_secret_value(SecretId=name)
+        return response.get("SecretString")
+    return None
+
+
+def _decode_id_token(id_token: str, issuer: str, client_id: str, nonce: str) -> Optional[Dict[str, Any]]:
+    config = _get_oidc_config(issuer)
+    if not config or not config.get("jwks_uri"):
+        return None
+    jwks = requests.get(config["jwks_uri"], timeout=10).json()
+    key_set = JsonWebKey.import_key_set(jwks)
+    claims = jwt.decode(
+        id_token,
+        key_set,
+        claims_options={
+            "iss": {"value": issuer},
+            "aud": {"value": client_id},
+            "exp": {"essential": True},
+            "nonce": {"value": nonce},
+        },
+    )
+    claims.validate()
+    return dict(claims)
+
+
+def _require_authenticated(request: HttpRequest) -> Optional[UserIdentity]:
+    identity_id = request.session.get("user_identity_id")
+    if not identity_id:
+        return None
+    return UserIdentity.objects.filter(id=identity_id).first()
+
+
+def _get_roles(identity: UserIdentity) -> List[str]:
+    return list(
+        RoleBinding.objects.filter(user_identity=identity)
+        .values_list("role", flat=True)
+    )
+
+
+def require_role(role: str):
+    def decorator(view):
+        @wraps(view)
+        def _wrapped(request: HttpRequest, *args, **kwargs):
+            identity = _require_authenticated(request)
+            if not identity:
+                return JsonResponse({"error": "not authenticated"}, status=401)
+            if not RoleBinding.objects.filter(user_identity=identity, role=role).exists():
+                return JsonResponse({"error": "forbidden"}, status=403)
+            request.user_identity = identity  # type: ignore[attr-defined]
+            return view(request, *args, **kwargs)
+
+        return _wrapped
+
+    return decorator
+
+
 @csrf_exempt
 def oidc_exchange(request: HttpRequest) -> JsonResponse:
     if request.method != "POST":
@@ -267,6 +366,184 @@ def oidc_exchange(request: HttpRequest) -> JsonResponse:
         {
             "id_token": id_token,
             "expires_in": token_payload.get("expires_in"),
+        }
+    )
+
+
+@csrf_exempt
+def internal_oidc_config(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    if not request.headers.get("X-Internal-Token"):
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+    env = _resolve_environment(request)
+    if not env:
+        return JsonResponse({"error": "environment not found"}, status=404)
+    config = _get_oidc_env_config(env) or {}
+    return JsonResponse(
+        {
+            "issuer_url": config.get("issuer_url", ""),
+            "client_id": config.get("client_id", ""),
+            "redirect_uri": config.get("redirect_uri", ""),
+            "scopes": config.get("scopes", "openid profile email"),
+            "allowed_email_domains": config.get("allowed_email_domains", []),
+        }
+    )
+
+
+@csrf_exempt
+def auth_login(request: HttpRequest) -> HttpResponse:
+    env = _resolve_environment(request)
+    if not env:
+        return JsonResponse({"error": "environment not found"}, status=404)
+    config = _get_oidc_env_config(env)
+    if not config:
+        return JsonResponse({"error": "OIDC not configured"}, status=500)
+    issuer = config.get("issuer_url")
+    client_id = config.get("client_id")
+    scopes = config.get("scopes") or "openid profile email"
+    if not issuer or not client_id:
+        return JsonResponse({"error": "OIDC client not configured"}, status=500)
+    oidc_config = _get_oidc_config(issuer)
+    if not oidc_config or not oidc_config.get("authorization_endpoint"):
+        return JsonResponse({"error": "OIDC configuration unavailable"}, status=502)
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    request.session["oidc_state"] = state
+    request.session["oidc_nonce"] = nonce
+    request.session["environment_id"] = str(env.id)
+    next_url = request.GET.get("next") or "/app/ems"
+    request.session["post_login_redirect"] = next_url
+    redirect_uri = config.get("redirect_uri") or request.build_absolute_uri("/auth/callback")
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": scopes,
+        "state": state,
+        "nonce": nonce,
+    }
+    url = f"{oidc_config['authorization_endpoint']}?{urlencode(params)}"
+    response = redirect(url)
+    return response
+
+
+@csrf_exempt
+def auth_callback(request: HttpRequest) -> HttpResponse:
+    error = request.GET.get("error")
+    if error:
+        return JsonResponse({"error": error}, status=400)
+    code = request.GET.get("code")
+    state = request.GET.get("state")
+    if not code or not state:
+        return JsonResponse({"error": "missing code/state"}, status=400)
+    if state != request.session.get("oidc_state"):
+        return JsonResponse({"error": "invalid state"}, status=400)
+    env = _resolve_environment(request)
+    if not env:
+        return JsonResponse({"error": "environment not found"}, status=404)
+    config = _get_oidc_env_config(env)
+    if not config:
+        return JsonResponse({"error": "OIDC not configured"}, status=500)
+    issuer = config.get("issuer_url")
+    client_id = config.get("client_id")
+    secret_ref = config.get("client_secret_ref") or {}
+    client_secret = _resolve_secret_ref(secret_ref) if secret_ref else None
+    if not issuer or not client_id or not client_secret:
+        return JsonResponse({"error": "OIDC client not configured"}, status=500)
+    oidc_config = _get_oidc_config(issuer)
+    if not oidc_config or not oidc_config.get("token_endpoint"):
+        return JsonResponse({"error": "OIDC configuration unavailable"}, status=502)
+    redirect_uri = config.get("redirect_uri") or request.build_absolute_uri("/auth/callback")
+    token_response = requests.post(
+        oidc_config["token_endpoint"],
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+        },
+        timeout=15,
+    )
+    if token_response.status_code >= 400:
+        return JsonResponse({"error": "token exchange failed"}, status=400)
+    token_payload = token_response.json()
+    id_token = token_payload.get("id_token")
+    if not id_token:
+        return JsonResponse({"error": "id_token missing"}, status=400)
+    nonce = request.session.get("oidc_nonce", "")
+    claims = _decode_id_token(id_token, issuer, client_id, nonce)
+    if not claims:
+        return JsonResponse({"error": "invalid id_token"}, status=401)
+    email = claims.get("email") or ""
+    allowed_domains = config.get("allowed_email_domains") or []
+    if allowed_domains and email:
+        domain = email.split("@")[-1].lower()
+        if domain not in [d.lower() for d in allowed_domains]:
+            return JsonResponse({"error": "email domain not allowed"}, status=403)
+    identity, created = UserIdentity.objects.get_or_create(
+        issuer=issuer,
+        subject=str(claims.get("sub")),
+        defaults={
+            "provider": "oidc",
+            "email": email,
+            "display_name": claims.get("name") or claims.get("preferred_username") or "",
+            "claims_json": {
+                "sub": claims.get("sub"),
+                "email": claims.get("email"),
+                "name": claims.get("name"),
+                "preferred_username": claims.get("preferred_username"),
+            },
+            "last_login_at": timezone.now(),
+        },
+    )
+    if not created:
+        identity.email = email
+        identity.display_name = claims.get("name") or claims.get("preferred_username") or ""
+        identity.claims_json = {
+            "sub": claims.get("sub"),
+            "email": claims.get("email"),
+            "name": claims.get("name"),
+            "preferred_username": claims.get("preferred_username"),
+        }
+        identity.last_login_at = timezone.now()
+        identity.save(update_fields=["email", "display_name", "claims_json", "last_login_at", "updated_at"])
+    if not RoleBinding.objects.exists() and os.environ.get("ALLOW_FIRST_ADMIN_BOOTSTRAP", "").lower() == "true":
+        RoleBinding.objects.create(
+            user_identity=identity,
+            scope_kind="platform",
+            role="platform_admin",
+        )
+    roles = _get_roles(identity)
+    if not roles:
+        return JsonResponse({"error": "no roles assigned"}, status=403)
+    request.session["user_identity_id"] = str(identity.id)
+    request.session["environment_id"] = str(env.id)
+    redirect_to = request.session.get("post_login_redirect") or "/app/ems"
+    return redirect(redirect_to)
+
+
+@csrf_exempt
+def auth_logout(request: HttpRequest) -> JsonResponse:
+    request.session.flush()
+    return JsonResponse({"status": "ok"})
+
+
+def api_me(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    roles = _get_roles(identity)
+    return JsonResponse(
+        {
+            "user": {
+                "issuer": identity.issuer,
+                "subject": identity.subject,
+                "email": identity.email,
+                "display_name": identity.display_name,
+            },
+            "roles": roles,
         }
     )
 

@@ -4336,6 +4336,36 @@ def internal_release_target_rollback_last_success(request: HttpRequest, target_i
     return internal_release_target_deploy_release(deploy_request, target_id)
 
 
+def _build_release_retention(
+    blueprint_id: str, environment_id: Optional[str], keep: int
+) -> Dict[str, Any]:
+    plan = _build_release_retention(blueprint_id, environment_id, keep)
+    retained = plan["retained"]
+    candidates = plan["candidates"]
+    protected = plan["protected"]
+    return {
+        "retained": retained,
+        "candidates": candidates,
+        "protected": protected,
+        "totals": {
+            "retained": len(retained),
+            "candidates": len(candidates),
+            "protected": len(protected),
+            "total": len(releases),
+        },
+    }
+
+
+def _write_gc_result(payload: Dict[str, Any]) -> str:
+    gc_dir = os.path.join(settings.MEDIA_ROOT, "gc_results")
+    os.makedirs(gc_dir, exist_ok=True)
+    filename = f"{uuid.uuid4()}.json"
+    file_path = os.path.join(gc_dir, filename)
+    with open(file_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return f"{settings.MEDIA_URL.rstrip('/')}/gc_results/{filename}"
+
+
 @csrf_exempt
 def internal_releases_retention_report(request: HttpRequest) -> JsonResponse:
     if token_error := _require_internal_token(request):
@@ -4378,10 +4408,7 @@ def internal_releases_retention_report(request: HttpRequest) -> JsonResponse:
                 for rel in protected
             ],
             "totals": {
-                "retained": len(retained),
-                "candidates": len(candidates),
-                "protected": len(protected),
-                "total": len(releases),
+                **plan["totals"],
             },
         }
     )
@@ -4415,6 +4442,89 @@ def internal_artifacts_orphans_report(request: HttpRequest) -> JsonResponse:
             "sample": sample,
         }
     )
+
+
+@csrf_exempt
+def internal_releases_gc(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    blueprint_id = payload.get("blueprint_id")
+    environment_id = payload.get("environment_id")
+    keep = int(payload.get("keep") or 20)
+    dry_run = bool(payload.get("dry_run", True))
+    confirm = bool(payload.get("confirm", False))
+    if not blueprint_id:
+        return JsonResponse({"error": "blueprint_id required"}, status=400)
+    plan = _build_release_retention(blueprint_id, environment_id, keep)
+    candidates = plan["candidates"]
+    if dry_run:
+        result = {
+            "dry_run": True,
+            "deprecated_count": 0,
+            "candidates": [str(rel.id) for rel in candidates],
+        }
+        url = _write_gc_result(result)
+        return JsonResponse({**result, "gc_result_url": url})
+    if not confirm:
+        return JsonResponse({"error": "confirm required"}, status=400)
+    updated = Release.objects.filter(id__in=[rel.id for rel in candidates]).update(status="deprecated")
+    result = {
+        "dry_run": False,
+        "deprecated_count": updated,
+        "candidates": [str(rel.id) for rel in candidates],
+    }
+    url = _write_gc_result(result)
+    return JsonResponse({**result, "gc_result_url": url})
+
+
+@csrf_exempt
+def internal_artifacts_gc(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    blueprint_id = payload.get("blueprint_id")
+    environment_id = payload.get("environment_id")
+    keep = int(payload.get("keep") or 20)
+    dry_run = bool(payload.get("dry_run", True))
+    confirm = bool(payload.get("confirm", False))
+    older_than_days = int(payload.get("older_than_days") or 30)
+    if not blueprint_id:
+        return JsonResponse({"error": "blueprint_id required"}, status=400)
+    plan = _build_release_retention(blueprint_id, environment_id, keep)
+    keep_ids = {rel.id for rel in plan["retained"] + plan["protected"]}
+    referenced_urls = set()
+    for rel in Release.objects.filter(id__in=keep_ids):
+        artifacts = rel.artifacts_json or {}
+        for key in ("release_manifest", "compose_file", "build_result"):
+            entry = artifacts.get(key) or {}
+            url = entry.get("url")
+            if url:
+                referenced_urls.add(url)
+    cutoff = timezone.now() - timezone.timedelta(days=older_than_days)
+    orphans = RunArtifact.objects.filter(created_at__lt=cutoff).exclude(url__in=referenced_urls)
+    if dry_run:
+        result = {
+            "dry_run": True,
+            "deleted_count": 0,
+            "orphans_count": orphans.count(),
+        }
+        url = _write_gc_result(result)
+        return JsonResponse({**result, "gc_result_url": url})
+    if not confirm:
+        return JsonResponse({"error": "confirm required"}, status=400)
+    deleted_count, _ = orphans.delete()
+    result = {
+        "dry_run": False,
+        "deleted_count": deleted_count,
+        "orphans_count": 0,
+    }
+    url = _write_gc_result(result)
+    return JsonResponse({**result, "gc_result_url": url})
 
 
 @csrf_exempt
