@@ -555,6 +555,24 @@ class TenantMembership(models.Model):
         return f"{self.tenant.name} - {self.user_identity.email or self.user_identity.subject}"
 
 
+class BrandProfile(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.OneToOneField(Tenant, on_delete=models.CASCADE, related_name="brand_profile")
+    display_name = models.CharField(max_length=200, null=True, blank=True)
+    logo_url = models.CharField(max_length=500, null=True, blank=True)
+    primary_color = models.CharField(max_length=40, null=True, blank=True)
+    secondary_color = models.CharField(max_length=40, null=True, blank=True)
+    theme_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["tenant__name"]
+
+    def __str__(self) -> str:
+        return f"{self.tenant.name} branding"
+
+
 class ReleasePlan(models.Model):
     TARGET_CHOICES = [
         ("module", "Module"),

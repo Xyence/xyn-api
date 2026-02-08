@@ -69,6 +69,7 @@ from xyn_orchestrator.models import (
     UserIdentity,
     Tenant,
     TenantMembership,
+    BrandProfile,
 )
 
 
@@ -323,6 +324,54 @@ class PlatformAdminTests(TestCase):
         response = self.client.post(
             f"/xyn/internal/tenants/{tenant.id}/contacts",
             data=json.dumps({"name": "Admin", "email": "admin@acme.io"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_branding_requires_membership(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        identity = UserIdentity.objects.create(provider="oidc", issuer="https://issuer.example.com", subject="sub-user")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session.save()
+        response = self.client.get(f"/xyn/api/tenants/{tenant.id}/branding")
+        self.assertEqual(response.status_code, 403)
+
+    def test_tenant_admin_can_update_branding(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        identity = UserIdentity.objects.create(provider="oidc", issuer="https://issuer.example.com", subject="sub-user")
+        TenantMembership.objects.create(tenant=tenant, user_identity=identity, role="tenant_admin")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session.save()
+        response = self.client.patch(
+            f"/xyn/internal/tenants/{tenant.id}/branding",
+            data=json.dumps({"display_name": "Acme Corp", "logo_url": "https://example.com/logo.png"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        profile = BrandProfile.objects.get(tenant=tenant)
+        self.assertEqual(profile.display_name, "Acme Corp")
+
+    def test_default_branding_fallback(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        identity = UserIdentity.objects.create(provider="oidc", issuer="https://issuer.example.com", subject="sub-user")
+        TenantMembership.objects.create(tenant=tenant, user_identity=identity, role="tenant_viewer")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session.save()
+        response = self.client.get(f"/xyn/api/tenants/{tenant.id}/branding")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("display_name", body)
+        self.assertIn("logo_url", body)
+
+    def test_platform_admin_can_edit_any_branding(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        self._set_admin_session()
+        response = self.client.patch(
+            f"/xyn/internal/tenants/{tenant.id}/branding",
+            data=json.dumps({"display_name": "Platform Edit"}),
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)

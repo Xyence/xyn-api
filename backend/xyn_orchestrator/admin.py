@@ -44,6 +44,7 @@ from .models import (
     Tenant,
     Contact,
     TenantMembership,
+    BrandProfile,
     VoiceNote,
     VoiceTranscript,
 )
@@ -200,6 +201,12 @@ class TenantMembershipAdmin(admin.ModelAdmin):
     list_display = ("tenant", "user_identity", "role", "status", "updated_at")
     search_fields = ("tenant__name", "user_identity__email", "user_identity__subject")
     list_filter = ("role", "status", "tenant")
+
+
+@admin.register(BrandProfile)
+class BrandProfileAdmin(admin.ModelAdmin):
+    list_display = ("tenant", "display_name", "updated_at")
+    search_fields = ("tenant__name", "display_name")
 
 
 @admin.register(ReleasePlan)

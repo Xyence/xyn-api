@@ -59,6 +59,7 @@ from .models import (
     Tenant,
     Contact,
     TenantMembership,
+    BrandProfile,
 )
 from .module_registry import maybe_sync_modules_from_registry
 
@@ -634,6 +635,29 @@ def _serialize_membership(membership: TenantMembership) -> Dict[str, Any]:
     }
 
 
+def _default_branding() -> Dict[str, Any]:
+    return {
+        "display_name": "Xyn Console",
+        "logo_url": "/xyence-logo.png",
+        "theme": {},
+    }
+
+
+def _serialize_branding(profile: Optional[BrandProfile]) -> Dict[str, Any]:
+    if not profile:
+        return _default_branding()
+    theme = profile.theme_json or {}
+    if profile.primary_color:
+        theme = {**theme, "--accent": profile.primary_color}
+    if profile.secondary_color:
+        theme = {**theme, "--accent-secondary": profile.secondary_color}
+    return {
+        "display_name": profile.display_name or _default_branding()["display_name"],
+        "logo_url": profile.logo_url or _default_branding()["logo_url"],
+        "theme": theme,
+    }
+
+
 @csrf_exempt
 @require_role("platform_admin")
 def tenants_collection(request: HttpRequest) -> JsonResponse:
@@ -877,6 +901,52 @@ def my_profile(request: HttpRequest) -> JsonResponse:
             "memberships": membership_data,
         }
     )
+
+
+def tenant_branding_public(request: HttpRequest, tenant_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_admin(identity) and not _require_tenant_access(identity, tenant_id, "tenant_viewer"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    tenant = get_object_or_404(Tenant, id=tenant_id)
+    profile = getattr(tenant, "brand_profile", None)
+    return JsonResponse(_serialize_branding(profile))
+
+
+@csrf_exempt
+def tenant_branding_update(request: HttpRequest, tenant_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_admin(identity) and not _require_tenant_access(identity, tenant_id, "tenant_admin"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method not in ("PATCH", "PUT"):
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    tenant = get_object_or_404(Tenant, id=tenant_id)
+    payload = _parse_json(request)
+    profile, _created = BrandProfile.objects.get_or_create(tenant=tenant)
+    if "display_name" in payload:
+        profile.display_name = payload.get("display_name")
+    if "logo_url" in payload:
+        profile.logo_url = payload.get("logo_url")
+    if "primary_color" in payload:
+        profile.primary_color = payload.get("primary_color")
+    if "secondary_color" in payload:
+        profile.secondary_color = payload.get("secondary_color")
+    if "theme_json" in payload:
+        profile.theme_json = payload.get("theme_json")
+    profile.save(
+        update_fields=[
+            "display_name",
+            "logo_url",
+            "primary_color",
+            "secondary_color",
+            "theme_json",
+            "updated_at",
+        ]
+    )
+    return JsonResponse({"status": "ok"})
 
 
 @csrf_exempt
