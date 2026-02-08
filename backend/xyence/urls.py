@@ -74,6 +74,7 @@ from xyn_orchestrator.provisioning_views import (
     bootstrap_log_view,
     destroy_instance_view,
     get_instance,
+    instance_containers_view,
     list_instances,
     retry_instance_view,
 )
@@ -208,6 +209,7 @@ urlpatterns = [
     path("xyn/api/provision/instances/<uuid:instance_id>/destroy", destroy_instance_view),
     path("xyn/api/provision/instances/<uuid:instance_id>/retry", retry_instance_view),
     path("xyn/api/provision/instances/<uuid:instance_id>/bootstrap-log", bootstrap_log_view),
+    path("xyn/api/provision/instances/<uuid:instance_id>/containers", instance_containers_view),
     path("xyn/internal/voice-notes/<uuid:voice_note_id>", internal_voice_note),
     path("xyn/internal/voice-notes/<uuid:voice_note_id>/audio", internal_voice_note_audio),
     path("xyn/internal/voice-notes/<uuid:voice_note_id>/transcript", internal_voice_note_transcript),

@@ -1,5 +1,9 @@
 import json
-from typing import Any
+import time
+from typing import Any, Dict, List, Tuple
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404
@@ -118,3 +122,91 @@ def bootstrap_log_view(request: HttpRequest, instance_id: str) -> JsonResponse:
     except Exception as exc:
         return JsonResponse({"error": str(exc)}, status=400)
     return JsonResponse({"instance_id": str(instance.id), **log})
+
+
+def _run_ssm_commands(instance: ProvisionedInstance, commands: List[str]) -> Dict[str, Any]:
+    if not instance.instance_id:
+        raise RuntimeError("Instance has no AWS instance_id")
+    if not instance.aws_region:
+        raise RuntimeError("Instance has no aws_region")
+    ssm = boto3.client("ssm", region_name=instance.aws_region)
+    try:
+        cmd = ssm.send_command(
+            InstanceIds=[instance.instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": commands},
+            TimeoutSeconds=600,
+        )
+    except (BotoCoreError, ClientError) as exc:
+        raise RuntimeError(f"SSM send_command failed: {exc}") from exc
+    command_id = cmd["Command"]["CommandId"]
+    last_error = None
+    for _ in range(40):
+        time.sleep(2)
+        try:
+            out = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance.instance_id)
+        except (BotoCoreError, ClientError) as exc:
+            last_error = exc
+            continue
+        status = out.get("Status")
+        if status in {"Success", "Failed", "Cancelled", "TimedOut"}:
+            return {
+                "ssm_command_id": command_id,
+                "status": status,
+                "stdout": out.get("StandardOutputContent", ""),
+                "stderr": out.get("StandardErrorContent", ""),
+            }
+    raise RuntimeError(f"SSM command invocation not found yet: {last_error}")
+
+
+@login_required
+def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    try:
+        result = _run_ssm_commands(
+            instance,
+            [
+                "command -v docker >/dev/null 2>&1 || { echo 'missing_docker'; exit 10; }",
+                "docker ps --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'",
+            ],
+        )
+        status = result.get("status")
+        if status != "Success":
+            return JsonResponse(
+                {
+                    "instance_id": str(instance.id),
+                    "status": status,
+                    "ssm_command_id": result.get("ssm_command_id"),
+                    "error": result.get("stderr") or result.get("stdout") or "SSM failed",
+                    "containers": [],
+                },
+                status=500,
+            )
+        containers = []
+        for line in (result.get("stdout") or "").splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("|")
+            if len(parts) < 5:
+                continue
+            containers.append(
+                {
+                    "id": parts[0],
+                    "name": parts[1],
+                    "image": parts[2],
+                    "status": parts[3],
+                    "ports": parts[4],
+                }
+            )
+        return JsonResponse(
+            {
+                "instance_id": str(instance.id),
+                "status": "ok",
+                "ssm_command_id": result.get("ssm_command_id"),
+                "containers": containers,
+            }
+        )
+    except Exception as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
