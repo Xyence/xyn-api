@@ -81,6 +81,64 @@ def _download_artifact_json(run_id: str, name: str) -> Optional[Dict[str, Any]]:
     return json.loads(content.decode("utf-8"))
 
 
+def _download_artifact_text(run_id: str, name: str) -> Optional[str]:
+    artifacts = _get_run_artifacts(run_id)
+    match = next((artifact for artifact in artifacts if artifact.get("name") == name), None)
+    if not match or not match.get("url"):
+        return None
+    url = match["url"]
+    if url.startswith("http"):
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        return response.text
+    content = _download_file(url)
+    return content.decode("utf-8")
+
+
+def _download_url_json(url: str) -> Dict[str, Any]:
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+
+def _download_url_text(url: str) -> str:
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response.text
+
+
+def _canonicalize_compose_content(compose_content: str) -> str:
+    return compose_content.rstrip("\n") + "\n"
+
+
+def _canonicalize_manifest_json(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_hex(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _resolve_release_manifest_from_release(
+    release_uuid: Optional[str],
+    release_version: Optional[str],
+    blueprint_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not release_uuid and not release_version:
+        return None
+    params: Dict[str, Any] = {}
+    if release_uuid:
+        params["release_uuid"] = release_uuid
+    if release_version:
+        params["release_version"] = release_version
+    if blueprint_id:
+        params["blueprint_id"] = blueprint_id
+    release = _post_json("/xyn/internal/releases/resolve", params)
+    if not release:
+        return None
+    return release
+
+
 def _load_schema(filename: str) -> Dict[str, Any]:
     path = os.path.join(SCHEMA_ROOT, filename)
     with open(path, "r", encoding="utf-8") as handle:
@@ -2821,6 +2879,10 @@ def _build_remote_pull_apply_commands(
     root_dir: str,
     compose_content: str,
     compose_hash: str,
+    manifest_json: str,
+    manifest_hash: str,
+    release_id: str,
+    release_uuid: str,
     registry_region: str,
     registry_host: str,
     extra_env: Dict[str, str],
@@ -2833,6 +2895,16 @@ def _build_remote_pull_apply_commands(
         env_exports.append(f"export {key}=\"{safe_value}\"")
     compose_path = f"{root_dir}/compose.release.yml"
     hash_path = f"{root_dir}/compose.release.sha256"
+    compose_tmp = f"{compose_path}.tmp"
+    hash_tmp = f"{hash_path}.tmp"
+    manifest_path = f"{root_dir}/release_manifest.json"
+    manifest_hash_path = f"{root_dir}/release_manifest.sha256"
+    manifest_tmp = f"{manifest_path}.tmp"
+    manifest_hash_tmp = f"{manifest_hash_path}.tmp"
+    release_id_path = f"{root_dir}/release_id"
+    release_id_tmp = f"{release_id_path}.tmp"
+    release_uuid_path = f"{root_dir}/release_uuid"
+    release_uuid_tmp = f"{release_uuid_path}.tmp"
     return [
         "set -euo pipefail",
         "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
@@ -2841,8 +2913,18 @@ def _build_remote_pull_apply_commands(
         "command -v curl >/dev/null 2>&1 || { echo \"missing_curl\"; exit 13; }",
         f"ROOT={root_dir}",
         "mkdir -p \"$ROOT\"",
-        f"cat <<'EOF' > \"{compose_path}\"\n{compose_content}\nEOF",
-        f"echo \"{compose_hash}\" > \"{hash_path}\"",
+        f"cat <<'EOF' > \"{compose_tmp}\"\n{compose_content}\nEOF",
+        f"mv \"{compose_tmp}\" \"{compose_path}\"",
+        f"echo \"{compose_hash}\" > \"{hash_tmp}\"",
+        f"mv \"{hash_tmp}\" \"{hash_path}\"",
+        f"cat <<'EOF' > \"{manifest_tmp}\"\n{manifest_json}\nEOF",
+        f"mv \"{manifest_tmp}\" \"{manifest_path}\"",
+        f"echo \"{manifest_hash}\" > \"{manifest_hash_tmp}\"",
+        f"mv \"{manifest_hash_tmp}\" \"{manifest_hash_path}\"",
+        f"echo \"{release_id}\" > \"{release_id_tmp}\"",
+        f"mv \"{release_id_tmp}\" \"{release_id_path}\"",
+        f"echo \"{release_uuid}\" > \"{release_uuid_tmp}\"",
+        f"mv \"{release_uuid_tmp}\" \"{release_uuid_path}\"",
         f"aws ecr get-login-password --region {registry_region} | docker login --username AWS --password-stdin {registry_host}",
         *env_exports,
         f"docker compose -f \"{compose_path}\" pull",
@@ -2852,24 +2934,57 @@ def _build_remote_pull_apply_commands(
     ]
 
 
-def _ssm_fetch_image_ids(instance_id: str, aws_region: str) -> Dict[str, str]:
+def _ssm_fetch_running_image_digests(instance_id: str, aws_region: str) -> Dict[str, str]:
     cmd = [
         "set -euo pipefail",
         "API_ID=$(docker ps -q --filter \"name=ems-api\" || true)",
         "WEB_ID=$(docker ps -q --filter \"name=ems-web\" || true)",
-        "if [ -n \"$API_ID\" ]; then docker inspect --format '{{.Image}}' $API_ID; fi",
-        "if [ -n \"$WEB_ID\" ]; then docker inspect --format '{{.Image}}' $WEB_ID; fi",
+        "if [ -n \"$API_ID\" ]; then "
+        "IMG_REF=$(docker inspect --format '{{.Config.Image}}' $API_ID || true); "
+        "if echo \"$IMG_REF\" | grep -q '@sha256:'; then "
+        "DIGEST=$(echo \"$IMG_REF\" | awk -F'@' '{print $2}'); "
+        "echo \"ems-api=$DIGEST\"; "
+        "else "
+        "IMG_ID=$(docker inspect --format '{{.Image}}' $API_ID); "
+        "REPOS=$(docker image inspect --format '{{join .RepoDigests \"\\n\"}}' $IMG_ID || true); "
+        "if [ -n \"$REPOS\" ]; then "
+        "DIGEST=$(echo \"$REPOS\" | head -n1 | awk -F'@' '{print $2}'); "
+        "echo \"ems-api=$DIGEST\"; "
+        "fi; "
+        "fi; "
+        "fi",
+        "if [ -n \"$WEB_ID\" ]; then "
+        "IMG_REF=$(docker inspect --format '{{.Config.Image}}' $WEB_ID || true); "
+        "if echo \"$IMG_REF\" | grep -q '@sha256:'; then "
+        "DIGEST=$(echo \"$IMG_REF\" | awk -F'@' '{print $2}'); "
+        "echo \"ems-web=$DIGEST\"; "
+        "else "
+        "IMG_ID=$(docker inspect --format '{{.Image}}' $WEB_ID); "
+        "REPOS=$(docker image inspect --format '{{join .RepoDigests \"\\n\"}}' $IMG_ID || true); "
+        "if [ -n \"$REPOS\" ]; then "
+        "DIGEST=$(echo \"$REPOS\" | head -n1 | awk -F'@' '{print $2}'); "
+        "echo \"ems-web=$DIGEST\"; "
+        "fi; "
+        "fi; "
+        "fi",
     ]
     result = _run_ssm_commands(instance_id, aws_region, cmd)
     if result.get("invocation_status") != "Success":
         raise RuntimeError(result.get("stderr") or "SSM image inspect failed")
     lines = [line.strip() for line in (result.get("stdout") or "").splitlines() if line.strip()]
     image_ids: Dict[str, str] = {}
-    if lines:
-        if len(lines) >= 1:
-            image_ids["ems-api"] = lines[0]
-        if len(lines) >= 2:
-            image_ids["ems-web"] = lines[1]
+    for line in lines:
+        if "=" not in line:
+            continue
+        svc, value = line.split("=", 1)
+        svc = svc.strip()
+        value = value.strip()
+        if not svc or not value:
+            continue
+        normalized = _normalize_digest(value)
+        if not normalized:
+            continue
+        image_ids[svc] = normalized
     return image_ids
 
 
@@ -2888,6 +3003,30 @@ def _ssm_fetch_compose_hash(instance_id: str, aws_region: str, hash_path: str) -
     return (result.get("stdout") or "").strip()
 
 
+def _ssm_fetch_runtime_marker(instance_id: str, aws_region: str, root_dir: str) -> Dict[str, Any]:
+    result = _run_ssm_commands(
+        instance_id,
+        aws_region,
+        [
+            "set -euo pipefail",
+            f"ROOT={root_dir}",
+            "if [ -f \"$ROOT/release_id\" ]; then cat \"$ROOT/release_id\"; fi",
+            "if [ -f \"$ROOT/release_uuid\" ]; then cat \"$ROOT/release_uuid\"; fi",
+            "if [ -f \"$ROOT/release_manifest.sha256\" ]; then cat \"$ROOT/release_manifest.sha256\"; fi",
+            "if [ -f \"$ROOT/compose.release.sha256\" ]; then cat \"$ROOT/compose.release.sha256\"; fi",
+        ],
+    )
+    if result.get("invocation_status") != "Success":
+        raise RuntimeError(result.get("stderr") or "SSM runtime marker read failed")
+    lines = [line.strip() for line in (result.get("stdout") or "").splitlines() if line.strip()]
+    return {
+        "release_id": lines[0] if len(lines) > 0 else "",
+        "release_uuid": lines[1] if len(lines) > 1 else "",
+        "manifest_sha256": lines[2] if len(lines) > 2 else "",
+        "compose_sha256": lines[3] if len(lines) > 3 else "",
+    }
+
+
 def _normalize_sha256(value: str) -> Optional[str]:
     if not value:
         return None
@@ -2901,6 +3040,13 @@ def _normalize_sha256(value: str) -> Optional[str]:
     except ValueError:
         return None
     return lowered
+
+
+def _normalize_digest(value: str) -> Optional[str]:
+    normalized = _normalize_sha256(value)
+    if not normalized:
+        return None
+    return f"sha256:{normalized}"
 
 
 def _validate_release_manifest_pinned(manifest: Dict[str, Any]) -> tuple[bool, List[Dict[str, str]]]:
@@ -2946,20 +3092,38 @@ def _validate_release_manifest_pinned(manifest: Dict[str, Any]) -> tuple[bool, L
                 "path": "compose.content_hash",
             }
         )
-    content = compose.get("content") or ""
-    if content and isinstance(images, dict):
-        for service, info in images.items():
-            digest = (info or {}).get("digest") or ""
-            normalized = _normalize_sha256(str(digest))
-            if normalized and normalized not in content.lower():
-                errors.append(
-                    {
-                        "code": "compose_missing_digest",
-                        "message": f"{service}: compose missing digest pin",
-                        "path": f"compose.content",
-                    }
-                )
     return len(errors) == 0, errors
+
+
+def _build_deploy_state_metadata(
+    release_target_id: str,
+    release_id: str,
+    release_uuid: str,
+    release_version: str,
+    manifest_run_id: str,
+    manifest_hash: str,
+    compose_hash: str,
+    outcome: str,
+) -> Dict[str, Any]:
+    payload = {
+        "release_target_id": release_target_id,
+        "release_id": release_id,
+        "release_uuid": release_uuid,
+        "release_version": release_version,
+        "manifest": {
+            "run_id": manifest_run_id,
+            "artifact": "release_manifest.json",
+            "content_hash": manifest_hash,
+        },
+        "compose": {"artifact": "compose.release.yml", "content_hash": compose_hash},
+        "deploy_outcome": outcome,
+    }
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    if outcome in {"succeeded", "noop"}:
+        payload["deployed_at"] = timestamp
+    else:
+        payload["failed_at"] = timestamp
+    return payload
 
 
 def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
@@ -3657,17 +3821,16 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     )
                     release_manifest["blueprint_id"] = blueprint_id or ""
                     release_manifest["release_target_id"] = (release_target or {}).get("id") or ""
-                    compose_content = _render_compose_for_images(images_map)
-                    compose_hash = hashlib.sha256(compose_content.encode("utf-8")).hexdigest()
+                    compose_content = _canonicalize_compose_content(_render_compose_for_images(images_map))
+                    compose_hash = _sha256_hex(compose_content)
                     release_manifest["compose"] = {
                         "file_path": "compose.release.yml",
                         "content_hash": compose_hash,
-                        "content": compose_content,
                     }
                     build_url = _write_artifact(run_id, "build_result.json", json.dumps(build_result, indent=2))
                     _post_json(
                         f"/xyn/internal/runs/{run_id}/artifacts",
-                        {"name": "build_result.json", "kind": "build", "url": build_url},
+                        {"name": "build_result.json", "kind": "build_result", "url": build_url},
                     )
                     manifest_url = _write_artifact(
                         run_id, "release_manifest.json", json.dumps(release_manifest, indent=2)
@@ -3675,6 +3838,11 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     _post_json(
                         f"/xyn/internal/runs/{run_id}/artifacts",
                         {"name": "release_manifest.json", "kind": "release_manifest", "url": manifest_url},
+                    )
+                    compose_url = _write_artifact(run_id, "compose.release.yml", compose_content)
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "compose.release.yml", "kind": "compose", "url": compose_url},
                     )
                     if source_run:
                         src_url = _write_artifact(
@@ -3684,6 +3852,39 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             f"/xyn/internal/runs/{source_run}/artifacts",
                             {"name": "release_manifest.json", "kind": "release_manifest", "url": src_url},
                         )
+                        src_compose_url = _write_artifact(source_run, "compose.release.yml", compose_content)
+                        _post_json(
+                            f"/xyn/internal/runs/{source_run}/artifacts",
+                            {"name": "compose.release.yml", "kind": "compose", "url": src_compose_url},
+                        )
+                    if build_result.get("outcome") == "succeeded":
+                        release_payload = {
+                            "blueprint_id": blueprint_id,
+                            "release_plan_id": source_entity_id if source_entity_type == "release_plan" else None,
+                            "created_from_run_id": run_id,
+                            "version": release_id,
+                            "status": "published",
+                            "artifacts_json": {
+                                "release_manifest": {
+                                    "run_id": str(run_id),
+                                    "artifact": "release_manifest.json",
+                                    "url": manifest_url,
+                                    "sha256": _sha256_hex(_canonicalize_manifest_json(release_manifest)),
+                                },
+                                "compose_file": {
+                                    "run_id": str(run_id),
+                                    "artifact": "compose.release.yml",
+                                    "url": compose_url,
+                                    "sha256": compose_hash,
+                                },
+                                "build_result": {
+                                    "run_id": str(run_id),
+                                    "artifact": "build_result.json",
+                                    "url": build_url,
+                                },
+                            },
+                        }
+                        _post_json("/xyn/internal/releases/upsert", release_payload)
                     artifacts.append(
                         {
                             "key": "build_result.json",
@@ -3830,6 +4031,8 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 try:
                     if not target_instance or not target_instance.get("instance_id"):
                         raise RuntimeError("Target instance missing for remote deploy")
+                    release_uuid = (work_item.get("config") or {}).get("release_uuid") or ""
+                    release_version = (work_item.get("config") or {}).get("release_version") or ""
                     effective_env = {}
                     secret_values: Dict[str, str] = {}
                     secret_keys: List[str] = []
@@ -4064,13 +4267,40 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     if secret_failed:
                         raise RuntimeError("Secret resolution failed.")
                     release_manifest = None
-                    if source_run:
+                    compose_content = None
+                    if release_uuid or release_version:
+                        resolved = _resolve_release_manifest_from_release(
+                            release_uuid, release_version, blueprint_id
+                        )
+                        if resolved:
+                            release_uuid = resolved.get("id") or release_uuid
+                            release_version = resolved.get("version") or release_version
+                            artifacts_json = resolved.get("artifacts_json") or {}
+                            manifest_info = artifacts_json.get("release_manifest") or {}
+                            compose_info = artifacts_json.get("compose_file") or {}
+                            if manifest_info.get("url"):
+                                release_manifest = _download_url_json(manifest_info["url"])
+                            if compose_info.get("url"):
+                                compose_content = _download_url_text(compose_info["url"])
+                    if not release_manifest and source_run:
                         release_manifest = _download_artifact_json(source_run, "release_manifest.json")
                     if not release_manifest:
                         raise RuntimeError("release_manifest.json not found for deploy")
                     images_map = release_manifest.get("images") or {}
-                    compose_content = (release_manifest.get("compose") or {}).get("content") or _render_compose_for_images(images_map)
-                    compose_hash = hashlib.sha256(compose_content.encode("utf-8")).hexdigest()
+                    compose_content = locals().get("compose_content")
+                    if not compose_content and source_run:
+                        compose_content = _download_artifact_text(source_run, "compose.release.yml")
+                    if not compose_content:
+                        compose_content = _render_compose_for_images(images_map)
+                    compose_content = _canonicalize_compose_content(compose_content)
+                    compose_hash = _sha256_hex(compose_content)
+                    manifest_hash = _normalize_sha256(
+                        str((release_manifest.get("compose") or {}).get("content_hash") or "")
+                    )
+                    if manifest_hash and _normalize_sha256(compose_hash) != manifest_hash:
+                        raise RuntimeError("compose.release.yml hash does not match release_manifest")
+                    manifest_json = _canonicalize_manifest_json(release_manifest)
+                    manifest_sha256 = _sha256_hex(manifest_json)
                     registry_region = (
                         (release_target or {}).get("runtime", {}).get("registry", {}).get("region")
                         or target_instance.get("aws_region")
@@ -4087,16 +4317,19 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     noop_debug = ""
                     if public_ok and images_map:
                         try:
-                            image_ids = _ssm_fetch_image_ids(
+                            image_ids = _ssm_fetch_running_image_digests(
                                 target_instance.get("instance_id"), target_instance.get("aws_region")
                             )
                             match = True
                             for svc, meta in images_map.items():
-                                digest = _normalize_sha256(str((meta or {}).get("digest") or ""))
+                                digest = _normalize_digest(str((meta or {}).get("digest") or ""))
                                 if not digest:
                                     match = False
                                     break
-                                remote_digest = _normalize_sha256(str(image_ids.get(svc) or ""))
+                                remote_digest = _normalize_digest(str(image_ids.get(svc) or ""))
+                                if not remote_digest:
+                                    match = False
+                                    break
                                 if remote_digest != digest:
                                     match = False
                                     break
@@ -4155,6 +4388,17 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                         "description": "Public verify checks",
                                     }
                                 )
+                                metadata_payload = _build_deploy_state_metadata(
+                                    str((release_target or {}).get("id") or ""),
+                                    str(release_manifest.get("release_id") or release_version or ""),
+                                    str(release_uuid or ""),
+                                    str(release_version or release_manifest.get("release_id") or ""),
+                                    str(source_run or run_id),
+                                    str((release_manifest.get("compose") or {}).get("content_hash") or manifest_sha256),
+                                    compose_hash,
+                                    "noop",
+                                )
+                                _post_json(f"/xyn/internal/runs/{run_id}", {"metadata_json": metadata_payload})
                                 noop_done = True
                         except Exception as exc:
                             noop_debug = f"noop_check_failed: {exc}"
@@ -4180,6 +4424,10 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
                             compose_content,
                             compose_hash,
+                            manifest_json,
+                            manifest_sha256,
+                            str(release_manifest.get("release_id") or release_version or ""),
+                            str(release_uuid or ""),
                             registry_region,
                             registry_host,
                             effective_env,
@@ -4240,6 +4488,17 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             f"/xyn/internal/runs/{run_id}/artifacts",
                             {"name": "deploy_result.json", "kind": "deploy", "url": deploy_url},
                         )
+                        metadata_payload = _build_deploy_state_metadata(
+                            str((release_target or {}).get("id") or ""),
+                            str(release_manifest.get("release_id") or release_version or ""),
+                            str(release_uuid or ""),
+                            str(release_version or release_manifest.get("release_id") or ""),
+                            str(source_run or run_id),
+                            str((release_manifest.get("compose") or {}).get("content_hash") or manifest_sha256),
+                            compose_hash,
+                            deploy_result.get("outcome") or "failed",
+                        )
+                        _post_json(f"/xyn/internal/runs/{run_id}", {"metadata_json": metadata_payload})
                         verify_url = _write_artifact(
                             run_id, "deploy_verify.json", json.dumps({"checks": public_checks}, indent=2)
                         )

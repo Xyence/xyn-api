@@ -6,7 +6,15 @@ from typing import Any, Dict, List, Optional
 from django.utils import timezone
 from jsonschema import Draft202012Validator
 
-from .models import BlueprintDraftSession, ContextPack, DraftSessionVoiceNote, OpenAIConfig, VoiceNote, VoiceTranscript
+from .models import (
+    BlueprintDraftSession,
+    ContextPack,
+    DraftSessionVoiceNote,
+    OpenAIConfig,
+    Run,
+    VoiceNote,
+    VoiceTranscript,
+)
 
 
 def _contracts_root() -> str:
@@ -76,6 +84,29 @@ def _openai_generate_blueprint(transcript: str, kind: str, context_text: str) ->
         return json.loads(response.output_text)
     except json.JSONDecodeError:
         return None
+
+
+def get_release_target_deploy_state(release_target_id: str) -> Dict[str, Any]:
+    run = (
+        Run.objects.filter(
+            metadata_json__release_target_id=str(release_target_id),
+            metadata_json__deploy_outcome__in=["succeeded", "noop"],
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if not run or not run.metadata_json:
+        return {}
+    meta = run.metadata_json or {}
+    return {
+        "run_id": str(run.id),
+        "release_target_id": meta.get("release_target_id"),
+        "release_id": meta.get("release_id"),
+        "manifest": meta.get("manifest") or {},
+        "compose": meta.get("compose") or {},
+        "deploy_outcome": meta.get("deploy_outcome"),
+        "deployed_at": meta.get("deployed_at"),
+    }
 
 
 def _transcribe_audio(path: str, language_code: str) -> Dict[str, Any]:

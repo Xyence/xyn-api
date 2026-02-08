@@ -838,6 +838,7 @@ def _select_next_slice(
         if entry.get("outcome") == "succeeded"
     }
     image_deploy_present = any(item.get("id") == "deploy.apply_remote_compose.pull" for item in work_items)
+    build_present = any(item.get("id") == "build.publish_images.container" for item in work_items)
     remote_http_items = (
         [
             "build.publish_images.container",
@@ -846,8 +847,17 @@ def _select_next_slice(
             "deploy.apply_remote_compose.pull",
             "verify.public_http",
         ]
-        if image_deploy_present
-        else ["dns.ensure_record.route53", "deploy.apply_remote_compose.ssm", "verify.public_http"]
+        if image_deploy_present and build_present
+        else (
+            [
+                "release.validate_manifest.pinned",
+                "dns.ensure_record.route53",
+                "deploy.apply_remote_compose.pull",
+                "verify.public_http",
+            ]
+            if image_deploy_present
+            else ["dns.ensure_record.route53", "deploy.apply_remote_compose.ssm", "verify.public_http"]
+        )
     )
     remote_https_items = (
         [
@@ -860,15 +870,27 @@ def _select_next_slice(
             "ingress.nginx_tls_configure",
             "verify.public_https",
         ]
-        if image_deploy_present
-        else [
-            "dns.ensure_record.route53",
-            "deploy.apply_remote_compose.ssm",
-            "verify.public_http",
-            "tls.acme_http01",
-            "ingress.nginx_tls_configure",
-            "verify.public_https",
-        ]
+        if image_deploy_present and build_present
+        else (
+            [
+                "release.validate_manifest.pinned",
+                "dns.ensure_record.route53",
+                "deploy.apply_remote_compose.pull",
+                "verify.public_http",
+                "tls.acme_http01",
+                "ingress.nginx_tls_configure",
+                "verify.public_https",
+            ]
+            if image_deploy_present
+            else [
+                "dns.ensure_record.route53",
+                "deploy.apply_remote_compose.ssm",
+                "verify.public_http",
+                "tls.acme_http01",
+                "ingress.nginx_tls_configure",
+                "verify.public_https",
+            ]
+        )
     )
     gap_to_items = {
         "local_chassis": ["ems-stack-prod-web"],
@@ -1014,6 +1036,7 @@ def _generate_implementation_plan(
     module_catalog: Optional[Dict[str, Any]] = None,
     run_history_summary: Optional[Dict[str, Any]] = None,
     release_target: Optional[Dict[str, Any]] = None,
+    manifest_override: bool = False,
 ) -> Dict[str, Any]:
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     repo_targets = _default_repo_targets()
@@ -1901,7 +1924,8 @@ def _generate_implementation_plan(
                     "deploy.apply_remote_compose.pull" if dep == "deploy.apply_remote_compose.ssm" else dep
                     for dep in item["depends_on"]
                 ]
-        if not any(item.get("id") == "build.publish_images.container" for item in work_items):
+        build_present = any(item.get("id") == "build.publish_images.container" for item in work_items)
+        if not manifest_override and not build_present:
             work_items.append(
                 {
                     "id": "build.publish_images.container",
@@ -1952,6 +1976,7 @@ def _generate_implementation_plan(
                     },
                 }
             )
+        build_present = any(item.get("id") == "build.publish_images.container" for item in work_items)
         if not any(item.get("id") == "release.validate_manifest.pinned" for item in work_items):
             work_items.append(
                 {
@@ -1973,7 +1998,7 @@ def _generate_implementation_plan(
                     "outputs": {"paths": [], "artifacts": ["validation_result.json"]},
                     "acceptance_criteria": ["Release manifest uses digest-pinned images."],
                     "verify": [{"name": "validate-manifest", "command": "echo 'handled by runner'", "cwd": "."}],
-                    "depends_on": ["build.publish_images.container"],
+                    "depends_on": ["build.publish_images.container"] if build_present else [],
                     "labels": ["deploy", "validate", "release"],
                 }
             )
@@ -2261,6 +2286,8 @@ def _generate_implementation_plan(
     if release_target:
         plan["release_target_id"] = release_target.get("id")
         plan["release_target_name"] = release_target.get("name")
+    if manifest_override:
+        plan["manifest_override"] = True
     return plan
 
 
@@ -2346,6 +2373,7 @@ def _queue_dev_tasks_for_plan(
             "remote-deploy-verify-https",
             "dns.ensure_record.route53",
             "deploy.apply_remote_compose.ssm",
+            "deploy.apply_remote_compose.pull",
             "verify.public_http",
             "tls.acme_http01",
             "ingress.nginx_tls_configure",
@@ -2858,6 +2886,7 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
             module_catalog=module_catalog,
             run_history_summary=run_history_summary,
             release_target=_release_target_payload(selected_release_target) if selected_release_target else None,
+            manifest_override=False,
         )
         plan_errors = _validate_schema(implementation_plan, "implementation_plan.v1.schema.json")
         if plan_errors:
@@ -4002,6 +4031,158 @@ def internal_release_plan_deploy_state(request: HttpRequest, plan_id: str) -> Js
 
 
 @csrf_exempt
+def internal_release_target_deploy_manifest(request: HttpRequest, target_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    manifest_run_id = payload.get("manifest_run_id")
+    manifest_artifact = payload.get("manifest_artifact") or "release_manifest.json"
+    compose_artifact = payload.get("compose_artifact") or "compose.release.yml"
+    if not manifest_run_id:
+        return JsonResponse({"error": "manifest_run_id required"}, status=400)
+    release_target = get_object_or_404(ReleaseTarget, id=target_id)
+    blueprint = release_target.blueprint
+    if not blueprint:
+        return JsonResponse({"error": "release target missing blueprint"}, status=400)
+    source_manifest = RunArtifact.objects.filter(run_id=manifest_run_id, name=manifest_artifact).first()
+    source_compose = RunArtifact.objects.filter(run_id=manifest_run_id, name=compose_artifact).first()
+    if not source_manifest or not source_compose:
+        return JsonResponse({"error": "manifest or compose artifact not found"}, status=404)
+    run = Run.objects.create(
+        entity_type="blueprint",
+        entity_id=blueprint.id,
+        status="running",
+        summary=f"Deploy manifest for {blueprint.namespace}.{blueprint.name}",
+        log_text="Preparing deploy-by-manifest run\n",
+    )
+    RunArtifact.objects.create(
+        run=run,
+        name=manifest_artifact,
+        kind=source_manifest.kind or "release_manifest",
+        url=source_manifest.url,
+    )
+    RunArtifact.objects.create(
+        run=run,
+        name=compose_artifact,
+        kind=source_compose.kind or "compose",
+        url=source_compose.url,
+    )
+    module_catalog = _build_module_catalog()
+    _write_run_artifact(run, "module_catalog.v1.json", module_catalog, "module_catalog")
+    release_payload = _release_target_payload(release_target)
+    _write_run_artifact(run, "release_target.json", release_payload, "release_target")
+    run_history_summary = _build_run_history_summary(blueprint)
+    _write_run_artifact(run, "run_history_summary.v1.json", run_history_summary, "run_history_summary")
+    implementation_plan = _generate_implementation_plan(
+        blueprint,
+        module_catalog=module_catalog,
+        run_history_summary=run_history_summary,
+        release_target=release_payload,
+        manifest_override=True,
+    )
+    _write_run_artifact(run, "implementation_plan.json", implementation_plan, "implementation_plan")
+    _queue_dev_tasks_for_plan(
+        blueprint=blueprint,
+        run=run,
+        plan=implementation_plan,
+        namespace=blueprint.namespace,
+        project_key=f"{blueprint.namespace}.{blueprint.name}",
+        release_target=release_payload,
+        enqueue_jobs=True,
+    )
+    run.status = "succeeded"
+    run.finished_at = timezone.now()
+    run.log_text = (run.log_text or "") + "Queued deploy-by-manifest tasks\n"
+    run.save(update_fields=["status", "finished_at", "log_text", "updated_at"])
+    _write_run_summary(run)
+    return JsonResponse({"run_id": str(run.id), "status": run.status})
+
+
+@csrf_exempt
+def internal_release_target_deploy_release(request: HttpRequest, target_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    release_uuid = payload.get("release_uuid")
+    release_version = payload.get("release_version")
+    if not release_uuid and not release_version:
+        return JsonResponse({"error": "release_uuid or release_version required"}, status=400)
+    release_target = get_object_or_404(ReleaseTarget, id=target_id)
+    blueprint = release_target.blueprint
+    if not blueprint:
+        return JsonResponse({"error": "release target missing blueprint"}, status=400)
+    if release_uuid:
+        release = Release.objects.filter(id=release_uuid).first()
+    else:
+        release = Release.objects.filter(version=release_version, blueprint_id=blueprint.id).first()
+    if not release:
+        return JsonResponse({"error": "release not found"}, status=404)
+    artifacts_json = release.artifacts_json or {}
+    manifest_info = artifacts_json.get("release_manifest") or {}
+    compose_info = artifacts_json.get("compose_file") or {}
+    if not manifest_info.get("url") or not compose_info.get("url"):
+        return JsonResponse({"error": "release artifacts missing"}, status=400)
+    run = Run.objects.create(
+        entity_type="blueprint",
+        entity_id=blueprint.id,
+        status="running",
+        summary=f"Deploy release {release.version} for {blueprint.namespace}.{blueprint.name}",
+        log_text="Preparing deploy-by-release run\n",
+        metadata_json={"release_uuid": str(release.id), "release_version": release.version},
+    )
+    RunArtifact.objects.create(
+        run=run,
+        name="release_manifest.json",
+        kind="release_manifest",
+        url=manifest_info.get("url"),
+    )
+    RunArtifact.objects.create(
+        run=run,
+        name="compose.release.yml",
+        kind="compose",
+        url=compose_info.get("url"),
+    )
+    module_catalog = _build_module_catalog()
+    _write_run_artifact(run, "module_catalog.v1.json", module_catalog, "module_catalog")
+    release_payload = _release_target_payload(release_target)
+    _write_run_artifact(run, "release_target.json", release_payload, "release_target")
+    run_history_summary = _build_run_history_summary(blueprint)
+    _write_run_artifact(run, "run_history_summary.v1.json", run_history_summary, "run_history_summary")
+    implementation_plan = _generate_implementation_plan(
+        blueprint,
+        module_catalog=module_catalog,
+        run_history_summary=run_history_summary,
+        release_target=release_payload,
+        manifest_override=True,
+    )
+    for item in implementation_plan.get("work_items", []):
+        if item.get("id") == "deploy.apply_remote_compose.pull":
+            item.setdefault("config", {})
+            item["config"]["release_uuid"] = str(release.id)
+            item["config"]["release_version"] = release.version
+    _write_run_artifact(run, "implementation_plan.json", implementation_plan, "implementation_plan")
+    _queue_dev_tasks_for_plan(
+        blueprint=blueprint,
+        run=run,
+        plan=implementation_plan,
+        namespace=blueprint.namespace,
+        project_key=f"{blueprint.namespace}.{blueprint.name}",
+        release_target=release_payload,
+        enqueue_jobs=True,
+    )
+    run.status = "succeeded"
+    run.finished_at = timezone.now()
+    run.log_text = (run.log_text or "") + "Queued deploy-by-release tasks\n"
+    run.save(update_fields=["status", "finished_at", "log_text", "metadata_json", "updated_at"])
+    _write_run_summary(run)
+    return JsonResponse({"run_id": str(run.id), "status": run.status})
+
+
+@csrf_exempt
 def internal_release_create(request: HttpRequest) -> JsonResponse:
     if token_error := _require_internal_token(request):
         return token_error
@@ -4024,6 +4205,68 @@ def internal_release_create(request: HttpRequest) -> JsonResponse:
         artifacts_json=payload.get("artifacts_json"),
     )
     return JsonResponse({"id": str(release.id), "version": release.version})
+
+
+@csrf_exempt
+def internal_release_upsert(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    blueprint_id = payload.get("blueprint_id")
+    version = payload.get("version")
+    if not blueprint_id or not version:
+        return JsonResponse({"error": "blueprint_id and version required"}, status=400)
+    release = Release.objects.filter(blueprint_id=blueprint_id, version=version).first()
+    if release:
+        release.status = payload.get("status", release.status)
+        release.artifacts_json = payload.get("artifacts_json") or release.artifacts_json
+        if payload.get("release_plan_id"):
+            release.release_plan_id = payload.get("release_plan_id")
+        if payload.get("created_from_run_id"):
+            release.created_from_run_id = payload.get("created_from_run_id")
+        release.save()
+    else:
+        release = Release.objects.create(
+            blueprint_id=blueprint_id,
+            release_plan_id=payload.get("release_plan_id"),
+            created_from_run_id=payload.get("created_from_run_id"),
+            version=version,
+            status=payload.get("status", "draft"),
+            artifacts_json=payload.get("artifacts_json"),
+        )
+    return JsonResponse({"id": str(release.id), "version": release.version})
+
+
+@csrf_exempt
+def internal_release_resolve(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    release_uuid = payload.get("release_uuid")
+    release_version = payload.get("release_version")
+    blueprint_id = payload.get("blueprint_id")
+    release = None
+    if release_uuid:
+        release = Release.objects.filter(id=release_uuid).first()
+    if not release and release_version:
+        qs = Release.objects.filter(version=release_version)
+        if blueprint_id:
+            qs = qs.filter(blueprint_id=blueprint_id)
+        release = qs.first()
+    if not release:
+        return JsonResponse({"error": "release not found"}, status=404)
+    return JsonResponse(
+        {
+            "id": str(release.id),
+            "version": release.version,
+            "blueprint_id": str(release.blueprint_id) if release.blueprint_id else "",
+            "artifacts_json": release.artifacts_json or {},
+        }
+    )
 
 
 @csrf_exempt

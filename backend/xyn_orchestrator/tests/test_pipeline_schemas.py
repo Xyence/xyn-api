@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from django.test import TestCase
+from django.test import TestCase, RequestFactory
 from jsonschema import Draft202012Validator
 import yaml
 
@@ -19,6 +19,8 @@ from xyn_orchestrator.blueprints import (
     _release_target_payload,
     _select_context_packs_for_dev_task,
     _select_next_slice,
+    internal_release_resolve,
+    internal_release_upsert,
     _write_run_artifact,
 )
 from xyn_orchestrator.xyn_api import _validate_release_target_payload
@@ -26,17 +28,21 @@ from xyn_orchestrator.worker_tasks import (
     _apply_scaffold_for_work_item,
     _collect_git_diff,
     _build_deploy_manifest,
+    _build_deploy_state_metadata,
+    _build_remote_pull_apply_commands,
     _merge_release_env,
     _mark_noop_codegen,
     _redact_secrets,
     _stage_all,
     _normalize_sha256,
+    _normalize_digest,
     _validate_release_manifest_pinned,
     _route53_ensure_with_noop,
     _run_remote_deploy,
     _work_item_capabilities,
 )
 from xyn_orchestrator.models import Blueprint, ContextPack, DevTask, Run, ReleaseTarget
+from xyn_orchestrator.models import Release
 
 
 class PipelineSchemaTests(TestCase):
@@ -456,6 +462,92 @@ class PipelineSchemaTests(TestCase):
     def test_noop_digest_normalization(self):
         digest = "SHA256:" + "A" * 64
         self.assertEqual(_normalize_sha256(digest), "a" * 64)
+
+    def test_normalize_digest_preserves_prefix(self):
+        digest = "SHA256:" + "A" * 64
+        self.assertEqual(_normalize_digest(digest), "sha256:" + "a" * 64)
+
+    def test_manifest_override_excludes_build_step(self):
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        release_target = {
+            "schema_version": "release_target.v1",
+            "id": str(uuid.uuid4()),
+            "blueprint_id": str(blueprint.id),
+            "name": "manager-demo",
+            "target_instance_id": str(uuid.uuid4()),
+            "fqdn": "ems.xyence.io",
+            "dns": {"provider": "route53"},
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "tls": {"mode": "none"},
+            "created_at": "2026-02-07T00:00:00Z",
+            "updated_at": "2026-02-07T00:00:00Z",
+        }
+        plan = _generate_implementation_plan(blueprint, release_target=release_target, manifest_override=True)
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertNotIn("build.publish_images.container", ids)
+        self.assertIn("release.validate_manifest.pinned", ids)
+        self.assertIn("deploy.apply_remote_compose.pull", ids)
+
+    def test_deploy_state_metadata_payload(self):
+        payload = _build_deploy_state_metadata(
+            release_target_id=str(uuid.uuid4()),
+            release_id="rel-1",
+            release_uuid=str(uuid.uuid4()),
+            release_version="v1",
+            manifest_run_id=str(uuid.uuid4()),
+            manifest_hash="abc",
+            compose_hash="def",
+            outcome="succeeded",
+        )
+        self.assertEqual(payload.get("deploy_outcome"), "succeeded")
+        self.assertEqual(payload.get("manifest", {}).get("content_hash"), "abc")
+        self.assertEqual(payload.get("compose", {}).get("content_hash"), "def")
+
+    def test_runtime_marker_commands_include_manifest_files(self):
+        commands = _build_remote_pull_apply_commands(
+            "/opt/xyn/apps/ems",
+            "services:\n  ems-api:\n    image: test\n",
+            "deadbeef",
+            "{\"schema_version\":\"release_manifest.v1\"}",
+            "bead",
+            "rel-1",
+            "rel-uuid-1",
+            "us-west-2",
+            "123456789012.dkr.ecr.us-west-2.amazonaws.com",
+            {},
+        )
+        joined = "\n".join(commands)
+        self.assertIn("release_manifest.json", joined)
+        self.assertIn("release_manifest.sha256", joined)
+        self.assertIn("release_id", joined)
+
+    def test_release_upsert_and_resolve(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        payload = {
+            "blueprint_id": str(blueprint.id),
+            "version": "rel-1",
+            "status": "published",
+            "artifacts_json": {"release_manifest": {"url": "http://example/manifest.json"}},
+        }
+        request = factory.post(
+            "/xyn/internal/releases/upsert",
+            data=json.dumps(payload),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_release_upsert(request)
+        self.assertEqual(response.status_code, 200)
+        release = Release.objects.get(blueprint_id=blueprint.id, version="rel-1")
+        resolve_request = factory.post(
+            "/xyn/internal/releases/resolve",
+            data=json.dumps({"release_version": "rel-1", "blueprint_id": str(blueprint.id)}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        resolve_response = internal_release_resolve(resolve_request)
+        self.assertEqual(resolve_response.status_code, 200)
 
     def test_planner_selects_remote_deploy_slice(self):
         blueprint = Blueprint.objects.create(
