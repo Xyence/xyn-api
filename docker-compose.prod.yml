@@ -1,4 +1,68 @@
 services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-xyence}
+      POSTGRES_USER: ${POSTGRES_USER:-xyence}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xyence}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+    image: xyn-api-backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      POSTGRES_HOST: db
+      XYNSEED_BASE_URL: ${XYNSEED_BASE_URL:-http://host.docker.internal:8001/api/v1}
+      XYNSEED_API_TOKEN: ${XYNSEED_API_TOKEN:-}
+      XYNSEED_CONTRACTS_ROOT: /xyn-contracts
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcp-speech.json
+      XYENCE_ASYNC_JOBS_MODE: ${XYENCE_ASYNC_JOBS_MODE:-redis}
+      XYENCE_JOBS_REDIS_URL: ${XYENCE_JOBS_REDIS_URL:-redis://redis:6379/0}
+      XYENCE_INTERNAL_TOKEN: ${XYENCE_INTERNAL_TOKEN:-change-me}
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - backend_media:/app/media
+      - backend_static:/app/staticfiles
+      - /home/ubuntu/src/xyn-contracts:/xyn-contracts:ro
+      - /home/ubuntu/central-xyence-io-9d049e62e994.json:/secrets/gcp-speech.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  worker:
+    build:
+      context: ./backend
+    image: xyn-api-worker
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      XYNSEED_CONTRACTS_ROOT: /xyn-contracts
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcp-speech.json
+      XYENCE_JOBS_REDIS_URL: ${XYENCE_JOBS_REDIS_URL:-redis://redis:6379/0}
+      XYENCE_INTERNAL_BASE_URL: http://backend:8000
+      XYENCE_INTERNAL_TOKEN: ${XYENCE_INTERNAL_TOKEN:-change-me}
+      XYENCE_MEDIA_ROOT: /app/media
+    depends_on:
+      - redis
+      - backend
+    command: python -m xyn_orchestrator.worker
+    volumes:
+      - /home/ubuntu/src/xyn-contracts:/xyn-contracts:ro
+      - /home/ubuntu/central-xyence-io-9d049e62e994.json:/secrets/gcp-speech.json:ro
+      - backend_media:/app/media
+
   nginx:
     image: nginx:1.27-alpine
     restart: unless-stopped
@@ -50,9 +114,18 @@ services:
       /bin/sh -c "trap exit TERM; while :; do sleep 12h & wait $${!}; nginx -s reload; done"
 
 volumes:
+  postgres_data:
+    name: xyence-web_postgres_data
+    external: true
   certbot_www:
     name: xyence-web_certbot_www
     external: true
   certbot_certs:
     name: xyence-web_certbot_certs
+    external: true
+  backend_media:
+    name: xyence-web_backend_media
+    external: true
+  backend_static:
+    name: xyence-web_backend_static
     external: true
