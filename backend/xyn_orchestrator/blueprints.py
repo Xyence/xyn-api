@@ -4339,10 +4339,22 @@ def internal_release_target_rollback_last_success(request: HttpRequest, target_i
 def _build_release_retention(
     blueprint_id: str, environment_id: Optional[str], keep: int
 ) -> Dict[str, Any]:
-    plan = _build_release_retention(blueprint_id, environment_id, keep)
-    retained = plan["retained"]
-    candidates = plan["candidates"]
-    protected = plan["protected"]
+    qs = Release.objects.filter(blueprint_id=blueprint_id, status="published").order_by("-created_at")
+    if environment_id:
+        qs = qs.filter(environment_id=environment_id)
+    releases = list(qs)
+    retained = releases[:keep]
+    candidates = releases[keep:]
+    targets_qs = ReleaseTarget.objects.filter(blueprint_id=blueprint_id)
+    if environment_id:
+        targets_qs = targets_qs.filter(environment=environment_id)
+    referenced_ids = set()
+    for target in targets_qs:
+        state = get_release_target_deploy_state(str(target.id))
+        rel_uuid = (state or {}).get("release_uuid")
+        if rel_uuid:
+            referenced_ids.add(rel_uuid)
+    protected = [rel for rel in releases if str(rel.id) in referenced_ids and rel not in retained]
     return {
         "retained": retained,
         "candidates": candidates,
@@ -4377,22 +4389,10 @@ def internal_releases_retention_report(request: HttpRequest) -> JsonResponse:
     keep = int(request.GET.get("keep") or 20)
     if not blueprint_id:
         return JsonResponse({"error": "blueprint_id required"}, status=400)
-    qs = Release.objects.filter(blueprint_id=blueprint_id, status="published").order_by("-created_at")
-    if environment_id:
-        qs = qs.filter(environment_id=environment_id)
-    releases = list(qs)
-    retained = releases[:keep]
-    candidates = releases[keep:]
-    targets_qs = ReleaseTarget.objects.filter(blueprint_id=blueprint_id)
-    if environment_id:
-        targets_qs = targets_qs.filter(environment=environment_id)
-    referenced_ids = set()
-    for target in targets_qs:
-        state = get_release_target_deploy_state(str(target.id))
-        rel_uuid = (state or {}).get("release_uuid")
-        if rel_uuid:
-            referenced_ids.add(rel_uuid)
-    protected = [rel for rel in releases if str(rel.id) in referenced_ids and rel not in retained]
+    plan = _build_release_retention(blueprint_id, environment_id, keep)
+    retained = plan["retained"]
+    candidates = plan["candidates"]
+    protected = plan["protected"]
     return JsonResponse(
         {
             "retained": [

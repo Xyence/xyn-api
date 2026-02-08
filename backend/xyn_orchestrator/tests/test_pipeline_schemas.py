@@ -376,6 +376,96 @@ class PlatformAdminTests(TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
+
+class AdminBridgeTests(TestCase):
+    def _make_env(self):
+        return Environment.objects.create(name="Dev", slug="dev")
+
+    def _seed_session(self, client, env):
+        session = client.session
+        session["oidc_state"] = "state-123"
+        session["oidc_nonce"] = "nonce-123"
+        session["environment_id"] = str(env.id)
+        session.save()
+
+    def _mock_oidc(self, claims, roles):
+        identity, _ = UserIdentity.objects.get_or_create(
+            issuer="https://accounts.google.com",
+            subject=claims["sub"],
+            defaults={"provider": "oidc", "email": claims.get("email")},
+        )
+        RoleBinding.objects.filter(user_identity=identity).delete()
+        for role in roles:
+            RoleBinding.objects.create(user_identity=identity, scope_kind="platform", role=role)
+
+    def test_user_username_is_issuer_scoped_no_collision(self):
+        env = self._make_env()
+        self._seed_session(self.client, env)
+        claims = {"sub": "sub-1", "email": "jrestivo@xyence.io", "name": "Josh"}
+        with (
+            mock.patch.object(xyn_api_module, "_get_oidc_config") as get_config,
+            mock.patch.object(xyn_api_module, "_resolve_secret_ref") as resolve_secret,
+            mock.patch.object(xyn_api_module, "_decode_id_token") as decode_token,
+            mock.patch.object(xyn_api_module.requests, "post") as post_request,
+        ):
+            get_config.return_value = {"token_endpoint": "https://issuer.example.com/token"}
+            resolve_secret.return_value = "secret"
+            decode_token.return_value = claims
+            post_request.return_value = type("Resp", (), {"status_code": 200, "json": lambda self: {"id_token": "tok"}})()
+            self._mock_oidc(claims, ["platform_admin"])
+            response = self.client.get("/auth/callback?code=abc&state=state-123")
+        self.assertEqual(response.status_code, 302)
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        user = User.objects.get(email="jrestivo@xyence.io")
+        self.assertTrue(user.username.startswith("oidc:"))
+
+    def test_staff_flag_revoked_when_platform_admin_removed(self):
+        env = self._make_env()
+        self._seed_session(self.client, env)
+        claims = {"sub": "sub-2", "email": "user@xyence.io", "name": "User"}
+        with (
+            mock.patch.object(xyn_api_module, "_get_oidc_config") as get_config,
+            mock.patch.object(xyn_api_module, "_resolve_secret_ref") as resolve_secret,
+            mock.patch.object(xyn_api_module, "_decode_id_token") as decode_token,
+            mock.patch.object(xyn_api_module.requests, "post") as post_request,
+        ):
+            get_config.return_value = {"token_endpoint": "https://issuer.example.com/token"}
+            resolve_secret.return_value = "secret"
+            decode_token.return_value = claims
+            post_request.return_value = type("Resp", (), {"status_code": 200, "json": lambda self: {"id_token": "tok"}})()
+            self._mock_oidc(claims, ["platform_admin"])
+            self.client.get("/auth/callback?code=abc&state=state-123")
+            self._mock_oidc(claims, [])
+            self.client.get("/auth/callback?code=abc&state=state-123")
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        user = User.objects.get(email="user@xyence.io")
+        self.assertFalse(user.is_staff)
+
+    def test_admin_denied_without_platform_admin_even_if_staff_true(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib import admin as django_admin
+
+        env = self._make_env()
+        identity = UserIdentity.objects.create(
+            issuer="https://accounts.google.com",
+            subject="sub-3",
+            provider="oidc",
+            email="staff@xyence.io",
+        )
+        User = get_user_model()
+        user = User.objects.create(username="staff@xyence.io", email="staff@xyence.io", is_staff=True, is_active=True)
+        request = RequestFactory().get("/admin/")
+        request.user = user
+        middleware = SessionMiddleware(lambda req: None)
+        middleware.process_request(request)
+        request.session["user_identity_id"] = str(identity.id)
+        request.session.save()
+        self.assertFalse(django_admin.site.has_permission(request))
+
     def test_role_binding_create_delete_requires_platform_admin(self):
         self._set_admin_session()
         identity = UserIdentity.objects.create(

@@ -4,6 +4,7 @@ import re
 import secrets
 import time
 import uuid
+import hashlib
 import fnmatch
 from functools import wraps
 from urllib.parse import urlencode
@@ -245,7 +246,8 @@ def _resolve_environment(request: HttpRequest) -> Optional[Environment]:
                     return env
                 if "*" in pattern and fnmatch.fnmatch(host, pattern):
                     return env
-    env_id = request.session.get("environment_id")
+    session = getattr(request, "session", None)
+    env_id = session.get("environment_id") if session else None
     if env_id:
         return Environment.objects.filter(id=env_id).first()
     allow_query = os.environ.get("ALLOW_ENV_QUERY", "").lower() == "true"
@@ -601,7 +603,8 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
         return JsonResponse({"error": "no roles assigned"}, status=403)
     # Bridge session auth into Django auth so login_required works.
     User = get_user_model()
-    username = email or str(claims.get("sub"))
+    issuer_hash = hashlib.sha256(issuer.encode("utf-8")).hexdigest()[:12]
+    username = f"oidc:{issuer_hash}:{claims.get('sub')}"
     user, created = User.objects.get_or_create(
         username=username,
         defaults={
@@ -610,9 +613,12 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
             "is_active": True,
         },
     )
-    if "platform_admin" in roles and not user.is_staff:
-        user.is_staff = True
-        user.save(update_fields=["is_staff"])
+    if email and user.email != email:
+        user.email = email
+    user.is_staff = "platform_admin" in roles
+    user.is_superuser = False
+    user.is_active = True
+    user.save()
     login(request, user, backend="django.contrib.auth.backends.ModelBackend")
     request.session["user_identity_id"] = str(identity.id)
     request.session["environment_id"] = str(env.id)

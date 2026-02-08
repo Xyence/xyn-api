@@ -1,10 +1,12 @@
 import os
 import time
+import hashlib
 from typing import Any, Dict, Optional
 
 import jwt
 import requests
 from django.contrib.auth import get_user_model
+from xyn_orchestrator.models import UserIdentity, RoleBinding
 
 
 class ApiTokenAuthMiddleware:
@@ -27,6 +29,15 @@ class ApiTokenAuthMiddleware:
                         request.user = user
                         request._cached_user = user
                         request._dont_enforce_csrf_checks = True
+        if not getattr(request, "user", None) or not request.user.is_authenticated:
+            identity_id = getattr(request, "session", {}).get("user_identity_id")
+            if identity_id:
+                identity = UserIdentity.objects.filter(id=identity_id).first()
+                if identity:
+                    user = _get_or_create_user_from_identity(identity)
+                    if user:
+                        request.user = user
+                        request._cached_user = user
         return self.get_response(request)
 
 
@@ -117,4 +128,32 @@ def _get_or_create_user_from_claims(claims: Dict[str, Any]):
         user.is_active = True
         user.email = email
         user.save(update_fields=["is_staff", "is_active", "email"])
+    return user
+
+
+def _get_or_create_user_from_identity(identity: UserIdentity):
+    User = get_user_model()
+    issuer_hash = hashlib.sha256(identity.issuer.encode("utf-8")).hexdigest()[:12]
+    username = f"oidc:{issuer_hash}:{identity.subject}"
+    user, created = User.objects.get_or_create(
+        username=username,
+        defaults={"email": identity.email or "", "is_staff": False, "is_active": True},
+    )
+    roles = RoleBinding.objects.filter(user_identity=identity).values_list("role", flat=True)
+    is_staff = "platform_admin" in set(roles)
+    changed = False
+    if user.email != (identity.email or ""):
+        user.email = identity.email or ""
+        changed = True
+    if user.is_staff != is_staff:
+        user.is_staff = is_staff
+        changed = True
+    if user.is_superuser:
+        user.is_superuser = False
+        changed = True
+    if not user.is_active:
+        user.is_active = True
+        changed = True
+    if created or changed:
+        user.save()
     return user
