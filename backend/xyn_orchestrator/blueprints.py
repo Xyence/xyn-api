@@ -4038,6 +4038,12 @@ def internal_release_target_deploy_manifest(request: HttpRequest, target_id: str
         return token_error
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
+    active = Run.objects.filter(
+        status__in=["pending", "running"],
+        metadata_json__release_target_id=str(target_id),
+    ).order_by("-created_at").first()
+    if active:
+        return JsonResponse({"error": "deploy_in_progress", "active_run_id": str(active.id)}, status=409)
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
     manifest_run_id = payload.get("manifest_run_id")
     manifest_artifact = payload.get("manifest_artifact") or "release_manifest.json"
@@ -4058,6 +4064,7 @@ def internal_release_target_deploy_manifest(request: HttpRequest, target_id: str
         status="running",
         summary=f"Deploy manifest for {blueprint.namespace}.{blueprint.name}",
         log_text="Preparing deploy-by-manifest run\n",
+        metadata_json={"release_target_id": str(release_target.id)},
     )
     RunArtifact.objects.create(
         run=run,
@@ -4108,6 +4115,12 @@ def internal_release_target_deploy_release(request: HttpRequest, target_id: str)
         return token_error
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
+    active = Run.objects.filter(
+        status__in=["pending", "running"],
+        metadata_json__release_target_id=str(target_id),
+    ).order_by("-created_at").first()
+    if active:
+        return JsonResponse({"error": "deploy_in_progress", "active_run_id": str(active.id)}, status=409)
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
     release_uuid = payload.get("release_uuid")
     release_version = payload.get("release_version")
@@ -4134,7 +4147,11 @@ def internal_release_target_deploy_release(request: HttpRequest, target_id: str)
         status="running",
         summary=f"Deploy release {release.version} for {blueprint.namespace}.{blueprint.name}",
         log_text="Preparing deploy-by-release run\n",
-        metadata_json={"release_uuid": str(release.id), "release_version": release.version},
+        metadata_json={
+            "release_target_id": str(release_target.id),
+            "release_uuid": str(release.id),
+            "release_version": release.version,
+        },
     )
     RunArtifact.objects.create(
         run=run,
@@ -4233,6 +4250,90 @@ def internal_release_target_check_drift(request: HttpRequest, target_id: str) ->
     if expected.get("compose_sha256") and expected.get("compose_sha256") != actual.get("compose_sha256"):
         drift = True
     return JsonResponse({"drift": drift, "expected": expected, "actual": actual})
+
+
+@csrf_exempt
+def internal_releases_latest(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    blueprint_id = request.GET.get("blueprint_id")
+    environment_id = request.GET.get("environment_id")
+    if not blueprint_id:
+        return JsonResponse({"error": "blueprint_id required"}, status=400)
+    qs = Release.objects.filter(blueprint_id=blueprint_id, status="published")
+    if environment_id:
+        qs = qs.filter(environment_id=environment_id)
+    release = qs.order_by("-created_at").first()
+    if not release:
+        return JsonResponse({"error": "release not found"}, status=404)
+    return JsonResponse({"id": str(release.id), "version": release.version})
+
+
+@csrf_exempt
+def internal_release_target_deploy_latest(request: HttpRequest, target_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    active = Run.objects.filter(
+        status__in=["pending", "running"],
+        metadata_json__release_target_id=str(target_id),
+    ).order_by("-created_at").first()
+    if active:
+        return JsonResponse({"error": "deploy_in_progress", "active_run_id": str(active.id)}, status=409)
+    release_target = get_object_or_404(ReleaseTarget, id=target_id)
+    blueprint = release_target.blueprint
+    if not blueprint:
+        return JsonResponse({"error": "release target missing blueprint"}, status=400)
+    release = Release.objects.filter(blueprint_id=blueprint.id, status="published").order_by("-created_at").first()
+    if not release:
+        return JsonResponse({"error": "release not found"}, status=404)
+    request_payload = json.dumps({"release_uuid": str(release.id)})
+    deploy_request = HttpRequest()
+    deploy_request.method = "POST"
+    deploy_request._body = request_payload.encode("utf-8")
+    deploy_request.headers = request.headers
+    return internal_release_target_deploy_release(deploy_request, target_id)
+
+
+@csrf_exempt
+def internal_release_target_rollback_last_success(request: HttpRequest, target_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    active = Run.objects.filter(
+        status__in=["pending", "running"],
+        metadata_json__release_target_id=str(target_id),
+    ).order_by("-created_at").first()
+    if active:
+        return JsonResponse({"error": "deploy_in_progress", "active_run_id": str(active.id)}, status=409)
+    state = get_release_target_deploy_state(target_id)
+    current_uuid = (state or {}).get("release_uuid")
+    if not current_uuid:
+        return JsonResponse({"error": "no_current_release"}, status=404)
+    prior = (
+        Run.objects.filter(
+            metadata_json__release_target_id=str(target_id),
+            metadata_json__deploy_outcome__in=["succeeded", "noop"],
+        )
+        .exclude(metadata_json__release_uuid=current_uuid)
+        .order_by("-created_at")
+        .first()
+    )
+    if not prior or not prior.metadata_json:
+        return JsonResponse({"error": "no_prior_successful_release"}, status=404)
+    release_uuid = prior.metadata_json.get("release_uuid")
+    if not release_uuid:
+        return JsonResponse({"error": "no_prior_successful_release"}, status=404)
+    request_payload = json.dumps({"release_uuid": release_uuid})
+    deploy_request = HttpRequest()
+    deploy_request.method = "POST"
+    deploy_request._body = request_payload.encode("utf-8")
+    deploy_request.headers = request.headers
+    return internal_release_target_deploy_release(deploy_request, target_id)
 
 
 @csrf_exempt

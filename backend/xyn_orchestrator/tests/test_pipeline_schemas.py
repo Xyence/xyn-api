@@ -23,6 +23,10 @@ from xyn_orchestrator.blueprints import (
     internal_release_upsert,
     internal_release_target_current_release,
     internal_release_target_check_drift,
+    internal_releases_latest,
+    internal_release_target_deploy_latest,
+    internal_release_target_rollback_last_success,
+    internal_release_target_deploy_manifest,
     _write_run_artifact,
 )
 from xyn_orchestrator.xyn_api import _validate_release_target_payload
@@ -641,6 +645,103 @@ class PipelineSchemaTests(TestCase):
         )
         drift_response = internal_release_target_check_drift(drift_request, str(target.id))
         self.assertEqual(drift_response.status_code, 200)
+
+    def test_deploy_lock_blocks_concurrent_runs(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="demo",
+            fqdn="ems.xyence.io",
+            config_json={},
+        )
+        active = Run.objects.create(
+            entity_type="blueprint",
+            entity_id=blueprint.id,
+            status="running",
+            metadata_json={"release_target_id": str(target.id)},
+        )
+        request = factory.post(
+            f"/xyn/internal/release-targets/{target.id}/deploy_manifest",
+            data=json.dumps({"manifest_run_id": str(uuid.uuid4())}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_release_target_deploy_manifest(request, str(target.id))
+        self.assertEqual(response.status_code, 409)
+
+    def test_deploy_latest_selects_newest_published_release(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="demo",
+            fqdn="ems.xyence.io",
+            config_json={},
+        )
+        Release.objects.create(blueprint_id=blueprint.id, version="v1", status="published")
+        latest = Release.objects.create(blueprint_id=blueprint.id, version="v2", status="published")
+        request = factory.get(
+            f"/xyn/internal/releases/latest?blueprint_id={blueprint.id}",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_releases_latest(request)
+        self.assertEqual(response.status_code, 200)
+        deploy_request = factory.post(
+            f"/xyn/internal/release-targets/{target.id}/deploy_latest",
+            data=json.dumps({}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        with mock.patch("xyn_orchestrator.blueprints.internal_release_target_deploy_release") as deploy_release:
+            deploy_release.return_value = JsonResponse({"run_id": "x"}, status=200)
+            internal_release_target_deploy_latest(deploy_request, str(target.id))
+            deploy_release.assert_called()
+
+    def test_rollback_last_success_selects_prior_release(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="demo",
+            fqdn="ems.xyence.io",
+            config_json={},
+        )
+        Run.objects.create(
+            entity_type="blueprint",
+            entity_id=blueprint.id,
+            status="succeeded",
+            metadata_json={
+                "release_target_id": str(target.id),
+                "release_uuid": "rel-new",
+                "release_version": "v2",
+                "deploy_outcome": "succeeded",
+            },
+        )
+        Run.objects.create(
+            entity_type="blueprint",
+            entity_id=blueprint.id,
+            status="succeeded",
+            metadata_json={
+                "release_target_id": str(target.id),
+                "release_uuid": "rel-old",
+                "release_version": "v1",
+                "deploy_outcome": "succeeded",
+            },
+        )
+        rollback_request = factory.post(
+            f"/xyn/internal/release-targets/{target.id}/rollback_last_success",
+            data=json.dumps({}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        with mock.patch("xyn_orchestrator.blueprints.internal_release_target_deploy_release") as deploy_release:
+            deploy_release.return_value = JsonResponse({"run_id": "x"}, status=200)
+            internal_release_target_rollback_last_success(rollback_request, str(target.id))
+            deploy_release.assert_called()
 
     def test_planner_selects_remote_deploy_slice(self):
         blueprint = Blueprint.objects.create(
