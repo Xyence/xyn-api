@@ -222,9 +222,21 @@ def _get_oidc_config(issuer: str) -> Optional[Dict[str, Any]]:
 
 
 def _resolve_environment(request: HttpRequest) -> Optional[Environment]:
-    env_id = request.GET.get("environment_id") or request.session.get("environment_id")
+    forwarded_host = request.headers.get("X-Forwarded-Host") or request.headers.get("X-Forwarded-Server")
+    host = forwarded_host or request.get_host()
+    if host:
+        host = host.split(",")[0].strip().split(":")[0].lower()
+        env = Environment.objects.filter(metadata_json__hosts__contains=[host]).first()
+        if env:
+            return env
+    env_id = request.session.get("environment_id")
     if env_id:
         return Environment.objects.filter(id=env_id).first()
+    allow_query = os.environ.get("ALLOW_ENV_QUERY", "").lower() == "true"
+    if allow_query:
+        env_id = request.GET.get("environment_id")
+        if env_id:
+            return Environment.objects.filter(id=env_id).first()
     return Environment.objects.first()
 
 

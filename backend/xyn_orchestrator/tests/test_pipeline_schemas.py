@@ -191,6 +191,23 @@ class OIDCAuthTests(TestCase):
         identity = UserIdentity.objects.get(subject="sub-abc")
         self.assertTrue(RoleBinding.objects.filter(user_identity=identity, role="platform_admin").exists())
 
+    def test_environment_resolution_prefers_host_mapping(self):
+        env = self._make_env()
+        env.metadata_json = {"oidc": env.metadata_json["oidc"], "hosts": ["auth.xyence.io"]}
+        env.save(update_fields=["metadata_json", "updated_at"])
+        request = RequestFactory().get("/auth/login", HTTP_X_FORWARDED_HOST="auth.xyence.io")
+        resolved = xyn_api_module._resolve_environment(request)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.id, env.id)
+
+    def test_environment_query_param_disabled_by_default(self):
+        env = self._make_env()
+        other = Environment.objects.create(name="Other", slug="other")
+        request = RequestFactory().get(f"/auth/login?environment_id={other.id}")
+        resolved = xyn_api_module._resolve_environment(request)
+        self.assertIsNotNone(resolved)
+        self.assertNotEqual(resolved.id, other.id)
+
 
 class PipelineSchemaTests(TestCase):
     def _load_schema(self, name: str) -> dict:
