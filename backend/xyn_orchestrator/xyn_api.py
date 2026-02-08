@@ -4,6 +4,7 @@ import re
 import secrets
 import time
 import uuid
+import fnmatch
 from functools import wraps
 from urllib.parse import urlencode
 from pathlib import Path
@@ -17,6 +18,7 @@ from django.db import models
 from django.http import HttpRequest, JsonResponse, HttpResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.utils import timezone
+from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth import get_user_model
@@ -54,6 +56,8 @@ from .models import (
     ReleaseTarget,
     RoleBinding,
     UserIdentity,
+    Tenant,
+    Contact,
 )
 from .module_registry import maybe_sync_modules_from_registry
 
@@ -226,9 +230,19 @@ def _resolve_environment(request: HttpRequest) -> Optional[Environment]:
     host = forwarded_host or request.get_host()
     if host:
         host = host.split(",")[0].strip().split(":")[0].lower()
-        env = Environment.objects.filter(metadata_json__hosts__contains=[host]).first()
-        if env:
-            return env
+        environments = list(Environment.objects.all().order_by("name"))
+        for env in environments:
+            hosts = (env.metadata_json or {}).get("hosts") or []
+            if host in [h.lower() for h in hosts]:
+                return env
+        for env in environments:
+            hosts = (env.metadata_json or {}).get("hosts") or []
+            for pattern in hosts:
+                pattern = str(pattern).lower()
+                if pattern == "*":
+                    return env
+                if "*" in pattern and fnmatch.fnmatch(host, pattern):
+                    return env
     env_id = request.session.get("environment_id")
     if env_id:
         return Environment.objects.filter(id=env_id).first()
@@ -558,6 +572,227 @@ def api_me(request: HttpRequest) -> JsonResponse:
             "roles": roles,
         }
     )
+
+
+def _serialize_tenant(tenant: Tenant) -> Dict[str, Any]:
+    return {
+        "id": str(tenant.id),
+        "name": tenant.name,
+        "slug": tenant.slug,
+        "status": tenant.status,
+        "metadata_json": tenant.metadata_json,
+        "created_at": tenant.created_at,
+        "updated_at": tenant.updated_at,
+    }
+
+
+def _serialize_contact(contact: Contact) -> Dict[str, Any]:
+    return {
+        "id": str(contact.id),
+        "tenant_id": str(contact.tenant_id),
+        "name": contact.name,
+        "email": contact.email,
+        "phone": contact.phone,
+        "role_title": contact.role_title,
+        "status": contact.status,
+        "metadata_json": contact.metadata_json,
+        "created_at": contact.created_at,
+        "updated_at": contact.updated_at,
+    }
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def tenants_collection(request: HttpRequest) -> JsonResponse:
+    if request.method == "POST":
+        payload = _parse_json(request)
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return JsonResponse({"error": "name is required"}, status=400)
+        slug = (payload.get("slug") or slugify(name)).lower()
+        status = payload.get("status") or "active"
+        metadata_json = payload.get("metadata_json")
+        if Tenant.objects.filter(slug=slug).exists():
+            return JsonResponse({"error": "slug already exists"}, status=400)
+        tenant = Tenant.objects.create(
+            name=name,
+            slug=slug,
+            status=status,
+            metadata_json=metadata_json,
+        )
+        return JsonResponse({"id": str(tenant.id)})
+
+    qs = Tenant.objects.all().order_by("name")
+    if query := request.GET.get("q"):
+        qs = qs.filter(models.Q(name__icontains=query) | models.Q(slug__icontains=query))
+    data = [_serialize_tenant(t) for t in qs]
+    return _paginate(request, data, "tenants")
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def tenant_detail(request: HttpRequest, tenant_id: str) -> JsonResponse:
+    tenant = get_object_or_404(Tenant, id=tenant_id)
+    if request.method == "GET":
+        return JsonResponse(_serialize_tenant(tenant))
+    if request.method in ("PATCH", "PUT"):
+        payload = _parse_json(request)
+        if "name" in payload:
+            tenant.name = payload.get("name") or tenant.name
+        if "slug" in payload:
+            slug = (payload.get("slug") or tenant.slug).lower()
+            if slug != tenant.slug and Tenant.objects.filter(slug=slug).exists():
+                return JsonResponse({"error": "slug already exists"}, status=400)
+            tenant.slug = slug
+        if "status" in payload:
+            tenant.status = payload.get("status") or tenant.status
+        if "metadata_json" in payload:
+            tenant.metadata_json = payload.get("metadata_json")
+        tenant.save(update_fields=["name", "slug", "status", "metadata_json", "updated_at"])
+        return JsonResponse({"id": str(tenant.id)})
+    if request.method == "DELETE":
+        tenant.status = "suspended"
+        tenant.save(update_fields=["status", "updated_at"])
+        return JsonResponse({"status": "suspended"})
+    return JsonResponse({"error": "method not allowed"}, status=405)
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def tenant_contacts_collection(request: HttpRequest, tenant_id: str) -> JsonResponse:
+    tenant = get_object_or_404(Tenant, id=tenant_id)
+    if request.method == "POST":
+        payload = _parse_json(request)
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return JsonResponse({"error": "name is required"}, status=400)
+        email = payload.get("email")
+        if email and Contact.objects.filter(tenant=tenant, email=email).exists():
+            return JsonResponse({"error": "email already exists for tenant"}, status=400)
+        contact = Contact.objects.create(
+            tenant=tenant,
+            name=name,
+            email=email,
+            phone=payload.get("phone"),
+            role_title=payload.get("role_title"),
+            status=payload.get("status") or "active",
+            metadata_json=payload.get("metadata_json"),
+        )
+        return JsonResponse({"id": str(contact.id)})
+
+    contacts = Contact.objects.filter(tenant=tenant).order_by("name")
+    data = [_serialize_contact(c) for c in contacts]
+    return JsonResponse({"contacts": data})
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def contact_detail(request: HttpRequest, contact_id: str) -> JsonResponse:
+    contact = get_object_or_404(Contact, id=contact_id)
+    if request.method == "GET":
+        return JsonResponse(_serialize_contact(contact))
+    if request.method in ("PATCH", "PUT"):
+        payload = _parse_json(request)
+        if "name" in payload:
+            contact.name = payload.get("name") or contact.name
+        if "email" in payload:
+            email = payload.get("email")
+            if email and Contact.objects.filter(tenant=contact.tenant, email=email).exclude(id=contact.id).exists():
+                return JsonResponse({"error": "email already exists for tenant"}, status=400)
+            contact.email = email
+        if "phone" in payload:
+            contact.phone = payload.get("phone")
+        if "role_title" in payload:
+            contact.role_title = payload.get("role_title")
+        if "status" in payload:
+            contact.status = payload.get("status") or contact.status
+        if "metadata_json" in payload:
+            contact.metadata_json = payload.get("metadata_json")
+        contact.save(
+            update_fields=["name", "email", "phone", "role_title", "status", "metadata_json", "updated_at"]
+        )
+        return JsonResponse({"id": str(contact.id)})
+    if request.method == "DELETE":
+        contact.status = "inactive"
+        contact.save(update_fields=["status", "updated_at"])
+        return JsonResponse({"status": "inactive"})
+    return JsonResponse({"error": "method not allowed"}, status=405)
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def identities_collection(request: HttpRequest) -> JsonResponse:
+    identities = UserIdentity.objects.all().order_by("-last_login_at", "email")
+    data = [
+        {
+            "id": str(i.id),
+            "provider": i.provider,
+            "issuer": i.issuer,
+            "subject": i.subject,
+            "email": i.email,
+            "display_name": i.display_name,
+            "last_login_at": i.last_login_at,
+        }
+        for i in identities
+    ]
+    return JsonResponse({"identities": data})
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def role_bindings_collection(request: HttpRequest) -> JsonResponse:
+    if request.method == "POST":
+        payload = _parse_json(request)
+        identity_id = payload.get("user_identity_id")
+        role = payload.get("role")
+        if not identity_id or not role:
+            return JsonResponse({"error": "user_identity_id and role required"}, status=400)
+        identity = get_object_or_404(UserIdentity, id=identity_id)
+        binding = RoleBinding.objects.create(
+            user_identity=identity,
+            scope_kind="platform",
+            scope_id=None,
+            role=role,
+        )
+        return JsonResponse({"id": str(binding.id)})
+
+    identity_id = request.GET.get("identity_id")
+    qs = RoleBinding.objects.all().order_by("role")
+    if identity_id:
+        qs = qs.filter(user_identity_id=identity_id)
+    data = [
+        {
+            "id": str(b.id),
+            "user_identity_id": str(b.user_identity_id),
+            "scope_kind": b.scope_kind,
+            "scope_id": str(b.scope_id) if b.scope_id else None,
+            "role": b.role,
+            "created_at": b.created_at,
+        }
+        for b in qs
+    ]
+    return JsonResponse({"role_bindings": data})
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def role_binding_detail(request: HttpRequest, binding_id: str) -> JsonResponse:
+    if request.method != "DELETE":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    binding = get_object_or_404(RoleBinding, id=binding_id)
+    binding.delete()
+    return JsonResponse({"status": "deleted"})
+
+
+def tenants_public(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not RoleBinding.objects.filter(user_identity=identity, role="platform_admin").exists():
+        return JsonResponse({"tenants": []})
+    tenants = Tenant.objects.all().order_by("name")
+    data = [_serialize_tenant(t) for t in tenants]
+    return JsonResponse({"tenants": data})
 
 
 @csrf_exempt

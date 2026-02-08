@@ -41,6 +41,8 @@ from .models import (
     ReleaseTarget,
     RoleBinding,
     UserIdentity,
+    Tenant,
+    Contact,
     VoiceNote,
     VoiceTranscript,
 )
@@ -176,6 +178,20 @@ class CapabilityAdmin(admin.ModelAdmin):
 class EnvironmentAdmin(admin.ModelAdmin):
     list_display = ("name", "slug", "base_domain", "aws_region", "updated_at")
     search_fields = ("name", "slug", "base_domain")
+
+
+@admin.register(Tenant)
+class TenantAdmin(admin.ModelAdmin):
+    list_display = ("name", "slug", "status", "updated_at")
+    search_fields = ("name", "slug")
+    list_filter = ("status",)
+
+
+@admin.register(Contact)
+class ContactAdmin(admin.ModelAdmin):
+    list_display = ("name", "email", "tenant", "status", "updated_at")
+    search_fields = ("name", "email", "tenant__name")
+    list_filter = ("status", "tenant")
 
 
 @admin.register(ReleasePlan)

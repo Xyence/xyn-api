@@ -483,6 +483,51 @@ class Environment(models.Model):
         return self.name
 
 
+class Tenant(models.Model):
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("suspended", "Suspended"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=120, unique=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
+    metadata_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Contact(models.Model):
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("inactive", "Inactive"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="contacts")
+    name = models.CharField(max_length=200)
+    email = models.EmailField(null=True, blank=True)
+    phone = models.CharField(max_length=50, null=True, blank=True)
+    role_title = models.CharField(max_length=120, null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
+    metadata_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.tenant.name})"
+
+
 class ReleasePlan(models.Model):
     TARGET_CHOICES = [
         ("module", "Module"),

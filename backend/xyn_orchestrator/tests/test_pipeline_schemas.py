@@ -67,6 +67,7 @@ from xyn_orchestrator.models import (
     RoleBinding,
     Run,
     UserIdentity,
+    Tenant,
 )
 
 
@@ -207,6 +208,84 @@ class OIDCAuthTests(TestCase):
         resolved = xyn_api_module._resolve_environment(request)
         self.assertIsNotNone(resolved)
         self.assertNotEqual(resolved.id, other.id)
+
+    def test_environment_resolution_supports_wildcards(self):
+        env = self._make_env()
+        env.metadata_json = {"oidc": env.metadata_json["oidc"], "hosts": ["*.xyence.io"]}
+        env.save(update_fields=["metadata_json", "updated_at"])
+        request = RequestFactory().get("/auth/login", HTTP_X_FORWARDED_HOST="ems.xyence.io")
+        resolved = xyn_api_module._resolve_environment(request)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.id, env.id)
+
+
+class PlatformAdminTests(TestCase):
+    def _set_admin_session(self):
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            issuer="https://issuer.example.com",
+            subject="sub-admin",
+            email="admin@xyence.io",
+        )
+        RoleBinding.objects.create(user_identity=identity, scope_kind="platform", role="platform_admin")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session.save()
+        return identity
+
+    def test_tenants_crud_requires_platform_admin(self):
+        response = self.client.get("/xyn/internal/tenants")
+        self.assertEqual(response.status_code, 401)
+        self._set_admin_session()
+        response = self.client.post(
+            "/xyn/internal/tenants",
+            data=json.dumps({"name": "Acme", "slug": "acme"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        tenant_id = response.json().get("id")
+        response = self.client.get("/xyn/internal/tenants")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any(t["id"] == tenant_id for t in response.json().get("tenants", [])))
+
+    def test_contacts_crud_requires_platform_admin(self):
+        self._set_admin_session()
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        response = self.client.post(
+            f"/xyn/internal/tenants/{tenant.id}/contacts",
+            data=json.dumps({"name": "Pat", "email": "pat@acme.io"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        contact_id = response.json().get("id")
+        response = self.client.get(f"/xyn/internal/contacts/{contact_id}")
+        self.assertEqual(response.status_code, 200)
+
+    def test_role_binding_create_delete_requires_platform_admin(self):
+        self._set_admin_session()
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            issuer="https://issuer.example.com",
+            subject="sub-user",
+        )
+        response = self.client.post(
+            "/xyn/internal/role_bindings",
+            data=json.dumps({"user_identity_id": str(identity.id), "role": "platform_operator"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        binding_id = response.json().get("id")
+        response = self.client.delete(f"/xyn/internal/role_bindings/{binding_id}")
+        self.assertEqual(response.status_code, 200)
+
+    def test_identities_list_requires_platform_admin(self):
+        UserIdentity.objects.create(provider="oidc", issuer="https://issuer.example.com", subject="sub")
+        response = self.client.get("/xyn/internal/identities")
+        self.assertEqual(response.status_code, 401)
+        self._set_admin_session()
+        response = self.client.get("/xyn/internal/identities")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("identities", response.json())
 
 
 class PipelineSchemaTests(TestCase):
