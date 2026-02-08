@@ -64,7 +64,12 @@
         "required": ["name", "ref"],
         "properties": {
           "name": { "type": "string" },
-          "ref": { "type": "string" }
+          "ref": { "type": "string" },
+          "type": {
+            "type": "string",
+            "enum": ["ssm_parameter", "secrets_manager"]
+          },
+          "version": { "type": "string" }
         },
         "additionalProperties": false
       }

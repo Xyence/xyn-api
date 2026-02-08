@@ -20,10 +20,14 @@ from xyn_orchestrator.blueprints import (
     _select_context_packs_for_dev_task,
     _write_run_artifact,
 )
+from xyn_orchestrator.xyn_api import _validate_release_target_payload
 from xyn_orchestrator.worker_tasks import (
     _apply_scaffold_for_work_item,
     _collect_git_diff,
+    _build_deploy_manifest,
+    _merge_release_env,
     _mark_noop_codegen,
+    _redact_secrets,
     _stage_all,
     _route53_ensure_with_noop,
     _run_remote_deploy,
@@ -208,6 +212,59 @@ class PipelineSchemaTests(TestCase):
         schema = self._load_schema("release_target.v1.schema.json")
         errors = list(Draft202012Validator(schema).iter_errors(payload))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
+
+    def test_release_target_secret_ref_validation(self):
+        payload = {
+            "schema_version": "release_target.v1",
+            "id": str(uuid.uuid4()),
+            "blueprint_id": str(uuid.uuid4()),
+            "name": "manager-demo",
+            "target_instance_id": str(uuid.uuid4()),
+            "fqdn": "ems.xyence.io",
+            "dns": {"provider": "route53"},
+            "runtime": {"type": "docker-compose", "transport": "ssm"},
+            "tls": {"mode": "none"},
+            "secret_refs": [
+                {"name": "ems_jwt_secret", "ref": "ssm:/xyn/ems/jwt"},
+                {"name": "EMS_JWT_SECRET", "ref": "vault:/bad"},
+            ],
+            "created_at": "2026-02-07T00:00:00Z",
+            "updated_at": "2026-02-07T00:00:00Z",
+        }
+        errors = _validate_release_target_payload(payload)
+        self.assertTrue(any("secret_refs[0].name" in err for err in errors))
+        self.assertTrue(any("secret_refs[1].ref" in err for err in errors))
+
+    @mock.patch("xyn_orchestrator.worker_tasks.boto3.client")
+    def test_secret_resolution_merges_and_overrides_env(self, mock_client):
+        ssm_mock = mock.Mock()
+        ssm_mock.get_parameter.return_value = {"Parameter": {"Value": "good-secret"}}
+        mock_client.return_value = ssm_mock
+        env = {"EMS_JWT_SECRET": "bad-secret", "EMS_JWT_ISSUER": "xyn-ems"}
+        secret_refs = [{"name": "EMS_JWT_SECRET", "ref": "ssm:/xyn/ems/jwt"}]
+        merged, secret_values, secret_keys = _merge_release_env(env, secret_refs, "us-west-2")
+        self.assertEqual(merged["EMS_JWT_SECRET"], "good-secret")
+        self.assertEqual(secret_values["EMS_JWT_SECRET"], "good-secret")
+        self.assertIn("EMS_JWT_SECRET", secret_keys)
+
+    def test_redaction_removes_secret_from_logs(self):
+        text = "token=supersecret and again supersecret"
+        redacted = _redact_secrets(text, {"EMS_JWT_SECRET": "supersecret"})
+        self.assertNotIn("supersecret", redacted)
+        self.assertIn("***REDACTED***", redacted)
+
+    def test_manifest_does_not_include_secret_values(self):
+        manifest = _build_deploy_manifest(
+            "ems.xyence.io",
+            {"id": "inst-1"},
+            "/opt/xyn/apps/ems",
+            "apps/ems-stack/docker-compose.yml",
+            {"EMS_JWT_ISSUER": "xyn-ems"},
+            ["EMS_JWT_SECRET"],
+        )
+        payload = json.dumps(manifest)
+        self.assertIn("EMS_JWT_SECRET", payload)
+        self.assertNotIn("supersecret", payload)
 
     def test_planner_selects_persistence_slice(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")

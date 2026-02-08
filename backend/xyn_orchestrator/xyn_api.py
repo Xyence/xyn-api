@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -79,6 +80,22 @@ def _validate_release_target_payload(payload: Dict[str, Any]) -> list[str]:
     fqdn = payload.get("fqdn") or ""
     if " " in fqdn or "." not in fqdn:
         errors.append("fqdn: must be a valid hostname")
+    secret_refs = payload.get("secret_refs") or []
+    name_re = re.compile(r"^[A-Z0-9_]+$")
+    for idx, ref in enumerate(secret_refs):
+        name = (ref or {}).get("name") or ""
+        value = (ref or {}).get("ref") or ""
+        if not name_re.match(name):
+            errors.append(f"secret_refs[{idx}].name: must match [A-Z0-9_]+")
+        if not (
+            value.startswith("ssm:")
+            or value.startswith("ssm-arn:")
+            or value.startswith("secretsmanager:")
+            or value.startswith("secretsmanager-arn:")
+        ):
+            errors.append(
+                f"secret_refs[{idx}].ref: must start with ssm:/, ssm-arn:, secretsmanager:/, or secretsmanager-arn:"
+            )
     return errors
 
 

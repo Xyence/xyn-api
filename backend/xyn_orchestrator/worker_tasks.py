@@ -2353,9 +2353,7 @@ def _verify_route53_record(fqdn: str, zone_id: str, target_ip: str) -> bool:
     return target_ip in values
 
 
-def _build_remote_deploy_commands(
-    root_dir: str, jwt_secret: str, compose_file: str, extra_env: Dict[str, str]
-) -> List[str]:
+def _build_remote_deploy_commands(root_dir: str, compose_file: str, extra_env: Dict[str, str]) -> List[str]:
     env_exports = []
     for key, value in extra_env.items():
         if not key:
@@ -2381,7 +2379,6 @@ def _build_remote_deploy_commands(
         "docker compose version",
         "docker version",
         f"export XYN_UI_PATH=\"{root_dir}/xyn-ui/apps/ems-ui\"",
-        f"export EMS_JWT_SECRET=\"{jwt_secret}\"",
         "export EMS_PUBLIC_PORT=80",
         "export EMS_PUBLIC_TLS_PORT=443",
         f"export EMS_CERTS_PATH=\"{root_dir}/certs/current\"",
@@ -2515,6 +2512,105 @@ def _work_item_matches(
     return False
 
 
+def _resolve_secret_refs(secret_refs: List[Dict[str, Any]], aws_region: Optional[str]) -> Dict[str, str]:
+    resolved: Dict[str, str] = {}
+    if not secret_refs:
+        return resolved
+    ssm_client = None
+    sm_client = None
+    for ref in secret_refs:
+        name = (ref or {}).get("name") or ""
+        ref_value = (ref or {}).get("ref") or ""
+        if ref_value.startswith("ssm:"):
+            param_name = ref_value[len("ssm:") :]
+            if not ssm_client:
+                ssm_client = boto3.client("ssm", region_name=aws_region) if aws_region else boto3.client("ssm")
+            try:
+                response = ssm_client.get_parameter(Name=param_name, WithDecryption=True)
+            except (BotoCoreError, ClientError) as exc:
+                raise RuntimeError(f"Secret resolve failed for {name} (ssm): {exc}") from exc
+            resolved[name] = response.get("Parameter", {}).get("Value", "")
+        elif ref_value.startswith("ssm-arn:"):
+            param_arn = ref_value[len("ssm-arn:") :]
+            if not ssm_client:
+                ssm_client = boto3.client("ssm", region_name=aws_region) if aws_region else boto3.client("ssm")
+            try:
+                response = ssm_client.get_parameter(Name=param_arn, WithDecryption=True)
+            except (BotoCoreError, ClientError) as exc:
+                raise RuntimeError(f"Secret resolve failed for {name} (ssm-arn): {exc}") from exc
+            resolved[name] = response.get("Parameter", {}).get("Value", "")
+        elif ref_value.startswith("secretsmanager:"):
+            secret_id = ref_value[len("secretsmanager:") :]
+            if not sm_client:
+                sm_client = (
+                    boto3.client("secretsmanager", region_name=aws_region)
+                    if aws_region
+                    else boto3.client("secretsmanager")
+                )
+            try:
+                response = sm_client.get_secret_value(SecretId=secret_id)
+            except (BotoCoreError, ClientError) as exc:
+                raise RuntimeError(f"Secret resolve failed for {name} (secretsmanager): {exc}") from exc
+            resolved[name] = response.get("SecretString", "") or ""
+        elif ref_value.startswith("secretsmanager-arn:"):
+            secret_arn = ref_value[len("secretsmanager-arn:") :]
+            if not sm_client:
+                sm_client = (
+                    boto3.client("secretsmanager", region_name=aws_region)
+                    if aws_region
+                    else boto3.client("secretsmanager")
+                )
+            try:
+                response = sm_client.get_secret_value(SecretId=secret_arn)
+            except (BotoCoreError, ClientError) as exc:
+                raise RuntimeError(f"Secret resolve failed for {name} (secretsmanager-arn): {exc}") from exc
+            resolved[name] = response.get("SecretString", "") or ""
+        else:
+            raise RuntimeError(f"Secret ref for {name} has unsupported prefix")
+    return resolved
+
+
+def _merge_release_env(
+    env: Optional[Dict[str, Any]],
+    secret_refs: Optional[List[Dict[str, Any]]],
+    aws_region: Optional[str],
+) -> tuple[Dict[str, str], Dict[str, str], List[str]]:
+    base_env = {str(k): str(v) for k, v in (env or {}).items()}
+    secret_refs = secret_refs or []
+    secret_values = _resolve_secret_refs(secret_refs, aws_region)
+    effective_env = dict(base_env)
+    effective_env.update(secret_values)
+    secret_keys = [str(item.get("name")) for item in secret_refs if item.get("name")]
+    return effective_env, secret_values, secret_keys
+
+
+def _redact_secrets(text: str, secrets: Dict[str, str]) -> str:
+    redacted = text or ""
+    for value in secrets.values():
+        if not value:
+            continue
+        redacted = redacted.replace(value, "***REDACTED***")
+    return redacted
+
+
+def _build_deploy_manifest(
+    fqdn: str,
+    target_instance: Dict[str, Any],
+    root_dir: str,
+    compose_file: str,
+    env_public: Dict[str, str],
+    secret_keys: List[str],
+) -> Dict[str, Any]:
+    return {
+        "fqdn": fqdn,
+        "target_instance": target_instance,
+        "root_dir": root_dir,
+        "compose_file": compose_file,
+        "env_public": env_public,
+        "env_secret_keys": secret_keys,
+    }
+
+
 def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
     checks = []
     ok = True
@@ -2601,7 +2697,7 @@ def _run_remote_deploy(
     run_id: str,
     fqdn: str,
     target_instance: Dict[str, Any],
-    jwt_secret: str,
+    extra_env: Dict[str, str],
     release_target: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     started_at = datetime.utcnow().isoformat() + "Z"
@@ -2628,8 +2724,7 @@ def _run_remote_deploy(
     runtime = (release_target or {}).get("runtime") or {}
     remote_root = runtime.get("remote_root") or "/opt/xyn/apps/ems"
     compose_file = runtime.get("compose_file_path") or "apps/ems-stack/docker-compose.yml"
-    extra_env = (release_target or {}).get("env") or {}
-    commands = _build_remote_deploy_commands(remote_root, jwt_secret, compose_file, extra_env)
+    commands = _build_remote_deploy_commands(remote_root, compose_file, extra_env)
     exec_result = _run_ssm_commands(
         target_instance.get("instance_id"),
         target_instance.get("aws_region"),
@@ -3012,6 +3107,8 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 or ""
             )
             jwt_secret = deploy_meta.get("ems_jwt_secret") or os.environ.get("EMS_JWT_SECRET", "dev-secret-change-me")
+            release_env: Dict[str, Any] = {}
+            release_secret_refs: List[Dict[str, Any]] = []
             if release_target:
                 fqdn = release_target.get("fqdn") or fqdn
                 release_dns = release_target.get("dns") or {}
@@ -3019,6 +3116,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 dns_zone_id = release_dns.get("zone_id") or dns_zone_id
                 dns_zone_name = release_dns.get("zone_name") or dns_zone_name
                 release_env = release_target.get("env") or {}
+                release_secret_refs = release_target.get("secret_refs") or []
                 jwt_secret = release_env.get("EMS_JWT_SECRET") or jwt_secret
             workspace_root = os.path.join(CODEGEN_WORKDIR, task_id)
             os.system(f"rm -rf {workspace_root}")
@@ -3244,6 +3342,32 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 try:
                     if not target_instance or not target_instance.get("instance_id"):
                         raise RuntimeError("Target instance missing for remote deploy")
+                    effective_env = {}
+                    secret_values: Dict[str, str] = {}
+                    secret_keys: List[str] = []
+                    secret_failed = False
+                    try:
+                        effective_env, secret_values, secret_keys = _merge_release_env(
+                            release_env, release_secret_refs, target_instance.get("aws_region")
+                        )
+                    except Exception as exc:
+                        secret_failed = True
+                        success = False
+                        errors.append(
+                            {
+                                "code": "secret_resolve_failed",
+                                "message": "Secret resolution failed.",
+                                "detail": {"error": str(exc)},
+                            }
+                        )
+                        effective_env = dict(release_env)
+                    if "EMS_JWT_SECRET" not in effective_env and jwt_secret:
+                        effective_env["EMS_JWT_SECRET"] = jwt_secret
+                        secret_values.setdefault("EMS_JWT_SECRET", jwt_secret)
+                        if "EMS_JWT_SECRET" not in secret_keys:
+                            secret_keys.append("EMS_JWT_SECRET")
+                    if secret_failed:
+                        raise RuntimeError("Secret resolution failed.")
                     dns_ok = None
                     try:
                         if fqdn:
@@ -3314,12 +3438,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         )
                         success = True
                     else:
-                        deploy_manifest = {
-                            "fqdn": fqdn,
-                            "target_instance": target_instance,
-                            "root_dir": "/opt/xyn/apps/ems",
-                            "compose_file": "apps/ems-stack/docker-compose.yml",
-                        }
+                        runtime = (release_target or {}).get("runtime") or {}
+                        remote_root = runtime.get("remote_root") or "/opt/xyn/apps/ems"
+                        compose_file = runtime.get("compose_file_path") or "apps/ems-stack/docker-compose.yml"
+                        env_public = {k: v for k, v in effective_env.items() if k not in secret_keys}
+                        deploy_manifest = _build_deploy_manifest(
+                            fqdn, target_instance, remote_root, compose_file, env_public, secret_keys
+                        )
                         manifest_url = _write_artifact(
                             run_id, "deploy_manifest.json", json.dumps(deploy_manifest, indent=2)
                         )
@@ -3328,15 +3453,15 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             {"name": "deploy_manifest.json", "kind": "deploy", "url": manifest_url},
                         )
                         deploy_payload = _run_remote_deploy(
-                            run_id, fqdn, target_instance, jwt_secret, release_target
+                            run_id, fqdn, target_instance, effective_env, release_target
                         )
                         exec_result = deploy_payload.get("exec_result", {})
                         verification = _build_deploy_verification(
                             fqdn, deploy_payload.get("public_checks", []), dns_ok, exec_result, True
                         )
                         log_payload = {
-                            "stdout": exec_result.get("stdout", ""),
-                            "stderr": exec_result.get("stderr", ""),
+                            "stdout": _redact_secrets(exec_result.get("stdout", "") or "", secret_values),
+                            "stderr": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
                             "invocation_status": exec_result.get("invocation_status"),
                             "response_code": exec_result.get("response_code"),
                         }
@@ -3357,7 +3482,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                     {
                                         "code": preflight_code,
                                         "message": "SSM preflight failed",
-                                        "detail": exec_result.get("stderr", ""),
+                                        "detail": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
                                     }
                                 )
                             elif not preflight_ok:
@@ -3365,14 +3490,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                     {
                                         "code": "ssm_preflight_failed",
                                         "message": "SSM preflight failed",
-                                        "detail": exec_result.get("stderr", ""),
+                                        "detail": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
                                     }
                                 )
                             deploy_result.setdefault("errors", []).append(
                                 {
                                     "code": "ssm_failed",
                                     "message": "SSM command failed",
-                                    "detail": exec_result.get("stderr", ""),
+                                    "detail": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
                                 }
                             )
                         deploy_url = _write_artifact(
