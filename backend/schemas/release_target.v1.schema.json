@@ -41,6 +41,9 @@
       "properties": {
         "type": { "type": "string", "enum": ["docker-compose"] },
         "transport": { "type": "string", "enum": ["ssm"] },
+        "mode": { "type": "string", "enum": ["compose_build", "compose_images"] },
+        "image_deploy": { "type": "boolean" },
+        "registry": { "type": "object" },
         "remote_root": { "type": "string" },
         "compose_file_path": { "type": "string" }
       },

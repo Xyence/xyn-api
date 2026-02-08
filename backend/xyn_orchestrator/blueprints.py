@@ -641,10 +641,15 @@ def _acceptance_checks_for_blueprint(
         return {key: list(value) for key, value in acceptance.items()}
     deploy_meta = metadata.get("deploy") or {}
     tls_meta = metadata.get("tls") or {}
+    image_deploy_enabled = False
     if release_target:
         deploy_target = release_target.get("target_instance_id")
         deploy_fqdn = release_target.get("fqdn")
         tls_meta = release_target.get("tls") or {}
+        runtime_meta = release_target.get("runtime") or {}
+        image_deploy_enabled = (
+            runtime_meta.get("mode") == "compose_images" or bool(runtime_meta.get("image_deploy"))
+        )
     else:
         deploy_target = deploy_meta.get("target_instance_id") or deploy_meta.get("target_instance") or deploy_meta.get(
             "target_instance_name"
@@ -666,17 +671,36 @@ def _acceptance_checks_for_blueprint(
             "persistence_devices": ["ems-api-devices-postgres", "ems-stack-verify-persistence"],
         }
         if remote_enabled:
-            checks["remote_http_health"] = [
-                "dns.ensure_record.route53",
-                "deploy.apply_remote_compose.ssm",
-                "verify.public_http",
-            ]
+            if image_deploy_enabled:
+                checks["remote_http_health"] = [
+                    "build.publish_images.container",
+                    "dns.ensure_record.route53",
+                    "deploy.apply_remote_compose.pull",
+                    "verify.public_http",
+                ]
+            else:
+                checks["remote_http_health"] = [
+                    "dns.ensure_record.route53",
+                    "deploy.apply_remote_compose.ssm",
+                    "verify.public_http",
+                ]
         if remote_enabled and tls_enabled:
-            checks["remote_https_health"] = [
-                "tls.acme_http01",
-                "ingress.nginx_tls_configure",
-                "verify.public_https",
-            ]
+            if image_deploy_enabled:
+                checks["remote_https_health"] = [
+                    "build.publish_images.container",
+                    "dns.ensure_record.route53",
+                    "deploy.apply_remote_compose.pull",
+                    "verify.public_http",
+                    "tls.acme_http01",
+                    "ingress.nginx_tls_configure",
+                    "verify.public_https",
+                ]
+            else:
+                checks["remote_https_health"] = [
+                    "tls.acme_http01",
+                    "ingress.nginx_tls_configure",
+                    "verify.public_https",
+                ]
         return checks
     return {}
 
@@ -805,6 +829,37 @@ def _select_next_slice(
         for entry in run_history_summary.get("completed_work_items", [])
         if entry.get("outcome") == "succeeded"
     }
+    image_deploy_present = any(item.get("id") == "deploy.apply_remote_compose.pull" for item in work_items)
+    remote_http_items = (
+        [
+            "build.publish_images.container",
+            "dns.ensure_record.route53",
+            "deploy.apply_remote_compose.pull",
+            "verify.public_http",
+        ]
+        if image_deploy_present
+        else ["dns.ensure_record.route53", "deploy.apply_remote_compose.ssm", "verify.public_http"]
+    )
+    remote_https_items = (
+        [
+            "build.publish_images.container",
+            "dns.ensure_record.route53",
+            "deploy.apply_remote_compose.pull",
+            "verify.public_http",
+            "tls.acme_http01",
+            "ingress.nginx_tls_configure",
+            "verify.public_https",
+        ]
+        if image_deploy_present
+        else [
+            "dns.ensure_record.route53",
+            "deploy.apply_remote_compose.ssm",
+            "verify.public_http",
+            "tls.acme_http01",
+            "ingress.nginx_tls_configure",
+            "verify.public_https",
+        ]
+    )
     gap_to_items = {
         "local_chassis": ["ems-stack-prod-web"],
         "jwt_required": ["ems-authn-jwt-module", "ems-api-jwt-protect-me", "ems-ui-token-input-me-call", "ems-stack-pass-jwt-secret-and-verify-me"],
@@ -818,19 +873,8 @@ def _select_next_slice(
         ],
         "oidc": ["ems-api-authn-oidc", "ems-ui-auth"],
         "route53_acme_ssm": ["ems-api-route53", "ems-api-acme", "ems-ssm-deploy"],
-        "remote_http_health": [
-            "dns.ensure_record.route53",
-            "deploy.apply_remote_compose.ssm",
-            "verify.public_http",
-        ],
-        "remote_https_health": [
-            "dns.ensure_record.route53",
-            "deploy.apply_remote_compose.ssm",
-            "verify.public_http",
-            "tls.acme_http01",
-            "ingress.nginx_tls_configure",
-            "verify.public_https",
-        ],
+        "remote_http_health": remote_http_items,
+        "remote_https_health": remote_https_items,
     }
     if not next_gap:
         return work_items, {"gaps_detected": [], "modules_selected": [], "why_next": ["All known gaps satisfied."]}
@@ -881,10 +925,14 @@ def _annotate_work_items(
         "dns-route53-module": ["dns.route53.records"],
         "deploy-ssm-compose-module": ["runtime.compose.apply_remote"],
         "ingress-nginx-acme-module": ["ingress.tls.acme_http01"],
+        "build-container-publish-module": ["build.container.image", "publish.container.registry"],
+        "runtime-compose-pull-apply-module": ["runtime.compose.pull_apply_remote"],
         "dns-route53-ensure-record": ["dns.route53.records"],
         "dns.ensure_record.route53": ["dns.route53.records"],
         "remote-deploy-compose-ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
         "deploy.apply_remote_compose.ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
+        "build.publish_images.container": ["build.container.image", "publish.container.registry"],
+        "deploy.apply_remote_compose.pull": ["runtime.compose.pull_apply_remote"],
         "remote-deploy-verify-public": ["deploy.verify.public_http"],
         "verify.public_http": ["deploy.verify.public_http"],
         "tls-acme-bootstrap": ["ingress.tls.acme_http01"],
@@ -915,10 +963,14 @@ def _annotate_work_items(
         "dns-route53-module": ["dns-route53"],
         "deploy-ssm-compose-module": ["deploy-ssm-compose"],
         "ingress-nginx-acme-module": ["ingress-nginx-acme"],
+        "build-container-publish-module": ["build-container-publish"],
+        "runtime-compose-pull-apply-module": ["runtime-compose-pull-apply"],
         "dns-route53-ensure-record": ["dns-route53"],
         "dns.ensure_record.route53": ["dns-route53"],
         "remote-deploy-compose-ssm": ["deploy-ssm-compose"],
         "deploy.apply_remote_compose.ssm": ["deploy-ssm-compose"],
+        "build.publish_images.container": ["build-container-publish"],
+        "deploy.apply_remote_compose.pull": ["runtime-compose-pull-apply"],
         "remote-deploy-verify-public": ["deploy-ssm-compose"],
         "verify.public_http": ["deploy-ssm-compose"],
         "tls-acme-bootstrap": ["ingress-nginx-acme"],
@@ -1795,12 +1847,16 @@ def _generate_implementation_plan(
     release_dns = release_target.get("dns") if isinstance(release_target, dict) else {}
     release_runtime = release_target.get("runtime") if isinstance(release_target, dict) else {}
     release_tls = release_target.get("tls") if isinstance(release_target, dict) else {}
+    image_deploy_enabled = bool(
+        release_runtime.get("mode") == "compose_images" or release_runtime.get("image_deploy")
+    )
     if release_dns:
         dns_provider = release_dns.get("provider") or dns_provider
     route53_requested = dns_provider == "route53" or "dns-route53" in modules_required
     deploy_ssm_requested = "deploy-ssm-compose" in modules_required
     tls_acme_requested = "ingress-nginx-acme" in modules_required
     runtime_requested = "runtime-web-static-nginx" in modules_required
+    image_deploy_requested = image_deploy_enabled or "build-container-publish" in modules_required or "runtime-compose-pull-apply" in modules_required
     if not runtime_requested:
         try:
             metadata_blob = json.dumps(metadata).lower()
@@ -1827,6 +1883,84 @@ def _generate_implementation_plan(
         tls_meta = release_tls or (metadata.get("tls") or {})
         tls_mode = str(tls_meta.get("mode") or "").lower()
         tls_acme_requested = tls_mode in {"nginx+acme", "acme", "letsencrypt"}
+    if image_deploy_enabled and blueprint_fqn == "core.ems.platform":
+        work_items = [item for item in work_items if item.get("id") != "deploy.apply_remote_compose.ssm"]
+        for item in work_items:
+            if "depends_on" in item:
+                item["depends_on"] = [
+                    "deploy.apply_remote_compose.pull" if dep == "deploy.apply_remote_compose.ssm" else dep
+                    for dep in item["depends_on"]
+                ]
+        if not any(item.get("id") == "build.publish_images.container" for item in work_items):
+            work_items.append(
+                {
+                    "id": "build.publish_images.container",
+                    "title": "Build and publish container images",
+                    "description": "Build EMS images and publish to the container registry.",
+                    "type": "deploy",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": ".",
+                            "auth": "https_token",
+                            "allow_write": False,
+                        }
+                    ],
+                    "inputs": {"artifacts": ["implementation_plan.json", "release_target.json"]},
+                    "outputs": {"paths": [], "artifacts": ["build_result.json", "release_manifest.json"]},
+                    "acceptance_criteria": ["Images are built and pushed to registry with digests."],
+                    "verify": [{"name": "build-publish", "command": "echo 'handled by runner'", "cwd": "."}],
+                    "depends_on": [],
+                    "labels": ["deploy", "build", "publish", "module:build-container-publish"],
+                    "config": {
+                        "images": [
+                            {
+                                "name": "ems-api",
+                                "service": "ems-api",
+                                "repo": "xyn-api",
+                                "context_path": "apps/ems-api",
+                                "dockerfile_path": "apps/ems-api/Dockerfile",
+                            },
+                            {
+                                "name": "ems-web",
+                                "service": "ems-web",
+                                "repo": "xyn-ui",
+                                "context_path": "apps/ems-ui",
+                                "dockerfile_path": "apps/ems-ui/Dockerfile",
+                            },
+                        ]
+                    },
+                }
+            )
+        if not any(item.get("id") == "deploy.apply_remote_compose.pull" for item in work_items):
+            work_items.append(
+                {
+                    "id": "deploy.apply_remote_compose.pull",
+                    "title": "Remote deploy via compose pull",
+                    "description": "Deploy EMS stack via compose pull/apply using published images.",
+                    "type": "deploy",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": ".",
+                            "auth": "https_token",
+                            "allow_write": False,
+                        }
+                    ],
+                    "inputs": {
+                        "artifacts": ["implementation_plan.json", "release_target.json", "release_manifest.json"]
+                    },
+                    "outputs": {"paths": [], "artifacts": ["deploy_result.json", "deploy_manifest.json"]},
+                    "acceptance_criteria": ["EMS stack deployed via image pull."],
+                    "verify": [{"name": "remote-deploy", "command": "echo 'handled by runner'", "cwd": "."}],
+                    "depends_on": ["dns.ensure_record.route53", "build.publish_images.container"],
+                    "labels": ["deploy", "ssm", "remote", "module:runtime-compose-pull-apply"],
+                }
+            )
     if route53_requested and "dns-route53" not in module_ids:
         if not any(item.get("id") == "dns-route53-module" for item in work_items):
             work_items.insert(
@@ -1933,6 +2067,82 @@ def _generate_implementation_plan(
                         "ingress",
                         "module:ingress-nginx-acme",
                         "capability:ingress.tls.acme_http01",
+                    ],
+                },
+            )
+    if image_deploy_requested and "build-container-publish" not in module_ids:
+        if not any(item.get("id") == "build-container-publish-module" for item in work_items):
+            work_items.insert(
+                0,
+                {
+                    "id": "build-container-publish-module",
+                    "title": "Container build/publish module scaffold",
+                    "description": "Register container build/publish module spec in the local registry.",
+                    "type": "scaffold",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": "backend/registry/modules",
+                            "auth": "https_token",
+                            "allow_write": True,
+                        }
+                    ],
+                    "inputs": {"artifacts": ["implementation_plan.json"]},
+                    "outputs": {"paths": ["backend/registry/modules/build-container-publish.json"]},
+                    "acceptance_criteria": ["Build/publish module spec exists in module registry."],
+                    "verify": [
+                        {
+                            "name": "module-spec",
+                            "command": "test -f backend/registry/modules/build-container-publish.json",
+                            "cwd": ".",
+                        }
+                    ],
+                    "depends_on": [],
+                    "labels": [
+                        "module",
+                        "build",
+                        "module:build-container-publish",
+                        "capability:build.container.image",
+                    ],
+                },
+            )
+    if image_deploy_requested and "runtime-compose-pull-apply" not in module_ids:
+        if not any(item.get("id") == "runtime-compose-pull-apply-module" for item in work_items):
+            work_items.insert(
+                0,
+                {
+                    "id": "runtime-compose-pull-apply-module",
+                    "title": "Compose pull/apply module scaffold",
+                    "description": "Register compose pull/apply module spec in the local registry.",
+                    "type": "scaffold",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": "backend/registry/modules",
+                            "auth": "https_token",
+                            "allow_write": True,
+                        }
+                    ],
+                    "inputs": {"artifacts": ["implementation_plan.json"]},
+                    "outputs": {"paths": ["backend/registry/modules/runtime-compose-pull-apply.json"]},
+                    "acceptance_criteria": ["Compose pull/apply module spec exists in module registry."],
+                    "verify": [
+                        {
+                            "name": "module-spec",
+                            "command": "test -f backend/registry/modules/runtime-compose-pull-apply.json",
+                            "cwd": ".",
+                        }
+                    ],
+                    "depends_on": [],
+                    "labels": [
+                        "module",
+                        "deploy",
+                        "module:runtime-compose-pull-apply",
+                        "capability:runtime.compose.pull_apply_remote",
                     ],
                 },
             )

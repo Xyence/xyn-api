@@ -1,0 +1,39 @@
+{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "runtime-compose-pull-apply",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "runtime.compose.pull_apply_remote"
+    }
+  },
+  "description": "Remote docker-compose pull/apply using image-based releases via SSM.",
+  "module": {
+    "type": "lib",
+    "fqn": "core.runtime-compose-pull-apply",
+    "capabilitiesProvided": [
+      "runtime.compose.pull_apply_remote"
+    ],
+    "interfaces": {
+      "config": {
+        "compose_template_path": "Path to compose template (optional).",
+        "images": "Service->image mapping (tag/digest).",
+        "env_public": "Non-secret env vars to export.",
+        "env_secret_keys": "Secret env var names to export at runtime.",
+        "remote_root": "Remote root path on instance.",
+        "transport": "ssm",
+        "fqdn": "Public fqdn for verification."
+      },
+      "operations": {
+        "generate_compose_for_images": "Render compose using image references only.",
+        "remote_pull_apply": "docker compose pull + up -d via SSM."
+      }
+    },
+    "constraints": {
+      "aws_auth": "Ambient AWS creds; instance role used for ECR pull.",
+      "logging": "Never log secret values."
+    }
+  }
+}

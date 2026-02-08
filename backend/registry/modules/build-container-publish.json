@@ -1,0 +1,42 @@
+{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "build-container-publish",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "build.container.image"
+    }
+  },
+  "description": "Build container images and publish to a registry (ECR preferred).",
+  "module": {
+    "type": "lib",
+    "fqn": "core.build-container-publish",
+    "capabilitiesProvided": [
+      "build.container.image",
+      "publish.container.registry"
+    ],
+    "interfaces": {
+      "config": {
+        "registry": {
+          "provider": "Registry provider (ecr).",
+          "account_id": "Optional AWS account id for ECR; inferred if omitted.",
+          "region": "AWS region for ECR.",
+          "repository_prefix": "Prefix for repositories (default: xyn)."
+        },
+        "images": "List of images to build (name, context_path, dockerfile_path, build_args, target).",
+        "tag_strategy": "release_id or git_sha (default release_id).",
+        "push": "Whether to push images (default true)."
+      },
+      "operations": {
+        "build_images": "Build images with docker.",
+        "publish_images": "Push images to the registry and resolve digests."
+      }
+    },
+    "constraints": {
+      "aws_auth": "Ambient AWS creds only; no inline secrets.",
+      "logging": "Never log registry auth tokens or secret build args."
+    }
+  }
+}

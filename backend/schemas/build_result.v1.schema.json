@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BuildResult v1",
+  "type": "object",
+  "required": ["schema_version", "release_id", "images", "outcome", "started_at", "finished_at", "errors"],
+  "properties": {
+    "schema_version": { "const": "build_result.v1" },
+    "release_id": { "type": "string", "minLength": 1 },
+    "images": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "repository", "tag", "image_uri", "pushed"],
+        "properties": {
+          "name": { "type": "string" },
+          "repository": { "type": "string" },
+          "tag": { "type": "string" },
+          "image_uri": { "type": "string" },
+          "digest": { "type": "string" },
+          "built_at": { "type": "string" },
+          "pushed": { "type": "boolean" },
+          "errors": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "outcome": { "type": "string", "enum": ["succeeded", "failed", "noop"] },
+    "started_at": { "type": "string" },
+    "finished_at": { "type": "string" },
+    "errors": { "type": "array", "items": { "type": "object" } }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReleaseManifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "release_id",
+    "blueprint_id",
+    "release_target_id",
+    "images",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "release_manifest.v1" },
+    "release_id": { "type": "string" },
+    "blueprint_id": { "type": "string" },
+    "release_target_id": { "type": "string" },
+    "images": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["image_uri"],
+        "properties": {
+          "image_uri": { "type": "string" },
+          "digest": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "compose": {
+      "type": "object",
+      "properties": {
+        "file_path": { "type": "string" },
+        "content_hash": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": false
+}

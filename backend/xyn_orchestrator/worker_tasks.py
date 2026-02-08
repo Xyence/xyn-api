@@ -2493,6 +2493,8 @@ def _work_item_capabilities(work_item: Dict[str, Any], work_item_id: str) -> set
             "tls-acme-bootstrap": ["ingress.tls.acme_http01"],
             "tls-nginx-configure": ["ingress.nginx.tls_configure"],
             "remote-deploy-verify-https": ["deploy.verify.public_https"],
+            "build.publish_images.container": ["build.container.image", "publish.container.registry"],
+            "deploy.apply_remote_compose.pull": ["runtime.compose.pull_apply_remote"],
         }
         caps = legacy_caps.get(work_item_id, [])
     return {cap for cap in caps if isinstance(cap, str)}
@@ -2609,6 +2611,263 @@ def _build_deploy_manifest(
         "env_public": env_public,
         "env_secret_keys": secret_keys,
     }
+
+
+def _ecr_repo_uri(account_id: str, region: str, repo_name: str) -> str:
+    return f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repo_name}"
+
+
+def _ensure_ecr_repo(client, repo_name: str) -> None:
+    try:
+        client.describe_repositories(repositoryNames=[repo_name])
+    except client.exceptions.RepositoryNotFoundException:
+        client.create_repository(repositoryName=repo_name)
+
+
+def _docker_login_ecr(region: str) -> str:
+    ecr = boto3.client("ecr", region_name=region)
+    token_response = ecr.get_authorization_token()
+    auth = token_response["authorizationData"][0]
+    endpoint = auth.get("proxyEndpoint", "")
+    token = base64.b64decode(auth.get("authorizationToken", "")).decode()
+    username, password = token.split(":", 1)
+    login_proc = subprocess.run(
+        ["docker", "login", "--username", username, "--password-stdin", endpoint],
+        input=password,
+        text=True,
+        capture_output=True,
+    )
+    if login_proc.returncode != 0:
+        raise RuntimeError(login_proc.stderr or login_proc.stdout or "docker login failed")
+    return endpoint.replace("https://", "").replace("http://", "")
+
+
+def _checkout_repo(repo_url: str, ref: str, dest_dir: str) -> None:
+    if not os.path.exists(dest_dir):
+        subprocess.run(["git", "clone", repo_url, dest_dir], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "fetch", "--all"], check=True, cwd=dest_dir, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", ref], check=True, cwd=dest_dir, capture_output=True, text=True)
+    subprocess.run(["git", "pull", "--ff-only"], check=True, cwd=dest_dir, capture_output=True, text=True)
+
+
+def _build_publish_images(
+    release_id: str,
+    images: List[Dict[str, Any]],
+    registry_cfg: Dict[str, Any],
+    repo_sources: Dict[str, Dict[str, str]],
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, str]]:
+    started_at = datetime.utcnow().isoformat() + "Z"
+    outcome = "succeeded"
+    errors: List[Dict[str, Any]] = []
+    image_results: List[Dict[str, Any]] = []
+    images_map: Dict[str, Dict[str, str]] = {}
+    registry_region = registry_cfg.get("region") or os.environ.get("AWS_REGION") or ""
+    if not registry_region:
+        raise RuntimeError("registry.region missing for build/publish")
+    sts = boto3.client("sts", region_name=registry_region)
+    account_id = registry_cfg.get("account_id") or sts.get_caller_identity().get("Account")
+    if not account_id:
+        raise RuntimeError("Unable to resolve AWS account id for ECR")
+    repo_prefix = registry_cfg.get("repository_prefix") or "xyn"
+    registry = _docker_login_ecr(registry_region)
+    ecr = boto3.client("ecr", region_name=registry_region)
+    workspace = tempfile.mkdtemp(prefix="xyn-build-")
+    checked_out: Dict[str, str] = {}
+    try:
+        for image in images:
+            name = image.get("name")
+            service = image.get("service") or name
+            repo_key = image.get("repo") or "xyn-api"
+            source = repo_sources.get(repo_key)
+            if not source:
+                raise RuntimeError(f"Unknown repo source {repo_key}")
+            if repo_key not in checked_out:
+                repo_dir = os.path.join(workspace, repo_key)
+                _checkout_repo(source["url"], source.get("ref", "main"), repo_dir)
+                checked_out[repo_key] = repo_dir
+            repo_dir = checked_out[repo_key]
+            context_path = os.path.join(repo_dir, image.get("context_path", ""))
+            dockerfile_path = os.path.join(repo_dir, image.get("dockerfile_path", "Dockerfile"))
+            repo_name = f"{repo_prefix}/{name}"
+            _ensure_ecr_repo(ecr, repo_name)
+            repo_uri = _ecr_repo_uri(account_id, registry_region, repo_name)
+            tag = release_id
+            image_uri = f"{repo_uri}:{tag}"
+            build_proc = subprocess.run(
+                ["docker", "build", "-f", dockerfile_path, "-t", image_uri, context_path],
+                capture_output=True,
+                text=True,
+            )
+            if build_proc.returncode != 0:
+                outcome = "failed"
+                image_results.append(
+                    {
+                        "name": name,
+                        "repository": repo_name,
+                        "tag": tag,
+                        "image_uri": image_uri,
+                        "pushed": False,
+                        "errors": [build_proc.stderr or build_proc.stdout or "build failed"],
+                    }
+                )
+                continue
+            push_proc = subprocess.run(
+                ["docker", "push", image_uri],
+                capture_output=True,
+                text=True,
+            )
+            if push_proc.returncode != 0:
+                outcome = "failed"
+                image_results.append(
+                    {
+                        "name": name,
+                        "repository": repo_name,
+                        "tag": tag,
+                        "image_uri": image_uri,
+                        "pushed": False,
+                        "errors": [push_proc.stderr or push_proc.stdout or "push failed"],
+                    }
+                )
+                continue
+            digest = ""
+            try:
+                describe = ecr.describe_images(repositoryName=repo_name, imageIds=[{"imageTag": tag}])
+                detail = (describe.get("imageDetails") or [{}])[0]
+                digest = detail.get("imageDigest", "")
+            except Exception:
+                digest = ""
+            image_results.append(
+                {
+                    "name": name,
+                    "repository": repo_name,
+                    "tag": tag,
+                    "image_uri": image_uri,
+                    "digest": digest,
+                    "built_at": datetime.utcnow().isoformat() + "Z",
+                    "pushed": True,
+                }
+            )
+            images_map[service] = {"image_uri": image_uri, "digest": digest}
+    except Exception as exc:
+        outcome = "failed"
+        errors.append({"code": "build_failed", "message": str(exc)})
+    finished_at = datetime.utcnow().isoformat() + "Z"
+    build_result = {
+        "schema_version": "build_result.v1",
+        "release_id": release_id,
+        "images": image_results,
+        "outcome": outcome if outcome == "failed" else "succeeded",
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "errors": errors,
+    }
+    release_manifest = {
+        "schema_version": "release_manifest.v1",
+        "release_id": release_id,
+        "blueprint_id": "",
+        "release_target_id": "",
+        "images": images_map,
+        "created_at": finished_at,
+    }
+    return build_result, release_manifest, images_map
+
+
+def _render_compose_for_images(images: Dict[str, Dict[str, str]]) -> str:
+    api_image = images.get("ems-api", {}).get("image_uri")
+    web_image = images.get("ems-web", {}).get("image_uri")
+    api_digest = images.get("ems-api", {}).get("digest")
+    web_digest = images.get("ems-web", {}).get("digest")
+    if api_digest and api_image:
+        api_image = f"{api_image.split(':')[0]}@{api_digest}"
+    if web_digest and web_image:
+        web_image = f"{web_image.split(':')[0]}@{web_digest}"
+    return (
+        "services:\n"
+        "  postgres:\n"
+        "    image: postgres:16-alpine\n"
+        "    environment:\n"
+        "      POSTGRES_USER: ${POSTGRES_USER:-ems}\n"
+        "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ems}\n"
+        "      POSTGRES_DB: ${POSTGRES_DB:-ems}\n"
+        "    volumes:\n"
+        "      - ems_pgdata:/var/lib/postgresql/data\n\n"
+        "  ems-api:\n"
+        f"    image: {api_image}\n"
+        "    environment:\n"
+        "      DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}\n"
+        "      EMS_JWT_SECRET: ${EMS_JWT_SECRET}\n"
+        "      EMS_JWT_ISSUER: ${EMS_JWT_ISSUER:-xyn-ems}\n"
+        "      EMS_JWT_AUDIENCE: ${EMS_JWT_AUDIENCE:-ems}\n"
+        "    depends_on:\n"
+        "      - postgres\n"
+        "    expose:\n"
+        "      - \"8000\"\n\n"
+        "  ems-web:\n"
+        f"    image: {web_image}\n"
+        "    ports:\n"
+        "      - \"${EMS_PUBLIC_PORT:-8080}:8080\"\n"
+        "      - \"${EMS_PUBLIC_TLS_PORT:-8443}:8443\"\n"
+        "    volumes:\n"
+        "      - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme\n"
+        "      - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro\n"
+        "    depends_on:\n"
+        "      - ems-api\n\n"
+        "volumes:\n"
+        "  ems_pgdata: {}\n"
+    )
+
+
+def _build_remote_pull_apply_commands(
+    root_dir: str,
+    compose_content: str,
+    registry_region: str,
+    registry_host: str,
+    extra_env: Dict[str, str],
+) -> List[str]:
+    env_exports = []
+    for key, value in extra_env.items():
+        if not key:
+            continue
+        safe_value = str(value).replace("\"", "\\\"")
+        env_exports.append(f"export {key}=\"{safe_value}\"")
+    compose_path = f"{root_dir}/compose.release.yml"
+    return [
+        "set -euo pipefail",
+        "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
+        "docker compose version >/dev/null 2>&1 || { echo \"missing_compose\"; exit 11; }",
+        "command -v aws >/dev/null 2>&1 || { echo \"missing_awscli\"; exit 14; }",
+        "command -v curl >/dev/null 2>&1 || { echo \"missing_curl\"; exit 13; }",
+        f"ROOT={root_dir}",
+        "mkdir -p \"$ROOT\"",
+        f"cat <<'EOF' > \"{compose_path}\"\n{compose_content}\nEOF",
+        f"aws ecr get-login-password --region {registry_region} | docker login --username AWS --password-stdin {registry_host}",
+        *env_exports,
+        f"docker compose -f \"{compose_path}\" pull",
+        f"docker compose -f \"{compose_path}\" up -d --remove-orphans",
+        "for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 2; done",
+        "for i in $(seq 1 30); do curl -fsS http://localhost:8080/api/health && break; sleep 2; done",
+    ]
+
+
+def _ssm_fetch_image_ids(instance_id: str, aws_region: str) -> Dict[str, str]:
+    cmd = [
+        "set -euo pipefail",
+        "API_ID=$(docker ps -q --filter \"name=ems-api\" || true)",
+        "WEB_ID=$(docker ps -q --filter \"name=ems-web\" || true)",
+        "if [ -n \"$API_ID\" ]; then docker inspect --format '{{.Image}}' $API_ID; fi",
+        "if [ -n \"$WEB_ID\" ]; then docker inspect --format '{{.Image}}' $WEB_ID; fi",
+    ]
+    result = _run_ssm_commands(instance_id, aws_region, cmd)
+    if result.get("invocation_status") != "Success":
+        raise RuntimeError(result.get("stderr") or "SSM image inspect failed")
+    lines = [line.strip() for line in (result.get("stdout") or "").splitlines() if line.strip()]
+    image_ids: Dict[str, str] = {}
+    if lines:
+        if len(lines) >= 1:
+            image_ids["ems-api"] = lines[0]
+        if len(lines) >= 2:
+            image_ids["ems-web"] = lines[1]
+    return image_ids
 
 
 def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
@@ -3284,6 +3543,92 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 work_item,
                 work_item_id,
                 caps,
+                {"build.publish_images.container"},
+                "build.container.image",
+            ):
+                try:
+                    release_id = run_id
+                    runtime = (release_target or {}).get("runtime") or {}
+                    registry_cfg = runtime.get("registry") or {}
+                    registry_cfg.setdefault("provider", "ecr")
+                    if not registry_cfg.get("region") and target_instance.get("aws_region"):
+                        registry_cfg["region"] = target_instance.get("aws_region")
+                    images = (work_item.get("config") or {}).get("images") or []
+                    if not images:
+                        raise RuntimeError("No images configured for build.")
+                    repo_sources = {
+                        "xyn-api": {"url": "https://github.com/Xyence/xyn-api", "ref": "main"},
+                        "xyn-ui": {"url": "https://github.com/Xyence/xyn-ui", "ref": "main"},
+                    }
+                    build_result, release_manifest, images_map = _build_publish_images(
+                        release_id, images, registry_cfg, repo_sources
+                    )
+                    release_manifest["blueprint_id"] = blueprint_id or ""
+                    release_manifest["release_target_id"] = (release_target or {}).get("id") or ""
+                    compose_content = _render_compose_for_images(images_map)
+                    compose_hash = hashlib.sha256(compose_content.encode("utf-8")).hexdigest()
+                    release_manifest["compose"] = {
+                        "file_path": "compose.release.yml",
+                        "content_hash": compose_hash,
+                        "content": compose_content,
+                    }
+                    build_url = _write_artifact(run_id, "build_result.json", json.dumps(build_result, indent=2))
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "build_result.json", "kind": "build", "url": build_url},
+                    )
+                    manifest_url = _write_artifact(
+                        run_id, "release_manifest.json", json.dumps(release_manifest, indent=2)
+                    )
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "release_manifest.json", "kind": "release_manifest", "url": manifest_url},
+                    )
+                    if source_run:
+                        src_url = _write_artifact(
+                            source_run, "release_manifest.json", json.dumps(release_manifest, indent=2)
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{source_run}/artifacts",
+                            {"name": "release_manifest.json", "kind": "release_manifest", "url": src_url},
+                        )
+                    artifacts.append(
+                        {
+                            "key": "build_result.json",
+                            "content_type": "application/json",
+                            "description": "Container build result",
+                        }
+                    )
+                    artifacts.append(
+                        {
+                            "key": "release_manifest.json",
+                            "content_type": "application/json",
+                            "description": "Release manifest with image refs",
+                        }
+                    )
+                    if build_result.get("outcome") != "succeeded":
+                        success = False
+                        errors.append(
+                            {
+                                "code": "build_failed",
+                                "message": "Image build/publish failed.",
+                                "detail": {"release_id": release_id},
+                            }
+                        )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "build_failed",
+                            "message": "Image build/publish failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                    )
+
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
                 {"dns-route53-ensure-record", "dns.ensure_record.route53"},
                 "dns.route53.records",
             ):
@@ -3534,6 +3879,232 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         {
                             "code": "remote_deploy_failed",
                             "message": "Remote deploy via SSM failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                        )
+
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"deploy.apply_remote_compose.pull"},
+                "runtime.compose.pull_apply_remote",
+            ):
+                deploy_started = datetime.utcnow().isoformat() + "Z"
+                try:
+                    if not target_instance or not target_instance.get("instance_id"):
+                        raise RuntimeError("Target instance missing for remote deploy")
+                    effective_env = {}
+                    secret_values: Dict[str, str] = {}
+                    secret_keys: List[str] = []
+                    secret_failed = False
+                    try:
+                        effective_env, secret_values, secret_keys = _merge_release_env(
+                            release_env, release_secret_refs, target_instance.get("aws_region")
+                        )
+                    except Exception as exc:
+                        secret_failed = True
+                        success = False
+                        errors.append(
+                            {
+                                "code": "secret_resolve_failed",
+                                "message": "Secret resolution failed.",
+                                "detail": {"error": str(exc)},
+                            }
+                        )
+                        effective_env = dict(release_env)
+                    if "EMS_JWT_SECRET" not in effective_env and jwt_secret:
+                        effective_env["EMS_JWT_SECRET"] = jwt_secret
+                        secret_values.setdefault("EMS_JWT_SECRET", jwt_secret)
+                        if "EMS_JWT_SECRET" not in secret_keys:
+                            secret_keys.append("EMS_JWT_SECRET")
+                    if secret_failed:
+                        raise RuntimeError("Secret resolution failed.")
+                    release_manifest = None
+                    if source_run:
+                        release_manifest = _download_artifact_json(source_run, "release_manifest.json")
+                    if not release_manifest:
+                        raise RuntimeError("release_manifest.json not found for deploy")
+                    images_map = release_manifest.get("images") or {}
+                    compose_content = (release_manifest.get("compose") or {}).get("content") or _render_compose_for_images(images_map)
+                    compose_hash = hashlib.sha256(compose_content.encode("utf-8")).hexdigest()
+                    registry_region = (
+                        (release_target or {}).get("runtime", {}).get("registry", {}).get("region")
+                        or target_instance.get("aws_region")
+                        or os.environ.get("AWS_REGION", "")
+                    )
+                    if not registry_region:
+                        raise RuntimeError("registry.region missing for deploy")
+                    image_uri = ""
+                    if isinstance(images_map, dict) and images_map:
+                        image_uri = next(iter(images_map.values())).get("image_uri", "")
+                    registry_host = image_uri.split("/")[0] if image_uri else ""
+                    public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
+                    noop_done = False
+                    if public_ok and images_map:
+                        try:
+                            image_ids = _ssm_fetch_image_ids(
+                                target_instance.get("instance_id"), target_instance.get("aws_region")
+                            )
+                            match = True
+                            for svc, meta in images_map.items():
+                                digest = meta.get("digest")
+                                if not digest:
+                                    match = False
+                                    break
+                                if image_ids.get(svc) != digest:
+                                    match = False
+                                    break
+                            if match:
+                                deploy_finished = datetime.utcnow().isoformat() + "Z"
+                                verification = _build_deploy_verification(
+                                    fqdn, public_checks, None, {}, False
+                                )
+                                deploy_result = {
+                                    "schema_version": "deploy_result.v1",
+                                    "target_instance": target_instance,
+                                    "fqdn": fqdn,
+                                    "ssm_command_id": "",
+                                    "outcome": "noop",
+                                    "changes": "No changes (already healthy, images match)",
+                                    "verification": verification,
+                                    "started_at": deploy_started,
+                                    "finished_at": deploy_finished,
+                                    "errors": [],
+                                }
+                                deploy_url = _write_artifact(
+                                    run_id, "deploy_result.json", json.dumps(deploy_result, indent=2)
+                                )
+                                _post_json(
+                                    f"/xyn/internal/runs/{run_id}/artifacts",
+                                    {"name": "deploy_result.json", "kind": "deploy", "url": deploy_url},
+                                )
+                                verify_url = _write_artifact(
+                                    run_id, "deploy_verify.json", json.dumps({"checks": public_checks}, indent=2)
+                                )
+                                _post_json(
+                                    f"/xyn/internal/runs/{run_id}/artifacts",
+                                    {"name": "deploy_verify.json", "kind": "deploy", "url": verify_url},
+                                )
+                                artifacts.append(
+                                    {
+                                        "key": "deploy_result.json",
+                                        "content_type": "application/json",
+                                        "description": "Remote deploy result",
+                                    }
+                                )
+                                artifacts.append(
+                                    {
+                                        "key": "deploy_verify.json",
+                                        "content_type": "application/json",
+                                        "description": "Public verify checks",
+                                    }
+                                )
+                                noop_done = True
+                        except Exception:
+                            pass
+                    if noop_done:
+                        pass
+                    else:
+                        env_public = {k: v for k, v in effective_env.items() if k not in secret_keys}
+                        deploy_manifest = _build_deploy_manifest(
+                            fqdn,
+                            target_instance,
+                            (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
+                            "compose.release.yml",
+                            env_public,
+                            secret_keys,
+                        )
+                        deploy_manifest["compose_hash"] = compose_hash
+                        manifest_url = _write_artifact(
+                            run_id, "deploy_manifest.json", json.dumps(deploy_manifest, indent=2)
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_manifest.json", "kind": "deploy", "url": manifest_url},
+                        )
+                        commands = _build_remote_pull_apply_commands(
+                            (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
+                            compose_content,
+                            registry_region,
+                            registry_host,
+                            effective_env,
+                        )
+                        exec_result = _run_ssm_commands(
+                            target_instance.get("instance_id"),
+                            target_instance.get("aws_region"),
+                            commands,
+                        )
+                        public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
+                        verification = _build_deploy_verification(
+                            fqdn, public_checks, None, exec_result, True
+                        )
+                        log_payload = {
+                            "stdout": _redact_secrets(exec_result.get("stdout", "") or "", secret_values),
+                            "stderr": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
+                            "invocation_status": exec_result.get("invocation_status"),
+                            "response_code": exec_result.get("response_code"),
+                        }
+                        log_url = _write_artifact(run_id, "deploy_execution.log", json.dumps(log_payload, indent=2))
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_execution.log", "kind": "deploy", "url": log_url},
+                        )
+                        deploy_result = {
+                            "schema_version": "deploy_result.v1",
+                            "target_instance": target_instance,
+                            "fqdn": fqdn,
+                            "ssm_command_id": exec_result.get("ssm_command_id", ""),
+                            "outcome": "succeeded" if exec_result.get("invocation_status") == "Success" else "failed",
+                            "changes": "docker compose pull + up -d",
+                            "verification": verification,
+                            "started_at": deploy_started,
+                            "finished_at": datetime.utcnow().isoformat() + "Z",
+                            "errors": [],
+                        }
+                        if exec_result.get("invocation_status") != "Success":
+                            success = False
+                            deploy_result.setdefault("errors", []).append(
+                                {
+                                    "code": "ssm_failed",
+                                    "message": "SSM command failed",
+                                    "detail": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
+                                }
+                            )
+                        deploy_url = _write_artifact(
+                            run_id, "deploy_result.json", json.dumps(deploy_result, indent=2)
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_result.json", "kind": "deploy", "url": deploy_url},
+                        )
+                        verify_url = _write_artifact(
+                            run_id, "deploy_verify.json", json.dumps({"checks": public_checks}, indent=2)
+                        )
+                        _post_json(
+                            f"/xyn/internal/runs/{run_id}/artifacts",
+                            {"name": "deploy_verify.json", "kind": "deploy", "url": verify_url},
+                        )
+                        artifacts.append(
+                            {
+                                "key": "deploy_result.json",
+                                "content_type": "application/json",
+                                "description": "Remote deploy result",
+                            }
+                        )
+                        artifacts.append(
+                            {
+                                "key": "deploy_verify.json",
+                                "content_type": "application/json",
+                                "description": "Public verify checks",
+                            }
+                        )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "deploy_failed",
+                            "message": "Remote deploy via image pull failed.",
                             "detail": {"error": str(exc)},
                         }
                     )

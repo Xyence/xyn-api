@@ -192,6 +192,43 @@ class PipelineSchemaTests(TestCase):
         errors = list(Draft202012Validator(schema).iter_errors(payload))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
 
+    def test_build_result_schema(self):
+        payload = {
+            "schema_version": "build_result.v1",
+            "release_id": "rel-1",
+            "images": [
+                {
+                    "name": "ems-api",
+                    "repository": "xyn/ems-api",
+                    "tag": "rel-1",
+                    "image_uri": "123.dkr.ecr.us-west-2.amazonaws.com/xyn/ems-api:rel-1",
+                    "digest": "sha256:abc",
+                    "pushed": True,
+                }
+            ],
+            "outcome": "succeeded",
+            "started_at": "2026-02-07T00:00:00Z",
+            "finished_at": "2026-02-07T00:00:10Z",
+            "errors": [],
+        }
+        schema = self._load_schema("build_result.v1.schema.json")
+        errors = list(Draft202012Validator(schema).iter_errors(payload))
+        self.assertEqual(errors, [], f"Schema errors: {errors}")
+
+    def test_release_manifest_schema(self):
+        payload = {
+            "schema_version": "release_manifest.v1",
+            "release_id": "rel-1",
+            "blueprint_id": str(uuid.uuid4()),
+            "release_target_id": str(uuid.uuid4()),
+            "images": {"ems-api": {"image_uri": "repo:tag", "digest": "sha256:abc"}},
+            "compose": {"file_path": "compose.release.yml", "content_hash": "abc"},
+            "created_at": "2026-02-07T00:00:00Z",
+        }
+        schema = self._load_schema("release_manifest.v1.schema.json")
+        errors = list(Draft202012Validator(schema).iter_errors(payload))
+        self.assertEqual(errors, [], f"Schema errors: {errors}")
+
     def test_release_target_schema_validates(self):
         payload = {
             "schema_version": "release_target.v1",
@@ -329,6 +366,26 @@ class PipelineSchemaTests(TestCase):
         )
         ids = {item.get("id") for item in plan.get("work_items", [])}
         self.assertIn("dns-route53-module", ids)
+
+    def test_planner_selects_image_deploy_when_enabled(self):
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        release_target = {
+            "schema_version": "release_target.v1",
+            "id": str(uuid.uuid4()),
+            "blueprint_id": str(blueprint.id),
+            "name": "manager-demo",
+            "target_instance_id": str(uuid.uuid4()),
+            "fqdn": "ems.xyence.io",
+            "dns": {"provider": "route53"},
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "tls": {"mode": "none"},
+            "created_at": "2026-02-07T00:00:00Z",
+            "updated_at": "2026-02-07T00:00:00Z",
+        }
+        plan = _generate_implementation_plan(blueprint, release_target=release_target)
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("build.publish_images.container", ids)
+        self.assertIn("deploy.apply_remote_compose.pull", ids)
         rationale = plan.get("plan_rationale", {})
         self.assertIn("dns-route53", rationale.get("modules_selected", []))
 
