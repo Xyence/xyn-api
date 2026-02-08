@@ -70,6 +70,7 @@ from xyn_orchestrator.models import (
     Tenant,
     TenantMembership,
     BrandProfile,
+    Device,
 )
 
 
@@ -376,10 +377,79 @@ class PlatformAdminTests(TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
+    def test_device_crud_requires_active_tenant(self):
+        self._set_admin_session()
+        response = self.client.get("/xyn/api/tenant/devices")
+        self.assertEqual(response.status_code, 400)
+
+    def test_viewer_cannot_modify_device(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        identity = UserIdentity.objects.create(provider="oidc", issuer="https://issuer.example.com", subject="sub-user")
+        TenantMembership.objects.create(tenant=tenant, user_identity=identity, role="tenant_viewer")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session["active_tenant_id"] = str(tenant.id)
+        session.save()
+        response = self.client.post(
+            "/xyn/api/tenant/devices",
+            data=json.dumps({"name": "dev1", "device_type": "router"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_operator_can_modify_device(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        identity = UserIdentity.objects.create(provider="oidc", issuer="https://issuer.example.com", subject="sub-user")
+        TenantMembership.objects.create(tenant=tenant, user_identity=identity, role="tenant_operator")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session["active_tenant_id"] = str(tenant.id)
+        session.save()
+        response = self.client.post(
+            "/xyn/api/tenant/devices",
+            data=json.dumps({"name": "dev1", "device_type": "router"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_platform_admin_can_access_any_device(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        device = Device.objects.create(tenant=tenant, name="dev1", device_type="router")
+        self._set_admin_session()
+        response = self.client.get(f"/xyn/api/devices/{device.id}")
+        self.assertEqual(response.status_code, 200)
+
+    def test_device_unique_name_per_tenant(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        Device.objects.create(tenant=tenant, name="dev1", device_type="router")
+        self._set_admin_session()
+        session = self.client.session
+        session["active_tenant_id"] = str(tenant.id)
+        session.save()
+        response = self.client.post(
+            "/xyn/api/tenant/devices",
+            data=json.dumps({"name": "dev1", "device_type": "router"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+
 
 class AdminBridgeTests(TestCase):
     def _make_env(self):
         return Environment.objects.create(name="Dev", slug="dev")
+
+    def _set_admin_session(self):
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            issuer="https://issuer.example.com",
+            subject="sub-admin",
+            email="admin@xyence.io",
+        )
+        RoleBinding.objects.create(user_identity=identity, scope_kind="platform", role="platform_admin")
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session.save()
+        return identity
 
     def _seed_session(self, client, env):
         session = client.session

@@ -61,6 +61,7 @@ from .models import (
     Contact,
     TenantMembership,
     BrandProfile,
+    Device,
 )
 from .module_registry import maybe_sync_modules_from_registry
 
@@ -599,8 +600,6 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
             role="platform_admin",
         )
     roles = _get_roles(identity)
-    if not roles:
-        return JsonResponse({"error": "no roles assigned"}, status=403)
     # Bridge session auth into Django auth so login_required works.
     User = get_user_model()
     issuer_hash = hashlib.sha256(issuer.encode("utf-8")).hexdigest()[:12]
@@ -619,6 +618,8 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
     user.is_superuser = False
     user.is_active = True
     user.save()
+    if not roles:
+        return JsonResponse({"error": "no roles assigned"}, status=403)
     login(request, user, backend="django.contrib.auth.backends.ModelBackend")
     request.session["user_identity_id"] = str(identity.id)
     request.session["environment_id"] = str(env.id)
@@ -709,6 +710,21 @@ def _serialize_branding(profile: Optional[BrandProfile]) -> Dict[str, Any]:
         "display_name": profile.display_name or _default_branding()["display_name"],
         "logo_url": profile.logo_url or _default_branding()["logo_url"],
         "theme": theme,
+    }
+
+
+def _serialize_device(device: Device) -> Dict[str, Any]:
+    return {
+        "id": str(device.id),
+        "tenant_id": str(device.tenant_id),
+        "name": device.name,
+        "device_type": device.device_type,
+        "mgmt_ip": device.mgmt_ip,
+        "status": device.status,
+        "tags": device.tags,
+        "metadata_json": device.metadata_json,
+        "created_at": device.created_at,
+        "updated_at": device.updated_at,
     }
 
 
@@ -920,7 +936,13 @@ def tenants_public(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "not authenticated"}, status=401)
     if _is_platform_admin(identity):
         tenants = Tenant.objects.all().order_by("name")
-        data = [_serialize_tenant(t) for t in tenants]
+        data = [
+            {
+                **_serialize_tenant(t),
+                "membership_role": "platform_admin",
+            }
+            for t in tenants
+        ]
         return JsonResponse({"tenants": data})
     memberships = TenantMembership.objects.filter(user_identity=identity, status="active").select_related("tenant")
     data = [
@@ -953,8 +975,133 @@ def my_profile(request: HttpRequest) -> JsonResponse:
             },
             "roles": roles,
             "memberships": membership_data,
+            "active_tenant_id": request.session.get("active_tenant_id"),
         }
     )
+
+
+def set_active_tenant(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = _parse_json(request)
+    tenant_id = payload.get("tenant_id")
+    if not tenant_id:
+        return JsonResponse({"error": "tenant_id required"}, status=400)
+    if not _is_platform_admin(identity) and not _require_tenant_access(identity, tenant_id, "tenant_viewer"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    request.session["active_tenant_id"] = str(tenant_id)
+    return JsonResponse({"status": "ok", "tenant_id": str(tenant_id)})
+
+
+def _get_active_tenant(identity: UserIdentity, request: HttpRequest) -> Optional[Tenant]:
+    session = getattr(request, "session", None)
+    tenant_id = session.get("active_tenant_id") if session else None
+    if tenant_id:
+        tenant = Tenant.objects.filter(id=tenant_id).first()
+        if tenant and (_is_platform_admin(identity) or _require_tenant_access(identity, tenant_id, "tenant_viewer")):
+            return tenant
+    memberships = list(
+        TenantMembership.objects.filter(user_identity=identity, status="active").select_related("tenant")
+    )
+    if len(memberships) == 1:
+        tenant = memberships[0].tenant
+        if session is not None:
+            session["active_tenant_id"] = str(tenant.id)
+        return tenant
+    if _is_platform_admin(identity):
+        tenants = list(Tenant.objects.all())
+        if len(tenants) == 1:
+            tenant = tenants[0]
+            if session is not None:
+                session["active_tenant_id"] = str(tenant.id)
+            return tenant
+    return None
+
+
+@csrf_exempt
+def tenant_devices_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    tenant = _get_active_tenant(identity, request)
+    if not tenant:
+        return JsonResponse({"error": "active tenant not set"}, status=400)
+    if request.method == "POST":
+        if not (_is_platform_admin(identity) or _require_tenant_access(identity, str(tenant.id), "tenant_operator")):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return JsonResponse({"error": "name is required"}, status=400)
+        if Device.objects.filter(tenant=tenant, name=name).exists():
+            return JsonResponse({"error": "device name already exists"}, status=400)
+        device = Device.objects.create(
+            tenant=tenant,
+            name=name,
+            device_type=payload.get("device_type") or "unknown",
+            mgmt_ip=payload.get("mgmt_ip"),
+            status=payload.get("status") or "unknown",
+            tags=payload.get("tags"),
+            metadata_json=payload.get("metadata_json"),
+        )
+        return JsonResponse(_serialize_device(device), status=201)
+
+    devices = Device.objects.filter(tenant=tenant).order_by("name")
+    return JsonResponse({"devices": [_serialize_device(d) for d in devices]})
+
+
+@csrf_exempt
+def device_detail(request: HttpRequest, device_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    device = get_object_or_404(Device, id=device_id)
+    if not _is_platform_admin(identity):
+        tenant = _get_active_tenant(identity, request)
+        if not tenant or str(device.tenant_id) != str(tenant.id):
+            return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method == "GET":
+        return JsonResponse(_serialize_device(device))
+    if request.method in ("PATCH", "PUT"):
+        if not (_is_platform_admin(identity) or _require_tenant_access(identity, str(device.tenant_id), "tenant_operator")):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        if "name" in payload:
+            name = (payload.get("name") or "").strip()
+            if name and Device.objects.filter(tenant=device.tenant, name=name).exclude(id=device.id).exists():
+                return JsonResponse({"error": "device name already exists"}, status=400)
+            device.name = name or device.name
+        if "device_type" in payload:
+            device.device_type = payload.get("device_type") or device.device_type
+        if "mgmt_ip" in payload:
+            device.mgmt_ip = payload.get("mgmt_ip")
+        if "status" in payload:
+            device.status = payload.get("status") or device.status
+        if "tags" in payload:
+            device.tags = payload.get("tags")
+        if "metadata_json" in payload:
+            device.metadata_json = payload.get("metadata_json")
+        device.save(
+            update_fields=[
+                "name",
+                "device_type",
+                "mgmt_ip",
+                "status",
+                "tags",
+                "metadata_json",
+                "updated_at",
+            ]
+        )
+        return JsonResponse(_serialize_device(device))
+    if request.method == "DELETE":
+        if not (_is_platform_admin(identity) or _require_tenant_access(identity, str(device.tenant_id), "tenant_operator")):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        device.delete()
+        return JsonResponse({"status": "deleted"})
+    return JsonResponse({"error": "method not allowed"}, status=405)
 
 
 def tenant_branding_public(request: HttpRequest, tenant_id: str) -> JsonResponse:

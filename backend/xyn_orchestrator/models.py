@@ -573,6 +573,33 @@ class BrandProfile(models.Model):
         return f"{self.tenant.name} branding"
 
 
+class Device(models.Model):
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("offline", "Offline"),
+        ("unknown", "Unknown"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="devices")
+    name = models.CharField(max_length=200)
+    device_type = models.CharField(max_length=120)
+    mgmt_ip = models.CharField(max_length=120, null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="unknown")
+    tags = models.JSONField(null=True, blank=True)
+    metadata_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        unique_together = ("tenant", "name")
+        indexes = [models.Index(fields=["tenant", "status"])]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.tenant.name})"
+
+
 class ReleasePlan(models.Model):
     TARGET_CHOICES = [
         ("module", "Module"),

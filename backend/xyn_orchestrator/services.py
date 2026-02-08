@@ -102,6 +102,8 @@ def get_release_target_deploy_state(release_target_id: str) -> Dict[str, Any]:
         "run_id": str(run.id),
         "release_target_id": meta.get("release_target_id"),
         "release_id": meta.get("release_id"),
+        "release_uuid": meta.get("release_uuid"),
+        "release_version": meta.get("release_version"),
         "manifest": meta.get("manifest") or {},
         "compose": meta.get("compose") or {},
         "deploy_outcome": meta.get("deploy_outcome"),

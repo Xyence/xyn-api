@@ -4386,7 +4386,7 @@ def internal_releases_retention_report(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "GET required"}, status=405)
     blueprint_id = request.GET.get("blueprint_id")
     environment_id = request.GET.get("environment_id")
-    keep = int(request.GET.get("keep") or 20)
+    keep = int(request.GET.get("keep", 20))
     if not blueprint_id:
         return JsonResponse({"error": "blueprint_id required"}, status=400)
     plan = _build_release_retention(blueprint_id, environment_id, keep)
@@ -4453,7 +4453,7 @@ def internal_releases_gc(request: HttpRequest) -> JsonResponse:
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
     blueprint_id = payload.get("blueprint_id")
     environment_id = payload.get("environment_id")
-    keep = int(payload.get("keep") or 20)
+    keep = int(payload.get("keep", 20))
     dry_run = bool(payload.get("dry_run", True))
     confirm = bool(payload.get("confirm", False))
     if not blueprint_id:
@@ -4489,7 +4489,7 @@ def internal_artifacts_gc(request: HttpRequest) -> JsonResponse:
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
     blueprint_id = payload.get("blueprint_id")
     environment_id = payload.get("environment_id")
-    keep = int(payload.get("keep") or 20)
+    keep = int(payload.get("keep", 20))
     dry_run = bool(payload.get("dry_run", True))
     confirm = bool(payload.get("confirm", False))
     older_than_days = int(payload.get("older_than_days") or 30)

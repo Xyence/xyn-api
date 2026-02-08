@@ -14,6 +14,7 @@ from allauth.account.models import EmailAddress, EmailConfirmation
 from django.contrib.sites.models import Site
 
 from .ai import generate_article_draft
+from . import admin_site  # noqa: F401
 from .models import (
     Article,
     ArticleVersion,
@@ -45,6 +46,7 @@ from .models import (
     Contact,
     TenantMembership,
     BrandProfile,
+    Device,
     VoiceNote,
     VoiceTranscript,
 )
@@ -207,6 +209,13 @@ class TenantMembershipAdmin(admin.ModelAdmin):
 class BrandProfileAdmin(admin.ModelAdmin):
     list_display = ("tenant", "display_name", "updated_at")
     search_fields = ("tenant__name", "display_name")
+
+
+@admin.register(Device)
+class DeviceAdmin(admin.ModelAdmin):
+    list_display = ("name", "tenant", "device_type", "status", "mgmt_ip", "updated_at")
+    search_fields = ("name", "tenant__name", "device_type", "mgmt_ip")
+    list_filter = ("status", "tenant")
 
 
 @admin.register(ReleasePlan)
