@@ -77,6 +77,7 @@ def list_instances(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"instances": data})
 
 
+@csrf_exempt
 @login_required
 def get_instance(request: HttpRequest, instance_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
