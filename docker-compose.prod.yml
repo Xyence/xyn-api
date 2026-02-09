@@ -37,6 +37,7 @@ services:
       XYENCE_LOCAL_AMI_ID: ${XYENCE_LOCAL_AMI_ID:-}
       XYENCE_LOCAL_STATUS: ${XYENCE_LOCAL_STATUS:-running}
       XYENCE_LOCAL_ENVIRONMENT_ID: ${XYENCE_LOCAL_ENVIRONMENT_ID:-}
+      GUNICORN_CMD_ARGS: ${GUNICORN_CMD_ARGS:---timeout 180}
     depends_on:
       - db
       - redis
@@ -45,6 +46,7 @@ services:
       - backend_static:/app/staticfiles
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/ubuntu/src/xyn-contracts:/xyn-contracts:ro
+      - /home/ubuntu/src/xyn-seed:/xyn-seed:ro
       - /home/ubuntu/central-xyence-io-9d049e62e994.json:/secrets/gcp-speech.json:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"

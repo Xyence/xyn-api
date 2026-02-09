@@ -42,6 +42,21 @@ def _read_media_json(url: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _read_media_text(url: str) -> Optional[str]:
+    if not url:
+        return None
+    file_path = ""
+    if url.startswith("/media/"):
+        file_path = os.path.join(settings.MEDIA_ROOT, url.replace("/media/", ""))
+    elif settings.MEDIA_URL and url.startswith(settings.MEDIA_URL):
+        suffix = url.replace(settings.MEDIA_URL, "").lstrip("/")
+        file_path = os.path.join(settings.MEDIA_ROOT, suffix)
+    if not file_path or not os.path.exists(file_path):
+        return None
+    with open(file_path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
 def _find_release_plan_artifact_url(release: Release) -> Optional[str]:
     artifacts = release.artifacts_json or {}
     if isinstance(artifacts, list):
@@ -55,6 +70,25 @@ def _find_release_plan_artifact_url(release: Release) -> Optional[str]:
         if isinstance(plan_info, dict):
             return plan_info.get("url")
     return None
+
+
+def _find_compose_artifact_url(release: Release) -> Optional[str]:
+    artifacts = release.artifacts_json or {}
+    if isinstance(artifacts, dict):
+        compose_info = artifacts.get("compose_file") or {}
+        if isinstance(compose_info, dict):
+            return compose_info.get("url")
+    return None
+
+
+def _load_default_compose() -> Optional[str]:
+    compose_path = os.environ.get("XYENCE_SEED_COMPOSE_PATH", "/xyn-seed/compose.yml")
+    if not compose_path:
+        return None
+    if not os.path.exists(compose_path):
+        return None
+    with open(compose_path, "r", encoding="utf-8") as handle:
+        return handle.read()
 
 
 def load_release_plan_json(release: Release, release_plan: Optional[ReleasePlan]) -> Optional[Dict[str, Any]]:
@@ -144,12 +178,50 @@ def execute_release_plan_deploy(
     deployment.status = "running"
     deployment.started_at = timezone.now()
     deployment.save(update_fields=["status", "started_at", "updated_at"])
+    compose_url = _find_compose_artifact_url(release)
+    compose_source = "release_artifact"
+    if compose_url:
+        compose_content = _read_media_text(compose_url)
+    else:
+        compose_content = None
+    if not compose_content:
+        compose_content = _load_default_compose()
+        compose_source = "seed_repo"
     steps = plan_json.get("steps") or []
     execution: Dict[str, Any] = {"status": "succeeded", "steps": []}
     ssm_command_ids: List[str] = []
     last_stdout = ""
     last_stderr = ""
     try:
+        if compose_content and compose_source == "release_artifact":
+            digest = hashlib.sha256(compose_content.encode("utf-8")).hexdigest()
+            _run_ssm_commands(
+                instance.instance_id,
+                instance.aws_region,
+                [
+                    "mkdir -p /var/lib/xyn/ems",
+                    f"cat > /var/lib/xyn/ems/docker-compose.yml <<'XYN_COMPOSE'\n{compose_content}\nXYN_COMPOSE",
+                    f"sha256sum /var/lib/xyn/ems/docker-compose.yml | grep -q {digest}",
+                ],
+            )
+        elif compose_source == "seed_repo":
+            seed_repo = os.environ.get("XYENCE_SEED_REPO_URL", "https://github.com/Xyence/xyn-seed.git")
+            seed_ref = os.environ.get("XYENCE_SEED_REPO_REF", "main")
+            _run_ssm_commands(
+                instance.instance_id,
+                instance.aws_region,
+                [
+                    "mkdir -p /var/lib/xyn",
+                    "rm -rf /var/lib/xyn/ems",
+                    "git clone --depth 1 --branch "
+                    + seed_ref
+                    + " "
+                    + seed_repo
+                    + " /var/lib/xyn/ems",
+                    "cp /var/lib/xyn/ems/compose.yml /var/lib/xyn/ems/docker-compose.yml",
+                    "docker rm -f xyn-postgres xyn-redis xyn-core 2>/dev/null || true",
+                ],
+            )
         for step in steps:
             step_name = step.get("name") or "step"
             commands = step.get("commands") or []
@@ -230,4 +302,3 @@ def execute_release_plan_deploy(
         instance.health_status = "failed"
         instance.save(update_fields=["health_status", "updated_at"])
     return execution
-
