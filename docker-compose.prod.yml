@@ -73,6 +73,7 @@ services:
       - /home/ubuntu/src/xyn-contracts:/xyn-contracts:ro
       - /home/ubuntu/central-xyence-io-9d049e62e994.json:/secrets/gcp-speech.json:ro
       - backend_media:/app/media
+      - /var/run/docker.sock:/var/run/docker.sock
 
   nginx:
     image: nginx:1.27-alpine
