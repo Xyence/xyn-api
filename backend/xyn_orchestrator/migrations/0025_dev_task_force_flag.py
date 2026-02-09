@@ -3,7 +3,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0024_run_command_execution_and_deploy_state"),
+        ("xyn_orchestrator", "0024_run_command_execution_and_deploy_state"),
     ]
 
     operations = [

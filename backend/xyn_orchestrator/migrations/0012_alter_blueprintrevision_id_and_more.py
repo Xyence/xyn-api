@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('articles', '0011_blueprint_voice_models'),
+        ('xyn_orchestrator', '0011_blueprint_voice_models'),
     ]
 
     operations = [

@@ -4,7 +4,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0020_contextpack_purpose"),
+        ("xyn_orchestrator", "0020_contextpack_purpose"),
     ]
 
     operations = [

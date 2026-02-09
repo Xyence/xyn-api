@@ -5,7 +5,7 @@ import django_ckeditor_5.fields
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0001_initial"),
+        ("xyn_orchestrator", "0001_initial"),
     ]
 
     operations = [
@@ -47,7 +47,7 @@ class Migration(migrations.Migration):
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 (
                     "article",
-                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="versions", to="articles.article"),
+                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="versions", to="xyn_orchestrator.article"),
                 ),
             ],
             options={

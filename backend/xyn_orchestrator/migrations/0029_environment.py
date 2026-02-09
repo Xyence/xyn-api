@@ -6,7 +6,7 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0028_instance_release_state"),
+        ("xyn_orchestrator", "0028_instance_release_state"),
     ]
 
     operations = [
@@ -33,7 +33,7 @@ class Migration(migrations.Migration):
                 null=True,
                 on_delete=django.db.models.deletion.SET_NULL,
                 related_name="release_plans",
-                to="articles.environment",
+                to="xyn_orchestrator.environment",
             ),
         ),
         migrations.AddField(
@@ -44,7 +44,7 @@ class Migration(migrations.Migration):
                 null=True,
                 on_delete=django.db.models.deletion.SET_NULL,
                 related_name="releases",
-                to="articles.environment",
+                to="xyn_orchestrator.environment",
             ),
         ),
         migrations.AddField(
@@ -55,7 +55,7 @@ class Migration(migrations.Migration):
                 null=True,
                 on_delete=django.db.models.deletion.SET_NULL,
                 related_name="instances",
-                to="articles.environment",
+                to="xyn_orchestrator.environment",
             ),
         ),
     ]

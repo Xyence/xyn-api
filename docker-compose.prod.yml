@@ -29,12 +29,21 @@ services:
       XYENCE_ASYNC_JOBS_MODE: ${XYENCE_ASYNC_JOBS_MODE:-redis}
       XYENCE_JOBS_REDIS_URL: ${XYENCE_JOBS_REDIS_URL:-redis://redis:6379/0}
       XYENCE_INTERNAL_TOKEN: ${XYENCE_INTERNAL_TOKEN:-change-me}
+      XYENCE_RUNTIME_SUBSTRATE: ${XYENCE_RUNTIME_SUBSTRATE:-auto}
+      XYENCE_LOCAL_INSTANCE_NAME: ${XYENCE_LOCAL_INSTANCE_NAME:-}
+      XYENCE_LOCAL_INSTANCE_ID: ${XYENCE_LOCAL_INSTANCE_ID:-}
+      XYENCE_LOCAL_AWS_REGION: ${XYENCE_LOCAL_AWS_REGION:-}
+      XYENCE_LOCAL_INSTANCE_TYPE: ${XYENCE_LOCAL_INSTANCE_TYPE:-}
+      XYENCE_LOCAL_AMI_ID: ${XYENCE_LOCAL_AMI_ID:-}
+      XYENCE_LOCAL_STATUS: ${XYENCE_LOCAL_STATUS:-running}
+      XYENCE_LOCAL_ENVIRONMENT_ID: ${XYENCE_LOCAL_ENVIRONMENT_ID:-}
     depends_on:
       - db
       - redis
     volumes:
       - backend_media:/app/media
       - backend_static:/app/staticfiles
+      - /var/run/docker.sock:/var/run/docker.sock
       - /home/ubuntu/src/xyn-contracts:/xyn-contracts:ro
       - /home/ubuntu/central-xyence-io-9d049e62e994.json:/secrets/gcp-speech.json:ro
     extra_hosts:

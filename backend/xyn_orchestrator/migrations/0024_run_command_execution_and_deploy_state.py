@@ -6,7 +6,7 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0023_releaseplan_links_and_dev_task_target_instance"),
+        ("xyn_orchestrator", "0023_releaseplan_links_and_dev_task_target_instance"),
     ]
 
     operations = [
@@ -31,7 +31,7 @@ class Migration(migrations.Migration):
                     models.ForeignKey(
                         on_delete=django.db.models.deletion.CASCADE,
                         related_name="command_executions",
-                        to="articles.run",
+                        to="xyn_orchestrator.run",
                     ),
                 ),
             ],
@@ -49,7 +49,7 @@ class Migration(migrations.Migration):
                     models.ForeignKey(
                         on_delete=django.db.models.deletion.CASCADE,
                         related_name="deploy_states",
-                        to="articles.provisionedinstance",
+                        to="xyn_orchestrator.provisionedinstance",
                     ),
                 ),
                 (
@@ -57,7 +57,7 @@ class Migration(migrations.Migration):
                     models.ForeignKey(
                         on_delete=django.db.models.deletion.CASCADE,
                         related_name="deploy_states",
-                        to="articles.releaseplan",
+                        to="xyn_orchestrator.releaseplan",
                     ),
                 ),
             ],

@@ -823,6 +823,46 @@ class ReleasePlanDeployment(models.Model):
         unique_together = ("release_plan", "instance")
 
 
+class Deployment(models.Model):
+    STATUS_CHOICES = [
+        ("queued", "Queued"),
+        ("running", "Running"),
+        ("succeeded", "Succeeded"),
+        ("failed", "Failed"),
+    ]
+    KIND_CHOICES = [
+        ("release", "Release"),
+        ("release_plan", "Release plan"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    idempotency_key = models.CharField(max_length=64, unique=True)
+    idempotency_base = models.CharField(max_length=64, db_index=True)
+    release = models.ForeignKey("Release", on_delete=models.CASCADE, related_name="deployments")
+    instance = models.ForeignKey(
+        "ProvisionedInstance", on_delete=models.CASCADE, related_name="deployment_records"
+    )
+    release_plan = models.ForeignKey(
+        ReleasePlan, null=True, blank=True, on_delete=models.SET_NULL, related_name="deployment_records"
+    )
+    deploy_kind = models.CharField(max_length=20, choices=KIND_CHOICES, default="release")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="queued")
+    submitted_by = models.CharField(max_length=120, blank=True)
+    transport = models.CharField(max_length=40, default="ssm")
+    transport_ref = models.JSONField(null=True, blank=True)
+    stdout_excerpt = models.TextField(blank=True)
+    stderr_excerpt = models.TextField(blank=True)
+    error_message = models.TextField(blank=True)
+    artifacts_json = models.JSONField(null=True, blank=True)
+    run = models.ForeignKey(Run, null=True, blank=True, on_delete=models.SET_NULL, related_name="deployments")
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
 class ContextPack(models.Model):
     PURPOSE_CHOICES = [
         ("any", "Any"),
@@ -946,7 +986,8 @@ class ProvisionedInstance(models.Model):
         "Environment", null=True, blank=True, on_delete=models.SET_NULL, related_name="instances"
     )
     aws_region = models.CharField(max_length=50)
-    instance_id = models.CharField(max_length=64, blank=True)
+    instance_id = models.CharField(max_length=255, blank=True)
+    runtime_substrate = models.CharField(max_length=20, default="local")
     instance_type = models.CharField(max_length=64)
     ami_id = models.CharField(max_length=64)
     security_group_id = models.CharField(max_length=64, blank=True)
@@ -969,6 +1010,7 @@ class ProvisionedInstance(models.Model):
     )
     health_status = models.CharField(max_length=20, choices=HEALTH_CHOICES, default="unknown")
     tags_json = models.JSONField(null=True, blank=True)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(

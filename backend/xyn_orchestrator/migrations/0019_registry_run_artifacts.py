@@ -8,7 +8,7 @@ import django.db.models.deletion
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0018_alter_blueprintdraftsession_status_and_more"),
+        ("xyn_orchestrator", "0018_alter_blueprintdraftsession_status_and_more"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -132,7 +132,7 @@ class Migration(migrations.Migration):
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 (
                     "run",
-                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="artifacts", to="articles.run"),
+                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="artifacts", to="xyn_orchestrator.run"),
                 ),
             ],
             options={

@@ -152,6 +152,7 @@ def provision_instance(payload: Dict[str, Any], user) -> ProvisionedInstance:
         aws_region=region,
         instance_type=instance_type,
         ami_id=ami_id,
+        runtime_substrate="ec2",
         security_group_id=sg_id,
         subnet_id=subnet_id or "",
         vpc_id=vpc_id or "",
@@ -354,7 +355,12 @@ def refresh_instance(instance: ProvisionedInstance) -> ProvisionedInstance:
         except (ClientError, BotoCoreError):
             pass
 
-    instance.save(update_fields=["public_ip", "private_ip", "status", "ssm_status", "last_error", "updated_at"])
+    update_fields = ["public_ip", "private_ip", "status", "ssm_status", "last_error", "updated_at"]
+    if instance.instance_id and instance.instance_id.startswith("i-"):
+        if not instance.runtime_substrate or instance.runtime_substrate == "local":
+            instance.runtime_substrate = "ec2"
+            update_fields.append("runtime_substrate")
+    instance.save(update_fields=update_fields)
     return instance
 
 

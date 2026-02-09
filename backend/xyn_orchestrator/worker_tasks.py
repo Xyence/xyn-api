@@ -7,6 +7,7 @@ import tempfile
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import boto3
 import requests
@@ -29,6 +30,12 @@ CODEGEN_PUSH = os.environ.get("XYN_CODEGEN_PUSH", os.environ.get("XYENCE_CODEGEN
 def _headers() -> Dict[str, str]:
     return {"X-Internal-Token": INTERNAL_TOKEN}
 
+def _media_path_from_url(url: str) -> Optional[str]:
+    path = urlparse(url).path or ""
+    if path.startswith("/media/"):
+        return path
+    return None
+
 
 def _get_json(path: str) -> Dict[str, Any]:
     response = requests.get(f"{INTERNAL_BASE_URL}{path}", headers=_headers(), timeout=30)
@@ -48,6 +55,10 @@ def _post_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _download_file(path: str) -> bytes:
+    if path.startswith("/media/"):
+        file_path = os.path.join(MEDIA_ROOT, path.replace("/media/", ""))
+        with open(file_path, "rb") as handle:
+            return handle.read()
     response = requests.get(f"{INTERNAL_BASE_URL}{path}", headers=_headers(), timeout=60)
     response.raise_for_status()
     return response.content
@@ -73,6 +84,13 @@ def _download_artifact_json(run_id: str, name: str) -> Optional[Dict[str, Any]]:
     if not match or not match.get("url"):
         return None
     url = match["url"]
+    media_path = _media_path_from_url(url)
+    if media_path:
+        content = _download_file(media_path)
+        return json.loads(content.decode("utf-8"))
+    if url.startswith(INTERNAL_BASE_URL):
+        content = _download_file(url[len(INTERNAL_BASE_URL) :])
+        return json.loads(content.decode("utf-8"))
     if url.startswith("http"):
         response = requests.get(url, timeout=60)
         response.raise_for_status()
@@ -87,6 +105,13 @@ def _download_artifact_text(run_id: str, name: str) -> Optional[str]:
     if not match or not match.get("url"):
         return None
     url = match["url"]
+    media_path = _media_path_from_url(url)
+    if media_path:
+        content = _download_file(media_path)
+        return content.decode("utf-8")
+    if url.startswith(INTERNAL_BASE_URL):
+        content = _download_file(url[len(INTERNAL_BASE_URL) :])
+        return content.decode("utf-8")
     if url.startswith("http"):
         response = requests.get(url, timeout=60)
         response.raise_for_status()
@@ -96,12 +121,26 @@ def _download_artifact_text(run_id: str, name: str) -> Optional[str]:
 
 
 def _download_url_json(url: str) -> Dict[str, Any]:
+    media_path = _media_path_from_url(url)
+    if media_path:
+        content = _download_file(media_path)
+        return json.loads(content.decode("utf-8"))
+    if url.startswith(INTERNAL_BASE_URL):
+        content = _download_file(url[len(INTERNAL_BASE_URL) :])
+        return json.loads(content.decode("utf-8"))
     response = requests.get(url, timeout=60)
     response.raise_for_status()
     return response.json()
 
 
 def _download_url_text(url: str) -> str:
+    media_path = _media_path_from_url(url)
+    if media_path:
+        content = _download_file(media_path)
+        return content.decode("utf-8")
+    if url.startswith(INTERNAL_BASE_URL):
+        content = _download_file(url[len(INTERNAL_BASE_URL) :])
+        return content.decode("utf-8")
     response = requests.get(url, timeout=60)
     response.raise_for_status()
     return response.text
@@ -5084,64 +5123,40 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             if not target_instance or not target_instance.get("instance_id"):
                 raise RuntimeError("target instance missing for deploy task")
             plan_hash = _hash_release_plan(plan_json)
-            deploy_state = _get_json(
-                f"/xyn/internal/release-plans/{source_entity_id}/deploy-state?instance_id={target_instance.get('id')}"
-            )
-            state = deploy_state.get("state")
-            if state and state.get("last_applied_hash") == plan_hash and not task.get("force"):
-                deploy_execution = {
-                    "status": "skipped_idempotent",
-                    "target_instance_id": target_instance.get("id"),
-                    "release_plan_hash": plan_hash,
-                    "steps": [],
-                }
-                exec_url = _write_artifact(
-                    run_id, "deploy_execution.json", json.dumps(deploy_execution, indent=2)
-                )
-                _post_json(
-                    f"/xyn/internal/runs/{run_id}/artifacts",
-                    {"name": "deploy_execution.json", "kind": "deploy", "url": exec_url},
-                )
-                _post_json(
-                    f"/xyn/internal/runs/{run_id}",
-                    {"status": "succeeded", "append_log": "Deploy skipped (already applied).\n"},
-                )
-                _post_json(
-                    f"/xyn/internal/dev-tasks/{task_id}/complete",
-                    {"status": "succeeded"},
-                )
-                return
-            plan_body = json.dumps(plan_json, indent=2)
-            plan_b64 = base64.b64encode(plan_body.encode("utf-8")).decode("utf-8")
-            upload_commands = [
-                "mkdir -p /var/lib/xyn",
-                f"echo '{plan_b64}' | base64 -d > /var/lib/xyn/release_plan.json",
-            ]
-            _run_ssm_commands(
-                target_instance.get("instance_id"),
-                target_instance.get("aws_region"),
-                upload_commands,
-            )
-            apply_result = _run_ssm_commands(
-                target_instance.get("instance_id"),
-                target_instance.get("aws_region"),
-                ["xynctl apply --from /var/lib/xyn/release_plan.json"],
-            )
-            exec_result = _run_ssm_commands(
-                target_instance.get("instance_id"),
-                target_instance.get("aws_region"),
-                ["cat /var/lib/xyn/deploy_execution.json"],
-            )
-            deploy_execution = {}
-            try:
-                deploy_execution = json.loads(exec_result.get("stdout", "") or "{}")
-            except json.JSONDecodeError:
-                deploy_execution = {
-                    "status": "failed",
-                    "error": "Failed to parse deploy_execution.json",
-                    "stdout": exec_result.get("stdout", ""),
-                    "stderr": exec_result.get("stderr", ""),
-                }
+            instance_detail = _get_json(f"/xyn/internal/instances/{target_instance.get('id')}")
+            release_id = instance_detail.get("desired_release_id")
+            if not release_id:
+                raise RuntimeError("desired_release_id missing for deployment")
+            deployment_payload = {
+                "release_id": release_id,
+                "instance_id": target_instance.get("id"),
+                "release_plan_id": source_entity_id,
+                "force": task.get("force", False),
+                "submitted_by": "worker",
+            }
+            deployment = _post_json("/xyn/internal/deployments", deployment_payload)
+            deployment_id = deployment.get("deployment_id")
+            status = deployment.get("status")
+            if status in {"queued", "running"} and deployment_id:
+                for _ in range(30):
+                    time.sleep(2)
+                    deployment = _get_json(f"/xyn/internal/deployments/{deployment_id}")
+                    status = deployment.get("status")
+                    if status in {"succeeded", "failed"}:
+                        break
+            deploy_execution = {
+                "status": "failed" if status != "succeeded" else "succeeded",
+                "target_instance_id": target_instance.get("id"),
+                "release_plan_hash": plan_hash,
+                "steps": [],
+            }
+            artifacts = deployment.get("artifacts_json") or {}
+            execution_info = artifacts.get("deploy_execution.json") or {}
+            if execution_info.get("url"):
+                try:
+                    deploy_execution = _download_url_json(execution_info["url"])
+                except Exception:
+                    pass
             deploy_execution["release_plan_hash"] = plan_hash
             deploy_execution.setdefault("target_instance_id", target_instance.get("id"))
             command_records = []
@@ -5161,15 +5176,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     }
                     command_records.append(record)
                     _post_json(f"/xyn/internal/runs/{run_id}/commands", record)
-            success = (
-                apply_result.get("invocation_status") == "Success"
-                and apply_result.get("response_code") == 0
-                and deploy_execution.get("status") != "failed"
-            )
+            success = status == "succeeded"
             deploy_result = {
                 "target_instance_id": target_instance.get("id"),
                 "release_plan_hash": plan_hash,
-                "apply": apply_result,
+                "deployment_id": deployment_id,
+                "status": status,
+                "error_message": deployment.get("error_message"),
             }
             url = _write_artifact(run_id, "deploy_result.json", json.dumps(deploy_result, indent=2))
             exec_url = _write_artifact(run_id, "deploy_execution.json", json.dumps(deploy_execution, indent=2))
@@ -5185,36 +5198,19 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 f"/xyn/internal/runs/{run_id}",
                 {
                     "status": "succeeded" if success else "failed",
-                    "append_log": "Deploy completed.\n",
+                    "append_log": f"Deploy finished: {'SUCCEEDED' if success else 'FAILED'}.\n",
                 },
             )
-            if success:
-                _post_json(
-                    f"/xyn/internal/release-plans/{source_entity_id}/deploy-state",
-                    {
-                        "instance_id": target_instance.get("id"),
-                        "last_applied_hash": plan_hash,
-                        "last_applied_at": datetime.utcnow().isoformat() + "Z",
-                    },
-                )
-                instance_detail = _get_json(f"/xyn/internal/instances/{target_instance.get('id')}")
-                _post_json(
-                    f"/xyn/internal/instances/{target_instance.get('id')}/state",
-                    {
-                        "observed_release_id": instance_detail.get("desired_release_id"),
-                        "observed_at": datetime.utcnow().isoformat() + "Z",
-                        "last_deploy_run_id": run_id,
-                        "health_status": "healthy",
-                    },
-                )
-            else:
-                _post_json(
-                    f"/xyn/internal/instances/{target_instance.get('id')}/state",
-                    {
-                        "last_deploy_run_id": run_id,
-                        "health_status": "failed",
-                    },
-                )
+            instance_detail = _get_json(f"/xyn/internal/instances/{target_instance.get('id')}")
+            _post_json(
+                f"/xyn/internal/instances/{target_instance.get('id')}/state",
+                {
+                    "observed_release_id": instance_detail.get("desired_release_id") if success else None,
+                    "observed_at": datetime.utcnow().isoformat() + "Z" if success else None,
+                    "last_deploy_run_id": run_id,
+                    "health_status": "healthy" if success else "failed",
+                },
+            )
             _post_json(
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
                 {"status": "succeeded" if success else "failed"},

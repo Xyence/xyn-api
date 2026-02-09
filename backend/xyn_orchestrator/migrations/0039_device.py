@@ -6,7 +6,7 @@ import uuid
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0038_brand_profile"),
+        ("xyn_orchestrator", "0038_brand_profile"),
     ]
 
     operations = [
@@ -22,7 +22,7 @@ class Migration(migrations.Migration):
                 ("metadata_json", models.JSONField(blank=True, null=True)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("updated_at", models.DateTimeField(auto_now=True)),
-                ("tenant", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="devices", to="articles.tenant")),
+                ("tenant", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="devices", to="xyn_orchestrator.tenant")),
             ],
             options={"ordering": ["name"], "unique_together": {("tenant", "name")}},
         ),

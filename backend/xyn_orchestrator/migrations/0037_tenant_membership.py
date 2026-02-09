@@ -6,7 +6,7 @@ import uuid
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0036_tenant_contact"),
+        ("xyn_orchestrator", "0036_tenant_contact"),
     ]
 
     operations = [
@@ -18,8 +18,8 @@ class Migration(migrations.Migration):
                 ("status", models.CharField(choices=[("active", "Active"), ("inactive", "Inactive")], default="active", max_length=20)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("updated_at", models.DateTimeField(auto_now=True)),
-                ("tenant", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="memberships", to="articles.tenant")),
-                ("user_identity", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="memberships", to="articles.useridentity")),
+                ("tenant", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="memberships", to="xyn_orchestrator.tenant")),
+                ("user_identity", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="memberships", to="xyn_orchestrator.useridentity")),
             ],
             options={"ordering": ["tenant__name"], "unique_together": {("tenant", "user_identity")}},
         ),

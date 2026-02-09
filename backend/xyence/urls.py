@@ -54,6 +54,8 @@ from xyn_orchestrator.blueprints import (
     internal_artifacts_gc,
     internal_release_promote,
     internal_release_plan_deploy_state,
+    internal_deployments,
+    internal_deployment_detail,
     internal_release_create,
     internal_instance_detail,
     internal_instance_state,
@@ -111,6 +113,7 @@ from xyn_orchestrator.xyn_api import (
     release_plans_collection,
     release_plan_detail,
     release_plan_generate,
+    release_plan_deployments,
     releases_collection,
     release_detail,
     releases_collection,
@@ -163,7 +166,7 @@ from web.public_views import (
 )
 def healthcheck(_request):
     return JsonResponse(
-        {"status": "ok", "admin": "/admin/", "articles": "/api/articles/"},
+        {"status": "ok", "admin": "/admin/", "xyn_orchestrator": "/api/articles/"},
     )
 
 urlpatterns = [
@@ -227,6 +230,7 @@ urlpatterns = [
     path("xyn/api/registries/<uuid:registry_id>/sync", registry_sync),
     path("xyn/api/release-plans", release_plans_collection),
     path("xyn/api/release-plans/<uuid:plan_id>", release_plan_detail),
+    path("xyn/api/release-plans/<uuid:plan_id>/deployments", release_plan_deployments),
     path("xyn/api/release-plans/<uuid:plan_id>/generate", release_plan_generate),
     path("xyn/api/release-targets", release_targets_collection),
     path("xyn/api/release-targets/<uuid:target_id>", release_target_detail),
@@ -291,6 +295,10 @@ urlpatterns = [
     path("xyn/internal/release-plans/<uuid:plan_id>/generate", internal_release_plan_generate),
     path("xyn/internal/release-plans/upsert", internal_release_plan_upsert),
     path("xyn/internal/release-plans/<uuid:plan_id>/deploy-state", internal_release_plan_deploy_state),
+    path("xyn/internal/deployments", internal_deployments),
+    path("xyn/internal/deployments/<uuid:deployment_id>", internal_deployment_detail),
+    path("api/internal/deployments", internal_deployments),
+    path("api/internal/deployments/<uuid:deployment_id>", internal_deployment_detail),
     path("xyn/internal/releases", internal_release_create),
     path("xyn/internal/releases/latest", internal_releases_latest),
     path("xyn/internal/releases/retention_report", internal_releases_retention_report),

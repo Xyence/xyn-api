@@ -3,7 +3,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0013_blueprint_diff_summary"),
+        ("xyn_orchestrator", "0013_blueprint_diff_summary"),
     ]
 
     operations = [

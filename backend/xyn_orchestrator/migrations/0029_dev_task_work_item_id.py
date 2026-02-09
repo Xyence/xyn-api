@@ -4,7 +4,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0028_instance_release_state"),
+        ("xyn_orchestrator", "0028_instance_release_state"),
     ]
 
     operations = [

@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0031_merge_20260206_0806"),
+        ("xyn_orchestrator", "0031_merge_20260206_0806"),
     ]
 
     operations = [

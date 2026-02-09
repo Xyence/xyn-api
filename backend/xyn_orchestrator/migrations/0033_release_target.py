@@ -6,7 +6,7 @@ import uuid
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0032_alter_runcommandexecution_options_and_more"),
+        ("xyn_orchestrator", "0032_alter_runcommandexecution_options_and_more"),
     ]
 
     operations = [
@@ -31,7 +31,7 @@ class Migration(migrations.Migration):
                     models.ForeignKey(
                         on_delete=django.db.models.deletion.CASCADE,
                         related_name="release_targets",
-                        to="articles.blueprint",
+                        to="xyn_orchestrator.blueprint",
                     ),
                 ),
                 (
@@ -51,7 +51,7 @@ class Migration(migrations.Migration):
                         null=True,
                         on_delete=django.db.models.deletion.SET_NULL,
                         related_name="release_targets",
-                        to="articles.provisionedinstance",
+                        to="xyn_orchestrator.provisionedinstance",
                     ),
                 ),
                 (

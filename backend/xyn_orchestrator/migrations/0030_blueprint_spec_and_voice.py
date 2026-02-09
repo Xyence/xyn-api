@@ -6,7 +6,7 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0029_environment"),
+        ("xyn_orchestrator", "0029_environment"),
     ]
 
     operations = [
@@ -28,7 +28,7 @@ class Migration(migrations.Migration):
                 null=True,
                 on_delete=django.db.models.deletion.SET_NULL,
                 related_name="draft_sessions_source",
-                to="articles.blueprint",
+                to="xyn_orchestrator.blueprint",
             ),
         ),
     ]

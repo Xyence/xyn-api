@@ -6,7 +6,7 @@ import uuid
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0010_remove_github_models"),
+        ("xyn_orchestrator", "0010_remove_github_models"),
     ]
 
     operations = [
@@ -39,7 +39,7 @@ class Migration(migrations.Migration):
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("updated_at", models.DateTimeField(auto_now=True)),
                 ("created_by", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="draft_sessions_created", to=settings.AUTH_USER_MODEL)),
-                ("linked_blueprint", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="draft_sessions", to="articles.blueprint")),
+                ("linked_blueprint", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="draft_sessions", to="xyn_orchestrator.blueprint")),
                 ("updated_by", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="draft_sessions_updated", to=settings.AUTH_USER_MODEL)),
             ],
         ),
@@ -54,7 +54,7 @@ class Migration(migrations.Migration):
                 ("operation_id", models.CharField(blank=True, max_length=100)),
                 ("error", models.TextField(blank=True)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
-                ("blueprint", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="instances", to="articles.blueprint")),
+                ("blueprint", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="instances", to="xyn_orchestrator.blueprint")),
                 ("created_by", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="blueprint_instances_created", to=settings.AUTH_USER_MODEL)),
             ],
         ),
@@ -65,7 +65,7 @@ class Migration(migrations.Migration):
                 ("revision", models.PositiveIntegerField()),
                 ("spec_json", models.JSONField()),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
-                ("blueprint", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="revisions", to="articles.blueprint")),
+                ("blueprint", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="revisions", to="xyn_orchestrator.blueprint")),
                 ("created_by", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="blueprint_revisions_created", to=settings.AUTH_USER_MODEL)),
             ],
             options={
@@ -93,8 +93,8 @@ class Migration(migrations.Migration):
             fields=[
                 ("id", models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
                 ("ordering", models.PositiveIntegerField(default=0)),
-                ("draft_session", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to="articles.blueprintdraftsession")),
-                ("voice_note", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to="articles.voicenote")),
+                ("draft_session", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to="xyn_orchestrator.blueprintdraftsession")),
+                ("voice_note", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to="xyn_orchestrator.voicenote")),
             ],
             options={
                 "ordering": ["ordering"],
@@ -110,7 +110,7 @@ class Migration(migrations.Migration):
                 ("confidence", models.FloatField(blank=True, null=True)),
                 ("raw_response_json", models.JSONField(blank=True, null=True)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
-                ("voice_note", models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name="transcript", to="articles.voicenote")),
+                ("voice_note", models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name="transcript", to="xyn_orchestrator.voicenote")),
             ],
         ),
     ]

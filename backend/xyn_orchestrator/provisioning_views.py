@@ -19,6 +19,7 @@ from .provisioning import (
     fetch_bootstrap_log,
 )
 from .blueprints import _require_staff
+from .instances.bootstrap import get_instance_metadata
 
 
 def _instance_payload(instance: ProvisionedInstance) -> dict:
@@ -37,6 +38,7 @@ def _instance_payload(instance: ProvisionedInstance) -> dict:
         "private_ip": instance.private_ip,
         "ssm_status": instance.ssm_status,
         "status": instance.status,
+        "runtime_substrate": instance.runtime_substrate,
         "last_error": instance.last_error,
         "desired_release_id": str(instance.desired_release_id) if instance.desired_release_id else None,
         "observed_release_id": str(instance.observed_release_id) if instance.observed_release_id else None,
@@ -44,6 +46,7 @@ def _instance_payload(instance: ProvisionedInstance) -> dict:
         "last_deploy_run_id": str(instance.last_deploy_run_id) if instance.last_deploy_run_id else None,
         "health_status": instance.health_status,
         "tags": instance.tags_json or {},
+        "last_seen_at": instance.last_seen_at,
         "created_at": instance.created_at,
         "updated_at": instance.updated_at,
     }
@@ -164,6 +167,24 @@ def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResp
     if staff_error := _require_staff(request):
         return staff_error
     instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    if _is_local_instance(instance):
+        try:
+            containers = _list_local_containers()
+            return JsonResponse(
+                {
+                    "instance_id": str(instance.id),
+                    "status": "ok",
+                    "containers": containers,
+                }
+            )
+        except Exception as exc:
+            return JsonResponse(
+                {
+                    "error": str(exc),
+                    "hint": "Ensure /var/run/docker.sock is mounted and the Docker SDK is installed.",
+                },
+                status=400,
+            )
     try:
         result = _run_ssm_commands(
             instance,
@@ -210,3 +231,54 @@ def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResp
         )
     except Exception as exc:
         return JsonResponse({"error": str(exc)}, status=400)
+
+
+def _is_local_instance(instance: ProvisionedInstance) -> bool:
+    if instance.runtime_substrate in {"local", "docker"}:
+        return True
+    if instance.instance_id and instance.instance_id.startswith(("local:", "docker:")):
+        return True
+    try:
+        metadata = get_instance_metadata()
+    except Exception:
+        return False
+    return bool(instance.instance_id and metadata.instance_id == instance.instance_id)
+
+
+def _list_local_containers() -> List[Dict[str, str]]:
+    try:
+        import docker
+    except Exception as exc:
+        raise RuntimeError(f"Docker SDK unavailable: {exc}") from exc
+    try:
+        client = docker.from_env()
+        containers = client.containers.list()
+    except Exception as exc:
+        raise RuntimeError(f"Docker client error: {exc}") from exc
+    payload = []
+    for container in containers:
+        attrs = container.attrs or {}
+        payload.append(
+            {
+                "id": container.short_id,
+                "name": container.name or "",
+                "image": (attrs.get("Config") or {}).get("Image") or "",
+                "status": container.status or "",
+                "ports": _format_ports(attrs.get("NetworkSettings") or {}),
+            }
+        )
+    return payload
+
+
+def _format_ports(network_settings: Dict[str, Any]) -> str:
+    ports = network_settings.get("Ports") or {}
+    formatted = []
+    for container_port, bindings in ports.items():
+        if not bindings:
+            formatted.append(container_port)
+            continue
+        for binding in bindings:
+            host_ip = binding.get("HostIp", "")
+            host_port = binding.get("HostPort", "")
+            formatted.append(f"{host_ip}:{host_port}->{container_port}")
+    return ", ".join(formatted)

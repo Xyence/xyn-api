@@ -3,7 +3,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0008_google_socialapp"),
+        ("xyn_orchestrator", "0008_google_socialapp"),
     ]
 
     operations = [

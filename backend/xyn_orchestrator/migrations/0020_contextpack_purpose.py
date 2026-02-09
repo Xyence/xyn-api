@@ -5,7 +5,7 @@ from django.db import migrations
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0019_registry_run_artifacts"),
+        ("xyn_orchestrator", "0019_registry_run_artifacts"),
     ]
 
     operations = [

@@ -4,7 +4,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0034_user_identity_role_binding"),
+        ("xyn_orchestrator", "0034_user_identity_role_binding"),
     ]
 
     operations = [

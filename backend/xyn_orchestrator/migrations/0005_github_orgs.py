@@ -4,7 +4,7 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0004_github_oauth"),
+        ("xyn_orchestrator", "0004_github_oauth"),
     ]
 
     operations = [
@@ -18,7 +18,7 @@ class Migration(migrations.Migration):
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 (
                     "config",
-                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="orgs", to="articles.githubconfig"),
+                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="orgs", to="xyn_orchestrator.githubconfig"),
                 ),
             ],
             options={
@@ -28,6 +28,6 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="githubconfig",
             name="organization_ref",
-            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to="articles.githuborganization"),
+            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to="xyn_orchestrator.githuborganization"),
         ),
     ]

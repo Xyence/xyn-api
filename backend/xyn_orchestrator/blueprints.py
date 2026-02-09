@@ -41,6 +41,7 @@ from .models import (
     ReleasePlan,
     ReleasePlanDeployState,
     ReleasePlanDeployment,
+    Deployment,
     Release,
     ReleaseTarget,
     ProvisionedInstance,
@@ -52,6 +53,11 @@ from .models import (
 )
 from .services import get_release_target_deploy_state
 from .worker_tasks import _ssm_fetch_runtime_marker
+from .deployments import (
+    compute_idempotency_base,
+    execute_release_plan_deploy,
+    load_release_plan_json,
+)
 
 _executor = ThreadPoolExecutor(max_workers=2)
 
@@ -101,6 +107,10 @@ def _require_internal_token(request: HttpRequest) -> Optional[JsonResponse]:
     if not expected:
         return JsonResponse({"error": "Internal token not configured"}, status=500)
     provided = request.headers.get("X-Internal-Token", "").strip()
+    if not provided:
+        auth_header = request.headers.get("Authorization", "").strip()
+        if auth_header.lower().startswith("bearer "):
+            provided = auth_header.split(" ", 1)[1].strip()
     if provided != expected:
         return JsonResponse({"error": "Unauthorized"}, status=401)
     return None
@@ -4030,6 +4040,109 @@ def internal_release_plan_deploy_state(request: HttpRequest, plan_id: str) -> Js
         state.last_applied_at = payload.get("last_applied_at")
     state.save()
     return JsonResponse({"status": "ok"})
+
+
+def _deployment_response(deployment: Deployment, existing: bool) -> JsonResponse:
+    return JsonResponse(
+        {
+            "deployment_id": str(deployment.id),
+            "status": deployment.status,
+            "existing": existing,
+            "error_message": deployment.error_message,
+            "stdout_excerpt": deployment.stdout_excerpt,
+            "stderr_excerpt": deployment.stderr_excerpt,
+            "started_at": deployment.started_at,
+            "finished_at": deployment.finished_at,
+            "artifacts_json": deployment.artifacts_json or {},
+        }
+    )
+
+
+@csrf_exempt
+def internal_deployments(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    release_id = payload.get("release_id")
+    instance_id = payload.get("instance_id")
+    if not release_id or not instance_id:
+        return JsonResponse({"error": "release_id and instance_id required"}, status=400)
+    release = get_object_or_404(Release, id=release_id)
+    allow_draft = bool(payload.get("allow_draft"))
+    if release.status != "published" and not allow_draft:
+        return JsonResponse({"error": "release must be published"}, status=400)
+    instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    release_plan = None
+    if payload.get("release_plan_id"):
+        release_plan = get_object_or_404(ReleasePlan, id=payload.get("release_plan_id"))
+    elif release.release_plan_id:
+        release_plan = ReleasePlan.objects.filter(id=release.release_plan_id).first()
+    deploy_kind = "release_plan" if release_plan else "release"
+    base_key = compute_idempotency_base(release, instance, release_plan, deploy_kind)
+    force = bool(payload.get("force"))
+    existing = (
+        Deployment.objects.filter(idempotency_base=base_key)
+        .order_by("-created_at")
+        .first()
+    )
+    if existing and (existing.status in {"queued", "running"} or not force):
+        return _deployment_response(existing, True)
+    idempotency_key = base_key
+    if force and existing:
+        idempotency_key = hashlib.sha256(f"{base_key}:{uuid.uuid4()}".encode("utf-8")).hexdigest()
+    deployment = Deployment.objects.create(
+        idempotency_key=idempotency_key,
+        idempotency_base=base_key,
+        release=release,
+        instance=instance,
+        release_plan=release_plan,
+        deploy_kind=deploy_kind,
+        submitted_by=payload.get("submitted_by", "worker"),
+        status="queued",
+    )
+    plan_json = load_release_plan_json(release, release_plan)
+    if not plan_json:
+        deployment.status = "failed"
+        deployment.error_message = "release_plan.json not found for deployment"
+        deployment.finished_at = timezone.now()
+        deployment.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+        return _deployment_response(deployment, False)
+    if not instance.instance_id or not instance.aws_region:
+        deployment.status = "failed"
+        deployment.error_message = "instance missing instance_id or aws_region"
+        deployment.finished_at = timezone.now()
+        deployment.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+        return _deployment_response(deployment, False)
+    execute_release_plan_deploy(deployment, release, instance, release_plan, plan_json)
+    return _deployment_response(deployment, False)
+
+
+@csrf_exempt
+def internal_deployment_detail(request: HttpRequest, deployment_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    deployment = get_object_or_404(Deployment, id=deployment_id)
+    return JsonResponse(
+        {
+            "deployment_id": str(deployment.id),
+            "status": deployment.status,
+            "release_id": str(deployment.release_id),
+            "instance_id": str(deployment.instance_id),
+            "release_plan_id": str(deployment.release_plan_id) if deployment.release_plan_id else None,
+            "deploy_kind": deployment.deploy_kind,
+            "started_at": deployment.started_at,
+            "finished_at": deployment.finished_at,
+            "stdout_excerpt": deployment.stdout_excerpt,
+            "stderr_excerpt": deployment.stderr_excerpt,
+            "error_message": deployment.error_message,
+            "transport_ref": deployment.transport_ref or {},
+            "artifacts_json": deployment.artifacts_json or {},
+        }
+    )
 
 
 @csrf_exempt

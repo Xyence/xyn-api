@@ -8,7 +8,7 @@ import django.db.models.deletion
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0021_run_context_fields"),
+        ("xyn_orchestrator", "0021_run_context_fields"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -73,7 +73,7 @@ class Migration(migrations.Migration):
                 ("updated_at", models.DateTimeField(auto_now=True)),
                 (
                     "context_packs",
-                    models.ManyToManyField(blank=True, related_name="dev_tasks", to="articles.contextpack"),
+                    models.ManyToManyField(blank=True, related_name="dev_tasks", to="xyn_orchestrator.contextpack"),
                 ),
                 (
                     "created_by",
@@ -102,7 +102,7 @@ class Migration(migrations.Migration):
                         null=True,
                         on_delete=django.db.models.deletion.SET_NULL,
                         related_name="dev_tasks_source",
-                        to="articles.run",
+                        to="xyn_orchestrator.run",
                     ),
                 ),
                 (
@@ -112,7 +112,7 @@ class Migration(migrations.Migration):
                         null=True,
                         on_delete=django.db.models.deletion.SET_NULL,
                         related_name="dev_tasks_result",
-                        to="articles.run",
+                        to="xyn_orchestrator.run",
                     ),
                 ),
             ],

@@ -533,7 +533,7 @@ def ai_studio_view(request: HttpRequest) -> HttpResponse:
     config = OpenAIConfig.objects.first()
     if not config:
         messages.error(request, "Create an OpenAI Config before using AI Studio.")
-        return redirect("/admin/articles/openaiconfig/")
+        return redirect("/admin/xyn_orchestrator/openaiconfig/")
 
     if request.method == "POST":
         form = AIStudioForm(request.POST)
@@ -604,7 +604,7 @@ def ai_studio_view(request: HttpRequest) -> HttpResponse:
             )
 
             messages.success(request, "Draft saved. Review in the article editor.")
-            return redirect(f"/admin/articles/article/{article.id}/change/")
+            return redirect(f"/admin/xyn_orchestrator/article/{article.id}/change/")
     else:
         form = AIStudioForm(
             initial={"persistent_context": config.persistent_context},

@@ -6,7 +6,7 @@ import uuid
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0037_tenant_membership"),
+        ("xyn_orchestrator", "0037_tenant_membership"),
     ]
 
     operations = [
@@ -21,7 +21,7 @@ class Migration(migrations.Migration):
                 ("theme_json", models.JSONField(blank=True, null=True)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("updated_at", models.DateTimeField(auto_now=True)),
-                ("tenant", models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name="brand_profile", to="articles.tenant")),
+                ("tenant", models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name="brand_profile", to="xyn_orchestrator.tenant")),
             ],
             options={"ordering": ["tenant__name"]},
         ),

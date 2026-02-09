@@ -22,7 +22,7 @@ def set_site_domain(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0006_ckeditor5"),
+        ("xyn_orchestrator", "0006_ckeditor5"),
         ("sites", "0002_alter_domain_unique"),
     ]
 

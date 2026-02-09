@@ -7,7 +7,7 @@ import uuid
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0016_context_packs"),
+        ("xyn_orchestrator", "0016_context_packs"),
     ]
 
     operations = [

@@ -14,7 +14,7 @@ def remove_github_socialapps(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0009_github_org_allow_login"),
+        ("xyn_orchestrator", "0009_github_org_allow_login"),
         ("socialaccount", "0003_extra_data_default_dict"),
     ]
 

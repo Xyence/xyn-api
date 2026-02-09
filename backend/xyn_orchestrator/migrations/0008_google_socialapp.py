@@ -31,7 +31,7 @@ def create_google_socialapp(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0007_site_domain"),
+        ("xyn_orchestrator", "0007_site_domain"),
         ("sites", "0002_alter_domain_unique"),
         ("socialaccount", "0003_extra_data_default_dict"),
     ]

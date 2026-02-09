@@ -19,6 +19,7 @@ from django.db import models
 from django.http import HttpRequest, JsonResponse, HttpResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
@@ -50,6 +51,7 @@ from .models import (
     ProvisionedInstance,
     Registry,
     ReleasePlan,
+    ReleasePlanDeployment,
     Release,
     Run,
     RunArtifact,
@@ -1834,6 +1836,15 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
     if request.method == "DELETE":
         plan.delete()
         return JsonResponse({"status": "deleted"})
+    deployments = [
+        {
+            "instance_id": str(dep.instance_id),
+            "instance_name": dep.instance.name,
+            "last_applied_hash": dep.last_applied_hash,
+            "last_applied_at": dep.last_applied_at,
+        }
+        for dep in plan.deployments.select_related("instance").order_by("-last_applied_at", "-updated_at")
+    ]
     return JsonResponse(
         {
             "id": str(plan.id),
@@ -1846,6 +1857,7 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
             "blueprint_id": str(plan.blueprint_id) if plan.blueprint_id else None,
             "environment_id": str(plan.environment_id) if plan.environment_id else None,
             "last_run": str(plan.last_run_id) if plan.last_run_id else None,
+            "deployments": deployments,
             "created_at": plan.created_at,
             "updated_at": plan.updated_at,
         }
@@ -1880,6 +1892,33 @@ def release_plan_generate(request: HttpRequest, plan_id: str) -> JsonResponse:
     run.save(update_fields=["status", "finished_at", "updated_at"])
     _write_run_summary(run)
     return JsonResponse({"run_id": str(run.id), "status": run.status})
+
+
+@csrf_exempt
+@login_required
+def release_plan_deployments(request: HttpRequest, plan_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    plan = get_object_or_404(ReleasePlan, id=plan_id)
+    payload = _parse_json(request)
+    instance_id = payload.get("instance_id")
+    if not instance_id:
+        return JsonResponse({"error": "instance_id required"}, status=400)
+    instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    deployment, _ = ReleasePlanDeployment.objects.get_or_create(
+        release_plan=plan, instance=instance
+    )
+    if payload.get("last_applied_hash") is not None:
+        deployment.last_applied_hash = payload.get("last_applied_hash", "")
+    applied_at = payload.get("last_applied_at")
+    if applied_at:
+        deployment.last_applied_at = parse_datetime(applied_at)
+    if not deployment.last_applied_at:
+        deployment.last_applied_at = timezone.now()
+    deployment.save()
+    return JsonResponse({"status": "ok"})
 
 
 @csrf_exempt

@@ -6,7 +6,7 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0026_release_plan_deployment"),
+        ("xyn_orchestrator", "0026_release_plan_deployment"),
     ]
 
     operations = [
@@ -26,7 +26,7 @@ class Migration(migrations.Migration):
                         blank=True,
                         on_delete=django.db.models.deletion.SET_NULL,
                         related_name="releases",
-                        to="articles.blueprint",
+                        to="xyn_orchestrator.blueprint",
                     ),
                 ),
                 (
@@ -36,7 +36,7 @@ class Migration(migrations.Migration):
                         blank=True,
                         on_delete=django.db.models.deletion.SET_NULL,
                         related_name="releases",
-                        to="articles.releaseplan",
+                        to="xyn_orchestrator.releaseplan",
                     ),
                 ),
                 (
@@ -46,7 +46,7 @@ class Migration(migrations.Migration):
                         blank=True,
                         on_delete=django.db.models.deletion.SET_NULL,
                         related_name="releases",
-                        to="articles.run",
+                        to="xyn_orchestrator.run",
                     ),
                 ),
                 (

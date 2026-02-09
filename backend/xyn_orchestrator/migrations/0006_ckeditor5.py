@@ -4,7 +4,7 @@ import django_ckeditor_5.fields
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0005_github_orgs"),
+        ("xyn_orchestrator", "0005_github_orgs"),
     ]
 
     operations = [

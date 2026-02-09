@@ -102,3 +102,20 @@ Optional codegen flags:
   - `XYNSEED_API_TOKEN` (optional bearer token)
   - Environment: `XYNSEED_BASE_URL`, `XYNSEED_API_TOKEN`
  - When running via Docker Compose on Linux, the default `XYNSEED_BASE_URL` uses `host.docker.internal` and `extra_hosts` to reach the host.
+
+## Runtime Substrate Detection
+Xyn automatically registers the host running `xyn-api` as a local instance in the Instances UI.
+
+Configuration:
+- `XYENCE_RUNTIME_SUBSTRATE` (default: `auto`)
+  - `auto` attempts detection in order: EC2 IMDSv2, ECS/Fargate metadata, Kubernetes, Docker, then local.
+  - You can force a mode with: `ec2`, `fargate`, `k8s`, `docker`, `local`.
+
+Overrides (optional):
+- `XYENCE_LOCAL_INSTANCE_ID`
+- `XYENCE_LOCAL_INSTANCE_NAME`
+- `XYENCE_LOCAL_AWS_REGION`
+- `XYENCE_LOCAL_INSTANCE_TYPE`
+- `XYENCE_LOCAL_AMI_ID`
+- `XYENCE_LOCAL_STATUS`
+- `XYENCE_LOCAL_ENVIRONMENT_ID`

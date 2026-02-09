@@ -7,7 +7,7 @@ import uuid
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0014_add_job_tracking"),
+        ("xyn_orchestrator", "0014_add_job_tracking"),
     ]
 
     operations = [

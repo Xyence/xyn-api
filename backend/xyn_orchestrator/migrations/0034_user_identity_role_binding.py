@@ -7,7 +7,7 @@ import uuid
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0033_release_target"),
+        ("xyn_orchestrator", "0033_release_target"),
     ]
 
     operations = [
@@ -39,7 +39,7 @@ class Migration(migrations.Migration):
                 ("role", models.CharField(max_length=120)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("updated_at", models.DateTimeField(auto_now=True)),
-                ("user_identity", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="role_bindings", to="articles.useridentity")),
+                ("user_identity", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="role_bindings", to="xyn_orchestrator.useridentity")),
             ],
             options={
                 "ordering": ["-created_at"],

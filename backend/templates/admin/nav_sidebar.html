@@ -41,7 +41,7 @@
               {% endwith %}
             {% endfor %}
             {% for subapp in available_apps %}
-              {% if subapp.app_label == "articles" %}
+              {% if subapp.app_label == "xyn_orchestrator" %}
                 {% for model in subapp.models %}
                   {% if model.object_name == "ArticleVersion" or model.object_name == "Article" %}
                     {% with model_name=model.object_name|lower %}
@@ -77,7 +77,7 @@
             {% endfor %}
           </table>
         </div>
-      {% elif app.app_label == "articles" %}
+      {% elif app.app_label == "xyn_orchestrator" %}
         <div class="app-ai-studio module">
           <table>
             <caption>

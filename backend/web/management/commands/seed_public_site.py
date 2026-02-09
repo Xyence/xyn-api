@@ -262,7 +262,6 @@ class Command(BaseCommand):
             },
             order=50,
         )
-
         self._upsert_section(
             page_objs["about"],
             key="about-bio",

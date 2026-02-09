@@ -4,7 +4,7 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0003_github_context"),
+        ("xyn_orchestrator", "0003_github_context"),
         ("socialaccount", "0001_initial"),
     ]
 

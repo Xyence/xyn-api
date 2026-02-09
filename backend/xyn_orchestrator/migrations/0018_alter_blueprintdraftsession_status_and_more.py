@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("articles", "0017_provisioned_instance"),
+        ("xyn_orchestrator", "0017_provisioned_instance"),
     ]
 
     operations = [

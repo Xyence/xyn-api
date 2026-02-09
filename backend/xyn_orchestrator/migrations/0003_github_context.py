@@ -5,7 +5,7 @@ import django.contrib.postgres.search
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("articles", "0002_articleversion_openaiconfig"),
+        ("xyn_orchestrator", "0002_articleversion_openaiconfig"),
     ]
 
     operations = [
@@ -38,7 +38,7 @@ class Migration(migrations.Migration):
                 ("last_indexed_at", models.DateTimeField(blank=True, null=True)),
                 (
                     "config",
-                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="repos", to="articles.githubconfig"),
+                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="repos", to="xyn_orchestrator.githubconfig"),
                 ),
             ],
         ),
@@ -52,7 +52,7 @@ class Migration(migrations.Migration):
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 (
                     "repo",
-                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="chunks", to="articles.githubrepo"),
+                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="chunks", to="xyn_orchestrator.githubrepo"),
                 ),
             ],
             options={
