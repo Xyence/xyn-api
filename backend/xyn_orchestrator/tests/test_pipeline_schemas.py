@@ -1314,11 +1314,10 @@ class PipelineSchemaTests(TestCase):
         rel.refresh_from_db()
         self.assertEqual(rel.status, "deprecated")
 
-    def test_release_promote_creates_new_release(self):
+    def test_release_promote_returns_existing_release(self):
         os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
         factory = RequestFactory()
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
-        env = Environment.objects.create(name="prod")
         source = Release.objects.create(
             blueprint_id=blueprint.id,
             version="v1",
@@ -1327,20 +1326,19 @@ class PipelineSchemaTests(TestCase):
         )
         request = factory.post(
             "/xyn/internal/releases/promote",
-            data=json.dumps({"release_uuid": str(source.id), "to_environment_id": str(env.id)}),
+            data=json.dumps({"release_uuid": str(source.id)}),
             content_type="application/json",
             HTTP_X_INTERNAL_TOKEN="test-token",
         )
         response = internal_release_promote(request)
         self.assertEqual(response.status_code, 200)
-        promoted = Release.objects.filter(environment_id=env.id, version="v1").first()
-        self.assertIsNotNone(promoted)
+        payload = json.loads(response.content.decode("utf-8"))
+        self.assertEqual(payload.get("id"), str(source.id))
 
     def test_release_promote_conflict(self):
         os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
         factory = RequestFactory()
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
-        env = Environment.objects.create(name="prod")
         source = Release.objects.create(
             blueprint_id=blueprint.id,
             version="v1",
@@ -1349,14 +1347,13 @@ class PipelineSchemaTests(TestCase):
         )
         Release.objects.create(
             blueprint_id=blueprint.id,
-            environment_id=env.id,
             version="v1",
             status="published",
             artifacts_json={"release_manifest": {"sha256": "aaa"}},
         )
         request = factory.post(
             "/xyn/internal/releases/promote",
-            data=json.dumps({"release_uuid": str(source.id), "to_environment_id": str(env.id)}),
+            data=json.dumps({"release_uuid": str(source.id)}),
             content_type="application/json",
             HTTP_X_INTERNAL_TOKEN="test-token",
         )

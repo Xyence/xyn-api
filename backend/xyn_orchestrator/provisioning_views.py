@@ -10,7 +10,7 @@ from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
 
-from .models import ProvisionedInstance
+from .models import AuditLog, Deployment, Environment, ProvisionedInstance
 from .provisioning import (
     provision_instance,
     retry_provision_instance,
@@ -82,6 +82,35 @@ def get_instance(request: HttpRequest, instance_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
     instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    if request.method == "PATCH":
+        payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+        if "environment_id" not in payload:
+            return JsonResponse({"error": "environment_id required"}, status=400)
+        new_env_id = payload.get("environment_id")
+        if not new_env_id:
+            return JsonResponse({"error": "environment_id required"}, status=400)
+        force = bool(payload.get("force"))
+        if not force and Deployment.objects.filter(
+            instance=instance, status__in=["queued", "running"]
+        ).exists():
+            return JsonResponse(
+                {"error": "instance has active deployments; use force to override"},
+                status=409,
+            )
+        new_env = get_object_or_404(Environment, id=new_env_id)
+        old_env = instance.environment
+        if old_env != new_env:
+            instance.environment = new_env
+            instance.updated_by = request.user
+            instance.save(update_fields=["environment", "updated_by", "updated_at"])
+            old_label = old_env.slug if old_env else "none"
+            new_label = new_env.slug if new_env else "none"
+            AuditLog.objects.create(
+                message=f"Instance {instance.id} environment changed {old_label} -> {new_label}",
+                created_by=request.user,
+                metadata_json={"instance_id": str(instance.id), "old": old_label, "new": new_label},
+            )
+        return JsonResponse(_instance_payload(instance))
     if request.method == "GET" and request.GET.get("refresh") == "true":
         instance = refresh_instance(instance)
     return JsonResponse(_instance_payload(instance))

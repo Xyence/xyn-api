@@ -653,9 +653,6 @@ class Release(models.Model):
     release_plan = models.ForeignKey(
         ReleasePlan, null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
     )
-    environment = models.ForeignKey(
-        "Environment", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
-    )
     created_from_run = models.ForeignKey(
         "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
     )
@@ -1025,3 +1022,19 @@ class ProvisionedInstance(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.aws_region})"
+
+
+class AuditLog(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    message = models.TextField()
+    metadata_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="audit_logs"
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.message[:120]

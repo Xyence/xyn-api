@@ -1780,6 +1780,8 @@ def release_plans_collection(request: HttpRequest) -> JsonResponse:
         to_version = payload.get("to_version")
         if not name or not target_kind or not target_fqn or not to_version:
             return JsonResponse({"error": "name, target_kind, target_fqn, to_version required"}, status=400)
+        if not payload.get("environment_id"):
+            return JsonResponse({"error": "environment_id required"}, status=400)
         plan = ReleasePlan.objects.create(
             name=name,
             target_kind=target_kind,
@@ -1823,6 +1825,8 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
     plan = get_object_or_404(ReleasePlan, id=plan_id)
     if request.method == "PATCH":
         payload = _parse_json(request)
+        if "environment_id" in payload and not payload.get("environment_id"):
+            return JsonResponse({"error": "environment_id required"}, status=400)
         for field in ["name", "target_kind", "target_fqn", "from_version", "to_version", "milestones_json"]:
             if field in payload:
                 setattr(plan, field, payload[field])
@@ -1830,6 +1834,8 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
             plan.blueprint_id = payload.get("blueprint_id")
         if "environment_id" in payload:
             plan.environment_id = payload.get("environment_id")
+        if plan.environment_id is None:
+            return JsonResponse({"error": "environment_id required"}, status=400)
         plan.updated_by = request.user
         plan.save()
         return JsonResponse({"id": str(plan.id)})
@@ -1907,6 +1913,12 @@ def release_plan_deployments(request: HttpRequest, plan_id: str) -> JsonResponse
     if not instance_id:
         return JsonResponse({"error": "instance_id required"}, status=400)
     instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    if not plan.environment_id:
+        return JsonResponse({"error": "release plan missing environment"}, status=400)
+    if not instance.environment_id:
+        return JsonResponse({"error": "instance missing environment"}, status=400)
+    if str(plan.environment_id) != str(instance.environment_id):
+        return JsonResponse({"error": "instance environment does not match release plan"}, status=400)
     deployment, _ = ReleasePlanDeployment.objects.get_or_create(
         release_plan=plan, instance=instance
     )
@@ -1934,7 +1946,6 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
         release = Release.objects.create(
             blueprint_id=payload.get("blueprint_id"),
             release_plan_id=payload.get("release_plan_id"),
-            environment_id=payload.get("environment_id"),
             created_from_run_id=payload.get("created_from_run_id"),
             version=version,
             status=payload.get("status", "draft"),
@@ -1946,8 +1957,8 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
     qs = Release.objects.all().order_by("-created_at")
     if blueprint_id := request.GET.get("blueprint_id"):
         qs = qs.filter(blueprint_id=blueprint_id)
-    if env_id := request.GET.get("environment_id"):
-        qs = qs.filter(environment_id=env_id)
+    if status := request.GET.get("status"):
+        qs = qs.filter(status=status)
     data = [
         {
             "id": str(release.id),
@@ -1956,7 +1967,6 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
             "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
             "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
             "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
-            "environment_id": str(release.environment_id) if release.environment_id else None,
             "created_at": release.created_at,
             "updated_at": release.updated_at,
         }
@@ -1976,8 +1986,6 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
         for field in ["version", "status", "artifacts_json", "release_plan_id", "blueprint_id"]:
             if field in payload:
                 setattr(release, field, payload[field])
-        if "environment_id" in payload:
-            release.environment_id = payload.get("environment_id")
         release.updated_by = request.user
         release.save()
         return JsonResponse({"id": str(release.id)})
@@ -1993,7 +2001,6 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
             "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
             "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
             "artifacts_json": release.artifacts_json,
-            "environment_id": str(release.environment_id) if release.environment_id else None,
             "created_at": release.created_at,
             "updated_at": release.updated_at,
         }

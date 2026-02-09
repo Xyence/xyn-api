@@ -6,7 +6,15 @@ from unittest import mock
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from xyn_orchestrator.models import Deployment, ProvisionedInstance, Release, ReleasePlan, Run, RunArtifact
+from xyn_orchestrator.models import (
+    Deployment,
+    Environment,
+    ProvisionedInstance,
+    Release,
+    ReleasePlan,
+    Run,
+    RunArtifact,
+)
 
 
 class InternalDeploymentsTests(TestCase):
@@ -29,12 +37,14 @@ class InternalDeploymentsTests(TestCase):
     def test_idempotency_and_force(self):
         with tempfile.TemporaryDirectory() as tmpdir, override_settings(MEDIA_ROOT=tmpdir):
             os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+            env = Environment.objects.create(name="prod")
             release_plan = ReleasePlan.objects.create(
                 name="Plan",
                 target_kind="blueprint",
                 target_fqn="core.ems.platform",
                 from_version="",
                 to_version="0.1.0",
+                environment=env,
             )
             run = Run.objects.create(entity_type="release_plan", entity_id=release_plan.id)
             release_plan.last_run = run
@@ -49,7 +59,7 @@ class InternalDeploymentsTests(TestCase):
             )
             instance = ProvisionedInstance.objects.create(
                 name="i-1",
-                environment=None,
+                environment=env,
                 aws_region="us-west-2",
                 instance_id="i-123",
                 instance_type="t3",
@@ -102,12 +112,14 @@ class InternalDeploymentsTests(TestCase):
     def test_draft_gating(self):
         with tempfile.TemporaryDirectory() as tmpdir, override_settings(MEDIA_ROOT=tmpdir):
             os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+            env = Environment.objects.create(name="prod")
             release_plan = ReleasePlan.objects.create(
                 name="Plan",
                 target_kind="blueprint",
                 target_fqn="core.ems.platform",
                 from_version="",
                 to_version="0.1.0",
+                environment=env,
             )
             run = Run.objects.create(entity_type="release_plan", entity_id=release_plan.id)
             release_plan.last_run = run
@@ -122,7 +134,7 @@ class InternalDeploymentsTests(TestCase):
             )
             instance = ProvisionedInstance.objects.create(
                 name="i-1",
-                environment=None,
+                environment=env,
                 aws_region="us-west-2",
                 instance_id="i-123",
                 instance_type="t3",
@@ -152,15 +164,18 @@ class InternalDeploymentsTests(TestCase):
                 self.assertEqual(response.status_code, 200)
 
     @override_settings(MEDIA_URL="/media/")
-    def test_failed_execution_sets_status(self):
+    def test_environment_mismatch_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir, override_settings(MEDIA_ROOT=tmpdir):
             os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+            env_a = Environment.objects.create(name="prod")
+            env_b = Environment.objects.create(name="staging")
             release_plan = ReleasePlan.objects.create(
                 name="Plan",
                 target_kind="blueprint",
                 target_fqn="core.ems.platform",
                 from_version="",
                 to_version="0.1.0",
+                environment=env_a,
             )
             run = Run.objects.create(entity_type="release_plan", entity_id=release_plan.id)
             release_plan.last_run = run
@@ -175,7 +190,52 @@ class InternalDeploymentsTests(TestCase):
             )
             instance = ProvisionedInstance.objects.create(
                 name="i-1",
-                environment=None,
+                environment=env_b,
+                aws_region="us-west-2",
+                instance_id="i-123",
+                instance_type="t3",
+                ami_id="ami-123",
+            )
+            payload = {
+                "release_id": str(release.id),
+                "instance_id": str(instance.id),
+                "release_plan_id": str(release_plan.id),
+            }
+            response = self.client.post(
+                "/xyn/internal/deployments",
+                data=json.dumps(payload),
+                content_type="application/json",
+                HTTP_X_INTERNAL_TOKEN="test-token",
+            )
+            self.assertEqual(response.status_code, 400)
+
+    @override_settings(MEDIA_URL="/media/")
+    def test_failed_execution_sets_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir, override_settings(MEDIA_ROOT=tmpdir):
+            os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+            env = Environment.objects.create(name="prod")
+            release_plan = ReleasePlan.objects.create(
+                name="Plan",
+                target_kind="blueprint",
+                target_fqn="core.ems.platform",
+                from_version="",
+                to_version="0.1.0",
+                environment=env,
+            )
+            run = Run.objects.create(entity_type="release_plan", entity_id=release_plan.id)
+            release_plan.last_run = run
+            release_plan.save(update_fields=["last_run"])
+            url = self._seed_plan_artifact(run, tmpdir)
+            RunArtifact.objects.create(run=run, name="release_plan.json", url=url)
+            release = Release.objects.create(
+                version="v1",
+                status="published",
+                release_plan=release_plan,
+                artifacts_json={"release_plan": {"url": url}},
+            )
+            instance = ProvisionedInstance.objects.create(
+                name="i-1",
+                environment=env,
                 aws_region="us-west-2",
                 instance_id="i-123",
                 instance_type="t3",

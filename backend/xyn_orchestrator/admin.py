@@ -28,6 +28,7 @@ from .models import (
     Run,
     RunArtifact,
     RunCommandExecution,
+    AuditLog,
     Capability,
     ContextPack,
     DraftSessionVoiceNote,
@@ -184,6 +185,13 @@ class EnvironmentAdmin(admin.ModelAdmin):
     search_fields = ("name", "slug", "base_domain")
 
 
+@admin.register(AuditLog)
+class AuditLogAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "message", "created_by")
+    search_fields = ("message",)
+    readonly_fields = ("created_at",)
+
+
 @admin.register(Tenant)
 class TenantAdmin(admin.ModelAdmin):
     list_display = ("name", "slug", "status", "updated_at")
@@ -243,8 +251,8 @@ class ReleaseTargetAdmin(admin.ModelAdmin):
 
 @admin.register(Release)
 class ReleaseAdmin(admin.ModelAdmin):
-    list_display = ("version", "status", "blueprint", "release_plan", "environment", "updated_at")
-    list_filter = ("status", "environment")
+    list_display = ("version", "status", "blueprint", "release_plan", "updated_at")
+    list_filter = ("status",)
     search_fields = ("version",)
 
 

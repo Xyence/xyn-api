@@ -35,9 +35,9 @@ from .models import (
     ContextPack,
     DevTask,
     DraftSessionVoiceNote,
+    Environment,
     Module,
     Registry,
-    Release,
     ReleasePlan,
     ReleasePlanDeployState,
     ReleasePlanDeployment,
@@ -3946,6 +3946,7 @@ def internal_release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResp
             "to_version": plan.to_version,
             "milestones_json": plan.milestones_json,
             "blueprint_id": str(plan.blueprint_id) if plan.blueprint_id else None,
+            "environment_id": str(plan.environment_id) if plan.environment_id else None,
             "last_run": str(plan.last_run_id) if plan.last_run_id else None,
         }
     )
@@ -3961,6 +3962,13 @@ def internal_release_plan_upsert(request: HttpRequest) -> JsonResponse:
     blueprint_id = payload.get("blueprint_id")
     target_kind = payload.get("target_kind", "blueprint")
     target_fqn = payload.get("target_fqn", "")
+    environment_id = payload.get("environment_id")
+    if not environment_id:
+        default_env = Environment.objects.filter(slug="local").first() or Environment.objects.first()
+        if default_env:
+            environment_id = str(default_env.id)
+    if not environment_id:
+        return JsonResponse({"error": "environment_id required"}, status=400)
     if target_fqn and target_fqn != "unknown":
         default_name = f"Release plan for {target_fqn}"
     else:
@@ -3978,6 +3986,7 @@ def internal_release_plan_upsert(request: HttpRequest) -> JsonResponse:
             "from_version": from_version,
             "to_version": to_version,
             "milestones_json": milestones_json,
+            "environment_id": environment_id,
         },
     )
     changed = False
@@ -3995,6 +4004,9 @@ def internal_release_plan_upsert(request: HttpRequest) -> JsonResponse:
         changed = True
     if blueprint_id and plan.blueprint_id != blueprint_id:
         plan.blueprint_id = blueprint_id
+        changed = True
+    if environment_id and str(plan.environment_id) != str(environment_id):
+        plan.environment_id = environment_id
         changed = True
     if payload.get("last_run_id"):
         plan.last_run_id = payload.get("last_run_id")
@@ -4079,6 +4091,13 @@ def internal_deployments(request: HttpRequest) -> JsonResponse:
         release_plan = get_object_or_404(ReleasePlan, id=payload.get("release_plan_id"))
     elif release.release_plan_id:
         release_plan = ReleasePlan.objects.filter(id=release.release_plan_id).first()
+    if release_plan:
+        if not release_plan.environment_id:
+            return JsonResponse({"error": "release_plan missing environment"}, status=400)
+        if not instance.environment_id:
+            return JsonResponse({"error": "instance missing environment"}, status=400)
+        if str(release_plan.environment_id) != str(instance.environment_id):
+            return JsonResponse({"error": "instance environment does not match release plan"}, status=400)
     deploy_kind = "release_plan" if release_plan else "release"
     base_key = compute_idempotency_base(release, instance, release_plan, deploy_kind)
     force = bool(payload.get("force"))
@@ -4372,12 +4391,9 @@ def internal_releases_latest(request: HttpRequest) -> JsonResponse:
     if request.method != "GET":
         return JsonResponse({"error": "GET required"}, status=405)
     blueprint_id = request.GET.get("blueprint_id")
-    environment_id = request.GET.get("environment_id")
     if not blueprint_id:
         return JsonResponse({"error": "blueprint_id required"}, status=400)
     qs = Release.objects.filter(blueprint_id=blueprint_id, status="published")
-    if environment_id:
-        qs = qs.filter(environment_id=environment_id)
     release = qs.order_by("-created_at").first()
     if not release:
         return JsonResponse({"error": "release not found"}, status=404)
@@ -4453,14 +4469,10 @@ def _build_release_retention(
     blueprint_id: str, environment_id: Optional[str], keep: int
 ) -> Dict[str, Any]:
     qs = Release.objects.filter(blueprint_id=blueprint_id, status="published").order_by("-created_at")
-    if environment_id:
-        qs = qs.filter(environment_id=environment_id)
     releases = list(qs)
     retained = releases[:keep]
     candidates = releases[keep:]
     targets_qs = ReleaseTarget.objects.filter(blueprint_id=blueprint_id)
-    if environment_id:
-        targets_qs = targets_qs.filter(environment=environment_id)
     referenced_ids = set()
     for target in targets_qs:
         state = get_release_target_deploy_state(str(target.id))
@@ -4694,33 +4706,24 @@ def internal_release_promote(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "POST required"}, status=405)
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
     release_uuid = payload.get("release_uuid")
-    to_environment_id = payload.get("to_environment_id")
     allow_existing = bool(payload.get("allow_existing"))
-    if not release_uuid or not to_environment_id:
-        return JsonResponse({"error": "release_uuid and to_environment_id required"}, status=400)
+    if not release_uuid:
+        return JsonResponse({"error": "release_uuid required"}, status=400)
     source = Release.objects.filter(id=release_uuid).first()
     if not source:
         return JsonResponse({"error": "source release not found"}, status=404)
     if source.status == "draft":
         return JsonResponse({"error": "cannot promote draft release"}, status=400)
-    existing = Release.objects.filter(
-        blueprint_id=source.blueprint_id,
-        environment_id=to_environment_id,
-        version=source.version,
-    ).first()
+    existing = (
+        Release.objects.filter(blueprint_id=source.blueprint_id, version=source.version)
+        .exclude(id=source.id)
+        .first()
+    )
     if existing:
         if allow_existing:
             return JsonResponse({"id": str(existing.id), "version": existing.version})
         return JsonResponse({"error": "release already exists"}, status=409)
-    promoted = Release.objects.create(
-        blueprint_id=source.blueprint_id,
-        environment_id=to_environment_id,
-        version=source.version,
-        status="published",
-        artifacts_json=source.artifacts_json,
-        created_from_run=None,
-    )
-    return JsonResponse({"id": str(promoted.id), "version": promoted.version})
+    return JsonResponse({"id": str(source.id), "version": source.version})
 
 
 @csrf_exempt
