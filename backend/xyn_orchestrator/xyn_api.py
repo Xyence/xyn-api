@@ -1,4 +1,6 @@
+import base64
 import json
+import logging
 import os
 import re
 import secrets
@@ -7,7 +9,7 @@ import uuid
 import hashlib
 import fnmatch
 from functools import wraps
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
@@ -32,6 +34,7 @@ from .blueprints import (
     _async_mode,
     _build_context_artifacts,
     _enqueue_job,
+    _enqueue_release_build,
     _require_staff,
     _resolve_context_pack_list,
     _write_run_summary,
@@ -57,6 +60,8 @@ from .models import (
     RunArtifact,
     RunCommandExecution,
     ReleaseTarget,
+    IdentityProvider,
+    AppOIDCClient,
     RoleBinding,
     UserIdentity,
     Tenant,
@@ -66,6 +71,15 @@ from .models import (
     Device,
 )
 from .module_registry import maybe_sync_modules_from_registry
+from .oidc import (
+    app_client_to_payload,
+    generate_pkce_pair,
+    get_discovery_doc,
+    get_jwks,
+    provider_to_payload,
+    resolve_app_client,
+    resolve_secret_ref as resolve_oidc_secret_ref,
+)
 
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
@@ -113,6 +127,16 @@ def _validate_release_target_payload(payload: Dict[str, Any]) -> list[str]:
             errors.append(
                 f"secret_refs[{idx}].ref: must start with ssm:/, ssm-arn:, secretsmanager:/, or secretsmanager-arn:"
             )
+    return errors
+
+
+def _validate_schema_payload(payload: Dict[str, Any], schema_name: str) -> list[str]:
+    schema = _load_schema_local(schema_name)
+    validator = Draft202012Validator(schema)
+    errors = []
+    for error in sorted(validator.iter_errors(payload), key=lambda e: e.path):
+        path = ".".join(str(p) for p in error.path) if error.path else "root"
+        errors.append(f"{path}: {error.message}")
     return errors
 
 
@@ -298,6 +322,93 @@ def _get_oidc_env_config(env: Environment) -> Optional[Dict[str, Any]]:
     return config
 
 
+def _normalize_provider_payload(payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    client = payload.get("client") or {}
+    discovery = payload.get("discovery") or {}
+    schema_payload = {
+        "type": "oidc.identity_provider",
+        "version": "v1",
+        "id": payload.get("id") or payload.get("provider_id") or "",
+        "displayName": payload.get("display_name") or payload.get("displayName") or "",
+        "enabled": payload.get("enabled", True),
+        "issuer": payload.get("issuer") or "",
+        "discovery": {
+            "mode": discovery.get("mode") or "issuer",
+            "jwksUri": discovery.get("jwksUri") or discovery.get("jwks_uri"),
+            "authorizationEndpoint": discovery.get("authorizationEndpoint")
+            or discovery.get("authorization_endpoint"),
+            "tokenEndpoint": discovery.get("tokenEndpoint") or discovery.get("token_endpoint"),
+            "userinfoEndpoint": discovery.get("userinfoEndpoint") or discovery.get("userinfo_endpoint"),
+        },
+        "client": {
+            "clientId": client.get("client_id") or client.get("clientId") or "",
+            "clientSecretRef": client.get("client_secret_ref") or client.get("clientSecretRef"),
+        },
+        "scopes": payload.get("scopes") or ["openid", "profile", "email"],
+        "pkce": payload.get("pkce", True),
+        "prompt": payload.get("prompt"),
+        "domainRules": payload.get("domain_rules") or payload.get("domainRules") or {},
+        "claims": payload.get("claims") or {},
+        "audienceRules": payload.get("audience_rules") or payload.get("audienceRules") or {},
+    }
+    model_fields = {
+        "id": schema_payload["id"],
+        "display_name": schema_payload["displayName"],
+        "enabled": bool(schema_payload.get("enabled", True)),
+        "issuer": schema_payload["issuer"],
+        "discovery_json": schema_payload.get("discovery") or {},
+        "client_id": schema_payload["client"]["clientId"],
+        "client_secret_ref_json": schema_payload["client"].get("clientSecretRef"),
+        "scopes_json": schema_payload.get("scopes"),
+        "pkce_enabled": bool(schema_payload.get("pkce", True)),
+        "prompt": schema_payload.get("prompt") or "",
+        "domain_rules_json": schema_payload.get("domainRules") or {},
+        "claims_json": schema_payload.get("claims") or {},
+        "audience_rules_json": schema_payload.get("audienceRules") or {},
+    }
+    return model_fields, schema_payload
+
+
+def _normalize_app_client_payload(payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    schema_payload = {
+        "type": "oidc.app_client",
+        "version": "v1",
+        "appId": payload.get("app_id") or payload.get("appId") or "",
+        "loginMode": payload.get("login_mode") or payload.get("loginMode") or "redirect",
+        "defaultProviderId": payload.get("default_provider_id") or payload.get("defaultProviderId") or "",
+        "allowedProviderIds": payload.get("allowed_provider_ids") or payload.get("allowedProviderIds") or [],
+        "redirectUris": payload.get("redirect_uris") or payload.get("redirectUris") or [],
+        "postLogoutRedirectUris": payload.get("post_logout_redirect_uris")
+        or payload.get("postLogoutRedirectUris")
+        or [],
+        "session": payload.get("session") or {},
+        "tokenValidation": payload.get("token_validation") or payload.get("tokenValidation") or {},
+    }
+    model_fields = {
+        "app_id": schema_payload["appId"],
+        "login_mode": schema_payload.get("loginMode") or "redirect",
+        "default_provider_id": schema_payload.get("defaultProviderId") or None,
+        "allowed_providers_json": schema_payload.get("allowedProviderIds") or [],
+        "redirect_uris_json": schema_payload.get("redirectUris") or [],
+        "post_logout_redirect_uris_json": schema_payload.get("postLogoutRedirectUris") or [],
+        "session_json": schema_payload.get("session") or {},
+        "token_validation_json": schema_payload.get("tokenValidation") or {},
+    }
+    return model_fields, schema_payload
+
+
+def _validate_provider_payload(payload: Dict[str, Any]) -> list[str]:
+    _fields, schema_payload = _normalize_provider_payload(payload)
+    errors = _validate_schema_payload(schema_payload, "oidc_identity_provider.v1.schema.json")
+    return errors
+
+
+def _validate_app_client_payload(payload: Dict[str, Any]) -> list[str]:
+    _fields, schema_payload = _normalize_app_client_payload(payload)
+    errors = _validate_schema_payload(schema_payload, "oidc_app_client.v1.schema.json")
+    return errors
+
+
 def _resolve_secret_ref(ref: Dict[str, Any]) -> Optional[str]:
     value = (ref or {}).get("ref") or ""
     if not value:
@@ -478,7 +589,425 @@ def internal_oidc_config(request: HttpRequest) -> JsonResponse:
 
 
 @csrf_exempt
+@login_required
+def identity_providers_collection(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "POST":
+        payload = _parse_json(request)
+        errors = _validate_provider_payload(payload)
+        if errors:
+            return JsonResponse({"error": "invalid provider", "details": errors}, status=400)
+        fields, _schema_payload = _normalize_provider_payload(payload)
+        provider = IdentityProvider.objects.create(
+            **fields,
+            created_by=request.user,
+        )
+        return JsonResponse({"id": provider.id})
+    providers = IdentityProvider.objects.all().order_by("id")
+    data = [provider_to_payload(provider) for provider in providers]
+    return JsonResponse({"identity_providers": data})
+
+
+@csrf_exempt
+@login_required
+def identity_provider_detail(request: HttpRequest, provider_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    provider = get_object_or_404(IdentityProvider, id=provider_id)
+    if request.method == "PATCH":
+        payload = _parse_json(request)
+        errors = _validate_provider_payload({**provider_to_payload(provider), **payload})
+        if errors:
+            return JsonResponse({"error": "invalid provider", "details": errors}, status=400)
+        fields, _schema_payload = _normalize_provider_payload({**provider_to_payload(provider), **payload})
+        for key, value in fields.items():
+            setattr(provider, key, value)
+        provider.save()
+        return JsonResponse({"id": provider.id})
+    if request.method == "DELETE":
+        provider.delete()
+        return JsonResponse({"status": "deleted"})
+    return JsonResponse(provider_to_payload(provider))
+
+
+@csrf_exempt
+@login_required
+def identity_provider_test(request: HttpRequest, provider_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    provider = get_object_or_404(IdentityProvider, id=provider_id)
+    try:
+        discovery = get_discovery_doc(provider, force=True)
+    except Exception as exc:
+        return JsonResponse({"ok": False, "error": str(exc)}, status=502)
+    return JsonResponse(
+        {
+            "ok": True,
+            "issuer": provider.issuer,
+            "authorization_endpoint": (discovery or {}).get("authorization_endpoint"),
+            "token_endpoint": (discovery or {}).get("token_endpoint"),
+            "jwks_uri": (discovery or {}).get("jwks_uri"),
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def oidc_app_clients_collection(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "POST":
+        payload = _parse_json(request)
+        errors = _validate_app_client_payload(payload)
+        if errors:
+            return JsonResponse({"error": "invalid app client", "details": errors}, status=400)
+        fields, _schema_payload = _normalize_app_client_payload(payload)
+        client = AppOIDCClient.objects.create(
+            **fields,
+            created_by=request.user,
+        )
+        return JsonResponse({"id": str(client.id)})
+    clients = AppOIDCClient.objects.all().order_by("app_id", "-created_at")
+    data = [app_client_to_payload(client) for client in clients]
+    return JsonResponse({"oidc_app_clients": data})
+
+
+@csrf_exempt
+@login_required
+def oidc_app_client_detail(request: HttpRequest, client_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    client = get_object_or_404(AppOIDCClient, id=client_id)
+    if request.method == "PATCH":
+        payload = _parse_json(request)
+        errors = _validate_app_client_payload({**app_client_to_payload(client), **payload})
+        if errors:
+            return JsonResponse({"error": "invalid app client", "details": errors}, status=400)
+        fields, _schema_payload = _normalize_app_client_payload({**app_client_to_payload(client), **payload})
+        for key, value in fields.items():
+            setattr(client, key, value)
+        client.save()
+        return JsonResponse({"id": str(client.id)})
+    if request.method == "DELETE":
+        client.delete()
+        return JsonResponse({"status": "deleted"})
+    return JsonResponse(app_client_to_payload(client))
+
+
+def _resolve_app_config(app_id: str) -> Optional[AppOIDCClient]:
+    return resolve_app_client(app_id)
+
+
+def _build_oidc_config_payload(client: AppOIDCClient) -> Dict[str, Any]:
+    allowed_ids = client.allowed_providers_json or []
+    providers = IdentityProvider.objects.filter(id__in=allowed_ids, enabled=True).order_by("id")
+    provider_payloads = []
+    for provider in providers:
+        provider_payloads.append(
+            {
+                "id": provider.id,
+                "display_name": provider.display_name,
+                "issuer": provider.issuer,
+                "client_id": provider.client_id,
+                "prompt": provider.prompt or None,
+                "pkce": provider.pkce_enabled,
+                "scopes": provider.scopes_json or ["openid", "profile", "email"],
+                "domain_rules": provider.domain_rules_json or {},
+            }
+        )
+    return {
+        "app_id": client.app_id,
+        "login_mode": client.login_mode,
+        "default_provider_id": client.default_provider_id if client.default_provider_id else None,
+        "allowed_providers": provider_payloads,
+        "redirect_uris": client.redirect_uris_json or [],
+        "post_logout_redirect_uris": client.post_logout_redirect_uris_json or [],
+        "session": client.session_json or {},
+        "token_validation": client.token_validation_json or {},
+    }
+
+
+@csrf_exempt
+def oidc_config(request: HttpRequest) -> JsonResponse:
+    app_id = request.GET.get("appId") or request.GET.get("app_id") or ""
+    if not app_id:
+        return JsonResponse({"error": "appId required"}, status=400)
+    client = _resolve_app_config(app_id)
+    if not client:
+        return JsonResponse({"error": "app not configured"}, status=404)
+    return JsonResponse(_build_oidc_config_payload(client))
+
+
+def _decode_oidc_id_token(
+    provider: IdentityProvider,
+    client: AppOIDCClient,
+    id_token: str,
+    nonce: str,
+) -> Optional[Dict[str, Any]]:
+    def _token_kid(token: str) -> str:
+        try:
+            header_b64 = token.split(".")[0]
+            header_b64 += "=" * (-len(header_b64) % 4)
+            header = json.loads(base64.urlsafe_b64decode(header_b64.encode("utf-8")).decode("utf-8"))
+            return header.get("kid") or ""
+        except Exception:
+            return ""
+
+    kid = _token_kid(id_token)
+    jwks = get_jwks(provider, kid=kid or None)
+    if not jwks:
+        return None
+    token_validation = client.token_validation_json or {}
+    clock_skew = int(token_validation.get("clockSkewSeconds", 120))
+    try:
+        key_set = JsonWebKey.import_key_set(jwks)
+        claims = jwt.decode(
+            id_token,
+            key_set,
+            claims_options={
+                "iss": {"value": provider.issuer},
+                "exp": {"essential": True},
+            },
+        )
+        claims.validate(leeway=clock_skew)
+    except Exception:
+        if kid:
+            jwks = get_jwks(provider, force=True, kid=kid)
+            if not jwks:
+                return None
+            key_set = JsonWebKey.import_key_set(jwks)
+            claims = jwt.decode(
+                id_token,
+                key_set,
+                claims_options={
+                    "iss": {"value": provider.issuer},
+                    "exp": {"essential": True},
+                },
+            )
+            claims.validate(leeway=clock_skew)
+        else:
+            return None
+    if nonce and claims.get("nonce") != nonce:
+        return None
+    aud = claims.get("aud")
+    azp = claims.get("azp")
+    accept_aud = (provider.audience_rules_json or {}).get("acceptAudiences") or [provider.client_id]
+    if isinstance(aud, list):
+        aud_ok = any(item in accept_aud for item in aud)
+    else:
+        aud_ok = aud in accept_aud
+    if not aud_ok:
+        return None
+    accept_azp = bool((provider.audience_rules_json or {}).get("acceptAzp", True))
+    if azp and not accept_azp:
+        return None
+    return dict(claims)
+
+
+def _extract_claim(claims: Dict[str, Any], key: str, fallback: str) -> str:
+    value = claims.get(key) if key else None
+    if value is None:
+        value = claims.get(fallback)
+    return str(value) if value is not None else ""
+
+
+@csrf_exempt
+def oidc_authorize(request: HttpRequest, provider_id: str) -> HttpResponse:
+    app_id = request.GET.get("appId") or request.GET.get("app_id") or ""
+    if not app_id:
+        return JsonResponse({"error": "appId required"}, status=400)
+    client = _resolve_app_config(app_id)
+    if not client:
+        return JsonResponse({"error": "app not configured"}, status=404)
+    allowed_ids = client.allowed_providers_json or []
+    if provider_id not in allowed_ids:
+        return JsonResponse({"error": "provider not allowed"}, status=403)
+    provider = get_object_or_404(IdentityProvider, id=provider_id)
+    if not provider.enabled:
+        return JsonResponse({"error": "provider disabled"}, status=400)
+    discovery = get_discovery_doc(provider)
+    if not discovery or not discovery.get("authorization_endpoint"):
+        return JsonResponse({"error": "provider discovery unavailable"}, status=502)
+    redirect_uris = client.redirect_uris_json or []
+    if not redirect_uris:
+        return JsonResponse({"error": "redirect_uris missing"}, status=400)
+    redirect_uri = redirect_uris[0]
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    code_verifier, code_challenge = generate_pkce_pair()
+    request.session[f"oidc_state:{app_id}:{provider_id}"] = state
+    request.session[f"oidc_nonce:{app_id}:{provider_id}"] = nonce
+    request.session[f"oidc_verifier:{app_id}:{provider_id}"] = code_verifier
+    request.session["oidc_app_id"] = app_id
+    request.session["oidc_provider_id"] = provider_id
+    next_url = request.GET.get("next") or "/app"
+    request.session["post_login_redirect"] = next_url
+    scopes = provider.scopes_json or ["openid", "profile", "email"]
+    params = {
+        "response_type": "code",
+        "client_id": provider.client_id,
+        "redirect_uri": redirect_uri,
+        "scope": " ".join(scopes),
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    if provider.prompt:
+        params["prompt"] = provider.prompt
+    domain_rules = provider.domain_rules_json or {}
+    if domain_rules.get("allowedHostedDomain"):
+        params["hd"] = domain_rules.get("allowedHostedDomain")
+    url = f"{discovery['authorization_endpoint']}?{urlencode(params)}"
+    return redirect(url)
+
+
+@csrf_exempt
+def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
+    if request.method not in {"POST", "GET"}:
+        return JsonResponse({"error": "POST required"}, status=405)
+    code = request.POST.get("code") if request.method == "POST" else request.GET.get("code")
+    state = request.POST.get("state") if request.method == "POST" else request.GET.get("state")
+    app_id = request.POST.get("appId") if request.method == "POST" else request.GET.get("appId")
+    app_id = app_id or request.session.get("oidc_app_id") or ""
+    if not code or not state:
+        return JsonResponse({"error": "missing code/state"}, status=400)
+    if not app_id:
+        return JsonResponse({"error": "appId required"}, status=400)
+    expected_state = request.session.get(f"oidc_state:{app_id}:{provider_id}")
+    if state != expected_state:
+        return JsonResponse({"error": "invalid state"}, status=400)
+    client = _resolve_app_config(app_id)
+    if not client:
+        return JsonResponse({"error": "app not configured"}, status=404)
+    allowed_ids = client.allowed_providers_json or []
+    if provider_id not in allowed_ids:
+        return JsonResponse({"error": "provider not allowed"}, status=403)
+    provider = get_object_or_404(IdentityProvider, id=provider_id)
+    discovery = get_discovery_doc(provider)
+    if not discovery or not discovery.get("token_endpoint"):
+        return JsonResponse({"error": "provider discovery unavailable"}, status=502)
+    redirect_uris = client.redirect_uris_json or []
+    if not redirect_uris:
+        return JsonResponse({"error": "redirect_uris missing"}, status=400)
+    redirect_uri = redirect_uris[0]
+    code_verifier = request.session.get(f"oidc_verifier:{app_id}:{provider_id}") or ""
+    token_payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": provider.client_id,
+        "redirect_uri": redirect_uri,
+    }
+    if code_verifier:
+        token_payload["code_verifier"] = code_verifier
+    client_secret = resolve_oidc_secret_ref(provider.client_secret_ref_json)
+    if client_secret:
+        token_payload["client_secret"] = client_secret
+    token_response = requests.post(discovery["token_endpoint"], data=token_payload, timeout=15)
+    if token_response.status_code >= 400:
+        try:
+            details = token_response.json()
+        except Exception:
+            details = token_response.text
+        return JsonResponse({"error": "token exchange failed", "details": details}, status=400)
+    token_body = token_response.json()
+    id_token = token_body.get("id_token")
+    if not id_token:
+        return JsonResponse({"error": "id_token missing"}, status=400)
+    nonce = request.session.get(f"oidc_nonce:{app_id}:{provider_id}") or ""
+    claims = _decode_oidc_id_token(provider, client, id_token, nonce)
+    if not claims:
+        return JsonResponse({"error": "invalid id_token"}, status=401)
+    claim_map = provider.claims_json or {}
+    subject = _extract_claim(claims, claim_map.get("subject", ""), "sub")
+    email = _extract_claim(claims, claim_map.get("email", ""), "email")
+    name = _extract_claim(claims, claim_map.get("name", ""), "name")
+    given_name = _extract_claim(claims, claim_map.get("givenName", ""), "given_name")
+    family_name = _extract_claim(claims, claim_map.get("familyName", ""), "family_name")
+    domain_rules = provider.domain_rules_json or {}
+    allowed_domains = domain_rules.get("allowedEmailDomains") or []
+    if allowed_domains and email:
+        domain = email.split("@")[-1].lower()
+        if domain not in [d.lower() for d in allowed_domains]:
+            return JsonResponse({"error": "email domain not allowed"}, status=403)
+    hosted_domain = domain_rules.get("allowedHostedDomain")
+    if hosted_domain:
+        hd_claim = claims.get("hd") or claims.get("hosted_domain") or ""
+        if hd_claim and str(hd_claim).lower() != str(hosted_domain).lower():
+            return JsonResponse({"error": "hosted domain not allowed"}, status=403)
+    identity, created = UserIdentity.objects.get_or_create(
+        issuer=provider.issuer,
+        subject=subject,
+        defaults={
+            "provider": "oidc",
+            "provider_id": provider.id,
+            "email": email,
+            "display_name": name or " ".join([given_name, family_name]).strip(),
+            "claims_json": claims,
+            "last_login_at": timezone.now(),
+        },
+    )
+    if not created:
+        identity.provider_id = provider.id
+        identity.provider = "oidc"
+        identity.email = email
+        identity.display_name = name or " ".join([given_name, family_name]).strip()
+        identity.claims_json = claims
+        identity.last_login_at = timezone.now()
+        identity.save(
+            update_fields=[
+                "provider_id",
+                "provider",
+                "email",
+                "display_name",
+                "claims_json",
+                "last_login_at",
+                "updated_at",
+            ]
+        )
+    if not RoleBinding.objects.exists() and os.environ.get("ALLOW_FIRST_ADMIN_BOOTSTRAP", "").lower() == "true":
+        RoleBinding.objects.create(user_identity=identity, scope_kind="platform", role="platform_admin")
+    roles = _get_roles(identity)
+    User = get_user_model()
+    issuer_hash = hashlib.sha256(provider.issuer.encode("utf-8")).hexdigest()[:12]
+    username = f"oidc:{issuer_hash}:{subject}"
+    user, created = User.objects.get_or_create(
+        username=username,
+        defaults={"email": email, "is_staff": "platform_admin" in roles, "is_active": True},
+    )
+    if email and user.email != email:
+        user.email = email
+    user.is_staff = "platform_admin" in roles
+    user.is_superuser = False
+    user.is_active = True
+    user.save()
+    if not roles and app_id == "xyn-ui":
+        return JsonResponse({"error": "no roles assigned"}, status=403)
+    login(request, user, backend="django.contrib.auth.backends.ModelBackend")
+    request.session["user_identity_id"] = str(identity.id)
+    redirect_to = request.session.get("post_login_redirect") or "/app"
+    if app_id != "xyn-ui":
+        split = urlsplit(redirect_to)
+        fragment_params = dict(parse_qsl(split.fragment, keep_blank_values=True))
+        fragment_params["id_token"] = id_token
+        rebuilt = split._replace(fragment=urlencode(fragment_params))
+        redirect_to = urlunsplit(rebuilt)
+    return redirect(redirect_to)
+
+
+@csrf_exempt
 def auth_login(request: HttpRequest) -> HttpResponse:
+    client = _resolve_app_config("xyn-ui")
+    if client and client.default_provider_id:
+        next_url = request.GET.get("next") or "/app"
+        request.GET = request.GET.copy()
+        request.GET["appId"] = "xyn-ui"
+        request.GET["next"] = next_url
+        return oidc_authorize(request, client.default_provider_id)
+    if AppOIDCClient.objects.exists():
+        return JsonResponse({"error": "OIDC app not configured"}, status=500)
+    logger.warning("Using ENV OIDC fallback (no app client configured)")
     env = _resolve_environment(request)
     if not env:
         return JsonResponse({"error": "environment not found"}, status=404)
@@ -510,12 +1039,14 @@ def auth_login(request: HttpRequest) -> HttpResponse:
         "nonce": nonce,
     }
     url = f"{oidc_config['authorization_endpoint']}?{urlencode(params)}"
-    response = redirect(url)
-    return response
+    return redirect(url)
 
 
 @csrf_exempt
 def auth_callback(request: HttpRequest) -> HttpResponse:
+    provider_id = request.session.get("oidc_provider_id")
+    if provider_id:
+        return oidc_callback(request, provider_id)
     error = request.GET.get("error")
     if error:
         return JsonResponse({"error": error}, status=400)
@@ -602,7 +1133,6 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
             role="platform_admin",
         )
     roles = _get_roles(identity)
-    # Bridge session auth into Django auth so login_required works.
     User = get_user_model()
     issuer_hash = hashlib.sha256(issuer.encode("utf-8")).hexdigest()[:12]
     username = f"oidc:{issuer_hash}:{claims.get('sub')}"
@@ -1949,6 +2479,7 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
             created_from_run_id=payload.get("created_from_run_id"),
             version=version,
             status=payload.get("status", "draft"),
+            build_state=payload.get("build_state", "draft"),
             artifacts_json=payload.get("artifacts_json"),
             created_by=request.user,
             updated_by=request.user,
@@ -1964,6 +2495,7 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
             "id": str(release.id),
             "version": release.version,
             "status": release.status,
+            "build_state": release.build_state,
             "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
             "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
             "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
@@ -1983,12 +2515,25 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
     release = get_object_or_404(Release, id=release_id)
     if request.method == "PATCH":
         payload = _parse_json(request)
-        for field in ["version", "status", "artifacts_json", "release_plan_id", "blueprint_id"]:
+        prev_status = release.status
+        for field in ["version", "status", "build_state", "artifacts_json", "release_plan_id", "blueprint_id"]:
             if field in payload:
                 setattr(release, field, payload[field])
         release.updated_by = request.user
         release.save()
-        return JsonResponse({"id": str(release.id)})
+        build_run_id = None
+        if payload.get("status") == "published" and prev_status != "published":
+            release.build_state = "building"
+            release.save(update_fields=["build_state", "updated_at"])
+            build_result = _enqueue_release_build(release, request.user)
+            build_run_id = build_result.get("run_id")
+            if not build_result.get("ok"):
+                release.build_state = "failed"
+                release.save(update_fields=["build_state", "updated_at"])
+            elif not build_result.get("queued"):
+                release.build_state = "ready"
+                release.save(update_fields=["build_state", "updated_at"])
+        return JsonResponse({"id": str(release.id), "build_run_id": build_run_id})
     if request.method == "DELETE":
         release.delete()
         return JsonResponse({"status": "deleted"})
@@ -1997,6 +2542,7 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
             "id": str(release.id),
             "version": release.version,
             "status": release.status,
+            "build_state": release.build_state,
             "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
             "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
             "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
@@ -2464,3 +3010,4 @@ def blueprint_dev_tasks(request: HttpRequest, blueprint_id: str) -> JsonResponse
         for task in tasks
     ]
     return JsonResponse({"dev_tasks": data})
+logger = logging.getLogger(__name__)
