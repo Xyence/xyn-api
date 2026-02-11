@@ -500,6 +500,73 @@ def _select_release_target_for_blueprint(
     return qs.first()
 
 
+def _enqueue_release_build(release: Release, user) -> Dict[str, Any]:
+    blueprint = release.blueprint
+    if not blueprint:
+        return {"ok": False, "error": "release missing blueprint"}
+    release_target = _select_release_target_for_blueprint(blueprint)
+    release_payload = _release_target_payload(release_target) if release_target else None
+    run = Run.objects.create(
+        entity_type="blueprint",
+        entity_id=blueprint.id,
+        status="running",
+        summary=f"Build artifacts for release {release.version}",
+        log_text="Preparing release build run\n",
+        metadata_json={
+            "release_id": str(release.id),
+            "release_version": release.version,
+            "release_target_id": str(release_target.id) if release_target else "",
+        },
+        created_by=user,
+    )
+    _write_run_artifact(run, "blueprint_metadata.json", blueprint.metadata_json or {}, "blueprint")
+    if release_payload:
+        _write_run_artifact(run, "release_target.json", release_payload, "release_target")
+    module_catalog = _build_module_catalog()
+    _write_run_artifact(run, "module_catalog.v1.json", module_catalog, "module_catalog")
+    run_history_summary = _build_run_history_summary(blueprint, release_payload)
+    _write_run_artifact(run, "run_history_summary.v1.json", run_history_summary, "run_history_summary")
+    implementation_plan = _generate_implementation_plan(
+        blueprint,
+        module_catalog=module_catalog,
+        run_history_summary=run_history_summary,
+        release_target=release_payload,
+    )
+    build_items = [
+        item
+        for item in implementation_plan.get("work_items", [])
+        if item.get("id") == "build.publish_images.container"
+    ]
+    if not build_items:
+        run.status = "succeeded"
+        run.finished_at = timezone.now()
+        run.log_text = (run.log_text or "") + "No build work items detected for release.\n"
+        run.save(update_fields=["status", "finished_at", "log_text", "updated_at"])
+        _write_run_summary(run)
+        return {"ok": True, "run_id": str(run.id), "queued": False}
+    for item in build_items:
+        config = item.setdefault("config", {})
+        config["release_uuid"] = str(release.id)
+        config["release_version"] = release.version
+    implementation_plan["work_items"] = build_items
+    _write_run_artifact(run, "implementation_plan.json", implementation_plan, "implementation_plan")
+    _queue_dev_tasks_for_plan(
+        blueprint=blueprint,
+        run=run,
+        plan=implementation_plan,
+        namespace=blueprint.namespace,
+        project_key=f"{blueprint.namespace}.{blueprint.name}",
+        release_target=release_payload,
+        enqueue_jobs=True,
+    )
+    run.status = "succeeded"
+    run.finished_at = timezone.now()
+    run.log_text = (run.log_text or "") + "Queued release build tasks\n"
+    run.save(update_fields=["status", "finished_at", "log_text", "updated_at"])
+    _write_run_summary(run)
+    return {"ok": True, "run_id": str(run.id), "queued": True}
+
+
 def _default_repo_targets() -> List[Dict[str, Any]]:
     return [
         {
@@ -4083,8 +4150,11 @@ def internal_deployments(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "release_id and instance_id required"}, status=400)
     release = get_object_or_404(Release, id=release_id)
     allow_draft = bool(payload.get("allow_draft"))
+    allow_unready = bool(payload.get("allow_unready"))
     if release.status != "published" and not allow_draft:
         return JsonResponse({"error": "release must be published"}, status=400)
+    if release.build_state != "ready" and not allow_unready:
+        return JsonResponse({"error": "release build is not ready"}, status=400)
     instance = get_object_or_404(ProvisionedInstance, id=instance_id)
     release_plan = None
     if payload.get("release_plan_id"):
@@ -4268,6 +4338,11 @@ def internal_release_target_deploy_release(request: HttpRequest, target_id: str)
         release = Release.objects.filter(version=release_version, blueprint_id=blueprint.id).first()
     if not release:
         return JsonResponse({"error": "release not found"}, status=404)
+    allow_unready = bool(payload.get("allow_unready"))
+    if release.status != "published":
+        return JsonResponse({"error": "release must be published"}, status=400)
+    if release.build_state != "ready" and not allow_unready:
+        return JsonResponse({"error": "release build is not ready"}, status=400)
     artifacts_json = release.artifacts_json or {}
     manifest_info = artifacts_json.get("release_manifest") or {}
     compose_info = artifacts_json.get("compose_file") or {}
@@ -4740,12 +4815,17 @@ def internal_release_create(request: HttpRequest) -> JsonResponse:
     if not version:
         count = Release.objects.filter(blueprint_id=blueprint_id).count() + 1
         version = f"v{count}"
+    status = payload.get("status", "draft")
+    build_state = payload.get("build_state")
+    if not build_state:
+        build_state = "building" if status == "published" else "draft"
     release = Release.objects.create(
         blueprint_id=blueprint_id,
         release_plan_id=release_plan_id,
         created_from_run_id=created_from_run_id,
         version=version,
-        status=payload.get("status", "draft"),
+        status=status,
+        build_state=build_state,
         artifacts_json=payload.get("artifacts_json"),
     )
     return JsonResponse({"id": str(release.id), "version": release.version})
@@ -4758,11 +4838,20 @@ def internal_release_upsert(request: HttpRequest) -> JsonResponse:
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    release_uuid = payload.get("release_uuid")
     blueprint_id = payload.get("blueprint_id")
     version = payload.get("version")
+    release = None
+    if release_uuid:
+        release = Release.objects.filter(id=release_uuid).first()
+        if not release:
+            return JsonResponse({"error": "release not found"}, status=404)
+        blueprint_id = release.blueprint_id
+        version = release.version
     if not blueprint_id or not version:
         return JsonResponse({"error": "blueprint_id and version required"}, status=400)
-    release = Release.objects.filter(blueprint_id=blueprint_id, version=version).first()
+    if not release:
+        release = Release.objects.filter(blueprint_id=blueprint_id, version=version).first()
     if release:
         allow_overwrite = bool(payload.get("allow_overwrite"))
         if release.status == "published" and not allow_overwrite:
@@ -4770,11 +4859,17 @@ def internal_release_upsert(request: HttpRequest) -> JsonResponse:
             existing = release.artifacts_json or {}
             def _hash(obj: Dict[str, Any]) -> str:
                 return str((obj or {}).get("sha256") or "")
-            if _hash(incoming.get("release_manifest")) and _hash(incoming.get("release_manifest")) != _hash(existing.get("release_manifest")):
+            incoming_manifest = _hash(incoming.get("release_manifest"))
+            existing_manifest = _hash(existing.get("release_manifest"))
+            if incoming_manifest and existing_manifest and incoming_manifest != existing_manifest:
                 return JsonResponse({"error": "release is immutable"}, status=409)
-            if _hash(incoming.get("compose_file")) and _hash(incoming.get("compose_file")) != _hash(existing.get("compose_file")):
+            incoming_compose = _hash(incoming.get("compose_file"))
+            existing_compose = _hash(existing.get("compose_file"))
+            if incoming_compose and existing_compose and incoming_compose != existing_compose:
                 return JsonResponse({"error": "release is immutable"}, status=409)
         release.status = payload.get("status", release.status)
+        if payload.get("build_state"):
+            release.build_state = payload.get("build_state")
         release.artifacts_json = payload.get("artifacts_json") or release.artifacts_json
         if payload.get("release_plan_id"):
             release.release_plan_id = payload.get("release_plan_id")
@@ -4782,12 +4877,17 @@ def internal_release_upsert(request: HttpRequest) -> JsonResponse:
             release.created_from_run_id = payload.get("created_from_run_id")
         release.save()
     else:
+        status = payload.get("status", "draft")
+        build_state = payload.get("build_state")
+        if not build_state:
+            build_state = "building" if status == "published" else "draft"
         release = Release.objects.create(
             blueprint_id=blueprint_id,
             release_plan_id=payload.get("release_plan_id"),
             created_from_run_id=payload.get("created_from_run_id"),
             version=version,
-            status=payload.get("status", "draft"),
+            status=status,
+            build_state=build_state,
             artifacts_json=payload.get("artifacts_json"),
         )
     return JsonResponse({"id": str(release.id), "version": release.version})

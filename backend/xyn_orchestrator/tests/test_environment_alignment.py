@@ -30,8 +30,8 @@ class EnvironmentAlignmentTests(TestCase):
         self.assertNotIn("environment_id", detail)
 
     def test_instance_environment_update_validation_and_audit(self):
-        env_a = Environment.objects.create(name="prod")
-        env_b = Environment.objects.create(name="staging")
+        env_a = Environment.objects.create(name="prod", slug="prod")
+        env_b = Environment.objects.create(name="staging", slug="staging")
         release = Release.objects.create(version="v1", status="published")
         instance = ProvisionedInstance.objects.create(
             name="i-1",
@@ -88,8 +88,8 @@ class EnvironmentAlignmentTests(TestCase):
         self.assertEqual(payload["releases"][0]["status"], "published")
 
     def test_release_plan_deployment_environment_mismatch(self):
-        env_a = Environment.objects.create(name="prod")
-        env_b = Environment.objects.create(name="staging")
+        env_a = Environment.objects.create(name="prod", slug="prod")
+        env_b = Environment.objects.create(name="staging", slug="staging")
         plan = ReleasePlan.objects.create(
             name="Plan",
             target_kind="blueprint",

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OIDC App Client v1",
+  "type": "object",
+  "required": ["type", "version", "appId", "defaultProviderId", "allowedProviderIds", "redirectUris"],
+  "properties": {
+    "type": {"const": "oidc.app_client"},
+    "version": {"const": "v1"},
+    "appId": {"type": "string", "minLength": 1},
+    "loginMode": {"type": "string", "enum": ["redirect"], "default": "redirect"},
+    "defaultProviderId": {"type": "string", "minLength": 1},
+    "allowedProviderIds": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    "redirectUris": {"type": "array", "items": {"type": "string", "format": "uri"}, "minItems": 1},
+    "postLogoutRedirectUris": {"type": "array", "items": {"type": "string", "format": "uri"}},
+    "session": {
+      "type": "object",
+      "properties": {
+        "cookieName": {"type": "string"},
+        "maxAgeSeconds": {"type": "integer", "minimum": 60}
+      },
+      "additionalProperties": false
+    },
+    "tokenValidation": {
+      "type": "object",
+      "properties": {
+        "issuerStrict": {"type": "boolean"},
+        "clockSkewSeconds": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OIDC Identity Provider v1",
+  "type": "object",
+  "required": ["type", "version", "id", "displayName", "issuer", "client"],
+  "properties": {
+    "type": {"const": "oidc.identity_provider"},
+    "version": {"const": "v1"},
+    "id": {"type": "string", "minLength": 1},
+    "displayName": {"type": "string", "minLength": 1},
+    "enabled": {"type": "boolean", "default": true},
+    "issuer": {"type": "string", "format": "uri"},
+    "discovery": {
+      "type": "object",
+      "properties": {
+        "mode": {"type": "string", "enum": ["issuer", "manual"], "default": "issuer"},
+        "jwksUri": {"type": ["string", "null"], "format": "uri"},
+        "authorizationEndpoint": {"type": ["string", "null"], "format": "uri"},
+        "tokenEndpoint": {"type": ["string", "null"], "format": "uri"},
+        "userinfoEndpoint": {"type": ["string", "null"], "format": "uri"}
+      },
+      "additionalProperties": false
+    },
+    "client": {
+      "type": "object",
+      "required": ["clientId"],
+      "properties": {
+        "clientId": {"type": "string", "minLength": 1},
+        "clientSecretRef": {
+          "type": ["object", "null"],
+          "properties": {
+            "type": {"type": "string", "enum": ["aws.ssm", "aws.secrets_manager", "env"]},
+            "ref": {"type": "string"}
+          },
+          "required": ["type", "ref"],
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "scopes": {"type": "array", "items": {"type": "string"}},
+    "pkce": {"type": "boolean", "default": true},
+    "prompt": {"type": ["string", "null"], "enum": ["select_account", "login", null]},
+    "domainRules": {
+      "type": "object",
+      "properties": {
+        "allowedEmailDomains": {"type": "array", "items": {"type": "string"}},
+        "allowedHostedDomain": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "claims": {
+      "type": "object",
+      "properties": {
+        "subject": {"type": "string"},
+        "email": {"type": "string"},
+        "emailVerified": {"type": "string"},
+        "name": {"type": "string"},
+        "givenName": {"type": "string"},
+        "familyName": {"type": "string"},
+        "picture": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "audienceRules": {
+      "type": "object",
+      "properties": {
+        "acceptAudiences": {"type": "array", "items": {"type": "string"}},
+        "acceptAzp": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -333,8 +333,65 @@ class ReleaseTarget(models.Model):
         return f"{self.blueprint} target {self.name}"
 
 
+class IdentityProvider(models.Model):
+    id = models.CharField(primary_key=True, max_length=120)
+    display_name = models.CharField(max_length=200)
+    enabled = models.BooleanField(default=True)
+    issuer = models.URLField()
+    discovery_json = models.JSONField(null=True, blank=True)
+    client_id = models.CharField(max_length=240)
+    client_secret_ref_json = models.JSONField(null=True, blank=True)
+    scopes_json = models.JSONField(null=True, blank=True)
+    pkce_enabled = models.BooleanField(default=True)
+    prompt = models.CharField(max_length=40, blank=True)
+    domain_rules_json = models.JSONField(null=True, blank=True)
+    claims_json = models.JSONField(null=True, blank=True)
+    audience_rules_json = models.JSONField(null=True, blank=True)
+    cached_discovery_doc = models.JSONField(null=True, blank=True)
+    cached_jwks = models.JSONField(null=True, blank=True)
+    last_discovery_refresh_at = models.DateTimeField(null=True, blank=True)
+    jwks_cached_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="identity_providers_created"
+    )
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return self.display_name or self.id
+
+
+class AppOIDCClient(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    app_id = models.CharField(max_length=120)
+    login_mode = models.CharField(max_length=40, default="redirect")
+    default_provider = models.ForeignKey(
+        IdentityProvider, null=True, blank=True, on_delete=models.SET_NULL, related_name="default_for_apps"
+    )
+    allowed_providers_json = models.JSONField(null=True, blank=True)
+    redirect_uris_json = models.JSONField(null=True, blank=True)
+    post_logout_redirect_uris_json = models.JSONField(null=True, blank=True)
+    session_json = models.JSONField(null=True, blank=True)
+    token_validation_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="oidc_clients_created"
+    )
+
+    class Meta:
+        ordering = ["app_id", "-created_at"]
+
+    def __str__(self) -> str:
+        return self.app_id
+
+
 class UserIdentity(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    provider_id = models.CharField(max_length=120, blank=True)
     provider = models.CharField(max_length=50)
     issuer = models.CharField(max_length=240)
     subject = models.CharField(max_length=240)
@@ -645,6 +702,12 @@ class Release(models.Model):
         ("published", "Published"),
         ("deprecated", "Deprecated"),
     ]
+    BUILD_STATE_CHOICES = [
+        ("draft", "Draft"),
+        ("building", "Building"),
+        ("ready", "Ready"),
+        ("failed", "Failed"),
+    ]
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     blueprint = models.ForeignKey(
         "Blueprint", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
@@ -657,6 +720,7 @@ class Release(models.Model):
         "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="releases"
     )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
+    build_state = models.CharField(max_length=20, choices=BUILD_STATE_CHOICES, default="draft")
     artifacts_json = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
