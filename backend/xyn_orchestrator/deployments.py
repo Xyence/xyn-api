@@ -128,7 +128,7 @@ def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dic
     out: Optional[Dict[str, Any]] = None
     last_error: Optional[Exception] = None
     started_at = timezone.now().isoformat()
-    for _ in range(30):
+    for _ in range(120):
         try:
             out = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
         except ClientError as exc:
