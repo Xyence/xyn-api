@@ -1448,6 +1448,13 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("ingress.nginx_tls_configure", ids)
         self.assertIn("verify.public_https", ids)
         self.assertEqual(plan.get("release_target_id"), str(target.id))
+        self.assertEqual(plan.get("release_target_name"), target.name)
+        build_publish = next((item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.container"), None)
+        self.assertIsNotNone(build_publish)
+        self.assertIn("config", build_publish)
+        schema = self._load_schema("implementation_plan.v1.schema.json")
+        errors = list(Draft202012Validator(schema).iter_errors(plan))
+        self.assertEqual(errors, [], f"Schema errors: {errors}")
 
     def test_planner_does_not_require_blueprint_metadata_deploy(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})

@@ -57,6 +57,15 @@
         "why_next": {"type": "array", "items": {"type": "string"}}
       }
     },
+    "release_target_id": {
+      "type": "string"
+    },
+    "release_target_name": {
+      "type": "string"
+    },
+    "manifest_override": {
+      "type": "boolean"
+    },
     "tasks": {
       "type": "array",
       "items": {
@@ -177,6 +186,10 @@
         "context_purpose_override": {
           "type": "string",
           "enum": ["coder", "planner"]
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
         }
       }
     }
