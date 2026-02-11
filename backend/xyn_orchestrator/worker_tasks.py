@@ -1664,24 +1664,11 @@ if __name__ == "__main__":
 import { Link } from "react-router-dom";
 import { clearStoredToken, getStoredToken } from "./session";
 
-type OidcProvider = {
-  id: string;
-  display_name?: string;
-};
-
-type OidcConfig = {
-  app_id: string;
-  auth_base_url?: string;
-  default_provider_id?: string;
-  allowed_providers?: OidcProvider[];
-};
-
 export default function Login() {
   const [status, setStatus] = useState<"ok" | "down" | "checking">("checking");
   const [authStatus, setAuthStatus] = useState<"unknown" | "signed_out" | "signed_in">("unknown");
   const [meResult, setMeResult] = useState<string>("");
   const [meIdentity, setMeIdentity] = useState<string>("");
-  const [config, setConfig] = useState<OidcConfig | null>(null);
   const meLabel = useMemo(() => (meResult ? "Response:" : "Response will appear here."), [meResult]);
 
   const checkHealth = useCallback(async () => {
@@ -1737,42 +1724,15 @@ export default function Login() {
     setMeResult("");
   }, []);
 
-  const loadConfig = useCallback(async () => {
-    try {
-      const response = await fetch("/api/auth/oidc/config");
-      if (!response.ok) {
-        setMeResult(`OIDC config unavailable (${response.status})`);
-        return;
-      }
-      const payload = (await response.json()) as OidcConfig;
-      setConfig(payload);
-    } catch (err) {
-      setMeResult(`OIDC config fetch failed: ${String(err)}`);
-    }
+  const startLogin = useCallback(() => {
+    const returnTo = `${window.location.origin}/auth/callback`;
+    window.location.href = `/auth/login?appId=ems.platform&returnTo=${encodeURIComponent(returnTo)}`;
   }, []);
-
-  const startLogin = useCallback(
-    (providerId: string) => {
-      if (!config) return;
-      const appId = encodeURIComponent(config.app_id || "ems.platform");
-      const nextUrl = encodeURIComponent(`${window.location.origin}/auth/callback`);
-      const authBase = (config.auth_base_url || "").replace(/\\/$/, "");
-      if (!authBase) {
-        setMeResult("OIDC auth base URL missing.");
-        return;
-      }
-      window.location.href = `${authBase}/xyn/api/auth/oidc/${encodeURIComponent(
-        providerId
-      )}/authorize?appId=${appId}&next=${nextUrl}`;
-    },
-    [config]
-  );
 
   useEffect(() => {
     checkHealth();
-    loadConfig();
     callMe();
-  }, [checkHealth, loadConfig, callMe]);
+  }, [checkHealth, callMe]);
 
   return (
     <section>
@@ -1784,19 +1744,9 @@ export default function Login() {
       </button>
       <div>
         {authStatus !== "signed_in" ? (
-          <>
-            {config?.allowed_providers?.length === 1 && (
-              <button type="button" onClick={() => startLogin(config.allowed_providers![0].id)}>
-                Sign in
-              </button>
-            )}
-            {(config?.allowed_providers?.length ?? 0) > 1 &&
-              config!.allowed_providers!.map((provider) => (
-                <button key={provider.id} type="button" onClick={() => startLogin(provider.id)}>
-                  Continue with {provider.display_name ?? provider.id}
-                </button>
-              ))}
-          </>
+          <button type="button" onClick={startLogin}>
+            Sign in
+          </button>
         ) : (
           <button type="button" onClick={signOut}>
             Sign out
@@ -2118,24 +2068,11 @@ export default function RoutesView() {
 import { Link } from "react-router-dom";
 import { clearStoredToken, getStoredToken } from "./session";
 
-type OidcProvider = {
-  id: string;
-  display_name?: string;
-};
-
-type OidcConfig = {
-  app_id: string;
-  auth_base_url?: string;
-  default_provider_id?: string;
-  allowed_providers?: OidcProvider[];
-};
-
 export default function Login() {
   const [status, setStatus] = useState<"ok" | "down" | "checking">("checking");
   const [authStatus, setAuthStatus] = useState<"unknown" | "signed_out" | "signed_in">("unknown");
   const [meResult, setMeResult] = useState<string>("");
   const [meIdentity, setMeIdentity] = useState<string>("");
-  const [config, setConfig] = useState<OidcConfig | null>(null);
   const meLabel = useMemo(() => (meResult ? "Response:" : "Response will appear here."), [meResult]);
 
   const checkHealth = useCallback(async () => {
@@ -2191,42 +2128,15 @@ export default function Login() {
     setMeResult("");
   }, []);
 
-  const loadConfig = useCallback(async () => {
-    try {
-      const response = await fetch("/api/auth/oidc/config");
-      if (!response.ok) {
-        setMeResult(`OIDC config unavailable (${response.status})`);
-        return;
-      }
-      const payload = (await response.json()) as OidcConfig;
-      setConfig(payload);
-    } catch (err) {
-      setMeResult(`OIDC config fetch failed: ${String(err)}`);
-    }
+  const startLogin = useCallback(() => {
+    const returnTo = `${window.location.origin}/auth/callback`;
+    window.location.href = `/auth/login?appId=ems.platform&returnTo=${encodeURIComponent(returnTo)}`;
   }, []);
-
-  const startLogin = useCallback(
-    (providerId: string) => {
-      if (!config) return;
-      const appId = encodeURIComponent(config.app_id || "ems.platform");
-      const nextUrl = encodeURIComponent(`${window.location.origin}/auth/callback`);
-      const authBase = (config.auth_base_url || "").replace(/\\/$/, "");
-      if (!authBase) {
-        setMeResult("OIDC auth base URL missing.");
-        return;
-      }
-      window.location.href = `${authBase}/xyn/api/auth/oidc/${encodeURIComponent(
-        providerId
-      )}/authorize?appId=${appId}&next=${nextUrl}`;
-    },
-    [config]
-  );
 
   useEffect(() => {
     checkHealth();
-    loadConfig();
     callMe();
-  }, [checkHealth, loadConfig, callMe]);
+  }, [checkHealth, callMe]);
 
   return (
     <section>
@@ -2238,19 +2148,9 @@ export default function Login() {
       </button>
       <div>
         {authStatus !== "signed_in" ? (
-          <>
-            {config?.allowed_providers?.length === 1 && (
-              <button type="button" onClick={() => startLogin(config.allowed_providers![0].id)}>
-                Sign in
-              </button>
-            )}
-            {(config?.allowed_providers?.length ?? 0) > 1 &&
-              config!.allowed_providers!.map((provider) => (
-                <button key={provider.id} type="button" onClick={() => startLogin(provider.id)}>
-                  Continue with {provider.display_name ?? provider.id}
-                </button>
-              ))}
-          </>
+          <button type="button" onClick={startLogin}>
+            Sign in
+          </button>
         ) : (
           <button type="button" onClick={signOut}>
             Sign out
@@ -2361,24 +2261,11 @@ export function readIdTokenFromHash(hash: string): string {
 import { Link } from "react-router-dom";
 import { clearStoredToken, getStoredToken } from "./session";
 
-type OidcProvider = {
-  id: string;
-  display_name?: string;
-};
-
-type OidcConfig = {
-  app_id: string;
-  auth_base_url?: string;
-  default_provider_id?: string;
-  allowed_providers?: OidcProvider[];
-};
-
 export default function Login() {
   const [status, setStatus] = useState<"ok" | "down" | "checking">("checking");
   const [authStatus, setAuthStatus] = useState<"unknown" | "signed_out" | "signed_in">("unknown");
   const [meResult, setMeResult] = useState<string>("");
   const [meIdentity, setMeIdentity] = useState<string>("");
-  const [config, setConfig] = useState<OidcConfig | null>(null);
   const meLabel = useMemo(() => (meResult ? "Response:" : "Response will appear here."), [meResult]);
 
   const checkHealth = useCallback(async () => {
@@ -2434,42 +2321,15 @@ export default function Login() {
     setMeResult("");
   }, []);
 
-  const loadConfig = useCallback(async () => {
-    try {
-      const response = await fetch("/api/auth/oidc/config");
-      if (!response.ok) {
-        setMeResult(`OIDC config unavailable (${response.status})`);
-        return;
-      }
-      const payload = (await response.json()) as OidcConfig;
-      setConfig(payload);
-    } catch (err) {
-      setMeResult(`OIDC config fetch failed: ${String(err)}`);
-    }
+  const startLogin = useCallback(() => {
+    const returnTo = `${window.location.origin}/auth/callback`;
+    window.location.href = `/auth/login?appId=ems.platform&returnTo=${encodeURIComponent(returnTo)}`;
   }, []);
-
-  const startLogin = useCallback(
-    (providerId: string) => {
-      if (!config) return;
-      const appId = encodeURIComponent(config.app_id || "ems.platform");
-      const nextUrl = encodeURIComponent(`${window.location.origin}/auth/callback`);
-      const authBase = (config.auth_base_url || "").replace(/\\/$/, "");
-      if (!authBase) {
-        setMeResult("OIDC auth base URL missing.");
-        return;
-      }
-      window.location.href = `${authBase}/xyn/api/auth/oidc/${encodeURIComponent(
-        providerId
-      )}/authorize?appId=${appId}&next=${nextUrl}`;
-    },
-    [config]
-  );
 
   useEffect(() => {
     checkHealth();
-    loadConfig();
     callMe();
-  }, [checkHealth, loadConfig, callMe]);
+  }, [checkHealth, callMe]);
 
   return (
     <section>
@@ -2481,19 +2341,9 @@ export default function Login() {
       </button>
       <div>
         {authStatus !== "signed_in" ? (
-          <>
-            {config?.allowed_providers?.length === 1 && (
-              <button type="button" onClick={() => startLogin(config.allowed_providers![0].id)}>
-                Sign in
-              </button>
-            )}
-            {(config?.allowed_providers?.length ?? 0) > 1 &&
-              config!.allowed_providers!.map((provider) => (
-                <button key={provider.id} type="button" onClick={() => startLogin(provider.id)}>
-                  Continue with {provider.display_name ?? provider.id}
-                </button>
-              ))}
-          </>
+          <button type="button" onClick={startLogin}>
+            Sign in
+          </button>
         ) : (
           <button type="button" onClick={signOut}>
             Sign out
