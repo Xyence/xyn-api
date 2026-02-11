@@ -17,7 +17,7 @@ import requests
 import boto3
 from authlib.jose import JsonWebKey, jwt
 from django.core.paginator import Paginator
-from django.db import models
+from django.db import models, transaction
 from django.http import HttpRequest, JsonResponse, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
@@ -665,10 +665,27 @@ def oidc_app_clients_collection(request: HttpRequest) -> JsonResponse:
         if errors:
             return JsonResponse({"error": "invalid app client", "details": errors}, status=400)
         fields, _schema_payload = _normalize_app_client_payload(payload)
-        client = AppOIDCClient.objects.create(
-            **fields,
-            created_by=request.user,
-        )
+        with transaction.atomic():
+            existing = (
+                AppOIDCClient.objects.select_for_update()
+                .filter(app_id=fields["app_id"])
+                .order_by("-updated_at", "-created_at")
+            )
+            client = existing.first()
+            if client:
+                for key, value in fields.items():
+                    setattr(client, key, value)
+                if not client.created_by_id:
+                    client.created_by = request.user
+                client.save()
+                duplicate_ids = list(existing.values_list("id", flat=True))[1:]
+                if duplicate_ids:
+                    AppOIDCClient.objects.filter(id__in=duplicate_ids).delete()
+            else:
+                client = AppOIDCClient.objects.create(
+                    **fields,
+                    created_by=request.user,
+                )
         return JsonResponse({"id": str(client.id)})
     clients = AppOIDCClient.objects.all().order_by("app_id", "-created_at")
     data = [app_client_to_payload(client) for client in clients]

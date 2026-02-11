@@ -264,6 +264,9 @@ def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResp
 
 
 def _is_local_instance(instance: ProvisionedInstance) -> bool:
+    # Treat EC2-style identifiers as remote even if legacy rows have stale substrate flags.
+    if instance.instance_id and instance.instance_id.startswith("i-"):
+        return False
     if instance.runtime_substrate in {"local", "docker"}:
         return True
     if instance.instance_id and instance.instance_id.startswith(("local:", "docker:")):

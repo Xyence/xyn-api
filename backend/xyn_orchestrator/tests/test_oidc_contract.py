@@ -99,6 +99,50 @@ class OidcContractTests(TestCase):
         self.assertEqual(payload["default_provider_id"], "google")
         self.assertEqual(len(payload["allowed_providers"]), 1)
 
+    def test_oidc_app_client_post_upserts_by_app_id(self):
+        provider = IdentityProvider.objects.create(
+            id="google",
+            display_name="Google",
+            issuer="https://accounts.google.com",
+            client_id="abc",
+            enabled=True,
+        )
+        old = AppOIDCClient.objects.create(
+            app_id="ems.platform",
+            login_mode="redirect",
+            default_provider=provider,
+            allowed_providers_json=["google"],
+            redirect_uris_json=["https://old.example.com/auth/callback"],
+        )
+        newer = AppOIDCClient.objects.create(
+            app_id="ems.platform",
+            login_mode="redirect",
+            default_provider=provider,
+            allowed_providers_json=["google"],
+            redirect_uris_json=["https://new.example.com/auth/callback"],
+        )
+        payload = {
+            "appId": "ems.platform",
+            "loginMode": "redirect",
+            "defaultProviderId": "google",
+            "allowedProviderIds": ["google"],
+            "redirectUris": ["https://xyence.io/auth/callback"],
+            "postLogoutRedirectUris": ["https://ems.xyence.io/"],
+            "session": {"cookieName": "ems_session", "maxAgeSeconds": 3600},
+            "tokenValidation": {"issuerStrict": True, "clockSkewSeconds": 120},
+        }
+        response = self.client.post(
+            "/xyn/api/platform/oidc-app-clients",
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(AppOIDCClient.objects.filter(app_id="ems.platform").count(), 1)
+        kept = AppOIDCClient.objects.get(app_id="ems.platform")
+        self.assertEqual(kept.id, newer.id)
+        self.assertEqual(kept.redirect_uris_json, ["https://xyence.io/auth/callback"])
+        self.assertFalse(AppOIDCClient.objects.filter(id=old.id).exists())
+
     @mock.patch("xyn_orchestrator.oidc.requests.get")
     def test_provider_test_endpoint(self, mock_get):
         provider = IdentityProvider.objects.create(
