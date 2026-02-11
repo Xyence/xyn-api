@@ -99,6 +99,31 @@ class OidcContractTests(TestCase):
         self.assertEqual(payload["default_provider_id"], "google")
         self.assertEqual(len(payload["allowed_providers"]), 1)
 
+    def test_authorize_redirects_stale_provider_to_default(self):
+        provider = IdentityProvider.objects.create(
+            id="google",
+            display_name="Google",
+            issuer="https://accounts.google.com",
+            client_id="abc",
+            enabled=True,
+            discovery_json={"mode": "manual", "authorizationEndpoint": "https://accounts.google.com/o/oauth2/v2/auth"},
+        )
+        AppOIDCClient.objects.create(
+            app_id="ems.platform",
+            login_mode="redirect",
+            default_provider=provider,
+            allowed_providers_json=["google"],
+            redirect_uris_json=["https://xyence.io/auth/callback"],
+        )
+        response = self.client.get(
+            "/xyn/api/auth/oidc/g3/authorize",
+            {"appId": "ems.platform", "returnTo": "https://ems.xyence.io/auth/callback"},
+        )
+        self.assertEqual(response.status_code, 302)
+        location = response.headers.get("Location", "")
+        self.assertIn("/xyn/api/auth/oidc/google/authorize?", location)
+        self.assertIn("appId=ems.platform", location)
+
     def test_oidc_app_client_post_upserts_by_app_id(self):
         provider = IdentityProvider.objects.create(
             id="google",

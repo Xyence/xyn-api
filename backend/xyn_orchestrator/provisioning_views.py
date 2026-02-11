@@ -171,7 +171,13 @@ def _run_ssm_commands(instance: ProvisionedInstance, commands: List[str]) -> Dic
             TimeoutSeconds=600,
         )
     except (BotoCoreError, ClientError) as exc:
-        raise RuntimeError(f"SSM send_command failed: {exc}") from exc
+        message = f"SSM send_command failed: {exc}"
+        if "InvalidInstanceId" in str(exc):
+            message = (
+                f"{message}. Instance record={instance.id} "
+                f"ec2_instance_id={instance.instance_id or 'n/a'} region={instance.aws_region or 'n/a'}"
+            )
+        raise RuntimeError(message) from exc
     command_id = cmd["Command"]["CommandId"]
     last_error = None
     for _ in range(40):
@@ -260,7 +266,15 @@ def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResp
             }
         )
     except Exception as exc:
-        return JsonResponse({"error": str(exc)}, status=400)
+        return JsonResponse(
+            {
+                "instance_id": str(instance.id),
+                "name": instance.name,
+                "aws_instance_id": instance.instance_id,
+                "error": str(exc),
+            },
+            status=400,
+        )
 
 
 def _is_local_instance(instance: ProvisionedInstance) -> bool:

@@ -854,6 +854,12 @@ def oidc_authorize(request: HttpRequest, provider_id: str) -> HttpResponse:
         return JsonResponse({"error": "app not configured"}, status=404)
     allowed_ids = client.allowed_providers_json or []
     if provider_id not in allowed_ids:
+        fallback_provider = (client.default_provider_id or "").strip()
+        if fallback_provider and fallback_provider in allowed_ids and fallback_provider != provider_id:
+            params = request.GET.copy()
+            return redirect(
+                f"/xyn/api/auth/oidc/{fallback_provider}/authorize?{params.urlencode()}"
+            )
         return JsonResponse({"error": "provider not allowed"}, status=403)
     provider = get_object_or_404(IdentityProvider, id=provider_id)
     if not provider.enabled:
@@ -1097,7 +1103,11 @@ def auth_login(request: HttpRequest) -> HttpResponse:
             "branding": branding,
             "login_title": f"Sign in to {branding.get('display_name') or app_id}",
         }
-        return render(request, "xyn_orchestrator/auth_login.html", context)
+        response = render(request, "xyn_orchestrator/auth_login.html", context)
+        # Provider lists are dynamic; avoid stale cached login pages pointing to removed providers.
+        response["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response["Pragma"] = "no-cache"
+        return response
     request.session["post_login_redirect"] = return_to
     return _start_env_fallback_login(request, app_id=app_id, return_to=return_to)
 
