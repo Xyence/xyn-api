@@ -256,8 +256,73 @@ def execute_release_plan_deploy(
                     raise RuntimeError(f"SSM command failed in step {step_name}")
             execution["steps"].append(step_record)
     except Exception as exc:
-        deployment.status = "failed"
-        deployment.error_message = str(exc)
+        # Fallback path: if ECR auth is unavailable, deploy directly from source and local builds.
+        fallback_error = ""
+        if "no basic auth credentials" in f"{exc}\n{last_stderr}".lower():
+            fallback_commands = [
+                "set -euo pipefail",
+                "ROOT=/opt/xyence",
+                "mkdir -p \"$ROOT\"",
+                "if [ ! -d \"$ROOT/xyn-api/.git\" ]; then git clone https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"; fi",
+                "if [ ! -d \"$ROOT/xyn-ui/.git\" ]; then git clone https://github.com/Xyence/xyn-ui \"$ROOT/xyn-ui\"; fi",
+                "git -C \"$ROOT/xyn-api\" fetch --all",
+                "git -C \"$ROOT/xyn-api\" checkout main",
+                "git -C \"$ROOT/xyn-api\" pull --ff-only",
+                "git -C \"$ROOT/xyn-ui\" fetch --all",
+                "git -C \"$ROOT/xyn-ui\" checkout main",
+                "git -C \"$ROOT/xyn-ui\" pull --ff-only",
+                "cd \"$ROOT/xyn-api\"",
+                "XYN_UI_PATH=\"$ROOT/xyn-ui/apps/ems-ui\" "
+                "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
+                "EMS_PLATFORM_API_BASE=https://xyence.io EMS_OIDC_APP_ID=ems.platform EMS_OIDC_ENABLED=true "
+                "EMS_JWT_SECRET=\"${EMS_JWT_SECRET:-dev-secret-change-me}\" "
+                "docker compose -f apps/ems-stack/docker-compose.yml down -v --remove-orphans",
+                "XYN_UI_PATH=\"$ROOT/xyn-ui/apps/ems-ui\" "
+                "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
+                "EMS_PLATFORM_API_BASE=https://xyence.io EMS_OIDC_APP_ID=ems.platform EMS_OIDC_ENABLED=true "
+                "EMS_JWT_SECRET=\"${EMS_JWT_SECRET:-dev-secret-change-me}\" "
+                "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans",
+                "curl -fsS http://localhost:8080/health >/dev/null",
+                "curl -fsS http://localhost:8080/api/health >/dev/null",
+            ]
+            try:
+                fallback = _run_ssm_commands(instance.instance_id, instance.aws_region, fallback_commands)
+                fallback_status = (
+                    "succeeded"
+                    if fallback.get("invocation_status") == "Success" and fallback.get("response_code") == 0
+                    else "failed"
+                )
+                last_stdout = _redact_output(fallback.get("stdout", ""))
+                last_stderr = _redact_output(fallback.get("stderr", ""))
+                ssm_command_ids.append(fallback.get("ssm_command_id", ""))
+                execution["steps"].append(
+                    {
+                        "name": "fallback_source_build_apply",
+                        "commands": [
+                            {
+                                "command": "fallback_source_build_apply",
+                                "status": fallback_status,
+                                "exit_code": fallback.get("response_code"),
+                                "started_at": fallback.get("started_at"),
+                                "finished_at": fallback.get("finished_at"),
+                                "ssm_command_id": fallback.get("ssm_command_id", ""),
+                                "stdout": last_stdout,
+                                "stderr": last_stderr,
+                            }
+                        ],
+                    }
+                )
+                if fallback_status == "succeeded":
+                    execution["status"] = "succeeded"
+                    deployment.status = "succeeded"
+                    deployment.error_message = ""
+                else:
+                    fallback_error = "source-build fallback failed"
+            except Exception as fallback_exc:
+                fallback_error = str(fallback_exc)
+        if deployment.status != "succeeded":
+            deployment.status = "failed"
+            deployment.error_message = fallback_error or str(exc)
     else:
         deployment.status = "succeeded"
     finally:

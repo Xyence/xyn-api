@@ -17,6 +17,9 @@ services:
       EMS_JWT_SECRET: ${EMS_JWT_SECRET:-dev-secret-change-me}
       EMS_JWT_ISSUER: ${EMS_JWT_ISSUER:-xyn-ems}
       EMS_JWT_AUDIENCE: ${EMS_JWT_AUDIENCE:-ems}
+      EMS_OIDC_ENABLED: ${EMS_OIDC_ENABLED:-true}
+      EMS_OIDC_APP_ID: ${EMS_OIDC_APP_ID:-ems.platform}
+      EMS_PLATFORM_API_BASE: ${EMS_PLATFORM_API_BASE:-https://xyence.io}
     depends_on:
       - postgres
     expose:
