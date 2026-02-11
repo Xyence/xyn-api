@@ -30,8 +30,8 @@ services:
       context: ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}
       dockerfile: Dockerfile
     ports:
-      - "${EMS_PUBLIC_PORT:-8080}:8080"
-      - "${EMS_PUBLIC_TLS_PORT:-8443}:8443"
+      - "${EMS_PUBLIC_PORT:-80}:8080"
+      - "${EMS_PUBLIC_TLS_PORT:-443}:8443"
     volumes:
       - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme
       - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro

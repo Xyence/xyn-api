@@ -750,7 +750,7 @@ XYN_UI_PATH=../../xyn-ui/apps/ems-ui
 EMS_JWT_SECRET=dev-secret-change-me
 EMS_CERTS_PATH=./certs
 EMS_ACME_WEBROOT_PATH=./acme-webroot
-EMS_PUBLIC_TLS_PORT=8443
+EMS_PUBLIC_TLS_PORT=443
 """,
         )
         _write_file(
@@ -784,8 +784,8 @@ EMS_PUBLIC_TLS_PORT=8443
       context: ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}
       dockerfile: Dockerfile
     ports:
-      - "${EMS_PUBLIC_PORT:-8080}:8080"
-      - "${EMS_PUBLIC_TLS_PORT:-8443}:8443"
+      - "${EMS_PUBLIC_PORT:-80}:8080"
+      - "${EMS_PUBLIC_TLS_PORT:-443}:8443"
     volumes:
       - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme
       - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro
@@ -805,7 +805,9 @@ http {
     listen 8080;
 
     location ^~ /.well-known/acme-challenge/ {
-      root /var/www/acme;
+      alias /var/www/acme/;
+      default_type text/plain;
+      try_files $uri =404;
     }
 
     location /health {
@@ -1660,12 +1662,26 @@ if __name__ == "__main__":
             p("src/auth/Login.tsx"),
             """import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { clearStoredToken, getStoredToken } from "./session";
+
+type OidcProvider = {
+  id: string;
+  display_name?: string;
+};
+
+type OidcConfig = {
+  app_id: string;
+  auth_base_url?: string;
+  default_provider_id?: string;
+  allowed_providers?: OidcProvider[];
+};
 
 export default function Login() {
   const [status, setStatus] = useState<"ok" | "down" | "checking">("checking");
-  const [token, setToken] = useState("");
+  const [authStatus, setAuthStatus] = useState<"unknown" | "signed_out" | "signed_in">("unknown");
   const [meResult, setMeResult] = useState<string>("");
   const [meIdentity, setMeIdentity] = useState<string>("");
+  const [config, setConfig] = useState<OidcConfig | null>(null);
   const meLabel = useMemo(() => (meResult ? "Response:" : "Response will appear here."), [meResult]);
 
   const checkHealth = useCallback(async () => {
@@ -1686,55 +1702,114 @@ export default function Login() {
   const callMe = useCallback(async () => {
     setMeResult("");
     setMeIdentity("");
+    const token = getStoredToken();
+    if (!token) {
+      setAuthStatus("signed_out");
+      setMeResult("Not signed in.");
+      return;
+    }
     try {
       const response = await fetch("/api/me", {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (!response.ok) {
+        setAuthStatus("signed_out");
         setMeResult(`Unauthorized (${response.status})`);
         return;
       }
       const payload = await response.json();
-      if (payload?.email) {
-        setMeIdentity(`Logged in as ${payload.email}`);
-      } else if (payload?.sub) {
-        setMeIdentity(`Logged in as ${payload.sub}`);
+      if (payload?.user?.email) {
+        setMeIdentity(`Logged in as ${payload.user.email}`);
+      } else if (payload?.user?.subject) {
+        setMeIdentity(`Logged in as ${payload.user.subject}`);
       }
       setMeResult(JSON.stringify(payload, null, 2));
+      setAuthStatus("signed_in");
     } catch (err) {
       setMeResult(`Request failed: ${String(err)}`);
     }
-  }, [token]);
+  }, []);
+
+  const signOut = useCallback(async () => {
+    clearStoredToken();
+    setAuthStatus("signed_out");
+    setMeIdentity("");
+    setMeResult("");
+  }, []);
+
+  const loadConfig = useCallback(async () => {
+    try {
+      const response = await fetch("/api/auth/oidc/config");
+      if (!response.ok) {
+        setMeResult(`OIDC config unavailable (${response.status})`);
+        return;
+      }
+      const payload = (await response.json()) as OidcConfig;
+      setConfig(payload);
+    } catch (err) {
+      setMeResult(`OIDC config fetch failed: ${String(err)}`);
+    }
+  }, []);
+
+  const startLogin = useCallback(
+    (providerId: string) => {
+      if (!config) return;
+      const appId = encodeURIComponent(config.app_id || "ems.platform");
+      const nextUrl = encodeURIComponent(`${window.location.origin}/auth/callback`);
+      const authBase = (config.auth_base_url || "").replace(/\\/$/, "");
+      if (!authBase) {
+        setMeResult("OIDC auth base URL missing.");
+        return;
+      }
+      window.location.href = `${authBase}/xyn/api/auth/oidc/${encodeURIComponent(
+        providerId
+      )}/authorize?appId=${appId}&next=${nextUrl}`;
+    },
+    [config]
+  );
 
   useEffect(() => {
     checkHealth();
-  }, [checkHealth]);
+    loadConfig();
+    callMe();
+  }, [checkHealth, loadConfig, callMe]);
 
   return (
-    <main>
-      <h1>Login (OIDC stub)</h1>
-      <p>This is a placeholder login view.</p>
+    <section>
+      <h2>Sign in</h2>
+      <p>Use your corporate account to sign in.</p>
       <p>API: {status === "ok" ? "OK" : status === "down" ? "DOWN" : "CHECKING"}</p>
       <button type="button" onClick={checkHealth}>
         Retry
       </button>
       <div>
-        <label htmlFor="token-input">JWT Token</label>
-        <input
-          id="token-input"
-          type="text"
-          value={token}
-          onChange={(event) => setToken(event.target.value)}
-          placeholder="Paste token from issue_dev_token.py"
-        />
+        {authStatus !== "signed_in" ? (
+          <>
+            {config?.allowed_providers?.length === 1 && (
+              <button type="button" onClick={() => startLogin(config.allowed_providers![0].id)}>
+                Sign in
+              </button>
+            )}
+            {(config?.allowed_providers?.length ?? 0) > 1 &&
+              config!.allowed_providers!.map((provider) => (
+                <button key={provider.id} type="button" onClick={() => startLogin(provider.id)}>
+                  Continue with {provider.display_name ?? provider.id}
+                </button>
+              ))}
+          </>
+        ) : (
+          <button type="button" onClick={signOut}>
+            Sign out
+          </button>
+        )}
         <button type="button" onClick={callMe}>
-          Call /api/me
+          Refresh session
         </button>
       </div>
       {meIdentity ? <p>{meIdentity}</p> : null}
       <pre>{meLabel}{meResult ? `\n${meResult}` : ""}</pre>
       <Link to="/devices">Continue to Devices</Link>
-    </main>
+    </section>
   );
 }
 """,
@@ -1750,7 +1825,7 @@ XYN_UI_PATH=../../xyn-ui/apps/ems-ui
 EMS_JWT_SECRET=dev-secret-change-me
 EMS_CERTS_PATH=./certs
 EMS_ACME_WEBROOT_PATH=./acme-webroot
-EMS_PUBLIC_TLS_PORT=8443
+EMS_PUBLIC_TLS_PORT=443
 """,
         )
         _write_file(
@@ -1784,8 +1859,8 @@ EMS_PUBLIC_TLS_PORT=8443
       context: ${XYN_UI_PATH:-../../xyn-ui/apps/ems-ui}
       dockerfile: Dockerfile
     ports:
-      - "8080:8080"
-      - "${EMS_PUBLIC_TLS_PORT:-8443}:8443"
+      - "${EMS_PUBLIC_PORT:-80}:8080"
+      - "${EMS_PUBLIC_TLS_PORT:-443}:8443"
     volumes:
       - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme
       - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro
@@ -1922,7 +1997,9 @@ COPY --from=build /app/dist /usr/share/nginx/html
   listen 8080;
 
   location ^~ /.well-known/acme-challenge/ {
-    root /var/www/acme;
+    alias /var/www/acme/;
+    default_type text/plain;
+    try_files $uri =404;
   }
 
   location /health {
@@ -2019,6 +2096,7 @@ export default function App() {
             p("src/routes.tsx"),
             """import { Routes, Route } from "react-router-dom";
 import Login from "./auth/Login";
+import Callback from "./auth/Callback";
 import DeviceList from "./devices/DeviceList";
 import Reports from "./reports/Reports";
 
@@ -2026,6 +2104,7 @@ export default function RoutesView() {
   return (
     <Routes>
       <Route path="/" element={<Login />} />
+      <Route path="/auth/callback" element={<Callback />} />
       <Route path="/devices" element={<DeviceList />} />
       <Route path="/reports" element={<Reports />} />
     </Routes>
@@ -2037,12 +2116,26 @@ export default function RoutesView() {
             p("src/auth/Login.tsx"),
             """import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { clearStoredToken, getStoredToken } from "./session";
+
+type OidcProvider = {
+  id: string;
+  display_name?: string;
+};
+
+type OidcConfig = {
+  app_id: string;
+  auth_base_url?: string;
+  default_provider_id?: string;
+  allowed_providers?: OidcProvider[];
+};
 
 export default function Login() {
   const [status, setStatus] = useState<"ok" | "down" | "checking">("checking");
-  const [token, setToken] = useState("");
+  const [authStatus, setAuthStatus] = useState<"unknown" | "signed_out" | "signed_in">("unknown");
   const [meResult, setMeResult] = useState<string>("");
   const [meIdentity, setMeIdentity] = useState<string>("");
+  const [config, setConfig] = useState<OidcConfig | null>(null);
   const meLabel = useMemo(() => (meResult ? "Response:" : "Response will appear here."), [meResult]);
 
   const checkHealth = useCallback(async () => {
@@ -2063,89 +2156,176 @@ export default function Login() {
   const callMe = useCallback(async () => {
     setMeResult("");
     setMeIdentity("");
+    const token = getStoredToken();
+    if (!token) {
+      setAuthStatus("signed_out");
+      setMeResult("Not signed in.");
+      return;
+    }
     try {
       const response = await fetch("/api/me", {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (!response.ok) {
+        setAuthStatus("signed_out");
         setMeResult(`Unauthorized (${response.status})`);
         return;
       }
       const payload = await response.json();
-      if (payload?.email) {
-        setMeIdentity(`Logged in as ${payload.email}`);
-      } else if (payload?.sub) {
-        setMeIdentity(`Logged in as ${payload.sub}`);
+      if (payload?.user?.email) {
+        setMeIdentity(`Logged in as ${payload.user.email}`);
+      } else if (payload?.user?.subject) {
+        setMeIdentity(`Logged in as ${payload.user.subject}`);
       }
       setMeResult(JSON.stringify(payload, null, 2));
+      setAuthStatus("signed_in");
     } catch (err) {
       setMeResult(`Request failed: ${String(err)}`);
     }
-  }, [token]);
+  }, []);
+
+  const signOut = useCallback(async () => {
+    clearStoredToken();
+    setAuthStatus("signed_out");
+    setMeIdentity("");
+    setMeResult("");
+  }, []);
+
+  const loadConfig = useCallback(async () => {
+    try {
+      const response = await fetch("/api/auth/oidc/config");
+      if (!response.ok) {
+        setMeResult(`OIDC config unavailable (${response.status})`);
+        return;
+      }
+      const payload = (await response.json()) as OidcConfig;
+      setConfig(payload);
+    } catch (err) {
+      setMeResult(`OIDC config fetch failed: ${String(err)}`);
+    }
+  }, []);
+
+  const startLogin = useCallback(
+    (providerId: string) => {
+      if (!config) return;
+      const appId = encodeURIComponent(config.app_id || "ems.platform");
+      const nextUrl = encodeURIComponent(`${window.location.origin}/auth/callback`);
+      const authBase = (config.auth_base_url || "").replace(/\\/$/, "");
+      if (!authBase) {
+        setMeResult("OIDC auth base URL missing.");
+        return;
+      }
+      window.location.href = `${authBase}/xyn/api/auth/oidc/${encodeURIComponent(
+        providerId
+      )}/authorize?appId=${appId}&next=${nextUrl}`;
+    },
+    [config]
+  );
 
   useEffect(() => {
     checkHealth();
-  }, [checkHealth]);
+    loadConfig();
+    callMe();
+  }, [checkHealth, loadConfig, callMe]);
 
   return (
-    <main>
-      <h1>Login (OIDC stub)</h1>
-      <p>This is a placeholder login view.</p>
+    <section>
+      <h2>Sign in</h2>
+      <p>Use your corporate account to sign in.</p>
       <p>API: {status === "ok" ? "OK" : status === "down" ? "DOWN" : "CHECKING"}</p>
       <button type="button" onClick={checkHealth}>
         Retry
       </button>
       <div>
-        <label htmlFor="token-input">JWT Token</label>
-        <input
-          id="token-input"
-          type="text"
-          value={token}
-          onChange={(event) => setToken(event.target.value)}
-          placeholder="Paste token from issue_dev_token.py"
-        />
+        {authStatus !== "signed_in" ? (
+          <>
+            {config?.allowed_providers?.length === 1 && (
+              <button type="button" onClick={() => startLogin(config.allowed_providers![0].id)}>
+                Sign in
+              </button>
+            )}
+            {(config?.allowed_providers?.length ?? 0) > 1 &&
+              config!.allowed_providers!.map((provider) => (
+                <button key={provider.id} type="button" onClick={() => startLogin(provider.id)}>
+                  Continue with {provider.display_name ?? provider.id}
+                </button>
+              ))}
+          </>
+        ) : (
+          <button type="button" onClick={signOut}>
+            Sign out
+          </button>
+        )}
         <button type="button" onClick={callMe}>
-          Call /api/me
+          Refresh session
         </button>
       </div>
       {meIdentity ? <p>{meIdentity}</p> : null}
       <pre>{meLabel}{meResult ? `\n${meResult}` : ""}</pre>
       <Link to="/devices">Continue to Devices</Link>
-    </main>
+    </section>
   );
 }
 """,
         )
         _write_file(
-            p("src/devices/DeviceList.tsx"),
-            """import { Link } from "react-router-dom";
+            p("src/auth/Callback.tsx"),
+            """import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { readIdTokenFromHash, setStoredToken } from "./session";
 
-export default function DeviceList() {
+export default function Callback() {
+  const navigate = useNavigate();
+  const [error, setError] = useState<string>("");
+
+  useEffect(() => {
+    const token = readIdTokenFromHash(window.location.hash);
+    if (!token) {
+      setError("OIDC callback did not include an id_token.");
+      return;
+    }
+    setStoredToken(token);
+    window.history.replaceState({}, "", window.location.pathname);
+    navigate("/devices", { replace: true });
+  }, [navigate]);
+
+  if (error) {
+    return (
+      <section>
+        <h2>Sign in failed</h2>
+        <p>{error}</p>
+      </section>
+    );
+  }
+
   return (
-    <main>
-      <h1>Devices</h1>
-      <ul>
-        <li>device-1</li>
-        <li>device-2</li>
-      </ul>
-      <Link to="/reports">View Reports</Link>
-    </main>
+    <section>
+      <h2>Signing you in...</h2>
+    </section>
   );
 }
 """,
         )
         _write_file(
-            p("src/reports/Reports.tsx"),
-            """import { Link } from "react-router-dom";
+            p("src/auth/session.ts"),
+            """const TOKEN_KEY = "ems_oidc_id_token";
 
-export default function Reports() {
-  return (
-    <main>
-      <h1>Reports</h1>
-      <p>Placeholder report data.</p>
-      <Link to="/devices">Back to Devices</Link>
-    </main>
-  );
+export function getStoredToken(): string {
+  return localStorage.getItem(TOKEN_KEY) ?? "";
+}
+
+export function setStoredToken(token: string): void {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
+export function clearStoredToken(): void {
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+export function readIdTokenFromHash(hash: string): string {
+  const value = hash.startsWith("#") ? hash.slice(1) : hash;
+  const params = new URLSearchParams(value);
+  return params.get("id_token") ?? "";
 }
 """,
         )
@@ -2167,6 +2347,8 @@ export default function Reports() {
                 "src/App.tsx",
                 "src/routes.tsx",
                 "src/auth/Login.tsx",
+                "src/auth/Callback.tsx",
+                "src/auth/session.ts",
                 "src/devices/DeviceList.tsx",
                 "src/reports/Reports.tsx",
                 "src/styles.css",
@@ -2175,21 +2357,222 @@ export default function Reports() {
     if work_item["id"] == "ems-ui-auth":
         _write_file(
             p("src/auth/Login.tsx"),
-            """export default function Login() {
-  return <div>Login</div>;
+            """import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
+import { clearStoredToken, getStoredToken } from "./session";
+
+type OidcProvider = {
+  id: string;
+  display_name?: string;
+};
+
+type OidcConfig = {
+  app_id: string;
+  auth_base_url?: string;
+  default_provider_id?: string;
+  allowed_providers?: OidcProvider[];
+};
+
+export default function Login() {
+  const [status, setStatus] = useState<"ok" | "down" | "checking">("checking");
+  const [authStatus, setAuthStatus] = useState<"unknown" | "signed_out" | "signed_in">("unknown");
+  const [meResult, setMeResult] = useState<string>("");
+  const [meIdentity, setMeIdentity] = useState<string>("");
+  const [config, setConfig] = useState<OidcConfig | null>(null);
+  const meLabel = useMemo(() => (meResult ? "Response:" : "Response will appear here."), [meResult]);
+
+  const checkHealth = useCallback(async () => {
+    setStatus("checking");
+    try {
+      const response = await fetch("/api/health");
+      if (!response.ok) {
+        setStatus("down");
+        return;
+      }
+      const payload = (await response.json()) as { status?: string };
+      setStatus(payload.status === "ok" ? "ok" : "down");
+    } catch {
+      setStatus("down");
+    }
+  }, []);
+
+  const callMe = useCallback(async () => {
+    setMeResult("");
+    setMeIdentity("");
+    const token = getStoredToken();
+    if (!token) {
+      setAuthStatus("signed_out");
+      setMeResult("Not signed in.");
+      return;
+    }
+    try {
+      const response = await fetch("/api/me", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) {
+        setAuthStatus("signed_out");
+        setMeResult(`Unauthorized (${response.status})`);
+        return;
+      }
+      const payload = await response.json();
+      if (payload?.user?.email) {
+        setMeIdentity(`Logged in as ${payload.user.email}`);
+      } else if (payload?.user?.subject) {
+        setMeIdentity(`Logged in as ${payload.user.subject}`);
+      }
+      setMeResult(JSON.stringify(payload, null, 2));
+      setAuthStatus("signed_in");
+    } catch (err) {
+      setMeResult(`Request failed: ${String(err)}`);
+    }
+  }, []);
+
+  const signOut = useCallback(async () => {
+    clearStoredToken();
+    setAuthStatus("signed_out");
+    setMeIdentity("");
+    setMeResult("");
+  }, []);
+
+  const loadConfig = useCallback(async () => {
+    try {
+      const response = await fetch("/api/auth/oidc/config");
+      if (!response.ok) {
+        setMeResult(`OIDC config unavailable (${response.status})`);
+        return;
+      }
+      const payload = (await response.json()) as OidcConfig;
+      setConfig(payload);
+    } catch (err) {
+      setMeResult(`OIDC config fetch failed: ${String(err)}`);
+    }
+  }, []);
+
+  const startLogin = useCallback(
+    (providerId: string) => {
+      if (!config) return;
+      const appId = encodeURIComponent(config.app_id || "ems.platform");
+      const nextUrl = encodeURIComponent(`${window.location.origin}/auth/callback`);
+      const authBase = (config.auth_base_url || "").replace(/\\/$/, "");
+      if (!authBase) {
+        setMeResult("OIDC auth base URL missing.");
+        return;
+      }
+      window.location.href = `${authBase}/xyn/api/auth/oidc/${encodeURIComponent(
+        providerId
+      )}/authorize?appId=${appId}&next=${nextUrl}`;
+    },
+    [config]
+  );
+
+  useEffect(() => {
+    checkHealth();
+    loadConfig();
+    callMe();
+  }, [checkHealth, loadConfig, callMe]);
+
+  return (
+    <section>
+      <h2>Sign in</h2>
+      <p>Use your corporate account to sign in.</p>
+      <p>API: {status === "ok" ? "OK" : status === "down" ? "DOWN" : "CHECKING"}</p>
+      <button type="button" onClick={checkHealth}>
+        Retry
+      </button>
+      <div>
+        {authStatus !== "signed_in" ? (
+          <>
+            {config?.allowed_providers?.length === 1 && (
+              <button type="button" onClick={() => startLogin(config.allowed_providers![0].id)}>
+                Sign in
+              </button>
+            )}
+            {(config?.allowed_providers?.length ?? 0) > 1 &&
+              config!.allowed_providers!.map((provider) => (
+                <button key={provider.id} type="button" onClick={() => startLogin(provider.id)}>
+                  Continue with {provider.display_name ?? provider.id}
+                </button>
+              ))}
+          </>
+        ) : (
+          <button type="button" onClick={signOut}>
+            Sign out
+          </button>
+        )}
+        <button type="button" onClick={callMe}>
+          Refresh session
+        </button>
+      </div>
+      {meIdentity ? <p>{meIdentity}</p> : null}
+      <pre>{meLabel}{meResult ? `\n${meResult}` : ""}</pre>
+      <Link to="/devices">Continue to Devices</Link>
+    </section>
+   );
 }
 """,
         )
         _write_file(
-            p("src/auth/AuthProvider.tsx"),
-            """import { ReactNode } from "react";
+            p("src/auth/Callback.tsx"),
+            """import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { readIdTokenFromHash, setStoredToken } from "./session";
 
-export function AuthProvider({ children }: { children: ReactNode }) {
-  return <>{children}</>;
+export default function Callback() {
+  const navigate = useNavigate();
+  const [error, setError] = useState<string>("");
+
+  useEffect(() => {
+    const token = readIdTokenFromHash(window.location.hash);
+    if (!token) {
+      setError("OIDC callback did not include an id_token.");
+      return;
+    }
+    setStoredToken(token);
+    window.history.replaceState({}, "", window.location.pathname);
+    navigate("/devices", { replace: true });
+  }, [navigate]);
+
+  if (error) {
+    return (
+      <section>
+        <h2>Sign in failed</h2>
+        <p>{error}</p>
+      </section>
+    );
+  }
+
+  return (
+    <section>
+      <h2>Signing you in...</h2>
+    </section>
+  );
 }
 """,
         )
-        changed.extend(["src/auth/Login.tsx", "src/auth/AuthProvider.tsx"])
+        _write_file(
+            p("src/auth/session.ts"),
+            """const TOKEN_KEY = "ems_oidc_id_token";
+
+export function getStoredToken(): string {
+  return localStorage.getItem(TOKEN_KEY) ?? "";
+}
+
+export function setStoredToken(token: string): void {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
+export function clearStoredToken(): void {
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+export function readIdTokenFromHash(hash: string): string {
+  const value = hash.startsWith("#") ? hash.slice(1) : hash;
+  const params = new URLSearchParams(value);
+  return params.get("id_token") ?? "";
+}
+""",
+        )
+        changed.extend(["src/auth/Login.tsx", "src/auth/Callback.tsx", "src/auth/session.ts"])
     if work_item["id"] == "ems-ui-devices":
         _write_file(
             p("src/devices/DeviceList.tsx"),
@@ -2902,8 +3285,8 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]]) -> str:
         "  ems-web:\n"
         f"    image: {web_image}\n"
         "    ports:\n"
-        "      - \"${EMS_PUBLIC_PORT:-8080}:8080\"\n"
-        "      - \"${EMS_PUBLIC_TLS_PORT:-8443}:8443\"\n"
+        "      - \"${EMS_PUBLIC_PORT:-80}:8080\"\n"
+        "      - \"${EMS_PUBLIC_TLS_PORT:-443}:8443\"\n"
         "    volumes:\n"
         "      - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme\n"
         "      - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro\n"
@@ -3849,7 +4232,10 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "build.container.image",
             ):
                 try:
-                    release_id = run_id
+                    work_config = work_item.get("config") or {}
+                    release_version = work_config.get("release_version") or run_id
+                    release_uuid = work_config.get("release_uuid") or ""
+                    release_id = release_version
                     runtime = (release_target or {}).get("runtime") or {}
                     registry_cfg = runtime.get("registry") or {}
                     registry_cfg.setdefault("provider", "ecr")
@@ -3910,6 +4296,8 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             "created_from_run_id": run_id,
                             "version": release_id,
                             "status": "published",
+                            "build_state": "ready",
+                            "allow_overwrite": True,
                             "artifacts_json": {
                                 "release_manifest": {
                                     "run_id": str(run_id),
@@ -3930,7 +4318,21 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                 },
                             },
                         }
+                        if release_uuid:
+                            release_payload["release_uuid"] = release_uuid
                         _post_json("/xyn/internal/releases/upsert", release_payload)
+                    else:
+                        if blueprint_id:
+                            _post_json(
+                                "/xyn/internal/releases/upsert",
+                                {
+                                    "blueprint_id": blueprint_id,
+                                    "version": release_id,
+                                    "status": "published",
+                                    "build_state": "failed",
+                                    "allow_overwrite": True,
+                                },
+                            )
                     artifacts.append(
                         {
                             "key": "build_result.json",
@@ -3956,6 +4358,17 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         )
                 except Exception as exc:
                     success = False
+                    if blueprint_id:
+                        _post_json(
+                            "/xyn/internal/releases/upsert",
+                            {
+                                "blueprint_id": blueprint_id,
+                                "version": release_id,
+                                "status": "published",
+                                "build_state": "failed",
+                                "allow_overwrite": True,
+                            },
+                        )
                     errors.append(
                         {
                             "code": "build_failed",

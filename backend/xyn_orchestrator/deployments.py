@@ -5,11 +5,20 @@ import time
 from typing import Any, Dict, List, Optional
 
 import boto3
+import requests
 from botocore.exceptions import ClientError
 from django.conf import settings
 from django.utils import timezone
 
-from .models import Deployment, ProvisionedInstance, Release, ReleasePlan, ReleasePlanDeployState, RunArtifact
+from .models import (
+    Deployment,
+    ProvisionedInstance,
+    Release,
+    ReleasePlan,
+    ReleasePlanDeployState,
+    ReleaseTarget,
+    RunArtifact,
+)
 
 
 def compute_idempotency_base(
@@ -168,6 +177,154 @@ def _write_deployment_artifact(deployment: Deployment, filename: str, content: s
     return f"{settings.MEDIA_URL.rstrip('/')}/deployment_artifacts/{deployment.id}/{filename}"
 
 
+TLS_TASK_IDS = {"tls.acme_http01", "ingress.nginx_tls_configure", "verify.public_https"}
+
+
+def _resolve_release_target(release: Release, instance: ProvisionedInstance) -> Optional[ReleaseTarget]:
+    if not release.blueprint_id:
+        return None
+    target = (
+        ReleaseTarget.objects.filter(blueprint_id=release.blueprint_id, target_instance=instance)
+        .order_by("-updated_at")
+        .first()
+    )
+    if target:
+        return target
+    return ReleaseTarget.objects.filter(blueprint_id=release.blueprint_id).order_by("-updated_at").first()
+
+
+def _plan_task_ids(plan_json: Dict[str, Any]) -> set[str]:
+    tasks = plan_json.get("tasks") or []
+    ids = set()
+    for task in tasks:
+        if isinstance(task, dict) and task.get("id"):
+            ids.add(str(task.get("id")))
+    return ids
+
+
+def _plan_expects_tls(plan_json: Dict[str, Any], release_target: Optional[ReleaseTarget]) -> bool:
+    if _plan_task_ids(plan_json).intersection(TLS_TASK_IDS):
+        return True
+    if release_target and isinstance(release_target.tls_json, dict):
+        mode = str((release_target.tls_json or {}).get("mode", "")).strip().lower()
+        return mode in {"nginx+acme", "acme_http01"}
+    return False
+
+
+def _lower_plan_steps(plan_json: Dict[str, Any], release_target: Optional[ReleaseTarget]) -> List[Dict[str, Any]]:
+    steps = [step for step in (plan_json.get("steps") or []) if isinstance(step, dict)]
+    if not _plan_expects_tls(plan_json, release_target):
+        return steps
+    existing = {str(step.get("name", "")).strip() for step in steps}
+    for name in ["tls_acme_http01_issue", "ingress_nginx_tls_configure", "verify_public_https"]:
+        if name not in existing:
+            steps.append({"name": name, "commands": []})
+    return steps
+
+
+def _build_tls_steps(
+    fqdn: str,
+    acme_email: str,
+    compose_file: str,
+    workdir: str,
+    cert_dir: str,
+    acme_webroot: str,
+    expected_ip: str = "",
+) -> List[Dict[str, Any]]:
+    lego_dir = os.path.join(os.path.dirname(cert_dir), "lego-data")
+    dns_mismatch_check = (
+        f"[ \"$resolved\" = \"{expected_ip}\" ] || {{ echo \"tls_error_code=dns_mismatch\"; exit 52; }}; "
+        if expected_ip
+        else ""
+    )
+    issue_cmd = (
+        "set -euo pipefail; "
+        f"mkdir -p \"{cert_dir}\" \"{acme_webroot}\" \"{lego_dir}\"; "
+        f"if [ -f \"{cert_dir}/fullchain.pem\" ] && [ -f \"{cert_dir}/privkey.pem\" ]; then "
+        f"openssl x509 -checkend 1209600 -noout -in \"{cert_dir}/fullchain.pem\" >/dev/null 2>&1 && "
+        "echo \"acme_noop\" && exit 0; "
+        "fi; "
+        f"resolved=$(getent ahostsv4 \"{fqdn}\" 2>/dev/null | awk '{{print $1}}' | sort -u | head -n1 || true); "
+        "[ -n \"$resolved\" ] || { echo \"tls_error_code=dns_lookup_failed\"; exit 51; }; "
+        + dns_mismatch_check
+        + " "
+        "command -v docker >/dev/null 2>&1 || { echo \"tls_error_code=docker_missing\"; exit 41; }; "
+        "command -v curl >/dev/null 2>&1 || { echo \"tls_error_code=curl_missing\"; exit 42; }; "
+        "command -v openssl >/dev/null 2>&1 || { echo \"tls_error_code=openssl_missing\"; exit 43; }; "
+        f"cd \"{workdir}\"; "
+        "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
+        f"docker compose -f \"{compose_file}\" stop ems-web || true; "
+        "docker run --rm -p 80:80 "
+        f"-v \"{lego_dir}\":/data "
+        "goacme/lego:v4.12.3 "
+        f"--email \"{acme_email}\" --domains \"{fqdn}\" --path /data --accept-tos "
+        "--http run; "
+        f"[ -f \"{lego_dir}/certificates/{fqdn}.crt\" ] || {{ echo \"tls_error_code=acme_issue_failed\"; exit 44; }}; "
+        f"[ -f \"{lego_dir}/certificates/{fqdn}.key\" ] || {{ echo \"tls_error_code=acme_key_missing\"; exit 45; }}; "
+        f"cp \"{lego_dir}/certificates/{fqdn}.crt\" \"{cert_dir}/fullchain.pem\"; "
+        f"cp \"{lego_dir}/certificates/{fqdn}.key\" \"{cert_dir}/privkey.pem\"; "
+        f"chmod 600 \"{cert_dir}/privkey.pem\""
+    )
+    configure_cmd = (
+        "set -euo pipefail; "
+        f"cd \"{workdir}\"; "
+        f"[ -f \"{cert_dir}/fullchain.pem\" ] || {{ echo \"tls_error_code=cert_missing\"; exit 46; }}; "
+        f"[ -f \"{cert_dir}/privkey.pem\" ] || {{ echo \"tls_error_code=key_missing\"; exit 47; }}; "
+        "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
+        f"docker compose -f \"{compose_file}\" up -d --remove-orphans; "
+        "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
+        f"docker compose -f \"{compose_file}\" restart ems-web"
+    )
+    verify_cmd = (
+        "set -euo pipefail; "
+        "command -v curl >/dev/null 2>&1 || { echo \"tls_error_code=curl_missing\"; exit 42; }; "
+        "command -v openssl >/dev/null 2>&1 || { echo \"tls_error_code=openssl_missing\"; exit 43; }; "
+        f"openssl x509 -in \"{cert_dir}/fullchain.pem\" -noout -ext subjectAltName | grep -q \"DNS:{fqdn}\" "
+        "|| { echo \"tls_error_code=hostname_mismatch\"; exit 48; }; "
+        f"issuer=$(openssl x509 -in \"{cert_dir}/fullchain.pem\" -noout -issuer | sed 's/^issuer=//'); "
+        f"subject=$(openssl x509 -in \"{cert_dir}/fullchain.pem\" -noout -subject | sed 's/^subject=//'); "
+        "[ \"$issuer\" != \"$subject\" ] || { echo \"tls_error_code=self_signed_detected\"; exit 49; }; "
+        f"for i in $(seq 1 24); do curl -fsS --resolve \"{fqdn}:443:127.0.0.1\" \"https://{fqdn}/health\" >/dev/null && break; sleep 5; done; "
+        f"curl -fsS --resolve \"{fqdn}:443:127.0.0.1\" \"https://{fqdn}/health\" >/dev/null "
+        "|| { echo \"tls_error_code=https_health_failed\"; exit 50; }"
+    )
+    return [
+        {"name": "tls_acme_http01_issue", "commands": [issue_cmd]},
+        {"name": "ingress_nginx_tls_configure", "commands": [configure_cmd]},
+        {"name": "verify_public_https", "commands": [verify_cmd]},
+    ]
+
+
+def _verify_public_https_from_backend(fqdn: str) -> tuple[bool, str]:
+    try:
+        response = requests.get(f"https://{fqdn}/health", timeout=15)
+    except requests.RequestException as exc:
+        return False, f"public_https_unreachable: {exc}"
+    if response.status_code != 200:
+        return False, f"public_https_bad_status:{response.status_code}"
+    return True, ""
+
+
+def _extract_tls_error_code(stderr: str) -> str:
+    marker = "tls_error_code="
+    idx = stderr.rfind(marker)
+    if idx < 0:
+        lower = (stderr or "").lower()
+        if "acme:error:connection" in lower and "connection refused" in lower:
+            return "acme_http01_connection_refused"
+        if "acme:error:connection" in lower and "timeout" in lower:
+            return "acme_http01_timeout"
+        if "acme:error:dns" in lower or "nxdomain" in lower:
+            return "acme_dns_invalid"
+        if "acme:error:ratelimited" in lower or "rate limit" in lower:
+            return "acme_rate_limited"
+        if "could not obtain certificates" in lower:
+            return "acme_issue_failed"
+        return "tls_unknown_failure"
+    code = stderr[idx + len(marker) :].splitlines()[0].strip()
+    return code or "tls_unknown_failure"
+
+
 def execute_release_plan_deploy(
     deployment: Deployment,
     release: Release,
@@ -187,11 +344,18 @@ def execute_release_plan_deploy(
     if not compose_content:
         compose_content = _load_default_compose()
         compose_source = "seed_repo"
-    steps = plan_json.get("steps") or []
+    release_target = _resolve_release_target(release, instance)
+    expects_tls = _plan_expects_tls(plan_json, release_target)
+    steps = _lower_plan_steps(plan_json, release_target)
+    plan_json["steps"] = steps
     execution: Dict[str, Any] = {"status": "succeeded", "steps": []}
     ssm_command_ids: List[str] = []
     last_stdout = ""
     last_stderr = ""
+    deploy_workdir = "/var/lib/xyn/ems"
+    deploy_compose_file = "/var/lib/xyn/ems/docker-compose.yml"
+    cert_dir = "/var/lib/xyn/ems/certs/current"
+    acme_webroot = "/var/lib/xyn/ems/acme-webroot"
     try:
         if compose_content and compose_source == "release_artifact":
             digest = hashlib.sha256(compose_content.encode("utf-8")).hexdigest()
@@ -271,13 +435,6 @@ def execute_release_plan_deploy(
                 "git -C \"$ROOT/xyn-ui\" fetch --all",
                 "git -C \"$ROOT/xyn-ui\" checkout main",
                 "git -C \"$ROOT/xyn-ui\" pull --ff-only",
-                "mkdir -p \"$ROOT/certs/current\" \"$ROOT/acme-webroot\"",
-                "if [ ! -f \"$ROOT/certs/current/fullchain.pem\" ] || [ ! -f \"$ROOT/certs/current/privkey.pem\" ]; then "
-                "openssl req -x509 -nodes -newkey rsa:2048 "
-                "-keyout \"$ROOT/certs/current/privkey.pem\" "
-                "-out \"$ROOT/certs/current/fullchain.pem\" "
-                "-days 2 -subj \"/CN=ems.xyence.io\"; "
-                "fi",
                 "cd \"$ROOT/xyn-api\"",
                 "XYN_UI_PATH=\"$ROOT/xyn-ui/apps/ems-ui\" "
                 "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
@@ -325,6 +482,10 @@ def execute_release_plan_deploy(
                     execution["status"] = "succeeded"
                     deployment.status = "succeeded"
                     deployment.error_message = ""
+                    deploy_workdir = "/opt/xyence/xyn-api"
+                    deploy_compose_file = "apps/ems-stack/docker-compose.yml"
+                    cert_dir = "/opt/xyence/certs/current"
+                    acme_webroot = "/opt/xyence/acme-webroot"
                 else:
                     fallback_error = "source-build fallback failed"
             except Exception as fallback_exc:
@@ -332,31 +493,109 @@ def execute_release_plan_deploy(
         if deployment.status != "succeeded":
             deployment.status = "failed"
             deployment.error_message = fallback_error or str(exc)
-    else:
+    if deployment.status == "running":
         deployment.status = "succeeded"
-    finally:
-        deployment.finished_at = timezone.now()
-        deployment.stdout_excerpt = last_stdout[-2000:]
-        deployment.stderr_excerpt = last_stderr[-2000:]
-        deployment.transport_ref = {
-            "ssm_command_ids": [cid for cid in ssm_command_ids if cid],
-        }
-        artifacts: Dict[str, Any] = {}
-        execution_url = _write_deployment_artifact(deployment, "deploy_execution.json", execution)
-        artifacts["deploy_execution.json"] = {"url": execution_url}
-        deployment.artifacts_json = artifacts
-        deployment.save(
-            update_fields=[
-                "status",
-                "error_message",
-                "finished_at",
-                "stdout_excerpt",
-                "stderr_excerpt",
-                "transport_ref",
-                "artifacts_json",
-                "updated_at",
-            ]
-        )
+    if deployment.status == "succeeded" and expects_tls:
+        tls_mode = str(((release_target.tls_json if release_target else {}) or {}).get("mode", "nginx+acme")).lower()
+        if tls_mode not in {"nginx+acme", "acme_http01"}:
+            deployment.status = "failed"
+            deployment.error_message = "tls_not_supported: unsupported tls mode"
+            execution["status"] = "failed"
+            execution["error"] = {"code": "tls_not_supported", "message": deployment.error_message}
+        else:
+            fqdn = (release_target.fqdn if release_target else "") or os.environ.get("EMS_PUBLIC_FQDN", "")
+            acme_email = (
+                str(((release_target.tls_json if release_target else {}) or {}).get("acme_email", "")).strip()
+                or os.environ.get("XYENCE_ACME_EMAIL", "")
+            )
+            if not fqdn or not acme_email:
+                deployment.status = "failed"
+                deployment.error_message = "tls_config_missing: fqdn and acme_email required"
+                execution["status"] = "failed"
+                execution["error"] = {"code": "tls_config_missing", "message": deployment.error_message}
+            else:
+                tls_steps = _build_tls_steps(
+                    fqdn=fqdn,
+                    acme_email=acme_email,
+                    compose_file=deploy_compose_file,
+                    workdir=deploy_workdir,
+                    cert_dir=cert_dir,
+                    acme_webroot=acme_webroot,
+                    expected_ip=instance.public_ip or "",
+                )
+                for step in tls_steps:
+                    step_record: Dict[str, Any] = {"name": step.get("name") or "tls_step", "commands": []}
+                    for command in step.get("commands") or []:
+                        result = _run_ssm_commands(instance.instance_id, instance.aws_region, [command])
+                        ssm_command_ids.append(result.get("ssm_command_id", ""))
+                        status = (
+                            "succeeded"
+                            if result.get("invocation_status") == "Success" and result.get("response_code") == 0
+                            else "failed"
+                        )
+                        stdout = _redact_output(result.get("stdout", ""))
+                        stderr = _redact_output(result.get("stderr", ""))
+                        command_record = {
+                            "command": command,
+                            "status": status,
+                            "exit_code": result.get("response_code"),
+                            "started_at": result.get("started_at"),
+                            "finished_at": result.get("finished_at"),
+                            "ssm_command_id": result.get("ssm_command_id", ""),
+                            "stdout": stdout,
+                            "stderr": stderr,
+                        }
+                        step_record["commands"].append(command_record)
+                        last_stdout = stdout
+                        last_stderr = stderr
+                        if status != "succeeded":
+                            error_code = _extract_tls_error_code(stderr)
+                            deployment.status = "failed"
+                            deployment.error_message = f"{error_code}: tls step failed"
+                            execution["status"] = "failed"
+                            execution["error"] = {
+                                "code": error_code,
+                                "message": "TLS flow failed",
+                                "detail": stderr[-800:],
+                            }
+                            execution["failed_command"] = command_record
+                            break
+                    execution["steps"].append(step_record)
+                    if deployment.status == "failed":
+                        break
+                if deployment.status == "succeeded":
+                    ok, detail = _verify_public_https_from_backend(fqdn)
+                    if not ok:
+                        deployment.status = "failed"
+                        deployment.error_message = f"verify_public_https_failed: {detail}"
+                        execution["status"] = "failed"
+                        execution["error"] = {
+                            "code": "verify_public_https_failed",
+                            "message": "Public HTTPS verification failed",
+                            "detail": detail,
+                        }
+    deployment.finished_at = timezone.now()
+    deployment.stdout_excerpt = last_stdout[-2000:]
+    deployment.stderr_excerpt = last_stderr[-2000:]
+    deployment.transport_ref = {
+        "ssm_command_ids": [cid for cid in ssm_command_ids if cid],
+    }
+    artifacts: Dict[str, Any] = {}
+    execution_url = _write_deployment_artifact(deployment, "deploy_execution.json", execution)
+    artifacts["deploy_execution.json"] = {"url": execution_url}
+    deployment.artifacts_json = artifacts
+    deployment.save(
+        update_fields=[
+            "status",
+            "error_message",
+            "finished_at",
+            "stdout_excerpt",
+            "stderr_excerpt",
+            "transport_ref",
+            "artifacts_json",
+            "updated_at",
+        ]
+    )
     if deployment.status == "succeeded":
         plan_hash = hash_release_plan(plan_json)
         if release_plan:

@@ -33,7 +33,7 @@ TLS assets (optional for local runs):
 ```bash
 export EMS_CERTS_PATH=./certs
 export EMS_ACME_WEBROOT_PATH=./acme-webroot
-export EMS_PUBLIC_TLS_PORT=8443
+export EMS_PUBLIC_TLS_PORT=443
 ```
 
 To run with verification checks (Docker required):
