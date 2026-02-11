@@ -119,3 +119,18 @@ Overrides (optional):
 - `XYENCE_LOCAL_AMI_ID`
 - `XYENCE_LOCAL_STATUS`
 - `XYENCE_LOCAL_ENVIRONMENT_ID`
+
+## Shared OIDC Login and Branding
+- Shared login entrypoint for all apps:
+  - `/auth/login?appId=<appId>&returnTo=<url>`
+- OIDC provider/app-client config is DB-managed:
+  - `Platform -> Identity Providers`
+  - `Platform -> OIDC App Clients`
+- Branding is DB-managed:
+  - `Platform -> Branding`
+- Return URL safety:
+  - Relative paths are allowed.
+  - Absolute URLs must match `XYENCE_ALLOWED_RETURN_HOSTS` or app-configured redirect hosts.
+- ENV fallback behavior:
+  - If no OIDC app client is configured, backend falls back to env-based OIDC and logs:
+    - `Using ENV OIDC fallback (no app client configured)`

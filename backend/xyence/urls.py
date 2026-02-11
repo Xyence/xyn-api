@@ -163,6 +163,9 @@ from xyn_orchestrator.xyn_api import (
     identity_provider_test,
     oidc_app_clients_collection,
     oidc_app_client_detail,
+    platform_branding,
+    platform_app_branding,
+    public_branding,
 )
 from web.public_views import (
     public_home,
@@ -214,6 +217,9 @@ urlpatterns = [
     path("xyn/api/platform/identity-providers/<str:provider_id>/test", identity_provider_test),
     path("xyn/api/platform/oidc-app-clients", oidc_app_clients_collection),
     path("xyn/api/platform/oidc-app-clients/<uuid:client_id>", oidc_app_client_detail),
+    path("xyn/api/platform/branding", platform_branding),
+    path("xyn/api/platform/branding/apps/<str:app_id>", platform_app_branding),
+    path("xyn/api/public/branding", public_branding),
     path("xyn/internal/identities", identities_collection),
     path("xyn/internal/role_bindings", role_bindings_collection),
     path("xyn/internal/role_bindings/<uuid:binding_id>", role_binding_detail),

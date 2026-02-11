@@ -630,6 +630,54 @@ class BrandProfile(models.Model):
         return f"{self.tenant.name} branding"
 
 
+class PlatformBranding(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    brand_name = models.CharField(max_length=200, default="Xyn")
+    logo_url = models.CharField(max_length=500, null=True, blank=True)
+    favicon_url = models.CharField(max_length=500, null=True, blank=True)
+    primary_color = models.CharField(max_length=40, default="#0f4c81")
+    background_color = models.CharField(max_length=40, default="#f5f7fb")
+    background_gradient = models.CharField(max_length=240, null=True, blank=True)
+    text_color = models.CharField(max_length=40, default="#10203a")
+    font_family = models.CharField(max_length=120, null=True, blank=True)
+    button_radius_px = models.IntegerField(default=12)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="platform_branding_updates"
+    )
+
+    class Meta:
+        ordering = ["-updated_at"]
+
+    def __str__(self) -> str:
+        return self.brand_name
+
+
+class AppBrandingOverride(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    app_id = models.CharField(max_length=120, unique=True)
+    display_name = models.CharField(max_length=200, null=True, blank=True)
+    logo_url = models.CharField(max_length=500, null=True, blank=True)
+    primary_color = models.CharField(max_length=40, null=True, blank=True)
+    background_color = models.CharField(max_length=40, null=True, blank=True)
+    background_gradient = models.CharField(max_length=240, null=True, blank=True)
+    text_color = models.CharField(max_length=40, null=True, blank=True)
+    font_family = models.CharField(max_length=120, null=True, blank=True)
+    button_radius_px = models.IntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="app_branding_updates"
+    )
+
+    class Meta:
+        ordering = ["app_id"]
+
+    def __str__(self) -> str:
+        return self.app_id
+
+
 class Device(models.Model):
     STATUS_CHOICES = [
         ("active", "Active"),

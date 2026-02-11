@@ -19,7 +19,7 @@ from authlib.jose import JsonWebKey, jwt
 from django.core.paginator import Paginator
 from django.db import models
 from django.http import HttpRequest, JsonResponse, HttpResponse
-from django.shortcuts import get_object_or_404, redirect
+from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.utils.text import slugify
@@ -68,6 +68,8 @@ from .models import (
     Contact,
     TenantMembership,
     BrandProfile,
+    PlatformBranding,
+    AppBrandingOverride,
     Device,
 )
 from .module_registry import maybe_sync_modules_from_registry
@@ -716,15 +718,28 @@ def _build_oidc_config_payload(client: AppOIDCClient) -> Dict[str, Any]:
                 "domain_rules": provider.domain_rules_json or {},
             }
         )
+    pkce_required = any(bool(provider.get("pkce")) for provider in provider_payloads) if provider_payloads else True
     return {
         "app_id": client.app_id,
+        "appId": client.app_id,
         "login_mode": client.login_mode,
+        "loginMode": client.login_mode,
         "default_provider_id": client.default_provider_id if client.default_provider_id else None,
+        "defaultProviderId": client.default_provider_id if client.default_provider_id else None,
         "allowed_providers": provider_payloads,
+        "providers": [
+            {
+                "id": provider["id"],
+                "displayName": provider["display_name"],
+                "issuer": provider["issuer"],
+            }
+            for provider in provider_payloads
+        ],
         "redirect_uris": client.redirect_uris_json or [],
         "post_logout_redirect_uris": client.post_logout_redirect_uris_json or [],
         "session": client.session_json or {},
         "token_validation": client.token_validation_json or {},
+        "pkce": pkce_required,
     }
 
 
@@ -841,8 +856,8 @@ def oidc_authorize(request: HttpRequest, provider_id: str) -> HttpResponse:
     request.session[f"oidc_verifier:{app_id}:{provider_id}"] = code_verifier
     request.session["oidc_app_id"] = app_id
     request.session["oidc_provider_id"] = provider_id
-    next_url = request.GET.get("next") or "/app"
-    request.session["post_login_redirect"] = next_url
+    requested_return_to = request.GET.get("returnTo") or request.GET.get("next") or ""
+    request.session["post_login_redirect"] = _sanitize_return_to(requested_return_to, request, client, app_id)
     scopes = provider.scopes_json or ["openid", "profile", "email"]
     params = {
         "response_type": "code",
@@ -986,7 +1001,12 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
         return JsonResponse({"error": "no roles assigned"}, status=403)
     login(request, user, backend="django.contrib.auth.backends.ModelBackend")
     request.session["user_identity_id"] = str(identity.id)
-    redirect_to = request.session.get("post_login_redirect") or "/app"
+    redirect_to = _sanitize_return_to(
+        request.session.get("post_login_redirect") or "",
+        request,
+        client,
+        app_id,
+    )
     if app_id != "xyn-ui":
         split = urlsplit(redirect_to)
         fragment_params = dict(parse_qsl(split.fragment, keep_blank_values=True))
@@ -997,14 +1017,7 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
 
 
 @csrf_exempt
-def auth_login(request: HttpRequest) -> HttpResponse:
-    client = _resolve_app_config("xyn-ui")
-    if client and client.default_provider_id:
-        next_url = request.GET.get("next") or "/app"
-        request.GET = request.GET.copy()
-        request.GET["appId"] = "xyn-ui"
-        request.GET["next"] = next_url
-        return oidc_authorize(request, client.default_provider_id)
+def _start_env_fallback_login(request: HttpRequest, app_id: str, return_to: str) -> HttpResponse:
     if AppOIDCClient.objects.exists():
         return JsonResponse({"error": "OIDC app not configured"}, status=500)
     logger.warning("Using ENV OIDC fallback (no app client configured)")
@@ -1027,8 +1040,7 @@ def auth_login(request: HttpRequest) -> HttpResponse:
     request.session["oidc_state"] = state
     request.session["oidc_nonce"] = nonce
     request.session["environment_id"] = str(env.id)
-    next_url = request.GET.get("next") or "/app/ems"
-    request.session["post_login_redirect"] = next_url
+    request.session["post_login_redirect"] = return_to
     redirect_uri = config.get("redirect_uri") or request.build_absolute_uri("/auth/callback")
     params = {
         "response_type": "code",
@@ -1040,6 +1052,37 @@ def auth_login(request: HttpRequest) -> HttpResponse:
     }
     url = f"{oidc_config['authorization_endpoint']}?{urlencode(params)}"
     return redirect(url)
+
+
+@csrf_exempt
+def auth_login(request: HttpRequest) -> HttpResponse:
+    app_id = request.GET.get("appId") or "xyn-ui"
+    client = _resolve_app_config(app_id)
+    return_to = _sanitize_return_to(request.GET.get("returnTo") or request.GET.get("next") or "", request, client, app_id)
+    if client:
+        config = _build_oidc_config_payload(client)
+        providers = config.get("providers") or []
+        if not providers and config.get("allowed_providers"):
+            providers = [
+                {
+                    "id": provider.get("id"),
+                    "displayName": provider.get("display_name") or provider.get("id"),
+                    "issuer": provider.get("issuer"),
+                }
+                for provider in config.get("allowed_providers")
+            ]
+        branding = _merge_branding_for_app(app_id)
+        context = {
+            "app_id": app_id,
+            "return_to": return_to,
+            "providers": providers,
+            "default_provider_id": config.get("defaultProviderId"),
+            "branding": branding,
+            "login_title": f"Sign in to {branding.get('display_name') or app_id}",
+        }
+        return render(request, "xyn_orchestrator/auth_login.html", context)
+    request.session["post_login_redirect"] = return_to
+    return _start_env_fallback_login(request, app_id=app_id, return_to=return_to)
 
 
 @csrf_exempt
@@ -1155,7 +1198,12 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
     login(request, user, backend="django.contrib.auth.backends.ModelBackend")
     request.session["user_identity_id"] = str(identity.id)
     request.session["environment_id"] = str(env.id)
-    redirect_to = request.session.get("post_login_redirect") or "/app/ems"
+    redirect_to = _sanitize_return_to(
+        request.session.get("post_login_redirect") or "",
+        request,
+        None,
+        "xyn-ui",
+    )
     return redirect(redirect_to)
 
 
@@ -1228,6 +1276,181 @@ def _default_branding() -> Dict[str, Any]:
         "logo_url": "/xyence-logo.png",
         "theme": {},
     }
+
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_GRADIENT_RE = re.compile(r"^linear-gradient\([a-zA-Z0-9\s,#.%()-]+\)$")
+
+
+def _default_platform_branding() -> Dict[str, Any]:
+    return {
+        "brand_name": "Xyn",
+        "logo_url": "/xyence-logo.png",
+        "favicon_url": "",
+        "primary_color": "#0f4c81",
+        "background_color": "#f5f7fb",
+        "background_gradient": "",
+        "text_color": "#10203a",
+        "font_family": "Space Grotesk, Source Sans 3, sans-serif",
+        "button_radius_px": 12,
+    }
+
+
+def _get_platform_branding() -> PlatformBranding:
+    defaults = _default_platform_branding()
+    branding, _created = PlatformBranding.objects.get_or_create(
+        id=PlatformBranding.objects.order_by("created_at").values_list("id", flat=True).first() or uuid.uuid4(),
+        defaults={
+            "brand_name": defaults["brand_name"],
+            "logo_url": defaults["logo_url"],
+            "favicon_url": defaults["favicon_url"],
+            "primary_color": defaults["primary_color"],
+            "background_color": defaults["background_color"],
+            "background_gradient": defaults["background_gradient"],
+            "text_color": defaults["text_color"],
+            "font_family": defaults["font_family"],
+            "button_radius_px": defaults["button_radius_px"],
+        },
+    )
+    return branding
+
+
+def _serialize_platform_branding(branding: PlatformBranding) -> Dict[str, Any]:
+    return {
+        "brand_name": branding.brand_name,
+        "logo_url": branding.logo_url or "",
+        "favicon_url": branding.favicon_url or "",
+        "primary_color": branding.primary_color,
+        "background_color": branding.background_color,
+        "background_gradient": branding.background_gradient or "",
+        "text_color": branding.text_color,
+        "font_family": branding.font_family or "",
+        "button_radius_px": int(branding.button_radius_px or 12),
+        "updated_at": branding.updated_at,
+    }
+
+
+def _serialize_app_branding_override(override: Optional[AppBrandingOverride], app_id: str) -> Dict[str, Any]:
+    if not override:
+        return {
+            "app_id": app_id,
+            "display_name": "",
+            "logo_url": "",
+            "primary_color": "",
+            "background_color": "",
+            "background_gradient": "",
+            "text_color": "",
+            "font_family": "",
+            "button_radius_px": None,
+            "updated_at": None,
+        }
+    return {
+        "app_id": override.app_id,
+        "display_name": override.display_name or "",
+        "logo_url": override.logo_url or "",
+        "primary_color": override.primary_color or "",
+        "background_color": override.background_color or "",
+        "background_gradient": override.background_gradient or "",
+        "text_color": override.text_color or "",
+        "font_family": override.font_family or "",
+        "button_radius_px": override.button_radius_px,
+        "updated_at": override.updated_at,
+    }
+
+
+def _merge_branding_for_app(app_id: str) -> Dict[str, Any]:
+    base = _serialize_platform_branding(_get_platform_branding())
+    override = AppBrandingOverride.objects.filter(app_id=app_id).first()
+    payload = _serialize_app_branding_override(override, app_id)
+    display_name = payload["display_name"] or base["brand_name"]
+    merged = {
+        "app_id": app_id,
+        "brand_name": display_name,
+        "display_name": display_name,
+        "logo_url": payload["logo_url"] or base["logo_url"],
+        "favicon_url": base["favicon_url"],
+        "primary_color": payload["primary_color"] or base["primary_color"],
+        "background_color": payload["background_color"] or base["background_color"],
+        "background_gradient": payload["background_gradient"] or base["background_gradient"],
+        "text_color": payload["text_color"] or base["text_color"],
+        "font_family": payload["font_family"] or base["font_family"],
+        "button_radius_px": payload["button_radius_px"] if payload["button_radius_px"] is not None else base["button_radius_px"],
+    }
+    merged["css_variables"] = {
+        "--brand-primary": merged["primary_color"],
+        "--brand-bg": merged["background_color"],
+        "--brand-text": merged["text_color"],
+        "--brand-radius": f"{int(merged['button_radius_px'])}px",
+        "--brand-font": merged["font_family"],
+    }
+    if merged["background_gradient"]:
+        merged["css_variables"]["--brand-bg-gradient"] = merged["background_gradient"]
+    return merged
+
+
+def _validate_branding_payload(payload: Dict[str, Any], partial: bool = True) -> Dict[str, str]:
+    errors: Dict[str, str] = {}
+    color_fields = ("primary_color", "background_color", "text_color")
+    for field in color_fields:
+        if field not in payload and partial:
+            continue
+        value = (payload.get(field) or "").strip()
+        if value and not _HEX_COLOR_RE.match(value):
+            errors[field] = "must be a hex color like #0f4c81"
+    if "background_gradient" in payload:
+        gradient = (payload.get("background_gradient") or "").strip()
+        if gradient and not _GRADIENT_RE.match(gradient):
+            errors["background_gradient"] = "must be a safe linear-gradient(...) value"
+    if "button_radius_px" in payload:
+        try:
+            radius = int(payload.get("button_radius_px"))
+        except Exception:
+            errors["button_radius_px"] = "must be an integer"
+        else:
+            if radius < 0 or radius > 32:
+                errors["button_radius_px"] = "must be between 0 and 32"
+    return errors
+
+
+def _default_post_login_redirect(client: Optional[AppOIDCClient], app_id: str) -> str:
+    if client:
+        post_logout = client.post_logout_redirect_uris_json or []
+        if post_logout:
+            return str(post_logout[0])
+    if app_id == "xyn-ui":
+        return "/app"
+    return "/"
+
+
+def _sanitize_return_to(raw_value: str, request: HttpRequest, client: Optional[AppOIDCClient], app_id: str) -> str:
+    fallback = _default_post_login_redirect(client, app_id)
+    value = (raw_value or "").strip()
+    if not value:
+        return fallback
+    split = urlsplit(value)
+    if split.scheme and split.scheme not in {"http", "https"}:
+        return fallback
+    if split.scheme == "":
+        if not value.startswith("/") or value.startswith("//"):
+            return fallback
+        return value
+    env_hosts = {
+        host.strip().lower()
+        for host in os.environ.get("XYENCE_ALLOWED_RETURN_HOSTS", "").split(",")
+        if host.strip()
+    }
+    allowed_hosts = {request.get_host().lower(), *env_hosts}
+    if client:
+        for uri in (client.redirect_uris_json or []) + (client.post_logout_redirect_uris_json or []):
+            try:
+                netloc = urlsplit(uri).netloc.lower()
+            except Exception:
+                netloc = ""
+            if netloc:
+                allowed_hosts.add(netloc)
+    if split.netloc.lower() not in allowed_hosts:
+        return fallback
+    return urlunsplit(split)
 
 
 def _serialize_branding(profile: Optional[BrandProfile]) -> Dict[str, Any]:
@@ -1680,6 +1903,76 @@ def tenant_branding_update(request: HttpRequest, tenant_id: str) -> JsonResponse
         ]
     )
     return JsonResponse({"status": "ok"})
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def platform_branding(request: HttpRequest) -> JsonResponse:
+    branding = _get_platform_branding()
+    if request.method == "GET":
+        return JsonResponse(_serialize_platform_branding(branding))
+    if request.method not in {"PUT", "PATCH"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    errors = _validate_branding_payload(payload, partial=request.method == "PATCH")
+    if errors:
+        return JsonResponse({"error": "invalid branding payload", "details": errors}, status=400)
+    for field in (
+        "brand_name",
+        "logo_url",
+        "favicon_url",
+        "primary_color",
+        "background_color",
+        "background_gradient",
+        "text_color",
+        "font_family",
+        "button_radius_px",
+    ):
+        if field in payload:
+            setattr(branding, field, payload.get(field))
+    identity = _require_authenticated(request)
+    if identity and request.user.is_authenticated:
+        branding.updated_by = request.user
+    branding.save()
+    return JsonResponse(_serialize_platform_branding(branding))
+
+
+@csrf_exempt
+@require_role("platform_admin")
+def platform_app_branding(request: HttpRequest, app_id: str) -> JsonResponse:
+    override = AppBrandingOverride.objects.filter(app_id=app_id).first()
+    if request.method == "GET":
+        return JsonResponse(_serialize_app_branding_override(override, app_id))
+    if request.method not in {"PUT", "PATCH"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    errors = _validate_branding_payload(payload, partial=request.method == "PATCH")
+    if errors:
+        return JsonResponse({"error": "invalid branding payload", "details": errors}, status=400)
+    if not override:
+        override = AppBrandingOverride(app_id=app_id)
+    for field in (
+        "display_name",
+        "logo_url",
+        "primary_color",
+        "background_color",
+        "background_gradient",
+        "text_color",
+        "font_family",
+        "button_radius_px",
+    ):
+        if field in payload:
+            setattr(override, field, payload.get(field))
+    identity = _require_authenticated(request)
+    if identity and request.user.is_authenticated:
+        override.updated_by = request.user
+    override.save()
+    return JsonResponse(_serialize_app_branding_override(override, app_id))
+
+
+def public_branding(request: HttpRequest) -> JsonResponse:
+    app_id = request.GET.get("appId") or request.GET.get("app_id") or "xyn-ui"
+    return JsonResponse(_merge_branding_for_app(app_id))
 
 
 @csrf_exempt

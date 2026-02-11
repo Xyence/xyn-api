@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ login_title }}</title>
+    {% if branding.favicon_url %}<link rel="icon" href="{{ branding.favicon_url }}" />{% endif %}
+    <style>
+      :root {
+        --brand-primary: {{ branding.primary_color|default:'#0f4c81' }};
+        --brand-bg: {{ branding.background_color|default:'#f5f7fb' }};
+        --brand-text: {{ branding.text_color|default:'#10203a' }};
+        --brand-font: {{ branding.font_family|default:'Space Grotesk, Source Sans 3, sans-serif' }};
+        --brand-radius: {{ branding.button_radius_px|default:12 }}px;
+      }
+      body {
+        margin: 0;
+        font-family: var(--brand-font);
+        background: {{ branding.background_gradient|default:'' }};
+        background-color: var(--brand-bg);
+        color: var(--brand-text);
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+      }
+      .card {
+        width: min(460px, 92vw);
+        background: #ffffff;
+        border: 1px solid rgba(16, 32, 58, 0.12);
+        border-radius: 18px;
+        padding: 28px;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.08);
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 10px;
+      }
+      .brand img {
+        width: 40px;
+        height: 40px;
+        border-radius: 10px;
+        object-fit: cover;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 1.45rem;
+      }
+      p {
+        margin: 0 0 18px;
+        color: rgba(16, 32, 58, 0.72);
+        line-height: 1.4;
+      }
+      .provider-list {
+        display: grid;
+        gap: 10px;
+      }
+      .provider-button {
+        display: block;
+        width: 100%;
+        text-align: center;
+        text-decoration: none;
+        background: var(--brand-primary);
+        color: #fff;
+        border: 1px solid var(--brand-primary);
+        border-radius: var(--brand-radius);
+        padding: 12px 14px;
+        font-weight: 600;
+      }
+      .muted {
+        margin-top: 14px;
+        font-size: 0.9rem;
+        color: rgba(16, 32, 58, 0.62);
+      }
+      .error {
+        border-left: 4px solid #b6412d;
+        background: #fff6f4;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-bottom: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <div class="brand">
+        {% if branding.logo_url %}<img src="{{ branding.logo_url }}" alt="{{ branding.display_name }}" />{% endif %}
+        <strong>{{ branding.display_name }}</strong>
+      </div>
+      <h1>{{ login_title }}</h1>
+      <p>Continue with your organization identity provider.</p>
+
+      {% if providers %}
+      <div class="provider-list">
+        {% for provider in providers %}
+        <a
+          class="provider-button"
+          href="/xyn/api/auth/oidc/{{ provider.id }}/authorize?appId={{ app_id|urlencode }}&returnTo={{ return_to|urlencode }}"
+        >
+          Continue with {{ provider.displayName }}
+        </a>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="error">No enabled identity providers are configured for {{ app_id }}.</div>
+      {% endif %}
+
+      <p class="muted">App ID: {{ app_id }}</p>
+    </main>
+  </body>
+</html>

@@ -7,7 +7,12 @@ from django.utils import timezone
 
 from authlib.jose import JsonWebKey, jwt
 
-from xyn_orchestrator.models import IdentityProvider, AppOIDCClient
+from xyn_orchestrator.models import (
+    IdentityProvider,
+    AppOIDCClient,
+    RoleBinding,
+    UserIdentity,
+)
 from xyn_orchestrator.oidc import get_jwks
 from xyn_orchestrator.xyn_api import _decode_oidc_id_token
 
@@ -22,6 +27,22 @@ class OidcContractTests(TestCase):
             is_staff=True,
         )
         self.client.force_login(self.user)
+        self.identity = UserIdentity.objects.create(
+            provider="oidc",
+            provider_id="google",
+            issuer="https://accounts.google.com",
+            subject="staff-subject",
+            email="staff@example.com",
+            display_name="Staff User",
+        )
+        RoleBinding.objects.create(
+            user_identity=self.identity,
+            scope_kind="platform",
+            role="platform_admin",
+        )
+        session = self.client.session
+        session["user_identity_id"] = str(self.identity.id)
+        session.save()
 
     def _provider_payload(self):
         return {
@@ -192,3 +213,126 @@ class OidcContractTests(TestCase):
         mock_get.return_value.json.return_value = {"keys": [{"kid": "new", "kty": "RSA", "n": "b", "e": "AQAB"}]}
         jwks = get_jwks(provider, kid="new")
         self.assertTrue(any(key.get("kid") == "new" for key in jwks.get("keys", [])))
+
+    def test_public_branding_defaults_and_override_merge(self):
+        global_payload = {
+            "brand_name": "Xyn Platform",
+            "logo_url": "https://cdn.example.com/logo.png",
+            "primary_color": "#123456",
+            "background_color": "#fafafa",
+            "text_color": "#111111",
+            "button_radius_px": 10,
+        }
+        response = self.client.put(
+            "/xyn/api/platform/branding",
+            data=json.dumps(global_payload),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        response = self.client.put(
+            "/xyn/api/platform/branding/apps/ems.platform",
+            data=json.dumps({"display_name": "EMS", "primary_color": "#654321"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        public_response = self.client.get("/xyn/api/public/branding?appId=ems.platform")
+        self.assertEqual(public_response.status_code, 200)
+        payload = public_response.json()
+        self.assertEqual(payload["display_name"], "EMS")
+        self.assertEqual(payload["primary_color"], "#654321")
+        self.assertEqual(payload["logo_url"], "https://cdn.example.com/logo.png")
+
+    @mock.patch("xyn_orchestrator.xyn_api.get_discovery_doc")
+    def test_authorize_blocks_untrusted_return_to(self, mock_discovery):
+        provider = IdentityProvider.objects.create(
+            id="google",
+            display_name="Google",
+            issuer="https://accounts.google.com",
+            client_id="abc",
+            enabled=True,
+        )
+        AppOIDCClient.objects.create(
+            app_id="xyn-ui",
+            login_mode="redirect",
+            default_provider=provider,
+            allowed_providers_json=["google"],
+            redirect_uris_json=["https://xyn.xyence.io/auth/callback"],
+        )
+        mock_discovery.return_value = {"authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth"}
+        response = self.client.get(
+            "/xyn/api/auth/oidc/google/authorize",
+            {"appId": "xyn-ui", "returnTo": "https://evil.example.com/phish"},
+        )
+        self.assertEqual(response.status_code, 302)
+        session = self.client.session
+        self.assertEqual(session.get("post_login_redirect"), "/app")
+
+    @mock.patch("xyn_orchestrator.xyn_api._decode_oidc_id_token")
+    @mock.patch("xyn_orchestrator.xyn_api.requests.post")
+    @mock.patch("xyn_orchestrator.xyn_api.get_discovery_doc")
+    def test_authorize_callback_preserves_app_and_return_to(self, mock_discovery, mock_post, mock_decode):
+        provider = IdentityProvider.objects.create(
+            id="google",
+            display_name="Google",
+            issuer="https://accounts.google.com",
+            client_id="abc",
+            enabled=True,
+        )
+        AppOIDCClient.objects.create(
+            app_id="ems.platform",
+            login_mode="redirect",
+            default_provider=provider,
+            allowed_providers_json=["google"],
+            redirect_uris_json=["https://ems.xyence.io/auth/callback"],
+            post_logout_redirect_uris_json=["https://ems.xyence.io/"],
+        )
+        mock_discovery.side_effect = [
+            {"authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth"},
+            {"token_endpoint": "https://accounts.google.com/token"},
+        ]
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"id_token": "token-1"}
+        mock_decode.return_value = {
+            "sub": "user-1",
+            "email": "user@xyence.io",
+            "iss": provider.issuer,
+            "aud": provider.client_id,
+            "name": "User One",
+        }
+        authorize_response = self.client.get(
+            "/xyn/api/auth/oidc/google/authorize",
+            {
+                "appId": "ems.platform",
+                "returnTo": "https://ems.xyence.io/devices",
+            },
+        )
+        self.assertEqual(authorize_response.status_code, 302)
+        state = self.client.session.get("oidc_state:ems.platform:google")
+        callback_response = self.client.get(
+            "/xyn/api/auth/oidc/google/callback",
+            {"code": "code-1", "state": state, "appId": "ems.platform"},
+        )
+        self.assertEqual(callback_response.status_code, 302)
+        location = callback_response["Location"]
+        self.assertTrue(location.startswith("https://ems.xyence.io"))
+        self.assertIn("id_token=token-1", location)
+
+    def test_auth_login_renders_shared_page(self):
+        provider = IdentityProvider.objects.create(
+            id="google",
+            display_name="Google",
+            issuer="https://accounts.google.com",
+            client_id="abc",
+            enabled=True,
+        )
+        AppOIDCClient.objects.create(
+            app_id="xyn-ui",
+            login_mode="redirect",
+            default_provider=provider,
+            allowed_providers_json=["google"],
+            redirect_uris_json=["https://xyn.xyence.io/auth/callback"],
+        )
+        response = self.client.get("/auth/login", {"appId": "xyn-ui", "returnTo": "/app/releases"})
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Continue with Google")
+        self.assertContains(response, "returnTo=/app/releases")

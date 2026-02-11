@@ -47,6 +47,8 @@ from .models import (
     Contact,
     TenantMembership,
     BrandProfile,
+    PlatformBranding,
+    AppBrandingOverride,
     Device,
     VoiceNote,
     VoiceTranscript,
@@ -217,6 +219,18 @@ class TenantMembershipAdmin(admin.ModelAdmin):
 class BrandProfileAdmin(admin.ModelAdmin):
     list_display = ("tenant", "display_name", "updated_at")
     search_fields = ("tenant__name", "display_name")
+
+
+@admin.register(PlatformBranding)
+class PlatformBrandingAdmin(admin.ModelAdmin):
+    list_display = ("brand_name", "primary_color", "updated_at")
+    search_fields = ("brand_name",)
+
+
+@admin.register(AppBrandingOverride)
+class AppBrandingOverrideAdmin(admin.ModelAdmin):
+    list_display = ("app_id", "display_name", "updated_at")
+    search_fields = ("app_id", "display_name")
 
 
 @admin.register(Device)
