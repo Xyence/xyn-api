@@ -426,23 +426,26 @@ def execute_release_plan_deploy(
         fallback_error = ""
         if "no basic auth credentials" in f"{exc}\n{last_stderr}".lower():
             fallback_root = f"/opt/xyence/deploy-{deployment.id}"
+            fallback_state_root = "/opt/xyence"
             fallback_commands = [
                 "set -euo pipefail",
                 f"ROOT={fallback_root}",
+                f"STATE={fallback_state_root}",
                 "mkdir -p \"$ROOT\"",
+                "mkdir -p \"$STATE/certs/current\" \"$STATE/acme-webroot\"",
                 "rm -rf \"$ROOT/xyn-api\" \"$ROOT/xyn-ui\"",
                 "git clone --depth 1 --branch main https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"",
                 "git clone --depth 1 --branch main https://github.com/Xyence/xyn-ui \"$ROOT/xyn-ui\"",
                 "cd \"$ROOT/xyn-api\"",
                 "XYN_UI_PATH=\"$ROOT/xyn-ui/apps/ems-ui\" "
                 "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
-                "EMS_CERTS_PATH=\"$ROOT/certs/current\" EMS_ACME_WEBROOT_PATH=\"$ROOT/acme-webroot\" "
+                "EMS_CERTS_PATH=\"$STATE/certs/current\" EMS_ACME_WEBROOT_PATH=\"$STATE/acme-webroot\" "
                 "EMS_PLATFORM_API_BASE=https://xyence.io EMS_OIDC_APP_ID=ems.platform EMS_OIDC_ENABLED=true "
                 "EMS_JWT_SECRET=\"${EMS_JWT_SECRET:-dev-secret-change-me}\" "
                 "docker compose -f apps/ems-stack/docker-compose.yml down -v --remove-orphans",
                 "XYN_UI_PATH=\"$ROOT/xyn-ui/apps/ems-ui\" "
                 "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
-                "EMS_CERTS_PATH=\"$ROOT/certs/current\" EMS_ACME_WEBROOT_PATH=\"$ROOT/acme-webroot\" "
+                "EMS_CERTS_PATH=\"$STATE/certs/current\" EMS_ACME_WEBROOT_PATH=\"$STATE/acme-webroot\" "
                 "EMS_PLATFORM_API_BASE=https://xyence.io EMS_OIDC_APP_ID=ems.platform EMS_OIDC_ENABLED=true "
                 "EMS_JWT_SECRET=\"${EMS_JWT_SECRET:-dev-secret-change-me}\" "
                 "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans",
@@ -480,8 +483,8 @@ def execute_release_plan_deploy(
                     deployment.error_message = ""
                     deploy_workdir = f"{fallback_root}/xyn-api"
                     deploy_compose_file = "apps/ems-stack/docker-compose.yml"
-                    cert_dir = f"{fallback_root}/certs/current"
-                    acme_webroot = f"{fallback_root}/acme-webroot"
+                    cert_dir = "/opt/xyence/certs/current"
+                    acme_webroot = "/opt/xyence/acme-webroot"
                 else:
                     fallback_error = "source-build fallback failed"
             except Exception as fallback_exc:

@@ -166,5 +166,6 @@ class DeploymentTlsTests(TestCase):
             self.assertIn("rm -rf \"$ROOT/xyn-api\" \"$ROOT/xyn-ui\"", fallback_commands)
             self.assertIn("git clone --depth 1 --branch main https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"", fallback_commands)
             self.assertIn("git clone --depth 1 --branch main https://github.com/Xyence/xyn-ui \"$ROOT/xyn-ui\"", fallback_commands)
-            self.assertIn("EMS_CERTS_PATH=\"$ROOT/certs/current\"", fallback_commands)
+            self.assertIn("EMS_CERTS_PATH=\"$STATE/certs/current\"", fallback_commands)
+            self.assertIn("mkdir -p \"$STATE/certs/current\" \"$STATE/acme-webroot\"", fallback_commands)
             self.assertNotIn("git -C \"$ROOT/xyn-api\" pull --ff-only", fallback_commands)
