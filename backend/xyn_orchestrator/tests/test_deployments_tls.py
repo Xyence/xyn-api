@@ -109,3 +109,61 @@ class DeploymentTlsTests(TestCase):
             self.assertIn("https_health_failed", deployment.error_message)
             self.assertEqual(execution.get("status"), "failed")
             self.assertEqual((execution.get("error") or {}).get("code"), "https_health_failed")
+
+    @override_settings(MEDIA_URL="/media/")
+    def test_source_build_fallback_uses_clean_checkout_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir, override_settings(MEDIA_ROOT=tmpdir):
+            blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+            plan = ReleasePlan.objects.create(
+                name="Plan",
+                target_kind="blueprint",
+                target_fqn="core.ems.platform",
+                from_version="",
+                to_version="v40",
+            )
+            instance = ProvisionedInstance.objects.create(
+                name="seed",
+                aws_region="us-west-2",
+                instance_id="i-123",
+                instance_type="t3",
+                ami_id="ami-123",
+            )
+            release = Release.objects.create(
+                blueprint=blueprint,
+                release_plan=plan,
+                version="v40",
+                status="published",
+                build_state="ready",
+            )
+            deployment = Deployment.objects.create(
+                idempotency_key="k2",
+                idempotency_base="b2",
+                release=release,
+                instance=instance,
+                release_plan=plan,
+                status="queued",
+            )
+            plan_json = {
+                "steps": [{"name": "deploy", "commands": ["docker pull private/repo:tag"]}],
+                "tasks": [],
+            }
+            second = self._ssm_result(status="Success", code=0)
+            calls = []
+
+            def _fake_run(_instance_id, _region, commands):
+                calls.append(commands)
+                if len(calls) == 1:
+                    raise RuntimeError("no basic auth credentials")
+                return second
+
+            with (
+                mock.patch("xyn_orchestrator.deployments._run_ssm_commands", side_effect=_fake_run),
+                mock.patch("xyn_orchestrator.deployments._load_default_compose", return_value=None),
+            ):
+                execute_release_plan_deploy(deployment, release, instance, plan, plan_json)
+            fallback_commands = "\n".join(calls[-1])
+            self.assertIn("deploy-", fallback_commands)
+            self.assertIn("rm -rf \"$ROOT/xyn-api\" \"$ROOT/xyn-ui\"", fallback_commands)
+            self.assertIn("git clone --depth 1 --branch main https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"", fallback_commands)
+            self.assertIn("git clone --depth 1 --branch main https://github.com/Xyence/xyn-ui \"$ROOT/xyn-ui\"", fallback_commands)
+            self.assertNotIn("git -C \"$ROOT/xyn-api\" pull --ff-only", fallback_commands)

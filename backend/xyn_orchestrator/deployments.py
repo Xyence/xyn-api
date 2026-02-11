@@ -423,18 +423,14 @@ def execute_release_plan_deploy(
         # Fallback path: if ECR auth is unavailable, deploy directly from source and local builds.
         fallback_error = ""
         if "no basic auth credentials" in f"{exc}\n{last_stderr}".lower():
+            fallback_root = f"/opt/xyence/deploy-{deployment.id}"
             fallback_commands = [
                 "set -euo pipefail",
-                "ROOT=/opt/xyence",
+                f"ROOT={fallback_root}",
                 "mkdir -p \"$ROOT\"",
-                "if [ ! -d \"$ROOT/xyn-api/.git\" ]; then git clone https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"; fi",
-                "if [ ! -d \"$ROOT/xyn-ui/.git\" ]; then git clone https://github.com/Xyence/xyn-ui \"$ROOT/xyn-ui\"; fi",
-                "git -C \"$ROOT/xyn-api\" fetch --all",
-                "git -C \"$ROOT/xyn-api\" checkout main",
-                "git -C \"$ROOT/xyn-api\" pull --ff-only",
-                "git -C \"$ROOT/xyn-ui\" fetch --all",
-                "git -C \"$ROOT/xyn-ui\" checkout main",
-                "git -C \"$ROOT/xyn-ui\" pull --ff-only",
+                "rm -rf \"$ROOT/xyn-api\" \"$ROOT/xyn-ui\"",
+                "git clone --depth 1 --branch main https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"",
+                "git clone --depth 1 --branch main https://github.com/Xyence/xyn-ui \"$ROOT/xyn-ui\"",
                 "cd \"$ROOT/xyn-api\"",
                 "XYN_UI_PATH=\"$ROOT/xyn-ui/apps/ems-ui\" "
                 "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
@@ -482,10 +478,10 @@ def execute_release_plan_deploy(
                     execution["status"] = "succeeded"
                     deployment.status = "succeeded"
                     deployment.error_message = ""
-                    deploy_workdir = "/opt/xyence/xyn-api"
+                    deploy_workdir = f"{fallback_root}/xyn-api"
                     deploy_compose_file = "apps/ems-stack/docker-compose.yml"
-                    cert_dir = "/opt/xyence/certs/current"
-                    acme_webroot = "/opt/xyence/acme-webroot"
+                    cert_dir = f"{fallback_root}/certs/current"
+                    acme_webroot = f"{fallback_root}/acme-webroot"
                 else:
                     fallback_error = "source-build fallback failed"
             except Exception as fallback_exc:
