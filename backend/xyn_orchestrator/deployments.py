@@ -291,8 +291,8 @@ def execute_release_plan_deploy(
                 "EMS_PLATFORM_API_BASE=https://xyence.io EMS_OIDC_APP_ID=ems.platform EMS_OIDC_ENABLED=true "
                 "EMS_JWT_SECRET=\"${EMS_JWT_SECRET:-dev-secret-change-me}\" "
                 "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans",
-                "for i in $(seq 1 30); do curl -fsS http://localhost:8080/health >/dev/null && break; sleep 2; done; curl -fsS http://localhost:8080/health >/dev/null",
-                "for i in $(seq 1 30); do curl -fsS http://localhost:8080/api/health >/dev/null && break; sleep 2; done; curl -fsS http://localhost:8080/api/health >/dev/null",
+                "for i in $(seq 1 30); do curl -fsS http://localhost:80/health >/dev/null && break; sleep 2; done; curl -fsS http://localhost:80/health >/dev/null",
+                "for i in $(seq 1 30); do curl -fsS http://localhost:80/api/health >/dev/null && break; sleep 2; done; curl -fsS http://localhost:80/api/health >/dev/null",
             ]
             try:
                 fallback = _run_ssm_commands(instance.instance_id, instance.aws_region, fallback_commands)
