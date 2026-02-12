@@ -107,9 +107,16 @@ def _validate_release_target_payload(payload: Dict[str, Any]) -> list[str]:
     for error in sorted(validator.iter_errors(payload), key=lambda e: e.path):
         path = ".".join(str(p) for p in error.path) if error.path else "root"
         errors.append(f"{path}: {error.message}")
-    tls_mode = (payload.get("tls") or {}).get("mode")
+    tls_mode = str((payload.get("tls") or {}).get("mode") or "").strip().lower()
     if tls_mode == "nginx+acme" and not (payload.get("tls") or {}).get("acme_email"):
         errors.append("tls.acme_email: required when tls.mode is nginx+acme")
+    if tls_mode == "host-ingress":
+        ingress = payload.get("ingress") or {}
+        routes = ingress.get("routes") if isinstance(ingress, dict) else None
+        if not isinstance(routes, list) or not routes:
+            errors.append("ingress.routes: required when tls.mode is host-ingress")
+        if not (payload.get("tls") or {}).get("acme_email"):
+            errors.append("tls.acme_email: required when tls.mode is host-ingress")
     fqdn = payload.get("fqdn") or ""
     if " " in fqdn or "." not in fqdn:
         errors.append("fqdn: must be a valid hostname")
@@ -148,6 +155,7 @@ def _normalize_release_target_payload(
     dns = payload.get("dns") or {}
     runtime = payload.get("runtime") or {}
     tls = payload.get("tls") or {}
+    ingress = payload.get("ingress") or {}
     normalized = {
         "schema_version": "release_target.v1",
         "id": target_id or payload.get("id") or str(uuid.uuid4()),
@@ -171,8 +179,16 @@ def _normalize_release_target_payload(
         },
         "tls": {
             "mode": tls.get("mode") or "none",
+            "termination": tls.get("termination") or "",
+            "provider": tls.get("provider") or "",
             "acme_email": tls.get("acme_email") or "",
+            "expose_http": bool(tls.get("expose_http", True)),
+            "expose_https": bool(tls.get("expose_https", True)),
             "redirect_http_to_https": bool(tls.get("redirect_http_to_https", True)),
+        },
+        "ingress": {
+            "network": ingress.get("network") or "xyn-edge",
+            "routes": ingress.get("routes") or [],
         },
         "env": payload.get("env") or {},
         "secret_refs": payload.get("secret_refs") or [],
@@ -201,6 +217,7 @@ def _serialize_release_target(target: ReleaseTarget) -> Dict[str, Any]:
             "dns": target.dns_json or {},
             "runtime": target.runtime_json or {},
             "tls": target.tls_json or {},
+            "ingress": (target.config_json or {}).get("ingress") or {},
             "env": target.env_json or {},
             "secret_refs": target.secret_refs_json or [],
             "created_at": target.created_at.isoformat() if target.created_at else "",

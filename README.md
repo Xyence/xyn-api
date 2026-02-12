@@ -120,6 +120,17 @@ Overrides (optional):
 - `XYENCE_LOCAL_STATUS`
 - `XYENCE_LOCAL_ENVIRONMENT_ID`
 
+## EMS TLS / Ingress Contract
+- `tls.mode=host-ingress`: host-level Traefik owns ports `80/443`; app compose must not publish those host ports.
+- `tls.mode=embedded`: app stack owns TLS termination (legacy).
+- `ingress.routes[]` describes host to service to port mapping and compiles to Traefik labels.
+- Host ingress runtime files:
+  - `/opt/xyn/ingress/compose.ingress.yml`
+  - `/opt/xyn/ingress/acme/acme.json`
+- Required infra for ACME HTTP-01:
+  - DNS A record points FQDN to the target host IP
+  - inbound `80/443` reachable on the target host
+
 ## Shared OIDC Login and Branding
 - Shared login entrypoint for all apps:
   - `/auth/login?appId=<appId>&returnTo=<url>`

@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -2778,11 +2779,6 @@ def _build_tls_acme_commands(root_dir: str, fqdn: str, email: str, compose_file:
         f"XYN_UI_PATH={root_dir}/xyn-ui/apps/ems-ui EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
         f"EMS_CERTS_PATH={cert_dir} EMS_ACME_WEBROOT_PATH={acme_webroot} "
         f"docker compose -f {compose_file} up -d --build --remove-orphans; "
-        "if command -v openssl >/dev/null 2>&1; then "
-        f"if [ ! -f {cert_dir}/fullchain.pem ] || [ ! -f {cert_dir}/privkey.pem ]; then "
-        f"openssl req -x509 -nodes -newkey rsa:2048 -keyout {cert_dir}/privkey.pem "
-        f"-out {cert_dir}/fullchain.pem -days 1 -subj \\\"/CN={fqdn}\\\"; "
-        "fi; fi; "
         "docker run --rm "
         f"-v {lego_dir}:/data "
         f"-v {acme_webroot}:/webroot "
@@ -3122,7 +3118,25 @@ def _build_publish_images(
     return build_result, release_manifest, images_map
 
 
-def _render_compose_for_images(images: Dict[str, Dict[str, str]]) -> str:
+def _sanitize_route_id(host: str) -> str:
+    base = re.sub(r"[^a-zA-Z0-9]+", "-", host or "route").strip("-").lower()
+    return base or "route"
+
+
+def _release_target_ingress(release_target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    target = release_target or {}
+    tls = target.get("tls") or {}
+    ingress = target.get("ingress") or {}
+    mode = str(tls.get("mode") or "none").strip().lower()
+    return {
+        "tls_mode": mode,
+        "network": (ingress.get("network") or "xyn-edge"),
+        "routes": ingress.get("routes") or [],
+        "acme_email": str(tls.get("acme_email") or os.environ.get("XYENCE_ACME_EMAIL", "")).strip(),
+    }
+
+
+def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target: Optional[Dict[str, Any]] = None) -> str:
     api_image = images.get("ems-api", {}).get("image_uri")
     web_image = images.get("ems-web", {}).get("image_uri")
     api_digest = images.get("ems-api", {}).get("digest")
@@ -3131,39 +3145,136 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]]) -> str:
         api_image = f"{api_image.rsplit(':', 1)[0]}@{api_digest}"
     if web_digest and web_image:
         web_image = f"{web_image.rsplit(':', 1)[0]}@{web_digest}"
-    return (
-        "services:\n"
-        "  postgres:\n"
-        "    image: postgres:16-alpine\n"
-        "    environment:\n"
-        "      POSTGRES_USER: ${POSTGRES_USER:-ems}\n"
-        "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ems}\n"
-        "      POSTGRES_DB: ${POSTGRES_DB:-ems}\n"
-        "    volumes:\n"
-        "      - ems_pgdata:/var/lib/postgresql/data\n\n"
-        "  ems-api:\n"
-        f"    image: {api_image}\n"
-        "    environment:\n"
-        "      DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}\n"
-        "      EMS_JWT_SECRET: ${EMS_JWT_SECRET}\n"
-        "      EMS_JWT_ISSUER: ${EMS_JWT_ISSUER:-xyn-ems}\n"
-        "      EMS_JWT_AUDIENCE: ${EMS_JWT_AUDIENCE:-ems}\n"
-        "    depends_on:\n"
-        "      - postgres\n"
-        "    expose:\n"
-        "      - \"8000\"\n\n"
-        "  ems-web:\n"
-        f"    image: {web_image}\n"
+    ingress = _release_target_ingress(release_target)
+    tls_mode = ingress["tls_mode"]
+    host_ingress = tls_mode == "host-ingress"
+    route_labels = ""
+    route_network = ingress["network"]
+    route_defs = ingress["routes"] if isinstance(ingress["routes"], list) else []
+    for route in route_defs:
+        if not isinstance(route, dict):
+            continue
+        host = str(route.get("host") or "").strip()
+        service = str(route.get("service") or "").strip()
+        if service and service != "ems-web":
+            continue
+        port = int(route.get("port") or 3000)
+        rid = _sanitize_route_id(host)
+        route_labels += (
+            "    labels:\n"
+            "      - \"traefik.enable=true\"\n"
+            f"      - \"traefik.http.routers.{rid}.rule=Host(`{host}`)\"\n"
+            f"      - \"traefik.http.routers.{rid}.entrypoints=websecure\"\n"
+            f"      - \"traefik.http.routers.{rid}.tls=true\"\n"
+            f"      - \"traefik.http.routers.{rid}.tls.certresolver=le\"\n"
+            f"      - \"traefik.http.services.{rid}.loadbalancer.server.port={port}\"\n"
+        )
+    api_service_networks = ""
+    web_service_networks = ""
+    tail_networks = ""
+    web_ports_block = (
         "    ports:\n"
         "      - \"${EMS_PUBLIC_PORT:-80}:8080\"\n"
         "      - \"${EMS_PUBLIC_TLS_PORT:-443}:8443\"\n"
+    )
+    if host_ingress:
+        web_ports_block = ""
+        api_service_networks = (
+            "    networks:\n"
+            "      - default\n"
+            f"      - {route_network}\n"
+        )
+        web_service_networks = (
+            "    networks:\n"
+            "      - default\n"
+            f"      - {route_network}\n"
+        )
+        tail_networks = (
+            "networks:\n"
+            f"  {route_network}:\n"
+            "    external: true\n\n"
+        )
+        if not route_labels:
+            route_labels = (
+                "    labels:\n"
+                "      - \"traefik.enable=true\"\n"
+                "      - \"traefik.http.routers.ems.rule=Host(`${EMS_FQDN:-ems.xyence.io}`)\"\n"
+                "      - \"traefik.http.routers.ems.entrypoints=websecure\"\n"
+                "      - \"traefik.http.routers.ems.tls=true\"\n"
+                "      - \"traefik.http.routers.ems.tls.certresolver=le\"\n"
+                "      - \"traefik.http.services.ems.loadbalancer.server.port=3000\"\n"
+            )
+    return "".join(
+        [
+            "services:\n",
+            "  postgres:\n",
+            "    image: postgres:16-alpine\n",
+            "    environment:\n",
+            "      POSTGRES_USER: ${POSTGRES_USER:-ems}\n",
+            "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ems}\n",
+            "      POSTGRES_DB: ${POSTGRES_DB:-ems}\n",
+            "    volumes:\n",
+            "      - ems_pgdata:/var/lib/postgresql/data\n\n",
+            "  ems-api:\n",
+            f"    image: {api_image}\n",
+            "    environment:\n",
+            "      DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}\n",
+            "      EMS_JWT_SECRET: ${EMS_JWT_SECRET}\n",
+            "      EMS_JWT_ISSUER: ${EMS_JWT_ISSUER:-xyn-ems}\n",
+            "      EMS_JWT_AUDIENCE: ${EMS_JWT_AUDIENCE:-ems}\n",
+            "    depends_on:\n",
+            "      - postgres\n",
+            "    expose:\n",
+            "      - \"8000\"\n\n",
+            api_service_networks,
+            "  ems-web:\n",
+            f"    image: {web_image}\n",
+            web_ports_block,
+            "    volumes:\n",
+            "      - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme\n",
+            "      - ${EMS_CERTS_PATH:-./certs/current}:/etc/nginx/certs/current:ro\n",
+            "    depends_on:\n",
+            "      - ems-api\n\n",
+            web_service_networks,
+            route_labels,
+            "\n" if (web_service_networks or route_labels) else "",
+            "volumes:\n",
+            "  ems_pgdata: {}\n",
+            tail_networks,
+        ]
+    )
+
+
+def _render_traefik_ingress_compose(network: str, acme_email: str) -> str:
+    email = acme_email or "admin@xyence.io"
+    return (
+        "services:\n"
+        "  traefik:\n"
+        "    image: traefik:v3.1\n"
+        "    container_name: xyn-ingress-traefik\n"
+        "    command:\n"
+        "      - --providers.docker=true\n"
+        "      - --providers.docker.exposedbydefault=false\n"
+        "      - --entrypoints.web.address=:80\n"
+        "      - --entrypoints.websecure.address=:443\n"
+        "      - --entrypoints.web.http.redirections.entrypoint.to=websecure\n"
+        "      - --entrypoints.web.http.redirections.entrypoint.scheme=https\n"
+        f"      - --certificatesresolvers.le.acme.email={email}\n"
+        "      - --certificatesresolvers.le.acme.storage=/acme/acme.json\n"
+        "      - --certificatesresolvers.le.acme.httpchallenge=true\n"
+        "      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web\n"
+        "    ports:\n"
+        "      - \"80:80\"\n"
+        "      - \"443:443\"\n"
         "    volumes:\n"
-        "      - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme\n"
-        "      - ${EMS_CERTS_PATH:-./certs/current}:/etc/nginx/certs/current:ro\n"
-        "    depends_on:\n"
-        "      - ems-api\n\n"
-        "volumes:\n"
-        "  ems_pgdata: {}\n"
+        "      - /var/run/docker.sock:/var/run/docker.sock:ro\n"
+        "      - /opt/xyn/ingress/acme:/acme\n"
+        "    restart: unless-stopped\n"
+        "    networks:\n"
+        f"      - {network}\n"
+        "networks:\n"
+        f"  {network}:\n"
+        "    external: true\n"
     )
 
 
@@ -3177,7 +3288,11 @@ def _build_remote_pull_apply_commands(
     release_uuid: str,
     registry_region: str,
     registry_host: str,
+    fqdn: str,
     extra_env: Dict[str, str],
+    tls_mode: str = "none",
+    ingress_network: str = "xyn-edge",
+    acme_email: str = "",
 ) -> List[str]:
     env_exports = []
     for key, value in extra_env.items():
@@ -3197,6 +3312,22 @@ def _build_remote_pull_apply_commands(
     release_id_tmp = f"{release_id_path}.tmp"
     release_uuid_path = f"{root_dir}/release_uuid"
     release_uuid_tmp = f"{release_uuid_path}.tmp"
+    ingress_compose_path = "/opt/xyn/ingress/compose.ingress.yml"
+    safe_fqdn = str(fqdn or "").replace("\"", "\\\"")
+    ingress_mode = str(tls_mode or "none").strip().lower() == "host-ingress"
+    ingress_compose = _render_traefik_ingress_compose(ingress_network, acme_email)
+    ingress_cmds: List[str] = []
+    if ingress_mode:
+        ingress_cmds = [
+            f"docker network inspect {ingress_network} >/dev/null 2>&1 || docker network create {ingress_network}",
+            "mkdir -p /opt/xyn/ingress/acme",
+            "touch /opt/xyn/ingress/acme/acme.json",
+            "chmod 600 /opt/xyn/ingress/acme/acme.json",
+            f"cat <<'EOF' > \"{ingress_compose_path}\"\n{ingress_compose}\nEOF",
+            "PORT_OWNERS=$(docker ps --format '{{.Names}} {{.Ports}}' | grep -E '(:80->|:443->)' | awk '{print $1}' | grep -v '^xyn-ingress-traefik$' || true); "
+            "if [ -n \"$PORT_OWNERS\" ]; then echo \"ingress_port_collision:$PORT_OWNERS\"; exit 61; fi",
+            f"docker compose -f \"{ingress_compose_path}\" up -d",
+        ]
     return [
         "set -euo pipefail",
         "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
@@ -3218,11 +3349,21 @@ def _build_remote_pull_apply_commands(
         f"echo \"{release_uuid}\" > \"{release_uuid_tmp}\"",
         f"mv \"{release_uuid_tmp}\" \"{release_uuid_path}\"",
         f"aws ecr get-login-password --region {registry_region} | docker login --username AWS --password-stdin {registry_host}",
+        f"export EMS_FQDN=\"{safe_fqdn}\"",
         *env_exports,
+        *ingress_cmds,
         f"docker compose -f \"{compose_path}\" pull",
         f"docker compose -f \"{compose_path}\" up -d --remove-orphans",
-        "for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 2; done",
-        "for i in $(seq 1 30); do curl -fsS http://localhost:8080/api/health && break; sleep 2; done",
+        (
+            "for i in $(seq 1 60); do curl -fsS https://${EMS_FQDN}/health && break; sleep 5; done"
+            if ingress_mode
+            else "for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 2; done"
+        ),
+        (
+            "for i in $(seq 1 60); do curl -fsS https://${EMS_FQDN}/api/health && break; sleep 5; done"
+            if ingress_mode
+            else "for i in $(seq 1 30); do curl -fsS http://localhost:8080/api/health && break; sleep 2; done"
+        ),
     ]
 
 
@@ -4123,7 +4264,9 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     )
                     release_manifest["blueprint_id"] = blueprint_id or ""
                     release_manifest["release_target_id"] = (release_target or {}).get("id") or ""
-                    compose_content = _canonicalize_compose_content(_render_compose_for_images(images_map))
+                    compose_content = _canonicalize_compose_content(
+                        _render_compose_for_images(images_map, release_target)
+                    )
                     compose_hash = _sha256_hex(compose_content)
                     release_manifest["compose"] = {
                         "file_path": "compose.release.yml",
@@ -4652,7 +4795,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     if not compose_content and source_run:
                         compose_content = _download_artifact_text(source_run, "compose.release.yml")
                     if not compose_content:
-                        compose_content = _render_compose_for_images(images_map)
+                        compose_content = _render_compose_for_images(images_map, release_target)
                     compose_content = _canonicalize_compose_content(compose_content)
                     compose_hash = _sha256_hex(compose_content)
                     manifest_hash = _normalize_sha256(
@@ -4792,7 +4935,11 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             str(release_uuid or ""),
                             registry_region,
                             registry_host,
+                            fqdn,
                             effective_env,
+                            str(((release_target or {}).get("tls") or {}).get("mode") or "none"),
+                            str(((release_target or {}).get("ingress") or {}).get("network") or "xyn-edge"),
+                            str(((release_target or {}).get("tls") or {}).get("acme_email") or ""),
                         )
                         exec_result = _run_ssm_commands(
                             target_instance.get("instance_id"),

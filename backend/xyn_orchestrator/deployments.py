@@ -9,6 +9,7 @@ import requests
 from botocore.exceptions import ClientError
 from django.conf import settings
 from django.utils import timezone
+import yaml
 
 from .models import (
     Deployment,
@@ -180,6 +181,120 @@ def _write_deployment_artifact(deployment: Deployment, filename: str, content: s
 TLS_TASK_IDS = {"tls.acme_http01", "ingress.nginx_tls_configure", "verify.public_https"}
 
 
+def _is_host_ingress_target(release_target: Optional[ReleaseTarget]) -> bool:
+    tls = (release_target.tls_json if release_target else {}) or {}
+    return str(tls.get("mode") or "").strip().lower() == "host-ingress"
+
+
+def _render_traefik_ingress_compose(network: str, acme_email: str) -> str:
+    email = acme_email or "admin@xyence.io"
+    return (
+        "services:\n"
+        "  traefik:\n"
+        "    image: traefik:v3.1\n"
+        "    container_name: xyn-ingress-traefik\n"
+        "    command:\n"
+        "      - --providers.docker=true\n"
+        "      - --providers.docker.exposedbydefault=false\n"
+        "      - --entrypoints.web.address=:80\n"
+        "      - --entrypoints.websecure.address=:443\n"
+        "      - --entrypoints.web.http.redirections.entrypoint.to=websecure\n"
+        "      - --entrypoints.web.http.redirections.entrypoint.scheme=https\n"
+        f"      - --certificatesresolvers.le.acme.email={email}\n"
+        "      - --certificatesresolvers.le.acme.storage=/acme/acme.json\n"
+        "      - --certificatesresolvers.le.acme.httpchallenge=true\n"
+        "      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web\n"
+        "    ports:\n"
+        "      - \"80:80\"\n"
+        "      - \"443:443\"\n"
+        "    volumes:\n"
+        "      - /var/run/docker.sock:/var/run/docker.sock:ro\n"
+        "      - /opt/xyn/ingress/acme:/acme\n"
+        "    restart: unless-stopped\n"
+        "    networks:\n"
+        f"      - {network}\n"
+        "networks:\n"
+        f"  {network}:\n"
+        "    external: true\n"
+    )
+
+
+def _adapt_compose_for_host_ingress(compose_content: str, release_target: Optional[ReleaseTarget]) -> str:
+    if not compose_content:
+        return compose_content
+    try:
+        data = yaml.safe_load(compose_content) or {}
+    except Exception:
+        return compose_content
+    if not isinstance(data, dict):
+        return compose_content
+    services = data.get("services")
+    if not isinstance(services, dict):
+        return compose_content
+    ingress = ((release_target.config_json if release_target else {}) or {}).get("ingress") or {}
+    network = str(ingress.get("network") or "xyn-edge")
+    routes = ingress.get("routes") if isinstance(ingress.get("routes"), list) else []
+    ems_web = services.get("ems-web")
+    ems_api = services.get("ems-api")
+    if not isinstance(ems_web, dict):
+        return compose_content
+    if isinstance(ems_api, dict):
+        api_networks = ems_api.get("networks")
+        if not isinstance(api_networks, list):
+            api_networks = []
+        for required in ("default", network):
+            if required not in api_networks:
+                api_networks.append(required)
+        ems_api["networks"] = api_networks
+    ems_web.pop("ports", None)
+    networks = ems_web.get("networks")
+    if not isinstance(networks, list):
+        networks = []
+    for required in ("default", network):
+        if required not in networks:
+            networks.append(required)
+    ems_web["networks"] = networks
+    labels = ems_web.get("labels")
+    if not isinstance(labels, list):
+        labels = []
+    labels = [entry for entry in labels if isinstance(entry, str) and not entry.startswith("traefik.")]
+    route_entries = routes or [
+        {"host": (release_target.fqdn if release_target else "") or "ems.xyence.io", "service": "ems-web", "port": 3000}
+    ]
+    for route in route_entries:
+        if not isinstance(route, dict):
+            continue
+        service_name = str(route.get("service") or "ems-web")
+        if service_name != "ems-web":
+            continue
+        host = str(route.get("host") or "").strip()
+        if not host:
+            continue
+        rid = "".join(ch if ch.isalnum() else "-" for ch in host).strip("-").lower() or "ems"
+        port = int(route.get("port") or 3000)
+        labels.extend(
+            [
+                "traefik.enable=true",
+                f"traefik.http.routers.{rid}.rule=Host(`{host}`)",
+                f"traefik.http.routers.{rid}.entrypoints=websecure",
+                f"traefik.http.routers.{rid}.tls=true",
+                f"traefik.http.routers.{rid}.tls.certresolver=le",
+                f"traefik.http.services.{rid}.loadbalancer.server.port={port}",
+            ]
+        )
+    ems_web["labels"] = labels
+    top_networks = data.get("networks")
+    if not isinstance(top_networks, dict):
+        top_networks = {}
+    if network not in top_networks:
+        top_networks[network] = {"external": True}
+    data["networks"] = top_networks
+    try:
+        return yaml.safe_dump(data, sort_keys=False)
+    except Exception:
+        return compose_content
+
+
 def _resolve_release_target(release: Release, instance: ProvisionedInstance) -> Optional[ReleaseTarget]:
     if not release.blueprint_id:
         return None
@@ -207,13 +322,18 @@ def _plan_expects_tls(plan_json: Dict[str, Any], release_target: Optional[Releas
         return True
     if release_target and isinstance(release_target.tls_json, dict):
         mode = str((release_target.tls_json or {}).get("mode", "")).strip().lower()
-        return mode in {"nginx+acme", "acme_http01"}
+        return mode in {"nginx+acme", "acme_http01", "host-ingress"}
     return False
 
 
 def _lower_plan_steps(plan_json: Dict[str, Any], release_target: Optional[ReleaseTarget]) -> List[Dict[str, Any]]:
     steps = [step for step in (plan_json.get("steps") or []) if isinstance(step, dict)]
     if not _plan_expects_tls(plan_json, release_target):
+        return steps
+    if _is_host_ingress_target(release_target):
+        existing = {str(step.get("name", "")).strip() for step in steps}
+        if "verify_public_https" not in existing:
+            steps.append({"name": "verify_public_https", "commands": []})
         return steps
     existing = {str(step.get("name", "")).strip() for step in steps}
     for name in ["tls_acme_http01_issue", "ingress_nginx_tls_configure", "verify_public_https"]:
@@ -298,13 +418,19 @@ def _build_tls_steps(
 
 
 def _verify_public_https_from_backend(fqdn: str) -> tuple[bool, str]:
-    try:
-        response = requests.get(f"https://{fqdn}/health", timeout=15)
-    except requests.RequestException as exc:
-        return False, f"public_https_unreachable: {exc}"
-    if response.status_code != 200:
-        return False, f"public_https_bad_status:{response.status_code}"
-    return True, ""
+    last_err = ""
+    for _ in range(18):
+        try:
+            response = requests.get(f"https://{fqdn}/health", timeout=15)
+        except requests.RequestException as exc:
+            last_err = f"public_https_unreachable: {exc}"
+            time.sleep(10)
+            continue
+        if response.status_code == 200:
+            return True, ""
+        last_err = f"public_https_bad_status:{response.status_code}"
+        time.sleep(10)
+    return False, last_err
 
 
 def _extract_tls_error_code(stderr: str) -> str:
@@ -360,6 +486,8 @@ def execute_release_plan_deploy(
     acme_webroot = "/var/lib/xyn/ems/acme-webroot"
     try:
         if compose_content and compose_source == "release_artifact":
+            if _is_host_ingress_target(release_target):
+                compose_content = _adapt_compose_for_host_ingress(compose_content, release_target)
             digest = hashlib.sha256(compose_content.encode("utf-8")).hexdigest()
             _run_ssm_commands(
                 instance.instance_id,
@@ -386,6 +514,26 @@ def execute_release_plan_deploy(
                     + " /var/lib/xyn/ems",
                     "cp /var/lib/xyn/ems/compose.yml /var/lib/xyn/ems/docker-compose.yml",
                     "docker rm -f xyn-postgres xyn-redis xyn-core 2>/dev/null || true",
+                ],
+            )
+        if _is_host_ingress_target(release_target):
+            ingress = (release_target.config_json or {}).get("ingress") or {}
+            network = str(ingress.get("network") or "xyn-edge")
+            tls = (release_target.tls_json or {}) if release_target else {}
+            acme_email = str(tls.get("acme_email") or os.environ.get("XYENCE_ACME_EMAIL", "")).strip()
+            ingress_compose = _render_traefik_ingress_compose(network, acme_email)
+            _run_ssm_commands(
+                instance.instance_id,
+                instance.aws_region,
+                [
+                    f"docker network inspect {network} >/dev/null 2>&1 || docker network create {network}",
+                    "mkdir -p /opt/xyn/ingress/acme",
+                    "touch /opt/xyn/ingress/acme/acme.json",
+                    "chmod 600 /opt/xyn/ingress/acme/acme.json",
+                    f"cat > /opt/xyn/ingress/compose.ingress.yml <<'XYN_TRAEFIK'\n{ingress_compose}\nXYN_TRAEFIK",
+                    "PORT_OWNERS=$(docker ps --format '{{.Names}} {{.Ports}}' | grep -E '(:80->|:443->)' | awk '{print $1}' | grep -v '^xyn-ingress-traefik$' || true); "
+                    "if [ -n \"$PORT_OWNERS\" ]; then echo \"tls_error_code=ingress_port_collision\"; exit 61; fi",
+                    "docker compose -f /opt/xyn/ingress/compose.ingress.yml up -d",
                 ],
             )
         for step in steps:
@@ -496,7 +644,25 @@ def execute_release_plan_deploy(
         deployment.status = "succeeded"
     if deployment.status == "succeeded" and expects_tls:
         tls_mode = str(((release_target.tls_json if release_target else {}) or {}).get("mode", "nginx+acme")).lower()
-        if tls_mode not in {"nginx+acme", "acme_http01"}:
+        if tls_mode == "host-ingress":
+            fqdn = (release_target.fqdn if release_target else "") or os.environ.get("EMS_PUBLIC_FQDN", "")
+            if not fqdn:
+                deployment.status = "failed"
+                deployment.error_message = "tls_config_missing: fqdn required"
+                execution["status"] = "failed"
+                execution["error"] = {"code": "tls_config_missing", "message": deployment.error_message}
+            else:
+                ok, detail = _verify_public_https_from_backend(fqdn)
+                if not ok:
+                    deployment.status = "failed"
+                    deployment.error_message = f"verify_public_https_failed: {detail}"
+                    execution["status"] = "failed"
+                    execution["error"] = {
+                        "code": "verify_public_https_failed",
+                        "message": "Public HTTPS verification failed",
+                        "detail": detail,
+                    }
+        elif tls_mode not in {"nginx+acme", "acme_http01"}:
             deployment.status = "failed"
             deployment.error_message = "tls_not_supported: unsupported tls mode"
             execution["status"] = "failed"

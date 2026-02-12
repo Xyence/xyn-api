@@ -62,9 +62,35 @@
       "type": "object",
       "required": ["mode"],
       "properties": {
-        "mode": { "type": "string", "enum": ["none", "nginx+acme"] },
+        "mode": { "type": "string", "enum": ["none", "nginx+acme", "host-ingress", "embedded"] },
+        "termination": { "type": "string", "enum": ["host", "app"] },
+        "provider": { "type": "string", "enum": ["traefik", "nginx"] },
         "acme_email": { "type": "string" },
+        "expose_http": { "type": "boolean" },
+        "expose_https": { "type": "boolean" },
         "redirect_http_to_https": { "type": "boolean", "default": true }
+      },
+      "additionalProperties": true
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "network": { "type": "string" },
+        "routes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["host", "service", "port"],
+            "properties": {
+              "host": { "type": "string", "minLength": 1 },
+              "service": { "type": "string", "minLength": 1 },
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "protocol": { "type": "string", "enum": ["http", "https"] },
+              "health_path": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        }
       },
       "additionalProperties": true
     },
@@ -105,6 +131,28 @@
         "properties": {
           "runtime": {
             "required": ["mode"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "tls": {
+            "properties": {
+              "mode": { "const": "host-ingress" }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": ["ingress"],
+        "properties": {
+          "tls": {
+            "required": ["acme_email"]
+          },
+          "ingress": {
+            "required": ["routes"]
           }
         }
       }

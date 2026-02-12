@@ -31,6 +31,34 @@ class DeploymentTlsTests(TestCase):
         self.assertIn("ingress_nginx_tls_configure", names)
         self.assertIn("verify_public_https", names)
 
+    def test_lowering_host_ingress_only_adds_https_verify_step(self):
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        instance = ProvisionedInstance.objects.create(
+            name="seed",
+            aws_region="us-west-2",
+            instance_id="i-123",
+            instance_type="t3",
+            ami_id="ami-123",
+        )
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="ems.xyence.io",
+            target_instance=instance,
+            target_instance_ref=str(instance.id),
+            fqdn="ems.xyence.io",
+            tls_json={"mode": "host-ingress", "acme_email": "admin@xyence.io"},
+            config_json={"ingress": {"network": "xyn-edge", "routes": [{"host": "ems.xyence.io", "service": "ems-web", "port": 3000}]}},
+        )
+        plan = {
+            "steps": [{"name": "deploy", "commands": ["echo ok"]}],
+            "tasks": [{"id": "tls.acme_http01"}, {"id": "verify.public_https"}],
+        }
+        lowered = _lower_plan_steps(plan, target)
+        names = [item.get("name") for item in lowered]
+        self.assertIn("deploy", names)
+        self.assertIn("verify_public_https", names)
+        self.assertNotIn("tls_acme_http01_issue", names)
+
     def test_extract_tls_error_code_maps_acme_connection_refused(self):
         stderr = (
             "Could not obtain certificates:\n"

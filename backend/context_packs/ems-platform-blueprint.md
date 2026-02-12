@@ -10,7 +10,7 @@ Project Key: core.ems.platform
 - Manager demo env + operator single-tenant env
 
 ## Constraints/Defaults
-- TLS: nginx + ACME
+- TLS: host-ingress (Traefik + ACME HTTP-01)
 - AuthN: OIDC (default Google for MVP), config-driven
 - Auth tokens: JWT between React UI and API
 - AuthZ: RBAC (Admin/Operator/Viewer), plus platform-level roles (Provider/Manager/Operator)
@@ -28,11 +28,11 @@ Project Key: core.ems.platform
 - operator-example: ems-operator-example.<base_domain>
 
 ## Modules Required (Scaffold)
-- app-web-stack, authn-oidc, authz-rbac, ingress-nginx-acme, dns-route53
+- app-web-stack, authn-oidc, authz-rbac, ingress-traefik-acme, dns-route53
 - mikrotik-mgmt, poncan-mgmt, voltha-integration, oktopus-integration (scaffold only)
 
 ## Acceptance Checks
-- HTTPS login works (ACME)
+- HTTPS login works (Traefik ACME)
 - OIDC login works
 - JWT minted/accepted by API
 - RBAC works (admin CRUD, viewer reports-only)

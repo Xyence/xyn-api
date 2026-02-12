@@ -27,11 +27,14 @@ ReleaseSpec must include:
 - `auth`: OIDC provider and client configuration placeholders
 - `rbac`: role list and policy summary
 - `compose`: docker-compose stack definitions
+- `tls.mode`: `host-ingress` or `embedded`
+- `ingress.routes[]`: host -> service -> port mapping (voice-friendly intent)
 
 ## ReleasePlan Rules
 - Produce steps oriented around SSM + docker-compose.
 - Steps must be deterministic and actionable.
 - Do not include placeholder commands like `uname -a` unless `smoke_test=true` is explicitly set.
+- In `host-ingress` mode, apps do not bind host `80/443`; ingress stack owns those ports.
 
 ## Guardrails
 - Planner produces plans/specs only. Do not write repo files.
