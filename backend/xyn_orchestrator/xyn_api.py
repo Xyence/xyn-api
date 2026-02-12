@@ -1457,10 +1457,6 @@ def _validate_branding_payload(payload: Dict[str, Any], partial: bool = True) ->
 
 
 def _default_post_login_redirect(client: Optional[AppOIDCClient], app_id: str) -> str:
-    if client:
-        post_logout = client.post_logout_redirect_uris_json or []
-        if post_logout:
-            return str(post_logout[0])
     if app_id == "xyn-ui":
         return "/app"
     return "/"

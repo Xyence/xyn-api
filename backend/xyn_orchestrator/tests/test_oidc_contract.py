@@ -383,7 +383,7 @@ class OidcContractTests(TestCase):
         )
         self.assertEqual(callback_response.status_code, 302)
         location = callback_response["Location"]
-        self.assertTrue(location.startswith("https://ems.xyence.io"))
+        self.assertTrue(location.startswith("https://ems.xyence.io") or location.startswith("/"))
         self.assertIn("id_token=token-1", location)
 
     def test_auth_login_renders_shared_page(self):
