@@ -2463,16 +2463,19 @@ export function readIdTokenFromHash(hash: string): string {
 
 def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dict[str, Any]:
     ssm = boto3.client("ssm", region_name=region)
+    max_wait_seconds = int(os.environ.get("XYENCE_SSM_WAIT_SECONDS", "600") or "600")
     cmd = ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
         Parameters={"commands": commands},
+        TimeoutSeconds=max_wait_seconds,
     )
     command_id = cmd["Command"]["CommandId"]
     out: Optional[Dict[str, Any]] = None
     last_error: Optional[Exception] = None
     started_at = datetime.utcnow().isoformat() + "Z"
-    for _ in range(30):
+    polls = max(1, max_wait_seconds // 2)
+    for _ in range(polls):
         try:
             out = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
         except ClientError as exc:
@@ -2485,6 +2488,13 @@ def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dic
         time.sleep(2)
     if out is None:
         raise last_error or RuntimeError("SSM command invocation not found yet")
+    if out.get("Status") not in {"Success", "Failed", "TimedOut", "Cancelled"}:
+        out["Status"] = "TimedOut"
+        out["ResponseCode"] = -1
+        out["StandardErrorContent"] = (
+            (out.get("StandardErrorContent") or "")
+            + f"\nSSM command did not complete within {max_wait_seconds}s."
+        ).strip()
     finished_at = datetime.utcnow().isoformat() + "Z"
     stdout = (out.get("StandardOutputContent") or "")[-4000:]
     stderr = (out.get("StandardErrorContent") or "")[-4000:]
