@@ -4556,6 +4556,8 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "runtime.compose.pull_apply_remote",
             ):
                 deploy_started = datetime.utcnow().isoformat() + "Z"
+                release_uuid = (work_item.get("config") or {}).get("release_uuid") or ""
+                release_version = (work_item.get("config") or {}).get("release_version") or ""
                 try:
                     if not target_instance or not target_instance.get("instance_id"):
                         raise RuntimeError("Target instance missing for remote deploy")
@@ -5217,7 +5219,11 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             )
             _post_json(
                 f"/xyn/internal/runs/{run_id}",
-                {"status": "succeeded" if success else "failed", "append_log": "Codegen task completed.\n"},
+                {
+                    "status": "succeeded" if success else "failed",
+                    "error": "" if success else (errors[0].get("message") if errors else "Codegen failed"),
+                    "append_log": f"Codegen task finished: {'SUCCEEDED' if success else 'FAILED'}.\n",
+                },
             )
             _post_json(
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
