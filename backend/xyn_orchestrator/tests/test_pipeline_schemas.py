@@ -1078,6 +1078,7 @@ class PipelineSchemaTests(TestCase):
             },
         )
         self.assertNotIn("${EMS_PUBLIC_TLS_PORT:-443}:8443", content)
+        self.assertIn("traefik.docker.network=xyn-edge", content)
         self.assertIn("traefik.http.routers.ems-xyence-io.rule=Host(`ems.xyence.io`)", content)
         self.assertIn("external: true", content)
 

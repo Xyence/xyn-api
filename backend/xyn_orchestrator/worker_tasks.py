@@ -3163,6 +3163,7 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target
         route_labels += (
             "    labels:\n"
             "      - \"traefik.enable=true\"\n"
+            f"      - \"traefik.docker.network={route_network}\"\n"
             f"      - \"traefik.http.routers.{rid}.rule=Host(`{host}`)\"\n"
             f"      - \"traefik.http.routers.{rid}.entrypoints=websecure\"\n"
             f"      - \"traefik.http.routers.{rid}.tls=true\"\n"
@@ -3198,6 +3199,7 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target
             route_labels = (
                 "    labels:\n"
                 "      - \"traefik.enable=true\"\n"
+                f"      - \"traefik.docker.network={route_network}\"\n"
                 "      - \"traefik.http.routers.ems.rule=Host(`${EMS_FQDN:-ems.xyence.io}`)\"\n"
                 "      - \"traefik.http.routers.ems.entrypoints=websecure\"\n"
                 "      - \"traefik.http.routers.ems.tls=true\"\n"

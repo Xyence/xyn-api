@@ -275,6 +275,7 @@ def _adapt_compose_for_host_ingress(compose_content: str, release_target: Option
         labels.extend(
             [
                 "traefik.enable=true",
+                f"traefik.docker.network={network}",
                 f"traefik.http.routers.{rid}.rule=Host(`{host}`)",
                 f"traefik.http.routers.{rid}.entrypoints=websecure",
                 f"traefik.http.routers.{rid}.tls=true",

@@ -173,9 +173,14 @@ def _run_ssm_commands(instance: ProvisionedInstance, commands: List[str]) -> Dic
     except (BotoCoreError, ClientError) as exc:
         message = f"SSM send_command failed: {exc}"
         if "InvalidInstanceId" in str(exc):
+            try:
+                instance = refresh_instance(instance)
+            except Exception:
+                pass
             message = (
                 f"{message}. Instance record={instance.id} "
-                f"ec2_instance_id={instance.instance_id or 'n/a'} region={instance.aws_region or 'n/a'}"
+                f"ec2_instance_id={instance.instance_id or 'n/a'} region={instance.aws_region or 'n/a'} "
+                f"status={instance.status or 'unknown'} ssm_status={instance.ssm_status or 'unknown'}"
             )
         raise RuntimeError(message) from exc
     command_id = cmd["Command"]["CommandId"]
@@ -221,6 +226,24 @@ def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResp
                 },
                 status=400,
             )
+    try:
+        instance = refresh_instance(instance)
+    except Exception:
+        # Best-effort refresh; if it fails we'll still attempt SSM below.
+        pass
+    non_runnable_statuses = {"terminated", "terminating"}
+    if (instance.status or "").lower() in non_runnable_statuses:
+        return JsonResponse(
+            {
+                "instance_id": str(instance.id),
+                "name": instance.name,
+                "aws_instance_id": instance.instance_id,
+                "status": instance.status,
+                "ssm_status": instance.ssm_status,
+                "error": "Instance is not in a runnable state for SSM container inspection.",
+            },
+            status=409,
+        )
     try:
         result = _run_ssm_commands(
             instance,
