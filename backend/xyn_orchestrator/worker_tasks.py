@@ -245,10 +245,17 @@ def _list_changed_files(repo_dir: str) -> List[str]:
 
 
 def _mark_noop_codegen(
-    changes_made: bool, work_item_id: str, errors: List[Dict[str, Any]], verify_ok: bool
+    changes_made: bool,
+    work_item_id: str,
+    errors: List[Dict[str, Any]],
+    verify_ok: bool,
+    *,
+    treat_noop_as_error: bool = True,
 ) -> tuple[bool, bool]:
     if changes_made:
         return True, False
+    if not treat_noop_as_error:
+        return verify_ok, True
     errors.append(
         {
             "code": "no_changes",
@@ -5172,7 +5179,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         "branch": branch,
                         "pushed": pushed,
                     }
-            success, noop = _mark_noop_codegen(changes_made, work_item_id, errors, success)
+            treat_noop_as_error = work_item.get("type") != "deploy"
+            success, noop = _mark_noop_codegen(
+                changes_made,
+                work_item_id,
+                errors,
+                success,
+                treat_noop_as_error=treat_noop_as_error,
+            )
             result = {
                 "schema_version": "codegen_result.v1",
                 "task_id": task_id,
