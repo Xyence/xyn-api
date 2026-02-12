@@ -453,6 +453,7 @@ def _release_target_payload(target: ReleaseTarget) -> Dict[str, Any]:
     dns = target.dns_json or {}
     runtime = target.runtime_json or {}
     tls = target.tls_json or {}
+    ingress = (target.config_json or {}).get("ingress") or {}
     env = target.env_json or {}
     secret_refs = target.secret_refs_json or []
     payload = {
@@ -470,6 +471,7 @@ def _release_target_payload(target: ReleaseTarget) -> Dict[str, Any]:
         "dns": dns,
         "runtime": runtime,
         "tls": tls,
+        "ingress": ingress,
         "env": env,
         "secret_refs": secret_refs,
         "created_at": target.created_at.isoformat() if target.created_at else now,
@@ -739,7 +741,8 @@ def _acceptance_checks_for_blueprint(
             env = environments[0] if isinstance(environments[0], dict) else {}
             deploy_fqdn = env.get("fqdn")
     remote_enabled = bool(deploy_target and deploy_fqdn)
-    tls_enabled = str(tls_meta.get("mode") or "").lower() in {"nginx+acme", "acme", "letsencrypt"}
+    tls_mode = str(tls_meta.get("mode") or "").lower()
+    tls_enabled = tls_mode in {"nginx+acme", "acme", "letsencrypt", "host-ingress", "embedded"}
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     if blueprint_fqn == "core.ems.platform":
         checks = {
@@ -764,21 +767,35 @@ def _acceptance_checks_for_blueprint(
                 ]
         if remote_enabled and tls_enabled:
             if image_deploy_enabled:
-                checks["remote_https_health"] = [
-                    "build.publish_images.container",
-                    "dns.ensure_record.route53",
-                    "deploy.apply_remote_compose.pull",
-                    "verify.public_http",
-                    "tls.acme_http01",
-                    "ingress.nginx_tls_configure",
-                    "verify.public_https",
-                ]
+                checks["remote_https_health"] = (
+                    [
+                        "build.publish_images.container",
+                        "dns.ensure_record.route53",
+                        "deploy.apply_remote_compose.pull",
+                        "verify.public_http",
+                        "verify.public_https",
+                    ]
+                    if tls_mode == "host-ingress"
+                    else [
+                        "build.publish_images.container",
+                        "dns.ensure_record.route53",
+                        "deploy.apply_remote_compose.pull",
+                        "verify.public_http",
+                        "tls.acme_http01",
+                        "ingress.nginx_tls_configure",
+                        "verify.public_https",
+                    ]
+                )
             else:
-                checks["remote_https_health"] = [
-                    "tls.acme_http01",
-                    "ingress.nginx_tls_configure",
-                    "verify.public_https",
-                ]
+                checks["remote_https_health"] = (
+                    ["verify.public_https"]
+                    if tls_mode == "host-ingress"
+                    else [
+                        "tls.acme_http01",
+                        "ingress.nginx_tls_configure",
+                        "verify.public_https",
+                    ]
+                )
         return checks
     return {}
 
@@ -1013,6 +1030,7 @@ def _select_next_slice(
 def _annotate_work_items(
     work_items: List[Dict[str, Any]],
     module_catalog: Dict[str, Any],
+    preferred_ingress_module: str = "ingress-nginx-acme",
 ) -> None:
     module_versions = {m["id"]: m.get("version", "0.1.0") for m in module_catalog.get("modules", [])}
     work_item_caps = {
@@ -1036,6 +1054,7 @@ def _annotate_work_items(
         "dns-route53-module": ["dns.route53.records"],
         "deploy-ssm-compose-module": ["runtime.compose.apply_remote"],
         "ingress-nginx-acme-module": ["ingress.tls.acme_http01"],
+        "ingress-traefik-acme-module": ["ingress.tls.acme_http01"],
         "build-container-publish-module": ["build.container.image", "publish.container.registry"],
         "runtime-compose-pull-apply-module": ["runtime.compose.pull_apply_remote"],
         "dns-route53-ensure-record": ["dns.route53.records"],
@@ -1075,6 +1094,7 @@ def _annotate_work_items(
         "dns-route53-module": ["dns-route53"],
         "deploy-ssm-compose-module": ["deploy-ssm-compose"],
         "ingress-nginx-acme-module": ["ingress-nginx-acme"],
+        "ingress-traefik-acme-module": ["ingress-traefik-acme"],
         "build-container-publish-module": ["build-container-publish"],
         "runtime-compose-pull-apply-module": ["runtime-compose-pull-apply"],
         "dns-route53-ensure-record": ["dns-route53"],
@@ -1086,12 +1106,12 @@ def _annotate_work_items(
         "deploy.apply_remote_compose.pull": ["runtime-compose-pull-apply"],
         "remote-deploy-verify-public": ["deploy-ssm-compose"],
         "verify.public_http": ["deploy-ssm-compose"],
-        "tls-acme-bootstrap": ["ingress-nginx-acme"],
-        "tls.acme_http01": ["ingress-nginx-acme"],
-        "tls-nginx-configure": ["ingress-nginx-acme"],
-        "ingress.nginx_tls_configure": ["ingress-nginx-acme"],
-        "remote-deploy-verify-https": ["ingress-nginx-acme"],
-        "verify.public_https": ["ingress-nginx-acme"],
+        "tls-acme-bootstrap": [preferred_ingress_module],
+        "tls.acme_http01": [preferred_ingress_module],
+        "tls-nginx-configure": [preferred_ingress_module],
+        "ingress.nginx_tls_configure": [preferred_ingress_module],
+        "remote-deploy-verify-https": [preferred_ingress_module],
+        "verify.public_https": [preferred_ingress_module],
     }
     for item in work_items:
         item_id = item.get("id")
@@ -1966,7 +1986,7 @@ def _generate_implementation_plan(
         dns_provider = release_dns.get("provider") or dns_provider
     route53_requested = dns_provider == "route53" or "dns-route53" in modules_required
     deploy_ssm_requested = "deploy-ssm-compose" in modules_required
-    tls_acme_requested = "ingress-nginx-acme" in modules_required
+    tls_acme_requested = any(module in modules_required for module in ("ingress-nginx-acme", "ingress-traefik-acme"))
     runtime_requested = "runtime-web-static-nginx" in modules_required
     image_deploy_requested = image_deploy_enabled or "build-container-publish" in modules_required or "runtime-compose-pull-apply" in modules_required
     if not runtime_requested:
@@ -1991,10 +2011,11 @@ def _generate_implementation_plan(
             except TypeError:
                 metadata_blob = str(metadata).lower()
             deploy_ssm_requested = "ssm" in metadata_blob
+    tls_meta = release_tls or (metadata.get("tls") or {})
+    tls_mode = str(tls_meta.get("mode") or "").lower()
+    preferred_ingress_module = "ingress-traefik-acme" if tls_mode == "host-ingress" else "ingress-nginx-acme"
     if not tls_acme_requested:
-        tls_meta = release_tls or (metadata.get("tls") or {})
-        tls_mode = str(tls_meta.get("mode") or "").lower()
-        tls_acme_requested = tls_mode in {"nginx+acme", "acme", "letsencrypt"}
+        tls_acme_requested = tls_mode in {"nginx+acme", "acme", "letsencrypt", "host-ingress"}
     if image_deploy_enabled and blueprint_fqn == "core.ems.platform":
         work_items = [item for item in work_items if item.get("id") != "deploy.apply_remote_compose.ssm"]
         for item in work_items:
@@ -2179,14 +2200,26 @@ def _generate_implementation_plan(
                     ],
                 },
             )
-    if tls_acme_requested and "ingress-nginx-acme" not in module_ids:
-        if not any(item.get("id") == "ingress-nginx-acme-module" for item in work_items):
+    ingress_module_item_id = f"{preferred_ingress_module}-module"
+    ingress_module_spec_path = f"backend/registry/modules/{preferred_ingress_module}.json"
+    ingress_module_title = (
+        "Ingress traefik ACME module scaffold"
+        if preferred_ingress_module == "ingress-traefik-acme"
+        else "Ingress nginx ACME module scaffold"
+    )
+    ingress_module_description = (
+        "Register Traefik+ACME ingress module spec in the local registry."
+        if preferred_ingress_module == "ingress-traefik-acme"
+        else "Register nginx+ACME ingress module spec in the local registry."
+    )
+    if tls_acme_requested and preferred_ingress_module not in module_ids:
+        if not any(item.get("id") == ingress_module_item_id for item in work_items):
             work_items.insert(
                 0,
                 {
-                    "id": "ingress-nginx-acme-module",
-                    "title": "Ingress nginx ACME module scaffold",
-                    "description": "Register nginx+ACME ingress module spec in the local registry.",
+                    "id": ingress_module_item_id,
+                    "title": ingress_module_title,
+                    "description": ingress_module_description,
                     "type": "scaffold",
                     "repo_targets": [
                         {
@@ -2199,12 +2232,12 @@ def _generate_implementation_plan(
                         }
                     ],
                     "inputs": {"artifacts": ["implementation_plan.json"]},
-                    "outputs": {"paths": ["backend/registry/modules/ingress-nginx-acme.json"]},
-                    "acceptance_criteria": ["Ingress nginx ACME module spec exists in module registry."],
+                    "outputs": {"paths": [ingress_module_spec_path]},
+                    "acceptance_criteria": [f"Ingress module spec {preferred_ingress_module} exists in module registry."],
                     "verify": [
                         {
                             "name": "module-spec",
-                            "command": "test -f backend/registry/modules/ingress-nginx-acme.json",
+                            "command": f"test -f {ingress_module_spec_path}",
                             "cwd": ".",
                         }
                     ],
@@ -2212,7 +2245,7 @@ def _generate_implementation_plan(
                     "labels": [
                         "module",
                         "ingress",
-                        "module:ingress-nginx-acme",
+                        f"module:{preferred_ingress_module}",
                         "capability:ingress.tls.acme_http01",
                     ],
                 },
@@ -2307,7 +2340,7 @@ def _generate_implementation_plan(
     if run_history_summary.get("acceptance_checks_status"):
         work_items, plan_rationale = _select_next_slice(blueprint, work_items, run_history_summary)
 
-    _annotate_work_items(work_items, module_catalog)
+    _annotate_work_items(work_items, module_catalog, preferred_ingress_module=preferred_ingress_module)
     modules_selected = sorted(
         {
             ref.get("id")
@@ -2322,8 +2355,8 @@ def _generate_implementation_plan(
         plan_rationale.setdefault("modules_selected", []).append("dns-route53")
     if deploy_ssm_requested and "deploy-ssm-compose" not in plan_rationale.get("modules_selected", []):
         plan_rationale.setdefault("modules_selected", []).append("deploy-ssm-compose")
-    if tls_acme_requested and "ingress-nginx-acme" not in plan_rationale.get("modules_selected", []):
-        plan_rationale.setdefault("modules_selected", []).append("ingress-nginx-acme")
+    if tls_acme_requested and preferred_ingress_module not in plan_rationale.get("modules_selected", []):
+        plan_rationale.setdefault("modules_selected", []).append(preferred_ingress_module)
     if runtime_requested and "runtime-web-static-nginx" not in plan_rationale.get("modules_selected", []):
         plan_rationale.setdefault("modules_selected", []).append("runtime-web-static-nginx")
 

@@ -43,6 +43,7 @@ from xyn_orchestrator.worker_tasks import (
     _build_deploy_manifest,
     _build_deploy_state_metadata,
     _build_remote_pull_apply_commands,
+    _render_compose_for_images,
     _build_ssm_service_digest_commands,
     _parse_service_digest_lines,
     _merge_release_env,
@@ -1032,12 +1033,53 @@ class PipelineSchemaTests(TestCase):
             "rel-uuid-1",
             "us-west-2",
             "123456789012.dkr.ecr.us-west-2.amazonaws.com",
+            "ems.xyence.io",
             {},
         )
         joined = "\n".join(commands)
         self.assertIn("release_manifest.json", joined)
         self.assertIn("release_manifest.sha256", joined)
         self.assertIn("release_id", joined)
+
+    def test_runtime_marker_commands_include_traefik_ingress_for_host_mode(self):
+        commands = _build_remote_pull_apply_commands(
+            "/opt/xyn/apps/ems",
+            "services:\n  ems-api:\n    image: test\n",
+            "deadbeef",
+            "{\"schema_version\":\"release_manifest.v1\"}",
+            "bead",
+            "rel-1",
+            "rel-uuid-1",
+            "us-west-2",
+            "123456789012.dkr.ecr.us-west-2.amazonaws.com",
+            "ems.xyence.io",
+            {},
+            "host-ingress",
+            "xyn-edge",
+            "admin@xyence.io",
+        )
+        joined = "\n".join(commands)
+        self.assertIn("compose.ingress.yml", joined)
+        self.assertIn("docker network inspect xyn-edge", joined)
+        self.assertIn("ingress_port_collision", joined)
+
+    def test_render_compose_for_images_host_ingress_adds_labels_and_no_host_ports(self):
+        content = _render_compose_for_images(
+            {
+                "ems-api": {"image_uri": "repo/ems-api:v40"},
+                "ems-web": {"image_uri": "repo/ems-web:v40"},
+            },
+            {
+                "tls": {"mode": "host-ingress"},
+                "ingress": {
+                    "network": "xyn-edge",
+                    "routes": [{"host": "ems.xyence.io", "service": "ems-web", "port": 3000}],
+                },
+            },
+        )
+        self.assertNotIn("${EMS_PUBLIC_TLS_PORT:-443}:8443", content)
+        self.assertIn("traefik.http.routers.ems-xyence-io.rule=Host(`ems.xyence.io`)", content)
+        self.assertIn("external: true", content)
 
     def test_ssm_service_digest_commands_include_label_filter(self):
         commands = _build_ssm_service_digest_commands(["api", "web"])
@@ -1050,6 +1092,25 @@ class PipelineSchemaTests(TestCase):
         parsed = _parse_service_digest_lines(lines)
         self.assertEqual(parsed["api"], "sha256:" + "a" * 64)
         self.assertEqual(parsed["web"], "sha256:" + "b" * 64)
+
+    def test_release_target_host_ingress_requires_routes(self):
+        payload = {
+            "schema_version": "release_target.v1",
+            "id": str(uuid.uuid4()),
+            "blueprint_id": str(uuid.uuid4()),
+            "name": "dev-target",
+            "environment": "dev",
+            "target_instance_id": str(uuid.uuid4()),
+            "fqdn": "ems.xyence.io",
+            "dns": {"provider": "route53"},
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "tls": {"mode": "host-ingress", "provider": "traefik", "acme_email": "admin@xyence.io"},
+            "ingress": {"network": "xyn-edge", "routes": []},
+            "created_at": "2026-02-12T00:00:00Z",
+            "updated_at": "2026-02-12T00:00:00Z",
+        }
+        errors = _validate_release_target_payload(payload)
+        self.assertTrue(any("ingress.routes" in err for err in errors))
 
     def test_release_upsert_and_resolve(self):
         os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
@@ -1418,6 +1479,30 @@ class PipelineSchemaTests(TestCase):
         }
         self.assertIn("ingress-nginx-acme", module_ids)
 
+    def test_planner_selects_traefik_module_for_host_ingress(self):
+        blueprint = Blueprint.objects.create(
+            name="ems.platform",
+            namespace="core",
+            metadata_json={
+                "dns_provider": "route53",
+                "deploy": {"target_instance_id": str(uuid.uuid4()), "primary_fqdn": "bedrock.xyence.io"},
+                "tls": {"mode": "host-ingress", "provider": "traefik", "acme_email": "admin@xyence.io"},
+            },
+        )
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=_build_module_catalog(),
+            run_history_summary=_build_run_history_summary(blueprint),
+        )
+        module_ids = {
+            ref.get("id")
+            for item in plan.get("work_items", [])
+            for ref in item.get("module_refs", [])
+            if isinstance(ref, dict)
+        }
+        self.assertIn("ingress-traefik-acme", module_ids)
+        self.assertNotIn("ingress-nginx-acme", module_ids)
+
     def test_planner_uses_release_target_for_remote_slices(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})
         target = ReleaseTarget.objects.create(
@@ -1542,6 +1627,19 @@ class PipelineSchemaTests(TestCase):
         module_spec = data.get("module", {})
         self.assertIn("ingress.tls.acme_http01", module_spec.get("capabilitiesProvided", []))
         self.assertIn("ingress.nginx.reverse_proxy", module_spec.get("capabilitiesProvided", []))
+
+    def test_ingress_traefik_acme_module_spec_fields(self):
+        spec_path = (
+            Path(__file__).resolve().parents[2] / "registry" / "modules" / "ingress-traefik-acme.json"
+        )
+        data = json.loads(spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("kind"), "Module")
+        metadata = data.get("metadata", {})
+        self.assertEqual(metadata.get("name"), "ingress-traefik-acme")
+        self.assertEqual(metadata.get("namespace"), "core")
+        module_spec = data.get("module", {})
+        self.assertIn("ingress.tls.acme_http01", module_spec.get("capabilitiesProvided", []))
+        self.assertIn("ingress.traefik.reverse_proxy", module_spec.get("capabilitiesProvided", []))
 
     def test_prod_web_scaffold_outputs(self):
         work_item = {

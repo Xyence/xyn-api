@@ -1,0 +1,43 @@
+{
+  "apiVersion": "xyn.module/v1",
+  "kind": "Module",
+  "metadata": {
+    "name": "ingress-traefik-acme",
+    "namespace": "core",
+    "version": "0.1.0",
+    "labels": {
+      "capability": "ingress.tls.acme_http01"
+    }
+  },
+  "description": "Traefik host ingress with ACME HTTP-01 TLS provisioning.",
+  "module": {
+    "type": "lib",
+    "fqn": "core.ingress-traefik-acme",
+    "capabilitiesProvided": [
+      "ingress.tls.acme_http01",
+      "ingress.traefik.reverse_proxy",
+      "ingress.traefik.tls_configure"
+    ],
+    "interfaces": {
+      "config": {
+        "fqdns": "List of FQDNs to provision certificates for.",
+        "acme_email": "Email for Let's Encrypt registration.",
+        "edge_network": "Shared external docker network used by ingress and app stacks (default: xyn-edge).",
+        "ingress_root": "Ingress compose root path (default: /opt/xyn/ingress).",
+        "acme_storage": "ACME state path (default: /opt/xyn/ingress/acme/acme.json).",
+        "entrypoints": "Traefik entrypoints used for HTTP/HTTPS routing (default: web,websecure)."
+      },
+      "operations": {
+        "ensure_ingress_stack": "Create shared network and start Traefik ingress stack.",
+        "ensure_acme_cert": "Issue or renew certificates via ACME HTTP-01.",
+        "configure_routers": "Attach route labels and TLS resolver to app services.",
+        "verify_https": "Verify HTTPS endpoints after deploy."
+      }
+    },
+    "constraints": {
+      "secrets": "No inline secrets; use environment or secret refs.",
+      "tls": "HTTP-01 challenge requires inbound port 80 reachable.",
+      "ports": "Host ports 80/443 must be owned by ingress stack in host-ingress mode."
+    }
+  }
+}
