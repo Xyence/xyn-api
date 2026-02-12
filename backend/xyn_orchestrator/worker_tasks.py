@@ -255,7 +255,10 @@ def _mark_noop_codegen(
     if changes_made:
         return True, False
     if not treat_noop_as_error:
-        return verify_ok, True
+        # For deploy-style work items, "noop" is only valid when the task actually succeeded.
+        if verify_ok:
+            return True, True
+        return False, False
     errors.append(
         {
             "code": "no_changes",
@@ -4484,12 +4487,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         if not ssm_ok:
                             success = False
                             preflight_ok, _, preflight_code = _ssm_preflight_check(exec_result)
+                            error_detail = _redact_secrets(exec_result.get("stderr", "") or "", secret_values)
+                            top_error_code = preflight_code or ("ssm_preflight_failed" if not preflight_ok else "ssm_failed")
                             if preflight_code:
                                 deploy_result.setdefault("errors", []).append(
                                     {
                                         "code": preflight_code,
                                         "message": "SSM preflight failed",
-                                        "detail": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
+                                        "detail": error_detail,
                                     }
                                 )
                             elif not preflight_ok:
@@ -4497,14 +4502,21 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                     {
                                         "code": "ssm_preflight_failed",
                                         "message": "SSM preflight failed",
-                                        "detail": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
+                                        "detail": error_detail,
                                     }
                                 )
                             deploy_result.setdefault("errors", []).append(
                                 {
                                     "code": "ssm_failed",
                                     "message": "SSM command failed",
-                                    "detail": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
+                                    "detail": error_detail,
+                                }
+                            )
+                            errors.append(
+                                {
+                                    "code": top_error_code,
+                                    "message": "Remote deploy via SSM failed.",
+                                    "detail": {"error": error_detail},
                                 }
                             )
                         deploy_url = _write_artifact(
@@ -4814,11 +4826,19 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             )
                         if exec_result.get("invocation_status") != "Success":
                             success = False
+                            error_detail = _redact_secrets(exec_result.get("stderr", "") or "", secret_values)
                             deploy_result.setdefault("errors", []).append(
                                 {
                                     "code": "ssm_failed",
                                     "message": "SSM command failed",
-                                    "detail": _redact_secrets(exec_result.get("stderr", "") or "", secret_values),
+                                    "detail": error_detail,
+                                }
+                            )
+                            errors.append(
+                                {
+                                    "code": "ssm_failed",
+                                    "message": "Remote deploy via image pull failed.",
+                                    "detail": {"error": error_detail},
                                 }
                             )
                         deploy_url = _write_artifact(
