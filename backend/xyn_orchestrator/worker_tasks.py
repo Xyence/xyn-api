@@ -798,7 +798,7 @@ EMS_PUBLIC_TLS_PORT=443
       - "${EMS_PUBLIC_TLS_PORT:-443}:8443"
     volumes:
       - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme
-      - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro
+      - ${EMS_CERTS_PATH:-./certs/current}:/etc/nginx/certs/current:ro
     depends_on:
       - ems-api
 
@@ -1823,7 +1823,7 @@ EMS_PUBLIC_TLS_PORT=443
       - "${EMS_PUBLIC_TLS_PORT:-443}:8443"
     volumes:
       - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme
-      - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro
+      - ${EMS_CERTS_PATH:-./certs/current}:/etc/nginx/certs/current:ro
     depends_on:
       - ems-api
 
@@ -3159,7 +3159,7 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]]) -> str:
         "      - \"${EMS_PUBLIC_TLS_PORT:-443}:8443\"\n"
         "    volumes:\n"
         "      - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme\n"
-        "      - ${EMS_CERTS_PATH:-./certs}:/etc/nginx/certs/current:ro\n"
+        "      - ${EMS_CERTS_PATH:-./certs/current}:/etc/nginx/certs/current:ro\n"
         "    depends_on:\n"
         "      - ems-api\n\n"
         "volumes:\n"
@@ -3537,7 +3537,7 @@ def _run_remote_deploy(
         }
     runtime = (release_target or {}).get("runtime") or {}
     remote_root = runtime.get("remote_root") or "/opt/xyn/apps/ems"
-    compose_file = runtime.get("compose_file_path") or "apps/ems-stack/docker-compose.yml"
+    compose_file = runtime.get("compose_file_path") or "compose.release.yml"
     commands = _build_remote_deploy_commands(remote_root, compose_file, extra_env)
     exec_result = _run_ssm_commands(
         target_instance.get("instance_id"),
@@ -4460,7 +4460,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     else:
                         runtime = (release_target or {}).get("runtime") or {}
                         remote_root = runtime.get("remote_root") or "/opt/xyn/apps/ems"
-                        compose_file = runtime.get("compose_file_path") or "apps/ems-stack/docker-compose.yml"
+                        compose_file = runtime.get("compose_file_path") or "compose.release.yml"
                         env_public = {k: v for k, v in effective_env.items() if k not in secret_keys}
                         deploy_manifest = _build_deploy_manifest(
                             fqdn, target_instance, remote_root, compose_file, env_public, secret_keys
@@ -4957,7 +4957,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         raise RuntimeError("Target instance missing for TLS bootstrap")
                     runtime = (release_target or {}).get("runtime") or {}
                     root_dir = runtime.get("remote_root") or "/opt/xyn/apps/ems"
-                    compose_file = runtime.get("compose_file_path") or "apps/ems-stack/docker-compose.yml"
+                    compose_file = runtime.get("compose_file_path") or "compose.release.yml"
                     exec_result = _run_ssm_commands(
                         target_instance.get("instance_id"),
                         target_instance.get("aws_region"),
@@ -5039,7 +5039,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         raise RuntimeError("Target instance missing for TLS nginx configure")
                     runtime = (release_target or {}).get("runtime") or {}
                     root_dir = runtime.get("remote_root") or "/opt/xyn/apps/ems"
-                    compose_file = runtime.get("compose_file_path") or "apps/ems-stack/docker-compose.yml"
+                    compose_file = runtime.get("compose_file_path") or "compose.release.yml"
                     exec_result = _run_ssm_commands(
                         target_instance.get("instance_id"),
                         target_instance.get("aws_region"),
