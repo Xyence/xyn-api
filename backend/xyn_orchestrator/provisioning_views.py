@@ -177,6 +177,10 @@ def _run_ssm_commands(instance: ProvisionedInstance, commands: List[str]) -> Dic
                 instance = refresh_instance(instance)
             except Exception:
                 pass
+            instance.status = "error"
+            instance.ssm_status = "Offline"
+            instance.last_error = "SSM InvalidInstanceId"
+            instance.save(update_fields=["status", "ssm_status", "last_error", "updated_at"])
             message = (
                 f"{message}. Instance record={instance.id} "
                 f"ec2_instance_id={instance.instance_id or 'n/a'} region={instance.aws_region or 'n/a'} "
@@ -231,8 +235,9 @@ def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResp
     except Exception:
         # Best-effort refresh; if it fails we'll still attempt SSM below.
         pass
-    non_runnable_statuses = {"terminated", "terminating"}
-    if (instance.status or "").lower() in non_runnable_statuses:
+    non_runnable_statuses = {"terminated", "terminating", "error"}
+    ssm_state = (instance.ssm_status or "").lower()
+    if (instance.status or "").lower() in non_runnable_statuses or ssm_state in {"offline", "connectionlost", "inactive"}:
         return JsonResponse(
             {
                 "instance_id": str(instance.id),
