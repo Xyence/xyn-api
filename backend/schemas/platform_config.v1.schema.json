@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Xyn Platform Config v1",
+  "type": "object",
+  "properties": {
+    "storage": {
+      "type": "object",
+      "required": ["primary", "providers"],
+      "properties": {
+        "primary": {
+          "type": "object",
+          "required": ["type", "name"],
+          "properties": {
+            "type": {"type": "string", "enum": ["s3", "local"]},
+            "name": {"type": "string"}
+          },
+          "additionalProperties": true
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type"],
+            "properties": {
+              "name": {"type": "string"},
+              "type": {"type": "string", "enum": ["s3", "local"]},
+              "s3": {
+                "type": "object",
+                "properties": {
+                  "bucket": {"type": "string"},
+                  "region": {"type": "string"},
+                  "prefix": {"type": "string"},
+                  "acl": {"type": "string"},
+                  "kms_key_id": {"type": ["string", "null"]},
+                  "use_presigned_put": {"type": "boolean"},
+                  "public_base_url": {"type": "string"}
+                },
+                "additionalProperties": true
+              },
+              "local": {
+                "type": "object",
+                "properties": {
+                  "base_path": {"type": "string"}
+                },
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "notifications": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "channels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type"],
+            "properties": {
+              "name": {"type": "string"},
+              "type": {"type": "string", "enum": ["discord", "aws_sns"]},
+              "enabled": {"type": "boolean"},
+              "discord": {
+                "type": "object",
+                "properties": {
+                  "webhook_url_ref": {"type": "string"},
+                  "username": {"type": "string"},
+                  "avatar_url": {"type": "string"}
+                },
+                "additionalProperties": true
+              },
+              "aws_sns": {
+                "type": "object",
+                "properties": {
+                  "topic_arn": {"type": "string"},
+                  "region": {"type": "string"},
+                  "subject_prefix": {"type": "string"},
+                  "message_attributes": {"type": "object", "additionalProperties": {"type": "string"}}
+                },
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "required": ["storage", "notifications"],
+  "additionalProperties": true
+}

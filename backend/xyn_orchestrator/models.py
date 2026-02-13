@@ -1281,3 +1281,71 @@ class AuditLog(models.Model):
 
     def __str__(self) -> str:
         return self.message[:120]
+
+
+class PlatformConfigDocument(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    version = models.PositiveIntegerField(default=1)
+    config_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="platform_configs_created"
+    )
+
+    class Meta:
+        ordering = ["-created_at", "-version"]
+
+    def __str__(self) -> str:
+        return f"Platform config v{self.version}"
+
+
+class Report(models.Model):
+    TYPE_CHOICES = [
+        ("bug", "Bug"),
+        ("feature", "Feature"),
+    ]
+    PRIORITY_CHOICES = [
+        ("p0", "P0"),
+        ("p1", "P1"),
+        ("p2", "P2"),
+        ("p3", "P3"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    report_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    title = models.CharField(max_length=240)
+    description = models.TextField()
+    priority = models.CharField(max_length=10, choices=PRIORITY_CHOICES, default="p2")
+    tags_json = models.JSONField(default=list, blank=True)
+    context_json = models.JSONField(default=dict, blank=True)
+    notification_errors_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="reports_created"
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.report_type}:{self.title}"
+
+
+class ReportAttachment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    report = models.ForeignKey(Report, on_delete=models.CASCADE, related_name="attachments")
+    filename = models.CharField(max_length=300)
+    content_type = models.CharField(max_length=120, blank=True)
+    size_bytes = models.PositiveIntegerField(default=0)
+    storage_provider = models.CharField(max_length=40, default="local")
+    storage_bucket = models.CharField(max_length=255, blank=True)
+    storage_key = models.CharField(max_length=700, blank=True)
+    storage_path = models.CharField(max_length=900, blank=True)
+    storage_metadata_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.filename} ({self.report_id})"

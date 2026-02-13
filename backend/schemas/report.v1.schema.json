@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Xyn Report v1",
+  "type": "object",
+  "required": ["type", "title", "description"],
+  "properties": {
+    "id": {"type": "string"},
+    "type": {"type": "string", "enum": ["bug", "feature"]},
+    "title": {"type": "string", "minLength": 1},
+    "description": {"type": "string", "minLength": 1},
+    "priority": {"type": "string", "enum": ["p0", "p1", "p2", "p3"], "default": "p2"},
+    "tags": {"type": "array", "items": {"type": "string"}},
+    "context": {
+      "type": "object",
+      "properties": {
+        "url": {"type": "string"},
+        "route": {"type": "string"},
+        "build": {
+          "type": "object",
+          "properties": {
+            "version": {"type": "string"},
+            "commit": {"type": "string"}
+          },
+          "additionalProperties": true
+        },
+        "user": {
+          "type": "object",
+          "properties": {
+            "id": {"type": "string"},
+            "email": {"type": "string"}
+          },
+          "additionalProperties": true
+        },
+        "blueprint_ids": {"type": "array", "items": {"type": "string"}},
+        "release_ids": {"type": "array", "items": {"type": "string"}},
+        "instance_ids": {"type": "array", "items": {"type": "string"}},
+        "client": {
+          "type": "object",
+          "properties": {
+            "user_agent": {"type": "string"},
+            "viewport": {
+              "type": "object",
+              "properties": {
+                "w": {"type": "number"},
+                "h": {"type": "number"}
+              },
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": true
+        },
+        "occurred_at_iso": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "attachments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "filename": {"type": "string"},
+          "content_type": {"type": "string"},
+          "size_bytes": {"type": "integer"},
+          "storage": {
+            "type": "object",
+            "properties": {
+              "provider": {"type": "string", "enum": ["s3", "local"]},
+              "bucket": {"type": "string"},
+              "key": {"type": "string"},
+              "url_expires_at": {"type": "string"}
+            },
+            "additionalProperties": true
+          },
+          "created_at_iso": {"type": "string"}
+        },
+        "required": ["filename", "content_type", "size_bytes", "storage"],
+        "additionalProperties": true
+      }
+    },
+    "created_at_iso": {"type": "string"},
+    "created_by": {"type": "object"}
+  },
+  "additionalProperties": true
+}

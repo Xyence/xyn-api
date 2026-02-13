@@ -79,6 +79,9 @@ from .models import (
     Device,
     Deployment,
     AuditLog,
+    PlatformConfigDocument,
+    Report,
+    ReportAttachment,
 )
 from .module_registry import maybe_sync_modules_from_registry
 from .deployments import (
@@ -98,6 +101,8 @@ from .oidc import (
     resolve_secret_ref as resolve_oidc_secret_ref,
 )
 from .secret_stores import SecretStoreError, normalize_secret_logical_name, write_secret_value
+from .storage.registry import StorageProviderRegistry
+from .notifications.registry import NotifierRegistry
 
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
@@ -783,6 +788,124 @@ def _derive_provider_secret_name(provider_id: str, issuer: str) -> str:
     return f"idp/{provider_key}/client_secret"
 
 
+def _default_platform_config() -> Dict[str, Any]:
+    return {
+        "storage": {
+            "primary": {"type": "local", "name": "local"},
+            "providers": [
+                {
+                    "name": "local",
+                    "type": "local",
+                    "local": {"base_path": os.environ.get("XYN_UPLOADS_LOCAL_PATH", "/tmp/xyn-uploads")},
+                }
+            ],
+        },
+        "notifications": {
+            "enabled": True,
+            "channels": [],
+        },
+    }
+
+
+def _load_platform_config() -> Dict[str, Any]:
+    latest = PlatformConfigDocument.objects.order_by("-created_at", "-version").first()
+    if not latest or not isinstance(latest.config_json, dict):
+        return _default_platform_config()
+    cfg = latest.config_json or {}
+    merged = _default_platform_config()
+    merged.update(cfg)
+    return merged
+
+
+def _platform_config_version() -> int:
+    latest = PlatformConfigDocument.objects.order_by("-version").first()
+    return int(latest.version) if latest else 0
+
+
+def _serialize_report_attachment(attachment: ReportAttachment) -> Dict[str, Any]:
+    storage_meta = attachment.storage_metadata_json or {}
+    return {
+        "id": str(attachment.id),
+        "filename": attachment.filename,
+        "content_type": attachment.content_type,
+        "size_bytes": int(attachment.size_bytes or 0),
+        "storage": {
+            "provider": attachment.storage_provider or storage_meta.get("provider") or "local",
+            "bucket": attachment.storage_bucket or storage_meta.get("bucket"),
+            "key": attachment.storage_key or storage_meta.get("key"),
+            "url_expires_at": storage_meta.get("url_expires_at"),
+        },
+        "created_at_iso": attachment.created_at.isoformat() if attachment.created_at else "",
+    }
+
+
+def _serialize_report(report: Report) -> Dict[str, Any]:
+    created_by = {
+        "id": str(report.created_by_id) if report.created_by_id else "",
+        "email": getattr(report.created_by, "email", "") if report.created_by_id else "",
+    }
+    return {
+        "id": str(report.id),
+        "type": report.report_type,
+        "title": report.title,
+        "description": report.description,
+        "priority": report.priority,
+        "tags": report.tags_json or [],
+        "context": report.context_json or {},
+        "attachments": [_serialize_report_attachment(item) for item in report.attachments.all().order_by("created_at")],
+        "created_at_iso": report.created_at.isoformat() if report.created_at else "",
+        "created_by": created_by,
+    }
+
+
+def _sanitize_report_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw_tags = payload.get("tags")
+    tags = [str(item).strip() for item in raw_tags] if isinstance(raw_tags, list) else []
+    tags = [item for item in tags if item]
+    priority = str(payload.get("priority") or "p2").lower()
+    if priority not in {"p0", "p1", "p2", "p3"}:
+        priority = "p2"
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    return {
+        "type": str(payload.get("type") or "").strip().lower(),
+        "title": str(payload.get("title") or "").strip(),
+        "description": str(payload.get("description") or "").strip(),
+        "priority": priority,
+        "tags": tags,
+        "context": context,
+    }
+
+
+def _validate_platform_config_semantics(payload: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+    storage = payload.get("storage") if isinstance(payload.get("storage"), dict) else {}
+    primary = storage.get("primary") if isinstance(storage.get("primary"), dict) else {}
+    providers = storage.get("providers") if isinstance(storage.get("providers"), list) else []
+    provider_names = {str(item.get("name") or "").strip() for item in providers if isinstance(item, dict)}
+    primary_name = str(primary.get("name") or "").strip()
+    if primary_name and primary_name not in provider_names:
+        errors.append("storage.primary.name must match a provider name")
+
+    notifications = payload.get("notifications") if isinstance(payload.get("notifications"), dict) else {}
+    channels = notifications.get("channels") if isinstance(notifications.get("channels"), list) else []
+    for idx, channel in enumerate(channels):
+        if not isinstance(channel, dict):
+            continue
+        enabled = bool(channel.get("enabled", True))
+        ctype = str(channel.get("type") or "").strip()
+        if ctype == "discord" and enabled:
+            discord_cfg = channel.get("discord") if isinstance(channel.get("discord"), dict) else {}
+            if not str(discord_cfg.get("webhook_url_ref") or "").strip():
+                errors.append(f"notifications.channels[{idx}].discord.webhook_url_ref is required when enabled")
+        if ctype == "aws_sns" and enabled:
+            sns_cfg = channel.get("aws_sns") if isinstance(channel.get("aws_sns"), dict) else {}
+            if not str(sns_cfg.get("topic_arn") or "").strip():
+                errors.append(f"notifications.channels[{idx}].aws_sns.topic_arn is required when enabled")
+            if not str(sns_cfg.get("region") or "").strip():
+                errors.append(f"notifications.channels[{idx}].aws_sns.region is required when enabled")
+    return errors
+
+
 def _status_from_run(run: Optional[Run]) -> str:
     if not run:
         return "unknown"
@@ -1266,6 +1389,150 @@ def secret_update(request: HttpRequest, secret_ref_id: str) -> JsonResponse:
             }
         }
     )
+
+
+@csrf_exempt
+@login_required
+def platform_config_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method == "GET":
+        if not _is_platform_admin(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        latest = PlatformConfigDocument.objects.order_by("-created_at", "-version").first()
+        payload = _load_platform_config()
+        return JsonResponse(
+            {
+                "version": int(latest.version) if latest else 0,
+                "config": payload,
+            }
+        )
+    if request.method in {"PUT", "PATCH"}:
+        if not _is_platform_admin(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        errors = _validate_schema_payload(payload, "platform_config.v1.schema.json")
+        errors.extend(_validate_platform_config_semantics(payload))
+        if errors:
+            return JsonResponse({"error": "invalid platform config", "details": errors}, status=400)
+        next_version = _platform_config_version() + 1
+        document = PlatformConfigDocument.objects.create(
+            version=next_version,
+            config_json=payload,
+            created_by=request.user if request.user.is_authenticated else None,
+        )
+        return JsonResponse({"version": int(document.version), "config": document.config_json})
+    return JsonResponse({"error": "method not allowed"}, status=405)
+
+
+def _report_payload_from_request(request: HttpRequest) -> Dict[str, Any]:
+    if request.content_type and "multipart/form-data" in request.content_type:
+        payload_raw = request.POST.get("payload") or "{}"
+        try:
+            return json.loads(payload_raw)
+        except Exception:
+            return {}
+    return _parse_json(request)
+
+
+def _report_attachment_files(request: HttpRequest):
+    return request.FILES.getlist("attachments")
+
+
+@csrf_exempt
+@login_required
+def reports_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    raw_payload = _report_payload_from_request(request)
+    payload = _sanitize_report_payload(raw_payload)
+    validation_errors = _validate_schema_payload(payload, "report.v1.schema.json")
+    if validation_errors:
+        return JsonResponse({"error": "invalid report", "details": validation_errors}, status=400)
+
+    files = _report_attachment_files(request)
+    platform_config = _load_platform_config()
+    storage_registry = StorageProviderRegistry(platform_config)
+    notifier_registry = NotifierRegistry(platform_config)
+
+    with transaction.atomic():
+        report = Report.objects.create(
+            report_type=payload.get("type") or "bug",
+            title=payload.get("title") or "",
+            description=payload.get("description") or "",
+            priority=payload.get("priority") or "p2",
+            tags_json=payload.get("tags") or [],
+            context_json=payload.get("context") or {},
+            created_by=request.user if request.user.is_authenticated else None,
+        )
+        attachments: List[ReportAttachment] = []
+        for upload in files:
+            attachment = ReportAttachment.objects.create(
+                report=report,
+                filename=str(getattr(upload, "name", "attachment")),
+                content_type=str(getattr(upload, "content_type", "") or "application/octet-stream"),
+                size_bytes=int(getattr(upload, "size", 0) or 0),
+                storage_provider="pending",
+            )
+            data = upload.read()
+            stored = storage_registry.store_attachment_bytes(
+                report_id=str(report.id),
+                attachment_id=str(attachment.id),
+                filename=attachment.filename,
+                content_type=attachment.content_type,
+                data=data,
+            )
+            attachment.storage_provider = str(stored.get("provider") or "local")
+            attachment.storage_bucket = str(stored.get("bucket") or "")
+            attachment.storage_key = str(stored.get("key") or "")
+            attachment.storage_path = str(stored.get("path") or "")
+            attachment.storage_metadata_json = stored
+            attachment.save(
+                update_fields=[
+                    "storage_provider",
+                    "storage_bucket",
+                    "storage_key",
+                    "storage_path",
+                    "storage_metadata_json",
+                ]
+            )
+            attachments.append(attachment)
+
+    report_payload = _serialize_report(report)
+    download_refs: List[str] = []
+    for attachment in attachments:
+        try:
+            ref = storage_registry.build_download_reference(attachment.storage_metadata_json or {}, ttl_seconds=86400)
+            if ref:
+                download_refs.append(ref)
+        except Exception:
+            continue
+    try:
+        notify_errors = notifier_registry.notify_report_created(report_payload, download_refs)
+    except Exception as exc:
+        notify_errors = [f"notify: {exc.__class__.__name__}"]
+    if notify_errors:
+        report.notification_errors_json = notify_errors
+        report.save(update_fields=["notification_errors_json"])
+
+    return JsonResponse(_serialize_report(report))
+
+
+@csrf_exempt
+@login_required
+def report_detail(request: HttpRequest, report_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    report = get_object_or_404(Report.objects.prefetch_related("attachments"), id=report_id)
+    return JsonResponse(_serialize_report(report))
 
 
 @csrf_exempt

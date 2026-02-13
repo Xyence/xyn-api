@@ -169,3 +169,36 @@ Overrides (optional):
 - UI now includes `Platform -> Guides` with:
   - `Xyn Quickstart Exercise (Developer Walkthrough)`
   - a copyable starter blueprint prompt for demo prep
+
+## Bug / Feature Report Facility
+- Global hotkey in xyn-ui: `Ctrl+Shift+B` (or `Cmd+Shift+B` on macOS) opens the report overlay.
+- API endpoints:
+  - `POST /api/v1/reports` (multipart: `payload` JSON + `attachments[]`)
+  - `GET /api/v1/reports/<report_id>`
+  - `GET/PUT /api/v1/platform-config` (platform admin)
+- Reports store structured context, attachments, and metadata for future automation.
+
+### Platform Config (Storage + Notifications)
+- Configure in UI: `Platform -> Platform Settings`.
+- Storage:
+  - `local` provider for dev fallback (`/tmp/xyn-uploads` by default)
+  - `s3` provider for production object storage
+- Notifications:
+  - Discord webhook (via SecretRef only)
+  - AWS SNS topic
+
+### SecretRefs
+- Discord webhook URL must be provided as a SecretRef reference:
+  - `secret_ref:<uuid>` or a platform SecretRef name
+- Secret values are never stored in report records and are resolved at send time.
+
+### S3 Storage Behavior
+- Attachments are written to:
+  - `{prefix}/reports/{report_id}/{attachment_id}-{sanitized_filename}`
+- Objects are private.
+- Notification payloads use short-lived pre-signed GET links for S3 attachments.
+
+### Local Dev Fallback
+- If no S3 provider is configured, local storage is used.
+- Default local attachment path:
+  - `/tmp/xyn-uploads`

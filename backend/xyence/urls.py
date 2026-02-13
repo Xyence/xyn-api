@@ -169,6 +169,9 @@ from xyn_orchestrator.xyn_api import (
     secret_refs_collection,
     secrets_collection,
     secret_update,
+    reports_collection,
+    report_detail,
+    platform_config_collection,
     oidc_config,
     oidc_authorize,
     oidc_callback,
@@ -197,6 +200,9 @@ def healthcheck(_request):
 
 urlpatterns = [
     path("", healthcheck),
+    path("api/v1/reports", reports_collection),
+    path("api/v1/reports/<uuid:report_id>", report_detail),
+    path("api/v1/platform-config", platform_config_collection),
     path("admin/", admin.site.urls),
     path("api/", include("xyn_orchestrator.urls")),
     path("xyn/api/public/menu", public_menu),

@@ -52,6 +52,9 @@ from .models import (
     Device,
     SecretStore,
     SecretRef,
+    PlatformConfigDocument,
+    Report,
+    ReportAttachment,
     VoiceNote,
     VoiceTranscript,
 )
@@ -254,6 +257,26 @@ class SecretRefAdmin(admin.ModelAdmin):
     list_display = ("name", "scope_kind", "scope_id", "store", "type", "updated_at")
     list_filter = ("scope_kind", "type", "store")
     search_fields = ("name", "external_ref")
+
+
+@admin.register(PlatformConfigDocument)
+class PlatformConfigDocumentAdmin(admin.ModelAdmin):
+    list_display = ("version", "created_at", "created_by")
+    readonly_fields = ("created_at",)
+
+
+@admin.register(Report)
+class ReportAdmin(admin.ModelAdmin):
+    list_display = ("report_type", "title", "priority", "created_at", "created_by")
+    list_filter = ("report_type", "priority")
+    search_fields = ("title", "description")
+
+
+@admin.register(ReportAttachment)
+class ReportAttachmentAdmin(admin.ModelAdmin):
+    list_display = ("report", "filename", "content_type", "size_bytes", "storage_provider", "created_at")
+    list_filter = ("storage_provider",)
+    search_fields = ("filename", "storage_key", "storage_path")
 
 
 @admin.register(ReleasePlan)
