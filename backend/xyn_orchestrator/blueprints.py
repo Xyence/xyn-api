@@ -4019,6 +4019,7 @@ def get_voice_note(request: HttpRequest, voice_note_id: str) -> JsonResponse:
     )
 
 
+@csrf_exempt
 @login_required
 def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
