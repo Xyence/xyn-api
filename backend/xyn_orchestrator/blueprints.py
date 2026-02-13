@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
@@ -907,6 +908,19 @@ def _normalize_runtime_mode(runtime_meta: Dict[str, Any]) -> str:
     return "compose_build"
 
 
+def _next_release_version_for_blueprint(blueprint_id: str) -> str:
+    qs = Release.objects.filter(blueprint_id=blueprint_id).values_list("version", flat=True)
+    max_seen = 0
+    for version in qs:
+        match = re.match(r"^v(\d+)$", str(version or "").strip(), flags=re.IGNORECASE)
+        if not match:
+            continue
+        number = int(match.group(1))
+        if number > max_seen:
+            max_seen = number
+    return f"v{max_seen + 1}"
+
+
 def _select_next_slice(
     blueprint: Blueprint,
     work_items: List[Dict[str, Any]],
@@ -1151,6 +1165,7 @@ def _generate_implementation_plan(
     manifest_override: bool = False,
 ) -> Dict[str, Any]:
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
+    planned_release_version = _next_release_version_for_blueprint(str(blueprint.id))
     repo_targets = _default_repo_targets()
     work_items: List[Dict[str, Any]] = []
     if blueprint_fqn == "core.ems.platform":
@@ -2348,6 +2363,9 @@ def _generate_implementation_plan(
                 artifacts.append(artifact_name)
         if release_target and "release_target.json" not in artifacts:
             artifacts.append("release_target.json")
+        if item.get("id") == "build.publish_images.container":
+            config = item.setdefault("config", {})
+            config.setdefault("release_version", planned_release_version)
 
     plan_rationale = {"gaps_detected": [], "modules_selected": [], "why_next": ["Default plan generated."]}
     if run_history_summary.get("acceptance_checks_status"):
@@ -2401,6 +2419,7 @@ def _generate_implementation_plan(
         "schema_version": "implementation_plan.v1",
         "blueprint_id": str(blueprint.id),
         "blueprint_name": blueprint_fqn,
+        "release_version": planned_release_version,
         "generated_at": timezone.now().isoformat(),
         "stack": {"api": "fastapi", "ui": "react"},
         "global_repo_targets": repo_targets,
@@ -4911,8 +4930,7 @@ def internal_release_create(request: HttpRequest) -> JsonResponse:
     created_from_run_id = payload.get("created_from_run_id")
     version = payload.get("version")
     if not version:
-        count = Release.objects.filter(blueprint_id=blueprint_id).count() + 1
-        version = f"v{count}"
+        version = _next_release_version_for_blueprint(str(blueprint_id or ""))
     status = payload.get("status", "draft")
     build_state = payload.get("build_state")
     if not build_state:

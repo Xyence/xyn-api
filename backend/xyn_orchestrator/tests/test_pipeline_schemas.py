@@ -33,6 +33,7 @@ from xyn_orchestrator.blueprints import (
     internal_artifacts_gc,
     internal_release_target_deploy_manifest,
     internal_release_promote,
+    internal_release_create,
     _write_run_artifact,
 )
 from xyn_orchestrator.xyn_api import _validate_release_target_payload
@@ -938,6 +939,10 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("build.publish_images.container", ids)
         self.assertIn("deploy.apply_remote_compose.pull", ids)
         self.assertIn("release.validate_manifest.pinned", ids)
+        build_item = next((item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.container"), None)
+        self.assertIsNotNone(build_item)
+        config = (build_item or {}).get("config") or {}
+        self.assertTrue(str(config.get("release_version", "")).startswith("v"))
 
     def test_select_next_slice_includes_manifest_validation_when_image_deploy_present(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
@@ -1166,6 +1171,23 @@ class PipelineSchemaTests(TestCase):
         )
         resolve_response = internal_release_resolve(resolve_request)
         self.assertEqual(resolve_response.status_code, 200)
+
+    def test_release_create_uses_max_numeric_version_not_count(self):
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"
+        factory = RequestFactory()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        Release.objects.create(blueprint_id=blueprint.id, version="v40", status="published")
+        Release.objects.create(blueprint_id=blueprint.id, version="v2", status="draft")
+        request = factory.post(
+            "/xyn/internal/releases",
+            data=json.dumps({"blueprint_id": str(blueprint.id)}),
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-token",
+        )
+        response = internal_release_create(request)
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.content.decode("utf-8"))
+        self.assertEqual(payload.get("version"), "v41")
 
     def test_release_upsert_rejects_published_overwrite(self):
         os.environ["XYENCE_INTERNAL_TOKEN"] = "test-token"

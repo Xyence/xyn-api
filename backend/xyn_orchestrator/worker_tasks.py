@@ -5515,6 +5515,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             }
             release_plan = _post_json("/xyn/internal/release-plans/upsert", release_plan_payload)
             release_plan_id = release_plan.get("id")
+            planned_release_version = str(plan_json.get("release_version") or "").strip()
             smoke_test = bool(plan_json.get("smoke_test"))
             steps = [
                 {
@@ -5557,18 +5558,39 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 f"/xyn/internal/runs/{run_id}/artifacts",
                 {"name": "release_plan.md", "kind": "release_plan", "url": url_md},
             )
-            _post_json(
-                "/xyn/internal/releases",
-                {
-                    "blueprint_id": plan_json.get("blueprint_id"),
-                    "release_plan_id": release_plan_id,
-                    "created_from_run_id": run_id,
-                    "artifacts_json": [
-                        {"name": "release_plan.json", "url": url_json},
-                        {"name": "release_plan.md", "url": url_md},
-                    ],
-                },
-            )
+            release_upsert_payload = {
+                "blueprint_id": plan_json.get("blueprint_id"),
+                "release_plan_id": release_plan_id,
+                "created_from_run_id": run_id,
+                "artifacts_json": [
+                    {"name": "release_plan.json", "url": url_json},
+                    {"name": "release_plan.md", "url": url_md},
+                ],
+            }
+            if planned_release_version:
+                release_upsert_payload["version"] = planned_release_version
+                try:
+                    resolved = _post_json(
+                        "/xyn/internal/releases/resolve",
+                        {
+                            "blueprint_id": plan_json.get("blueprint_id"),
+                            "release_version": planned_release_version,
+                        },
+                    )
+                    if resolved.get("id"):
+                        release_upsert_payload["release_uuid"] = resolved.get("id")
+                except Exception:
+                    pass
+            if release_upsert_payload.get("release_uuid"):
+                _post_json("/xyn/internal/releases/upsert", release_upsert_payload)
+            else:
+                _post_json(
+                    "/xyn/internal/releases",
+                    {
+                        **release_upsert_payload,
+                        "version": release_upsert_payload.get("version"),
+                    },
+                )
             _post_json(
                 f"/xyn/internal/runs/{run_id}",
                 {"status": "succeeded", "append_log": "Release plan generated.\n"},
