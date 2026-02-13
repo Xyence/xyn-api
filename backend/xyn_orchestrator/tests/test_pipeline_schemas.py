@@ -963,6 +963,32 @@ class PipelineSchemaTests(TestCase):
         selected_ids = {item.get("id") for item in selected}
         self.assertIn("release.validate_manifest.pinned", selected_ids)
 
+    def test_select_next_slice_omits_nginx_tls_for_host_ingress(self):
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        release_target = {
+            "schema_version": "release_target.v1",
+            "id": str(uuid.uuid4()),
+            "blueprint_id": str(blueprint.id),
+            "name": "manager-demo",
+            "target_instance_id": str(uuid.uuid4()),
+            "fqdn": "bedrock.xyence.io",
+            "dns": {"provider": "route53"},
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "tls": {"mode": "host-ingress", "provider": "traefik", "acme_email": "admin@xyence.io"},
+            "created_at": "2026-02-07T00:00:00Z",
+            "updated_at": "2026-02-07T00:00:00Z",
+        }
+        plan = _generate_implementation_plan(blueprint, release_target=release_target)
+        run_history = {
+            "acceptance_checks_status": [{"id": "remote_https_health", "status": "fail"}],
+            "completed_work_items": [],
+        }
+        selected, _ = _select_next_slice(blueprint, plan.get("work_items", []), run_history, release_target)
+        selected_ids = {item.get("id") for item in selected}
+        self.assertIn("verify.public_https", selected_ids)
+        self.assertNotIn("tls.acme_http01", selected_ids)
+        self.assertNotIn("ingress.nginx_tls_configure", selected_ids)
+
     def test_manifest_validation_fails_when_digest_missing(self):
         manifest = {"images": {"ems-api": {"image_uri": "repo:tag"}}}
         ok, errors = _validate_release_manifest_pinned(manifest)
@@ -1495,6 +1521,10 @@ class PipelineSchemaTests(TestCase):
             module_catalog=_build_module_catalog(),
             run_history_summary=_build_run_history_summary(blueprint),
         )
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("verify.public_https", ids)
+        self.assertNotIn("tls.acme_http01", ids)
+        self.assertNotIn("ingress.nginx_tls_configure", ids)
         module_ids = {
             ref.get("id")
             for item in plan.get("work_items", [])

@@ -911,6 +911,7 @@ def _select_next_slice(
     blueprint: Blueprint,
     work_items: List[Dict[str, Any]],
     run_history_summary: Dict[str, Any],
+    release_target: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     priority = [
         "remote_https_health",
@@ -937,6 +938,12 @@ def _select_next_slice(
     }
     image_deploy_present = any(item.get("id") == "deploy.apply_remote_compose.pull" for item in work_items)
     build_present = any(item.get("id") == "build.publish_images.container" for item in work_items)
+    metadata = blueprint.metadata_json or {}
+    tls_meta = metadata.get("tls") or {}
+    if release_target:
+        tls_meta = release_target.get("tls") or tls_meta
+    tls_mode = str(tls_meta.get("mode") or "").lower()
+    host_ingress = tls_mode == "host-ingress"
     remote_http_items = (
         [
             "build.publish_images.container",
@@ -958,19 +965,11 @@ def _select_next_slice(
         )
     )
     remote_https_items = (
-        [
-            "build.publish_images.container",
-            "release.validate_manifest.pinned",
-            "dns.ensure_record.route53",
-            "deploy.apply_remote_compose.pull",
-            "verify.public_http",
-            "tls.acme_http01",
-            "ingress.nginx_tls_configure",
-            "verify.public_https",
-        ]
-        if image_deploy_present and build_present
+        remote_http_items + ["verify.public_https"]
+        if host_ingress
         else (
             [
+                "build.publish_images.container",
                 "release.validate_manifest.pinned",
                 "dns.ensure_record.route53",
                 "deploy.apply_remote_compose.pull",
@@ -979,15 +978,27 @@ def _select_next_slice(
                 "ingress.nginx_tls_configure",
                 "verify.public_https",
             ]
-            if image_deploy_present
-            else [
-                "dns.ensure_record.route53",
-                "deploy.apply_remote_compose.ssm",
-                "verify.public_http",
-                "tls.acme_http01",
-                "ingress.nginx_tls_configure",
-                "verify.public_https",
-            ]
+            if image_deploy_present and build_present
+            else (
+                [
+                    "release.validate_manifest.pinned",
+                    "dns.ensure_record.route53",
+                    "deploy.apply_remote_compose.pull",
+                    "verify.public_http",
+                    "tls.acme_http01",
+                    "ingress.nginx_tls_configure",
+                    "verify.public_https",
+                ]
+                if image_deploy_present
+                else [
+                    "dns.ensure_record.route53",
+                    "deploy.apply_remote_compose.ssm",
+                    "verify.public_http",
+                    "tls.acme_http01",
+                    "ingress.nginx_tls_configure",
+                    "verify.public_https",
+                ]
+            )
         )
     )
     gap_to_items = {
@@ -2340,7 +2351,7 @@ def _generate_implementation_plan(
 
     plan_rationale = {"gaps_detected": [], "modules_selected": [], "why_next": ["Default plan generated."]}
     if run_history_summary.get("acceptance_checks_status"):
-        work_items, plan_rationale = _select_next_slice(blueprint, work_items, run_history_summary)
+        work_items, plan_rationale = _select_next_slice(blueprint, work_items, run_history_summary, release_target)
 
     _annotate_work_items(work_items, module_catalog, preferred_ingress_module=preferred_ingress_module)
     modules_selected = sorted(
