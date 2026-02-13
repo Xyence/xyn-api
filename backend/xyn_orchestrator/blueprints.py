@@ -4266,7 +4266,21 @@ def internal_deployments(request: HttpRequest) -> JsonResponse:
         .order_by("-created_at")
         .first()
     )
-    if existing and (existing.status in {"queued", "running"} or not force):
+    if existing and existing.status in {"queued", "running"} and not force:
+        try:
+            stale_seconds = int(os.environ.get("XYENCE_DEPLOYMENT_STALE_SECONDS", "900") or "900")
+        except ValueError:
+            stale_seconds = 900
+        anchor = existing.started_at or existing.created_at
+        age_seconds = int((timezone.now() - anchor).total_seconds()) if anchor else 0
+        if age_seconds > stale_seconds:
+            existing.status = "failed"
+            existing.error_message = f"stale deployment exceeded {stale_seconds}s"
+            existing.finished_at = timezone.now()
+            existing.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+        else:
+            return _deployment_response(existing, True)
+    if existing and not force:
         return _deployment_response(existing, True)
     idempotency_key = base_key
     if force and existing:

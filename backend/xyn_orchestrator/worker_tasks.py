@@ -44,12 +44,12 @@ def _get_json(path: str) -> Dict[str, Any]:
     return response.json()
 
 
-def _post_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _post_json(path: str, payload: Dict[str, Any], timeout_seconds: int = 60) -> Dict[str, Any]:
     response = requests.post(
         f"{INTERNAL_BASE_URL}{path}",
         headers={**_headers(), "Content-Type": "application/json"},
         json=payload,
-        timeout=60,
+        timeout=max(1, timeout_seconds),
     )
     response.raise_for_status()
     return response.json()
@@ -5405,7 +5405,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             )
             _post_json(
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
-                {"status": "succeeded" if success else "failed"},
+                {
+                    "status": "succeeded" if success else "failed",
+                    **(
+                        {"error": deployment.get("error_message") or f"Deploy failed with status {status}"}
+                        if not success
+                        else {}
+                    ),
+                },
             )
             return
 
@@ -5605,16 +5612,44 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "force": task.get("force", False),
                 "submitted_by": "worker",
             }
-            deployment = _post_json("/xyn/internal/deployments", deployment_payload)
+            try:
+                deploy_request_timeout = int(
+                    os.environ.get("XYENCE_DEPLOYMENT_REQUEST_TIMEOUT_SECONDS", "1200") or "1200"
+                )
+            except ValueError:
+                deploy_request_timeout = 1200
+            deployment = _post_json(
+                "/xyn/internal/deployments",
+                deployment_payload,
+                timeout_seconds=max(60, deploy_request_timeout),
+            )
             deployment_id = deployment.get("deployment_id")
             status = deployment.get("status")
             if status in {"queued", "running"} and deployment_id:
-                for _ in range(30):
-                    time.sleep(2)
+                try:
+                    poll_interval_seconds = int(os.environ.get("XYENCE_DEPLOYMENT_POLL_INTERVAL_SECONDS", "2") or "2")
+                except ValueError:
+                    poll_interval_seconds = 2
+                poll_interval_seconds = max(1, poll_interval_seconds)
+                try:
+                    max_wait_seconds = int(os.environ.get("XYENCE_DEPLOYMENT_POLL_MAX_SECONDS", "900") or "900")
+                except ValueError:
+                    max_wait_seconds = 900
+                polls = max(1, max_wait_seconds // poll_interval_seconds)
+                for _ in range(polls):
+                    time.sleep(poll_interval_seconds)
                     deployment = _get_json(f"/xyn/internal/deployments/{deployment_id}")
                     status = deployment.get("status")
                     if status in {"succeeded", "failed"}:
                         break
+                if status in {"queued", "running"}:
+                    status = "failed"
+                    timeout_message = (
+                        f"Deployment timed out after {max_wait_seconds}s while status remained {deployment.get('status')}."
+                    )
+                    deployment["error_message"] = (
+                        f"{deployment.get('error_message') or ''} {timeout_message}"
+                    ).strip()
             deploy_execution = {
                 "status": "failed" if status != "succeeded" else "succeeded",
                 "target_instance_id": target_instance.get("id"),
