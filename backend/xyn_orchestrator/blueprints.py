@@ -2731,19 +2731,25 @@ def _publish_draft_session(session: BlueprintDraftSession, user) -> Dict[str, An
         }
     kind = session.blueprint_kind
     if kind == "solution":
+        spec_text = json.dumps(draft, indent=2, ensure_ascii=False)
+        metadata_json = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
         blueprint, created = Blueprint.objects.get_or_create(
             name=draft["metadata"]["name"],
             namespace=draft["metadata"].get("namespace", "core"),
             defaults={
                 "description": draft.get("description", ""),
+                "spec_text": spec_text,
+                "metadata_json": metadata_json,
                 "created_by": user,
                 "updated_by": user,
             },
         )
         if not created:
             blueprint.description = draft.get("description", blueprint.description)
+            blueprint.spec_text = spec_text
+            blueprint.metadata_json = metadata_json
             blueprint.updated_by = user
-            blueprint.save(update_fields=["description", "updated_by", "updated_at"])
+            blueprint.save(update_fields=["description", "spec_text", "metadata_json", "updated_by", "updated_at"])
         next_rev = (blueprint.revisions.aggregate(max_rev=models.Max("revision")).get("max_rev") or 0) + 1
         BlueprintRevision.objects.create(
             blueprint=blueprint,

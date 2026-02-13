@@ -160,7 +160,11 @@ class DraftSessionDefaultsTests(TestCase):
         self.assertEqual(payload["initial_prompt"], "Create EMS blueprint")
         self.assertEqual(payload["source_artifacts"][0]["type"], "audio_transcript")
         self.assertEqual(submit_data.get("entity_type"), "blueprint")
-        self.assertTrue(submit_data.get("entity_id"))
+        entity_id = submit_data.get("entity_id")
+        self.assertTrue(entity_id)
+        published = Blueprint.objects.get(id=entity_id)
+        self.assertTrue((published.spec_text or "").strip())
+        self.assertIn('"apiVersion": "xyn.blueprint/v1"', published.spec_text)
 
     def test_delete_draft_session(self):
         create = self.client.post(
