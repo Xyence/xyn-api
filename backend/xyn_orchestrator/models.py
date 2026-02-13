@@ -947,6 +947,10 @@ class Deployment(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     idempotency_key = models.CharField(max_length=64, unique=True)
     idempotency_base = models.CharField(max_length=64, db_index=True)
+    app_id = models.CharField(max_length=120, blank=True)
+    environment = models.ForeignKey(
+        "Environment", null=True, blank=True, on_delete=models.SET_NULL, related_name="deployments"
+    )
     release = models.ForeignKey("Release", on_delete=models.CASCADE, related_name="deployments")
     instance = models.ForeignKey(
         "ProvisionedInstance", on_delete=models.CASCADE, related_name="deployment_records"
@@ -959,11 +963,16 @@ class Deployment(models.Model):
     submitted_by = models.CharField(max_length=120, blank=True)
     transport = models.CharField(max_length=40, default="ssm")
     transport_ref = models.JSONField(null=True, blank=True)
+    health_check_status = models.CharField(max_length=20, blank=True)
+    health_check_details_json = models.JSONField(null=True, blank=True)
     stdout_excerpt = models.TextField(blank=True)
     stderr_excerpt = models.TextField(blank=True)
     error_message = models.TextField(blank=True)
     artifacts_json = models.JSONField(null=True, blank=True)
     run = models.ForeignKey(Run, null=True, blank=True, on_delete=models.SET_NULL, related_name="deployments")
+    rollback_of = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="rollback_attempts"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
@@ -1012,6 +1021,34 @@ class ContextPack(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.scope}) v{self.version}"
+
+
+class EnvironmentAppState(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    environment = models.ForeignKey(
+        "Environment", on_delete=models.CASCADE, related_name="app_states"
+    )
+    app_id = models.CharField(max_length=120)
+    current_release = models.ForeignKey(
+        "Release", null=True, blank=True, on_delete=models.SET_NULL, related_name="current_in_env_states"
+    )
+    last_good_release = models.ForeignKey(
+        "Release", null=True, blank=True, on_delete=models.SET_NULL, related_name="last_good_in_env_states"
+    )
+    last_deployed_at = models.DateTimeField(null=True, blank=True)
+    last_good_at = models.DateTimeField(null=True, blank=True)
+    last_deploy_run = models.ForeignKey(
+        "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="environment_app_states"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("environment", "app_id")
+        ordering = ["environment__name", "app_id"]
+
+    def __str__(self) -> str:
+        return f"{self.environment.slug}:{self.app_id}"
 
 
 class DevTask(models.Model):

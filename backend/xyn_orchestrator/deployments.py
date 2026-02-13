@@ -12,7 +12,9 @@ from django.utils import timezone
 import yaml
 
 from .models import (
+    AuditLog,
     Deployment,
+    EnvironmentAppState,
     ProvisionedInstance,
     Release,
     ReleasePlan,
@@ -20,6 +22,55 @@ from .models import (
     ReleaseTarget,
     RunArtifact,
 )
+
+
+CONTROL_PLANE_APP_IDS = {"xyn-api", "xyn-ui", "xyn-seed", "xyn-worker"}
+
+
+def infer_app_id(release: Release, release_plan: Optional[ReleasePlan] = None) -> str:
+    if release.blueprint_id and release.blueprint:
+        return f"{release.blueprint.namespace}.{release.blueprint.name}"
+    if release_plan and release_plan.target_fqn:
+        return str(release_plan.target_fqn)
+    if release.release_plan_id and release.release_plan and release.release_plan.target_fqn:
+        return str(release.release_plan.target_fqn)
+    return "unknown"
+
+
+def _canonical_app_id(app_id: str) -> str:
+    raw = (app_id or "").strip().lower()
+    if raw in CONTROL_PLANE_APP_IDS:
+        return raw
+    if raw.endswith(".xyn-api") or raw == "core.xyn-api":
+        return "xyn-api"
+    if raw.endswith(".xyn-ui") or raw == "core.xyn-ui":
+        return "xyn-ui"
+    if raw.endswith(".xyn-seed") or raw == "core.xyn-seed":
+        return "xyn-seed"
+    if raw.endswith(".xyn-worker") or raw == "core.xyn-worker":
+        return "xyn-worker"
+    return raw
+
+
+def is_control_plane_app(app_id: str) -> bool:
+    return _canonical_app_id(app_id) in CONTROL_PLANE_APP_IDS
+
+
+def _ensure_environment_app_state(deployment: Deployment) -> Optional[EnvironmentAppState]:
+    if not deployment.environment_id or not deployment.app_id:
+        return None
+    state, _ = EnvironmentAppState.objects.get_or_create(
+        environment_id=deployment.environment_id,
+        app_id=deployment.app_id,
+    )
+    return state
+
+
+def _record_audit(message: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        AuditLog.objects.create(message=message, metadata_json=metadata or {})
+    except Exception:
+        return
 
 
 def compute_idempotency_base(
@@ -454,6 +505,54 @@ def _extract_tls_error_code(stderr: str) -> str:
     return code or "tls_unknown_failure"
 
 
+def _probe_http(url: str, timeout: int = 10) -> tuple[bool, str]:
+    try:
+        response = requests.get(url, timeout=timeout, allow_redirects=True)
+    except requests.RequestException as exc:
+        return False, str(exc)
+    if response.status_code >= 400:
+        return False, f"status={response.status_code}"
+    return True, f"status={response.status_code}"
+
+
+def run_post_deploy_health_gate(
+    deployment: Deployment,
+    app_id: str,
+    release_target: Optional[ReleaseTarget],
+    instance: ProvisionedInstance,
+) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+    canonical = _canonical_app_id(app_id)
+    fqdn = (release_target.fqdn if release_target else "") or ""
+    urls: List[tuple[str, str]] = []
+    if canonical == "xyn-api":
+        if fqdn:
+            urls.append((f"https://{fqdn}/health", "api_health"))
+        elif instance.public_ip:
+            urls.append((f"http://{instance.public_ip}:8000/health", "api_health"))
+    elif canonical == "xyn-ui":
+        if fqdn:
+            urls.append((f"https://{fqdn}/", "ui_home"))
+            urls.append((f"https://{fqdn}/auth/login?appId=xyn-ui&returnTo=/app", "login_page"))
+        elif instance.public_ip:
+            urls.append((f"http://{instance.public_ip}/", "ui_home"))
+    else:
+        if fqdn:
+            urls.append((f"https://{fqdn}/health", "app_health"))
+            urls.append((f"https://{fqdn}/auth/login?appId={app_id}&returnTo=/", "login_page"))
+    if not urls:
+        return {"status": "skipped", "checks": [], "detail": "no health endpoints configured"}
+    failed = False
+    detail = ""
+    for url, name in urls:
+        ok, probe_detail = _probe_http(url)
+        checks.append({"name": name, "url": url, "ok": ok, "detail": probe_detail})
+        if not ok and not failed:
+            failed = True
+            detail = f"{name} {probe_detail}"
+    return {"status": "failed" if failed else "passed", "checks": checks, "detail": detail}
+
+
 def execute_release_plan_deploy(
     deployment: Deployment,
     release: Release,
@@ -461,9 +560,13 @@ def execute_release_plan_deploy(
     release_plan: Optional[ReleasePlan],
     plan_json: Dict[str, Any],
 ) -> Dict[str, Any]:
+    if not deployment.app_id:
+        deployment.app_id = infer_app_id(release, release_plan)
+    if not deployment.environment_id:
+        deployment.environment_id = release_plan.environment_id if release_plan else instance.environment_id
     deployment.status = "running"
     deployment.started_at = timezone.now()
-    deployment.save(update_fields=["status", "started_at", "updated_at"])
+    deployment.save(update_fields=["app_id", "environment", "status", "started_at", "updated_at"])
     compose_url = _find_compose_artifact_url(release)
     compose_source = "release_artifact"
     if compose_url:
@@ -740,6 +843,19 @@ def execute_release_plan_deploy(
                             "message": "Public HTTPS verification failed",
                             "detail": detail,
                         }
+    if deployment.status == "succeeded":
+        gate_result = run_post_deploy_health_gate(deployment, deployment.app_id, release_target, instance)
+        deployment.health_check_status = gate_result.get("status", "")
+        deployment.health_check_details_json = gate_result
+        if gate_result.get("status") == "failed":
+            deployment.status = "failed"
+            deployment.error_message = gate_result.get("detail") or "post_deploy_verify failed"
+            execution["status"] = "failed"
+            execution["error"] = {
+                "code": "post_deploy_verify_failed",
+                "message": "Post-deploy health verification failed",
+                "detail": deployment.error_message,
+            }
     deployment.finished_at = timezone.now()
     deployment.stdout_excerpt = last_stdout[-2000:]
     deployment.stderr_excerpt = last_stderr[-2000:]
@@ -758,10 +874,13 @@ def execute_release_plan_deploy(
             "stdout_excerpt",
             "stderr_excerpt",
             "transport_ref",
+            "health_check_status",
+            "health_check_details_json",
             "artifacts_json",
             "updated_at",
         ]
     )
+    state = _ensure_environment_app_state(deployment)
     if deployment.status == "succeeded":
         plan_hash = hash_release_plan(plan_json)
         if release_plan:
@@ -777,7 +896,85 @@ def execute_release_plan_deploy(
         instance.observed_at = timezone.now()
         instance.health_status = "healthy"
         instance.save(update_fields=["observed_release", "observed_at", "health_status", "updated_at"])
+        if state:
+            now = timezone.now()
+            state.current_release = release
+            state.last_good_release = release
+            state.last_deployed_at = now
+            state.last_good_at = now
+            state.last_deploy_run = deployment.run
+            state.save(
+                update_fields=[
+                    "current_release",
+                    "last_good_release",
+                    "last_deployed_at",
+                    "last_good_at",
+                    "last_deploy_run",
+                    "updated_at",
+                ]
+            )
     else:
         instance.health_status = "failed"
         instance.save(update_fields=["health_status", "updated_at"])
+        if state:
+            state.current_release = release
+            state.last_deployed_at = timezone.now()
+            state.last_deploy_run = deployment.run
+            state.save(update_fields=["current_release", "last_deployed_at", "last_deploy_run", "updated_at"])
     return execution
+
+
+def maybe_trigger_rollback(deployment: Deployment) -> Optional[Deployment]:
+    if deployment.status != "failed":
+        return None
+    if not deployment.environment_id or not deployment.app_id:
+        return None
+    state = EnvironmentAppState.objects.filter(
+        environment_id=deployment.environment_id,
+        app_id=deployment.app_id,
+    ).first()
+    if not state or not state.last_good_release_id:
+        return None
+    if state.last_good_release_id == deployment.release_id:
+        return None
+    rollback_release = state.last_good_release
+    if not rollback_release:
+        return None
+    rollback_plan = deployment.release_plan or rollback_release.release_plan
+    rollback_instance = deployment.instance
+    if not rollback_instance.instance_id or not rollback_instance.aws_region:
+        return None
+    rollback_base = compute_idempotency_base(rollback_release, rollback_instance, rollback_plan, "release_plan")
+    rollback_key = hashlib.sha256(f"{rollback_base}:rollback:{deployment.id}".encode("utf-8")).hexdigest()
+    rollback = Deployment.objects.create(
+        idempotency_key=rollback_key,
+        idempotency_base=rollback_base,
+        app_id=deployment.app_id,
+        environment_id=deployment.environment_id,
+        release=rollback_release,
+        instance=rollback_instance,
+        release_plan=rollback_plan,
+        deploy_kind="release_plan" if rollback_plan else "release",
+        submitted_by="supervisor",
+        status="queued",
+        rollback_of=deployment,
+    )
+    plan_json = load_release_plan_json(rollback_release, rollback_plan)
+    if not plan_json:
+        rollback.status = "failed"
+        rollback.error_message = "rollback release_plan.json not found"
+        rollback.finished_at = timezone.now()
+        rollback.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+        return rollback
+    execute_release_plan_deploy(rollback, rollback_release, rollback_instance, rollback_plan, plan_json)
+    if rollback.status == "failed":
+        _record_audit(
+            f"Rollback failed for app {deployment.app_id} in environment {deployment.environment_id}",
+            {
+                "failed_deployment_id": str(deployment.id),
+                "rollback_deployment_id": str(rollback.id),
+                "release_id": str(rollback_release.id),
+                "instance_id": str(rollback_instance.id),
+            },
+        )
+    return rollback

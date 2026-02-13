@@ -4246,8 +4246,16 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             ):
                 try:
                     work_config = work_item.get("config") or {}
-                    release_version = work_config.get("release_version") or run_id
                     release_uuid = work_config.get("release_uuid") or ""
+                    release_version = work_config.get("release_version") or ""
+                    if not release_version and release_uuid:
+                        try:
+                            resolved = _post_json("/xyn/internal/releases/resolve", {"release_uuid": release_uuid})
+                            release_version = str(resolved.get("version") or "")
+                        except Exception:
+                            release_version = ""
+                    if not release_version:
+                        release_version = f"v{int(time.time())}"
                     release_id = release_version
                     runtime = (release_target or {}).get("runtime") or {}
                     registry_cfg = runtime.get("registry") or {}

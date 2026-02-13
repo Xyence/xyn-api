@@ -320,19 +320,32 @@ def refresh_instance(instance: ProvisionedInstance) -> ProvisionedInstance:
     instance.public_ip = info.get("PublicIpAddress")
     instance.private_ip = info.get("PrivateIpAddress")
     instance.status = "running" if state == "running" else state
-
+    is_runtime_host_instance = False
     try:
-        ssm = _ssm(instance.aws_region)
-        inv = ssm.describe_instance_information(
-            Filters=[{"Key": "InstanceIds", "Values": [instance.instance_id]}]
-        )
-        if inv.get("InstanceInformationList"):
-            instance.ssm_status = inv["InstanceInformationList"][0].get("PingStatus", "unknown")
-    except (ClientError, BotoCoreError) as exc:
-        instance.last_error = str(exc)
+        from .instances.bootstrap import get_instance_metadata
+
+        metadata = get_instance_metadata()
+        is_runtime_host_instance = bool(instance.instance_id and metadata.instance_id == instance.instance_id)
+    except Exception:
+        is_runtime_host_instance = False
+
+    if is_runtime_host_instance:
+        instance.ssm_status = "local"
+        instance.last_error = ""
+        instance.health_status = "healthy"
+    else:
+        try:
+            ssm = _ssm(instance.aws_region)
+            inv = ssm.describe_instance_information(
+                Filters=[{"Key": "InstanceIds", "Values": [instance.instance_id]}]
+            )
+            if inv.get("InstanceInformationList"):
+                instance.ssm_status = inv["InstanceInformationList"][0].get("PingStatus", "unknown")
+        except (ClientError, BotoCoreError) as exc:
+            instance.last_error = str(exc)
 
     # READY marker check via SSM
-    if instance.ssm_status == "Online":
+    if not is_runtime_host_instance and instance.ssm_status == "Online":
         try:
             cmd = _ssm(instance.aws_region).send_command(
                 InstanceIds=[instance.instance_id],
@@ -355,7 +368,7 @@ def refresh_instance(instance: ProvisionedInstance) -> ProvisionedInstance:
         except (ClientError, BotoCoreError):
             pass
 
-    update_fields = ["public_ip", "private_ip", "status", "ssm_status", "last_error", "updated_at"]
+    update_fields = ["public_ip", "private_ip", "status", "ssm_status", "last_error", "health_status", "updated_at"]
     if instance.instance_id and instance.instance_id.startswith("i-"):
         if not instance.runtime_substrate or instance.runtime_substrate == "local":
             instance.runtime_substrate = "ec2"

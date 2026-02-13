@@ -56,7 +56,9 @@ from .worker_tasks import _ssm_fetch_runtime_marker
 from .deployments import (
     compute_idempotency_base,
     execute_release_plan_deploy,
+    infer_app_id,
     load_release_plan_json,
+    maybe_trigger_rollback,
 )
 
 _executor = ThreadPoolExecutor(max_workers=2)
@@ -4160,7 +4162,12 @@ def _deployment_response(deployment: Deployment, existing: bool) -> JsonResponse
             "deployment_id": str(deployment.id),
             "status": deployment.status,
             "existing": existing,
+            "app_id": deployment.app_id,
+            "environment_id": str(deployment.environment_id) if deployment.environment_id else None,
             "error_message": deployment.error_message,
+            "health_check_status": deployment.health_check_status,
+            "health_check_details_json": deployment.health_check_details_json or {},
+            "rollback_of_deployment_id": str(deployment.rollback_of_id) if deployment.rollback_of_id else None,
             "stdout_excerpt": deployment.stdout_excerpt,
             "stderr_excerpt": deployment.stderr_excerpt,
             "started_at": deployment.started_at,
@@ -4217,6 +4224,8 @@ def internal_deployments(request: HttpRequest) -> JsonResponse:
     deployment = Deployment.objects.create(
         idempotency_key=idempotency_key,
         idempotency_base=base_key,
+        app_id=infer_app_id(release, release_plan),
+        environment_id=release_plan.environment_id if release_plan else instance.environment_id,
         release=release,
         instance=instance,
         release_plan=release_plan,
@@ -4238,6 +4247,27 @@ def internal_deployments(request: HttpRequest) -> JsonResponse:
         deployment.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
         return _deployment_response(deployment, False)
     execute_release_plan_deploy(deployment, release, instance, release_plan, plan_json)
+    rollback = maybe_trigger_rollback(deployment)
+    if rollback:
+        return JsonResponse(
+            {
+                "deployment_id": str(deployment.id),
+                "status": deployment.status,
+                "existing": False,
+                "app_id": deployment.app_id,
+                "environment_id": str(deployment.environment_id) if deployment.environment_id else None,
+                "error_message": deployment.error_message,
+                "health_check_status": deployment.health_check_status,
+                "health_check_details_json": deployment.health_check_details_json or {},
+                "rollback_deployment_id": str(rollback.id),
+                "rollback_status": rollback.status,
+                "stdout_excerpt": deployment.stdout_excerpt,
+                "stderr_excerpt": deployment.stderr_excerpt,
+                "started_at": deployment.started_at,
+                "finished_at": deployment.finished_at,
+                "artifacts_json": deployment.artifacts_json or {},
+            }
+        )
     return _deployment_response(deployment, False)
 
 
@@ -4252,10 +4282,15 @@ def internal_deployment_detail(request: HttpRequest, deployment_id: str) -> Json
         {
             "deployment_id": str(deployment.id),
             "status": deployment.status,
+            "app_id": deployment.app_id,
+            "environment_id": str(deployment.environment_id) if deployment.environment_id else None,
             "release_id": str(deployment.release_id),
             "instance_id": str(deployment.instance_id),
             "release_plan_id": str(deployment.release_plan_id) if deployment.release_plan_id else None,
             "deploy_kind": deployment.deploy_kind,
+            "health_check_status": deployment.health_check_status,
+            "health_check_details_json": deployment.health_check_details_json or {},
+            "rollback_of_deployment_id": str(deployment.rollback_of_id) if deployment.rollback_of_id else None,
             "started_at": deployment.started_at,
             "finished_at": deployment.finished_at,
             "stdout_excerpt": deployment.stdout_excerpt,
@@ -4263,6 +4298,25 @@ def internal_deployment_detail(request: HttpRequest, deployment_id: str) -> Json
             "error_message": deployment.error_message,
             "transport_ref": deployment.transport_ref or {},
             "artifacts_json": deployment.artifacts_json or {},
+        }
+    )
+
+
+@csrf_exempt
+def internal_deployment_rollback(request: HttpRequest, deployment_id: str) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    deployment = get_object_or_404(Deployment, id=deployment_id)
+    rollback = maybe_trigger_rollback(deployment)
+    if not rollback:
+        return JsonResponse({"error": "rollback unavailable"}, status=400)
+    return JsonResponse(
+        {
+            "deployment_id": str(deployment.id),
+            "rollback_deployment_id": str(rollback.id),
+            "rollback_status": rollback.status,
         }
     )
 

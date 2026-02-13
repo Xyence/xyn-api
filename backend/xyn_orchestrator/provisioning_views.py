@@ -215,6 +215,22 @@ def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResp
     if _is_local_instance(instance):
         try:
             containers = _list_local_containers()
+            update_fields: List[str] = []
+            if (instance.status or "").lower() != "running":
+                instance.status = "running"
+                update_fields.append("status")
+            if (instance.health_status or "").lower() != "healthy":
+                instance.health_status = "healthy"
+                update_fields.append("health_status")
+            if instance.ssm_status:
+                instance.ssm_status = ""
+                update_fields.append("ssm_status")
+            if instance.last_error:
+                instance.last_error = ""
+                update_fields.append("last_error")
+            if update_fields:
+                update_fields.append("updated_at")
+                instance.save(update_fields=update_fields)
             return JsonResponse(
                 {
                     "instance_id": str(instance.id),
@@ -243,11 +259,11 @@ def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResp
                 "instance_id": str(instance.id),
                 "name": instance.name,
                 "aws_instance_id": instance.instance_id,
-                "status": instance.status,
+                "status": "unavailable",
                 "ssm_status": instance.ssm_status,
                 "error": "Instance is not in a runnable state for SSM container inspection.",
+                "containers": [],
             },
-            status=409,
         )
     try:
         result = _run_ssm_commands(
@@ -306,18 +322,18 @@ def instance_containers_view(request: HttpRequest, instance_id: str) -> JsonResp
 
 
 def _is_local_instance(instance: ProvisionedInstance) -> bool:
-    # Treat EC2-style identifiers as remote even if legacy rows have stale substrate flags.
-    if instance.instance_id and instance.instance_id.startswith("i-"):
-        return False
+    # If this row points to the same runtime host as the backend process, treat it as local.
+    try:
+        metadata = get_instance_metadata()
+    except Exception:
+        metadata = None
+    if metadata and instance.instance_id and metadata.instance_id == instance.instance_id:
+        return True
     if instance.runtime_substrate in {"local", "docker"}:
         return True
     if instance.instance_id and instance.instance_id.startswith(("local:", "docker:")):
         return True
-    try:
-        metadata = get_instance_metadata()
-    except Exception:
-        return False
-    return bool(instance.instance_id and metadata.instance_id == instance.instance_id)
+    return False
 
 
 def _list_local_containers() -> List[Dict[str, str]]:

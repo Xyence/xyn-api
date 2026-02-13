@@ -145,3 +145,27 @@ Overrides (optional):
 - ENV fallback behavior:
   - If no OIDC app client is configured, backend falls back to env-based OIDC and logs:
     - `Using ENV OIDC fallback (no app client configured)`
+
+## Xyn Manages Xyn (MVP)
+- Deployments now track post-deploy verification and rollback metadata.
+- `EnvironmentAppState` tracks per-environment app release state:
+  - `current_release`
+  - `last_good_release`
+  - `last_deployed_at`
+  - `last_good_at`
+- Failed deployments can trigger rollback to `last_good_release` using the same deployment path.
+- Internal rollback endpoint:
+  - `POST /xyn/internal/deployments/<deployment_id>/rollback`
+
+## Platform Architect Role
+- New role: `platform_architect`
+- This role can:
+  - Publish control-plane releases (`xyn-api`, `xyn-ui`)
+  - Deploy/rollback control-plane releases
+  - Manage platform OIDC and branding settings
+- `platform_admin` retains full access.
+
+## Guided Exercise
+- UI now includes `Platform -> Guides` with:
+  - `Xyn Quickstart Exercise (Developer Walkthrough)`
+  - a copyable starter blueprint prompt for demo prep

@@ -35,6 +35,9 @@ from .blueprints import (
     _build_context_artifacts,
     _enqueue_job,
     _enqueue_release_build,
+    internal_release_target_check_drift,
+    internal_release_target_deploy_latest,
+    internal_release_target_rollback_last_success,
     _require_staff,
     _resolve_context_pack_list,
     _write_run_summary,
@@ -50,6 +53,7 @@ from .models import (
     ContextPack,
     DevTask,
     Environment,
+    EnvironmentAppState,
     Module,
     ProvisionedInstance,
     Registry,
@@ -71,8 +75,17 @@ from .models import (
     PlatformBranding,
     AppBrandingOverride,
     Device,
+    Deployment,
+    AuditLog,
 )
 from .module_registry import maybe_sync_modules_from_registry
+from .deployments import (
+    compute_idempotency_base,
+    execute_release_plan_deploy,
+    infer_app_id,
+    maybe_trigger_rollback,
+    load_release_plan_json,
+)
 from .oidc import (
     app_client_to_payload,
     generate_pkce_pair,
@@ -485,6 +498,16 @@ def _require_authenticated(request: HttpRequest) -> Optional[UserIdentity]:
     return UserIdentity.objects.filter(id=identity_id).first()
 
 
+def _require_platform_architect(request: HttpRequest) -> Optional[JsonResponse]:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_architect(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    request.user_identity = identity  # type: ignore[attr-defined]
+    return None
+
+
 def _get_roles(identity: UserIdentity) -> List[str]:
     return list(
         RoleBinding.objects.filter(user_identity=identity)
@@ -494,6 +517,49 @@ def _get_roles(identity: UserIdentity) -> List[str]:
 
 def _is_platform_admin(identity: UserIdentity) -> bool:
     return RoleBinding.objects.filter(user_identity=identity, role="platform_admin").exists()
+
+
+def _has_platform_role(identity: UserIdentity, roles: List[str]) -> bool:
+    return RoleBinding.objects.filter(user_identity=identity, role__in=roles).exists()
+
+
+def _is_platform_architect(identity: UserIdentity) -> bool:
+    return _has_platform_role(identity, ["platform_architect", "platform_admin"])
+
+
+def _control_plane_app_ids() -> set[str]:
+    return {"xyn-api", "xyn-ui", "xyn-seed", "xyn-worker", "core.xyn-api", "core.xyn-ui", "core.xyn-seed"}
+
+
+def _is_control_plane_release(release: Release) -> bool:
+    if release.blueprint_id and release.blueprint:
+        fqn = f"{release.blueprint.namespace}.{release.blueprint.name}"
+        return fqn in _control_plane_app_ids() or release.blueprint.name in _control_plane_app_ids()
+    if release.release_plan_id and release.release_plan:
+        target = (release.release_plan.target_fqn or "").strip()
+        return target in _control_plane_app_ids()
+    return False
+
+
+def _is_control_plane_plan(plan: ReleasePlan) -> bool:
+    target = (plan.target_fqn or "").strip()
+    if target in _control_plane_app_ids():
+        return True
+    if plan.blueprint_id and plan.blueprint:
+        fqn = f"{plan.blueprint.namespace}.{plan.blueprint.name}"
+        return fqn in _control_plane_app_ids() or plan.blueprint.name in _control_plane_app_ids()
+    return False
+
+
+def _audit_action(message: str, metadata: Optional[Dict[str, Any]] = None, request: Optional[HttpRequest] = None) -> None:
+    try:
+        AuditLog.objects.create(
+            message=message,
+            metadata_json=metadata or {},
+            created_by=request.user if request and getattr(request, "user", None) and request.user.is_authenticated else None,
+        )
+    except Exception:
+        return
 
 
 def _tenant_role_rank(role: str) -> int:
@@ -512,6 +578,181 @@ def _require_tenant_access(identity: UserIdentity, tenant_id: str, minimum_role:
     return _tenant_role_rank(membership.role) >= _tenant_role_rank(minimum_role)
 
 
+def _parse_bool_param(raw: Optional[str], default: bool = False) -> bool:
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _extract_tenant_hint(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    direct = payload.get("tenant_id") or payload.get("tenantId")
+    if direct:
+        return str(direct)
+    metadata = payload.get("metadata") or payload.get("metadata_json")
+    if isinstance(metadata, dict):
+        direct = metadata.get("tenant_id") or metadata.get("tenantId")
+        if direct:
+            return str(direct)
+    env = payload.get("env")
+    if isinstance(env, dict):
+        for key in ("TENANT_ID", "tenant_id", "tenantId"):
+            value = env.get(key)
+            if value:
+                return str(value)
+    return None
+
+
+def _status_from_run(run: Optional[Run]) -> str:
+    if not run:
+        return "unknown"
+    if run.status == "succeeded":
+        return "ok"
+    if run.status in {"failed"}:
+        return "error"
+    if run.status in {"pending", "running"}:
+        return "warn"
+    return "unknown"
+
+
+def _status_from_release(release: Release) -> str:
+    if release.status == "published" and release.build_state == "ready":
+        return "ok"
+    if release.build_state == "failed":
+        return "error"
+    if release.status == "draft" or release.build_state in {"building"}:
+        return "warn"
+    return "unknown"
+
+
+def _read_json_from_artifact_url(url: str) -> Optional[Dict[str, Any]]:
+    if not url:
+        return None
+    try:
+        if url.startswith("/media/"):
+            media_root = Path(__file__).resolve().parents[1] / "media"
+            file_path = media_root / url.replace("/media/", "")
+            if not file_path.exists():
+                return None
+            with open(file_path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        if url.startswith("http"):
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            return response.json()
+    except Exception:
+        return None
+    return None
+
+
+def _load_release_manifest(release: Release) -> Optional[Dict[str, Any]]:
+    artifacts = release.artifacts_json or {}
+    if not isinstance(artifacts, dict):
+        return None
+    manifest = artifacts.get("release_manifest")
+    if isinstance(manifest, dict):
+        inline = manifest.get("content")
+        if isinstance(inline, dict):
+            return inline
+        url = str(manifest.get("url") or "")
+        if url:
+            return _read_json_from_artifact_url(url)
+    return None
+
+
+def _extract_release_ecr_refs(release: Release) -> List[Dict[str, str]]:
+    manifest = _load_release_manifest(release) or {}
+    images = manifest.get("images") or {}
+    if not isinstance(images, dict):
+        return []
+    refs: List[Dict[str, str]] = []
+    for meta in images.values():
+        if not isinstance(meta, dict):
+            continue
+        image_uri = str(meta.get("image_uri") or "").strip()
+        digest = str(meta.get("digest") or "").strip()
+        if not image_uri:
+            continue
+        parts = image_uri.split("/", 1)
+        if len(parts) < 2:
+            continue
+        registry = parts[0]
+        if ".dkr.ecr." not in registry or ".amazonaws.com" not in registry:
+            continue
+        repository_and_tag = parts[1]
+        repository = repository_and_tag.split("@", 1)[0]
+        tag = ""
+        if ":" in repository and "/" in repository:
+            last_colon = repository.rfind(":")
+            last_slash = repository.rfind("/")
+            if last_colon > last_slash:
+                tag = repository[last_colon + 1 :]
+                repository = repository[:last_colon]
+        elif ":" in repository:
+            repo_part, tag_part = repository.rsplit(":", 1)
+            repository = repo_part
+            tag = tag_part
+        region = ""
+        try:
+            region = registry.split(".dkr.ecr.", 1)[1].split(".amazonaws.com", 1)[0]
+        except Exception:
+            region = os.environ.get("AWS_REGION", "").strip()
+        refs.append(
+            {
+                "repository": repository,
+                "region": region,
+                "digest": digest,
+                "tag": tag,
+            }
+        )
+    return refs
+
+
+def _delete_release_images(release: Release) -> Dict[str, Any]:
+    refs = _extract_release_ecr_refs(release)
+    deleted = 0
+    failures: List[Dict[str, str]] = []
+    grouped: Dict[tuple[str, str], List[Dict[str, str]]] = {}
+    for ref in refs:
+        key = (ref.get("region") or "", ref.get("repository") or "")
+        grouped.setdefault(key, []).append(ref)
+    for (region, repository), entries in grouped.items():
+        if not repository:
+            continue
+        image_ids = []
+        for item in entries:
+            if item.get("digest"):
+                image_ids.append({"imageDigest": item["digest"]})
+            elif item.get("tag"):
+                image_ids.append({"imageTag": item["tag"]})
+        if not image_ids:
+            continue
+        try:
+            client = boto3.client("ecr", region_name=region or None)
+            result = client.batch_delete_image(repositoryName=repository, imageIds=image_ids)
+            deleted += len(result.get("imageIds") or [])
+            for failure in result.get("failures") or []:
+                failures.append(
+                    {
+                        "repository": repository,
+                        "region": region,
+                        "code": str(failure.get("failureCode") or ""),
+                        "reason": str(failure.get("failureReason") or ""),
+                    }
+                )
+        except Exception as exc:
+            failures.append(
+                {
+                    "repository": repository,
+                    "region": region,
+                    "code": "client_error",
+                    "reason": str(exc),
+                }
+            )
+    return {"referenced": len(refs), "deleted": deleted, "failures": failures}
+
+
 def require_role(role: str):
     def decorator(view):
         @wraps(view)
@@ -520,6 +761,25 @@ def require_role(role: str):
             if not identity:
                 return JsonResponse({"error": "not authenticated"}, status=401)
             if not RoleBinding.objects.filter(user_identity=identity, role=role).exists():
+                return JsonResponse({"error": "forbidden"}, status=403)
+            request.user_identity = identity  # type: ignore[attr-defined]
+            return view(request, *args, **kwargs)
+
+        return _wrapped
+
+    return decorator
+
+
+def require_any_role(*roles: str):
+    role_set = {role for role in roles if role}
+
+    def decorator(view):
+        @wraps(view)
+        def _wrapped(request: HttpRequest, *args, **kwargs):
+            identity = _require_authenticated(request)
+            if not identity:
+                return JsonResponse({"error": "not authenticated"}, status=401)
+            if not RoleBinding.objects.filter(user_identity=identity, role__in=role_set).exists():
                 return JsonResponse({"error": "forbidden"}, status=403)
             request.user_identity = identity  # type: ignore[attr-defined]
             return view(request, *args, **kwargs)
@@ -612,6 +872,8 @@ def internal_oidc_config(request: HttpRequest) -> JsonResponse:
 def identity_providers_collection(request: HttpRequest) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
+    if architect_error := _require_platform_architect(request):
+        return architect_error
     if request.method == "POST":
         payload = _parse_json(request)
         errors = _validate_provider_payload(payload)
@@ -633,6 +895,8 @@ def identity_providers_collection(request: HttpRequest) -> JsonResponse:
 def identity_provider_detail(request: HttpRequest, provider_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
+    if architect_error := _require_platform_architect(request):
+        return architect_error
     provider = get_object_or_404(IdentityProvider, id=provider_id)
     if request.method == "PATCH":
         payload = _parse_json(request)
@@ -655,6 +919,8 @@ def identity_provider_detail(request: HttpRequest, provider_id: str) -> JsonResp
 def identity_provider_test(request: HttpRequest, provider_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
+    if architect_error := _require_platform_architect(request):
+        return architect_error
     provider = get_object_or_404(IdentityProvider, id=provider_id)
     try:
         discovery = get_discovery_doc(provider, force=True)
@@ -676,6 +942,8 @@ def identity_provider_test(request: HttpRequest, provider_id: str) -> JsonRespon
 def oidc_app_clients_collection(request: HttpRequest) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
+    if architect_error := _require_platform_architect(request):
+        return architect_error
     if request.method == "POST":
         payload = _parse_json(request)
         errors = _validate_app_client_payload(payload)
@@ -714,6 +982,8 @@ def oidc_app_clients_collection(request: HttpRequest) -> JsonResponse:
 def oidc_app_client_detail(request: HttpRequest, client_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
+    if architect_error := _require_platform_architect(request):
+        return architect_error
     client = get_object_or_404(AppOIDCClient, id=client_id)
     if request.method == "PATCH":
         payload = _parse_json(request)
@@ -1029,11 +1299,15 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
     username = f"oidc:{issuer_hash}:{subject}"
     user, created = User.objects.get_or_create(
         username=username,
-        defaults={"email": email, "is_staff": "platform_admin" in roles, "is_active": True},
+        defaults={
+            "email": email,
+            "is_staff": ("platform_admin" in roles or "platform_architect" in roles),
+            "is_active": True,
+        },
     )
     if email and user.email != email:
         user.email = email
-    user.is_staff = "platform_admin" in roles
+    user.is_staff = ("platform_admin" in roles or "platform_architect" in roles)
     user.is_superuser = False
     user.is_active = True
     user.save()
@@ -1227,13 +1501,13 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
         username=username,
         defaults={
             "email": email,
-            "is_staff": "platform_admin" in roles,
+            "is_staff": ("platform_admin" in roles or "platform_architect" in roles),
             "is_active": True,
         },
     )
     if email and user.email != email:
         user.email = email
-    user.is_staff = "platform_admin" in roles
+    user.is_staff = ("platform_admin" in roles or "platform_architect" in roles)
     user.is_superuser = False
     user.is_active = True
     user.save()
@@ -1946,7 +2220,7 @@ def tenant_branding_update(request: HttpRequest, tenant_id: str) -> JsonResponse
 
 
 @csrf_exempt
-@require_role("platform_admin")
+@require_any_role("platform_admin", "platform_architect")
 def platform_branding(request: HttpRequest) -> JsonResponse:
     branding = _get_platform_branding()
     if request.method == "GET":
@@ -1978,7 +2252,7 @@ def platform_branding(request: HttpRequest) -> JsonResponse:
 
 
 @csrf_exempt
-@require_role("platform_admin")
+@require_any_role("platform_admin", "platform_architect")
 def platform_app_branding(request: HttpRequest, app_id: str) -> JsonResponse:
     override = AppBrandingOverride.objects.filter(app_id=app_id).first()
     if request.method == "GET":
@@ -2531,6 +2805,405 @@ def release_target_detail(request: HttpRequest, target_id: str) -> JsonResponse:
     return JsonResponse({"id": str(target.id)})
 
 
+@login_required
+def map_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+
+    blueprint_id = (request.GET.get("blueprint_id") or "").strip()
+    environment_id = (request.GET.get("environment_id") or "").strip()
+    tenant_id = (request.GET.get("tenant_id") or "").strip()
+    include_runs = _parse_bool_param(request.GET.get("include_runs"), default=True)
+    include_instances = _parse_bool_param(request.GET.get("include_instances"), default=True)
+    include_drafts = _parse_bool_param(request.GET.get("include_drafts"), default=False)
+    latest_per_blueprint = 10
+
+    is_platform_admin = _is_platform_admin(identity)
+    allowed_tenant_ids = set(
+        str(value)
+        for value in TenantMembership.objects.filter(user_identity=identity, status="active").values_list("tenant_id", flat=True)
+    )
+    if tenant_id and not is_platform_admin and tenant_id not in allowed_tenant_ids:
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    blueprints = list(Blueprint.objects.all().order_by("namespace", "name"))
+    if blueprint_id:
+        blueprints = [b for b in blueprints if str(b.id) == blueprint_id]
+
+    def _blueprint_allowed(blueprint: Blueprint) -> bool:
+        hinted_tenant = _extract_tenant_hint(blueprint.metadata_json)
+        if tenant_id:
+            return hinted_tenant == tenant_id
+        if is_platform_admin:
+            return True
+        if not hinted_tenant:
+            return False
+        return hinted_tenant in allowed_tenant_ids
+
+    blueprints = [b for b in blueprints if _blueprint_allowed(b)]
+    blueprint_ids = [b.id for b in blueprints]
+
+    environments = list(Environment.objects.all().order_by("name"))
+    env = next((item for item in environments if str(item.id) == environment_id), None) if environment_id else None
+
+    release_plans_qs = ReleasePlan.objects.filter(blueprint_id__in=blueprint_ids).select_related("last_run", "environment")
+    if environment_id:
+        release_plans_qs = release_plans_qs.filter(environment_id=environment_id)
+    release_plans = list(release_plans_qs.order_by("-created_at"))
+
+    releases_qs = Release.objects.filter(blueprint_id__in=blueprint_ids).select_related("release_plan", "created_from_run")
+    if not include_drafts:
+        releases_qs = releases_qs.exclude(status="draft")
+    if environment_id:
+        releases_qs = releases_qs.filter(release_plan__environment_id=environment_id)
+    releases = list(releases_qs.order_by("-created_at"))
+    release_counts: Dict[str, int] = {}
+    filtered_releases: List[Release] = []
+    for release in releases:
+        key = str(release.blueprint_id)
+        release_counts[key] = release_counts.get(key, 0) + 1
+        if release_counts[key] <= latest_per_blueprint:
+            filtered_releases.append(release)
+    releases = filtered_releases
+
+    targets_qs = ReleaseTarget.objects.filter(blueprint_id__in=blueprint_ids).select_related("target_instance", "blueprint")
+    if environment_id:
+        env_matches = {environment_id}
+        if env:
+            env_matches.add(env.slug)
+            env_matches.add(env.name)
+        targets_qs = targets_qs.filter(environment__in=env_matches)
+    targets = list(targets_qs.order_by("name"))
+
+    def _target_allowed(target: ReleaseTarget) -> bool:
+        hinted_tenant = _extract_tenant_hint(target.config_json) or _extract_tenant_hint(target.blueprint.metadata_json)
+        if tenant_id:
+            return hinted_tenant == tenant_id
+        if is_platform_admin:
+            return True
+        if not hinted_tenant:
+            return False
+        return hinted_tenant in allowed_tenant_ids
+
+    targets = [t for t in targets if _target_allowed(t)]
+    target_ids = [str(target.id) for target in targets]
+
+    instances: Dict[str, ProvisionedInstance] = {}
+    if include_instances:
+        instance_ids = [target.target_instance_id for target in targets if target.target_instance_id]
+        if instance_ids:
+            instance_qs = ProvisionedInstance.objects.filter(id__in=instance_ids).select_related("environment")
+            instances = {str(instance.id): instance for instance in instance_qs}
+
+    latest_deploy_by_target: Dict[str, Run] = {}
+    latest_success_by_target: Dict[str, Run] = {}
+    active_run_by_target: Dict[str, Run] = {}
+    if include_runs and target_ids:
+        deploy_runs = list(
+            Run.objects.filter(metadata_json__release_target_id__in=target_ids)
+            .order_by("-created_at")
+        )
+        for run in deploy_runs:
+            rt_id = str((run.metadata_json or {}).get("release_target_id") or "")
+            if not rt_id:
+                continue
+            if rt_id not in latest_deploy_by_target:
+                latest_deploy_by_target[rt_id] = run
+            if rt_id not in latest_success_by_target and (run.metadata_json or {}).get("deploy_outcome") in {"succeeded", "noop"}:
+                latest_success_by_target[rt_id] = run
+            if rt_id not in active_run_by_target and run.status in {"pending", "running"}:
+                active_run_by_target[rt_id] = run
+
+    run_ids_from_releases = [release.created_from_run_id for release in releases if release.created_from_run_id]
+    release_runs: Dict[str, Run] = {}
+    if include_runs and run_ids_from_releases:
+        release_runs = {str(run.id): run for run in Run.objects.filter(id__in=run_ids_from_releases)}
+
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    seen_nodes: set[str] = set()
+    seen_edges: set[str] = set()
+
+    def _add_node(payload: Dict[str, Any]) -> None:
+        node_id = payload["id"]
+        if node_id in seen_nodes:
+            return
+        seen_nodes.add(node_id)
+        nodes.append(payload)
+
+    def _add_edge(from_id: str, to_id: str, kind: str) -> None:
+        edge_id = f"{kind}:{from_id}:{to_id}"
+        if edge_id in seen_edges:
+            return
+        seen_edges.add(edge_id)
+        edges.append({"id": edge_id, "from": from_id, "to": to_id, "kind": kind})
+
+    blueprint_by_id = {str(blueprint.id): blueprint for blueprint in blueprints}
+    for blueprint in blueprints:
+        _add_node(
+            {
+                "id": f"blueprint:{blueprint.id}",
+                "kind": "blueprint",
+                "ref": {"id": str(blueprint.id), "kind": "blueprint"},
+                "label": f"{blueprint.namespace}.{blueprint.name}",
+                "status": "ok",
+                "badges": [],
+                "metrics": {
+                    "description": blueprint.description or "",
+                    "updated_at": blueprint.updated_at.isoformat() if blueprint.updated_at else None,
+                },
+                "links": {"detail": "/app/blueprints"},
+            }
+        )
+
+    for plan in release_plans:
+        node_id = f"release_plan:{plan.id}"
+        _add_node(
+            {
+                "id": node_id,
+                "kind": "release_plan",
+                "ref": {"id": str(plan.id), "kind": "release_plan"},
+                "label": plan.name,
+                "status": _status_from_run(plan.last_run),
+                "badges": [plan.target_kind],
+                "metrics": {
+                    "target_fqn": plan.target_fqn,
+                    "environment_id": str(plan.environment_id) if plan.environment_id else None,
+                    "last_run_id": str(plan.last_run_id) if plan.last_run_id else None,
+                    "to_version": plan.to_version,
+                },
+                "links": {"detail": "/app/release-plans"},
+            }
+        )
+        if plan.blueprint_id:
+            _add_edge(f"blueprint:{plan.blueprint_id}", node_id, "plans")
+
+    releases_by_blueprint: Dict[str, List[Release]] = {}
+    for release in releases:
+        bp_key = str(release.blueprint_id) if release.blueprint_id else ""
+        if bp_key:
+            releases_by_blueprint.setdefault(bp_key, []).append(release)
+        release_node_id = f"release:{release.id}"
+        run = release_runs.get(str(release.created_from_run_id)) if release.created_from_run_id else None
+        badges = [release.status]
+        if release.build_state:
+            badges.append(release.build_state)
+        _add_node(
+            {
+                "id": release_node_id,
+                "kind": "release",
+                "ref": {"id": str(release.id), "kind": "release"},
+                "label": release.version,
+                "status": _status_from_release(release),
+                "badges": badges,
+                "metrics": {
+                    "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
+                    "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
+                    "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
+                    "build_state": release.build_state,
+                    "release_status": release.status,
+                },
+                "links": {"detail": "/app/releases"},
+            }
+        )
+        if release.release_plan_id:
+            _add_edge(f"release_plan:{release.release_plan_id}", release_node_id, "produces")
+        elif release.blueprint_id:
+            _add_edge(f"blueprint:{release.blueprint_id}", release_node_id, "publishes")
+        if include_runs and run:
+            run_node_id = f"run:{run.id}"
+            _add_node(
+                {
+                    "id": run_node_id,
+                    "kind": "run",
+                    "ref": {"id": str(run.id), "kind": "run"},
+                    "label": run.summary or f"Run {str(run.id)[:8]}",
+                    "status": _status_from_run(run),
+                    "badges": [run.entity_type],
+                    "metrics": {
+                        "entity_type": run.entity_type,
+                        "entity_id": str(run.entity_id),
+                        "run_status": run.status,
+                        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+                    },
+                    "links": {"detail": f"/app/runs?run={run.id}"},
+                }
+            )
+            _add_edge(release_node_id, run_node_id, "built_by")
+
+    for target in targets:
+        target_node_id = f"release_target:{target.id}"
+        latest = latest_deploy_by_target.get(str(target.id))
+        latest_success = latest_success_by_target.get(str(target.id))
+        active = active_run_by_target.get(str(target.id))
+        metrics = {
+            "environment": target.environment or "",
+            "fqdn": target.fqdn,
+            "target_instance_id": str(target.target_instance_id) if target.target_instance_id else None,
+            "current_release_id": (latest_success.metadata_json or {}).get("release_uuid") if latest_success else None,
+            "current_release_version": (latest_success.metadata_json or {}).get("release_version") if latest_success else None,
+            "drift_state": "unknown",
+            "lock_state": "running" if active else "unlocked",
+            "last_deploy_outcome": (latest.metadata_json or {}).get("deploy_outcome") if latest else None,
+            "last_deploy_at": latest.finished_at.isoformat() if latest and latest.finished_at else None,
+            "last_deploy_run_id": str(latest.id) if latest else None,
+        }
+        badges: List[str] = []
+        if metrics["lock_state"] == "running":
+            badges.append("locked")
+        if metrics["current_release_id"]:
+            badges.append("published")
+        status = "warn" if active else "ok"
+        if latest and latest.status == "failed":
+            status = "error"
+        _add_node(
+            {
+                "id": target_node_id,
+                "kind": "release_target",
+                "ref": {"id": str(target.id), "kind": "release_target"},
+                "label": target.name,
+                "status": status,
+                "badges": badges,
+                "metrics": metrics,
+                "links": {
+                    "detail": "/app/release-plans",
+                    "runs": f"/app/runs?q={target.id}",
+                },
+            }
+        )
+        blueprint_releases = releases_by_blueprint.get(str(target.blueprint_id), [])
+        for release in blueprint_releases:
+            _add_edge(f"release:{release.id}", target_node_id, "deployed_to")
+        if include_instances and target.target_instance_id:
+            instance = instances.get(str(target.target_instance_id))
+            if instance:
+                instance_node_id = f"instance:{instance.id}"
+                _add_node(
+                    {
+                        "id": instance_node_id,
+                        "kind": "instance",
+                        "ref": {"id": str(instance.id), "kind": "instance"},
+                        "label": instance.name,
+                        "status": "ok" if instance.status in {"running", "ready"} else "warn",
+                        "badges": [instance.status, instance.health_status],
+                        "metrics": {
+                            "status": instance.status,
+                            "health_status": instance.health_status,
+                            "environment_id": str(instance.environment_id) if instance.environment_id else None,
+                            "public_ip": instance.public_ip,
+                            "private_ip": instance.private_ip,
+                            "last_deploy_run_id": str(instance.last_deploy_run_id) if instance.last_deploy_run_id else None,
+                        },
+                        "links": {"detail": "/app/instances"},
+                    }
+                )
+                _add_edge(target_node_id, instance_node_id, "runs_on")
+        if include_runs and latest:
+            run_node_id = f"run:{latest.id}"
+            _add_node(
+                {
+                    "id": run_node_id,
+                    "kind": "run",
+                    "ref": {"id": str(latest.id), "kind": "run"},
+                    "label": latest.summary or f"Run {str(latest.id)[:8]}",
+                    "status": _status_from_run(latest),
+                    "badges": [latest.entity_type],
+                    "metrics": {
+                        "entity_type": latest.entity_type,
+                        "entity_id": str(latest.entity_id),
+                        "run_status": latest.status,
+                        "finished_at": latest.finished_at.isoformat() if latest.finished_at else None,
+                    },
+                    "links": {"detail": f"/app/runs?run={latest.id}"},
+                }
+            )
+            _add_edge(target_node_id, run_node_id, "latest_deploy_run")
+
+    tenant_options: List[Dict[str, str]] = []
+    if is_platform_admin:
+        tenant_options = [{"id": str(t.id), "name": t.name} for t in Tenant.objects.all().order_by("name")]
+    else:
+        tenant_options = [
+            {"id": str(m.tenant_id), "name": m.tenant.name}
+            for m in TenantMembership.objects.filter(
+                user_identity=identity,
+                status="active",
+            ).select_related("tenant").order_by("tenant__name")
+        ]
+
+    return JsonResponse(
+        {
+            "meta": {
+                "generated_at": timezone.now().isoformat(),
+                "filters": {
+                    "blueprint_id": blueprint_id or None,
+                    "environment_id": environment_id or None,
+                    "tenant_id": tenant_id or None,
+                    "include_runs": include_runs,
+                    "include_instances": include_instances,
+                    "include_drafts": include_drafts,
+                },
+                "options": {
+                    "blueprints": [{"id": str(b.id), "label": f"{b.namespace}.{b.name}"} for b in blueprints],
+                    "environments": [{"id": str(item.id), "name": item.name} for item in environments],
+                    "tenants": tenant_options,
+                },
+            },
+            "nodes": nodes,
+            "edges": edges,
+            "suggested_layout": "layered_lr",
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def release_target_deploy_latest_action(request: HttpRequest, target_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    token = os.environ.get("XYENCE_INTERNAL_TOKEN", "").strip()
+    if not token:
+        return JsonResponse({"error": "Internal token not configured"}, status=500)
+    internal_request = HttpRequest()
+    internal_request.method = "POST"
+    internal_request.META["HTTP_X_INTERNAL_TOKEN"] = token
+    return internal_release_target_deploy_latest(internal_request, target_id)
+
+
+@csrf_exempt
+@login_required
+def release_target_rollback_last_success_action(request: HttpRequest, target_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    token = os.environ.get("XYENCE_INTERNAL_TOKEN", "").strip()
+    if not token:
+        return JsonResponse({"error": "Internal token not configured"}, status=500)
+    internal_request = HttpRequest()
+    internal_request.method = "POST"
+    internal_request.META["HTTP_X_INTERNAL_TOKEN"] = token
+    return internal_release_target_rollback_last_success(internal_request, target_id)
+
+
+@login_required
+def release_target_check_drift_action(request: HttpRequest, target_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    token = os.environ.get("XYENCE_INTERNAL_TOKEN", "").strip()
+    if not token:
+        return JsonResponse({"error": "Internal token not configured"}, status=500)
+    internal_request = HttpRequest()
+    internal_request.method = "GET"
+    internal_request.META["HTTP_X_INTERNAL_TOKEN"] = token
+    return internal_release_target_check_drift(internal_request, target_id)
+
+
 @csrf_exempt
 @login_required
 def registries_collection(request: HttpRequest) -> JsonResponse:
@@ -2636,6 +3309,9 @@ def release_plans_collection(request: HttpRequest) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
     if request.method == "POST":
+        identity = _require_authenticated(request)
+        if not identity:
+            return JsonResponse({"error": "not authenticated"}, status=401)
         payload = _parse_json(request)
         name = payload.get("name")
         target_kind = payload.get("target_kind")
@@ -2645,6 +3321,9 @@ def release_plans_collection(request: HttpRequest) -> JsonResponse:
             return JsonResponse({"error": "name, target_kind, target_fqn, to_version required"}, status=400)
         if not payload.get("environment_id"):
             return JsonResponse({"error": "environment_id required"}, status=400)
+        target_fqn = str(payload.get("target_fqn") or "")
+        if target_fqn in _control_plane_app_ids() and not _is_platform_architect(identity):
+            return JsonResponse({"error": "platform_architect role required for control plane plans"}, status=403)
         plan = ReleasePlan.objects.create(
             name=name,
             target_kind=target_kind,
@@ -2687,7 +3366,13 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
         return staff_error
     plan = get_object_or_404(ReleasePlan, id=plan_id)
     if request.method == "PATCH":
+        identity = _require_authenticated(request)
+        if not identity:
+            return JsonResponse({"error": "not authenticated"}, status=401)
         payload = _parse_json(request)
+        target_fqn = str(payload.get("target_fqn") or plan.target_fqn or "")
+        if target_fqn in _control_plane_app_ids() and not _is_platform_architect(identity):
+            return JsonResponse({"error": "platform_architect role required for control plane plans"}, status=403)
         if "environment_id" in payload and not payload.get("environment_id"):
             return JsonResponse({"error": "environment_id required"}, status=400)
         for field in ["name", "target_kind", "target_fqn", "from_version", "to_version", "milestones_json"]:
@@ -2771,6 +3456,12 @@ def release_plan_deployments(request: HttpRequest, plan_id: str) -> JsonResponse
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
     plan = get_object_or_404(ReleasePlan, id=plan_id)
+    if _is_control_plane_plan(plan):
+        identity = _require_authenticated(request)
+        if not identity:
+            return JsonResponse({"error": "not authenticated"}, status=401)
+        if not _is_platform_architect(identity):
+            return JsonResponse({"error": "platform_architect role required for control plane deploys"}, status=403)
     payload = _parse_json(request)
     instance_id = payload.get("instance_id")
     if not instance_id:
@@ -2793,6 +3484,11 @@ def release_plan_deployments(request: HttpRequest, plan_id: str) -> JsonResponse
     if not deployment.last_applied_at:
         deployment.last_applied_at = timezone.now()
     deployment.save()
+    _audit_action(
+        f"Release plan deployment marker updated for {plan.id}",
+        {"release_plan_id": str(plan.id), "instance_id": str(instance.id)},
+        request,
+    )
     return JsonResponse({"status": "ok"})
 
 
@@ -2847,8 +3543,18 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
         return staff_error
     release = get_object_or_404(Release, id=release_id)
     if request.method == "PATCH":
+        identity = _require_authenticated(request)
+        if not identity:
+            return JsonResponse({"error": "not authenticated"}, status=401)
         payload = _parse_json(request)
         prev_status = release.status
+        next_status = payload.get("status", release.status)
+        if (
+            _is_control_plane_release(release)
+            and str(next_status) == "published"
+            and not _is_platform_architect(identity)
+        ):
+            return JsonResponse({"error": "platform_architect role required for control plane release publish"}, status=403)
         for field in ["version", "status", "build_state", "artifacts_json", "release_plan_id", "blueprint_id"]:
             if field in payload:
                 setattr(release, field, payload[field])
@@ -2858,6 +3564,11 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
         if payload.get("status") == "published" and prev_status != "published":
             release.build_state = "building"
             release.save(update_fields=["build_state", "updated_at"])
+            _audit_action(
+                f"Release {release.id} published",
+                {"release_id": str(release.id), "version": release.version},
+                request,
+            )
             build_result = _enqueue_release_build(release, request.user)
             build_run_id = build_result.get("run_id")
             if not build_result.get("ok"):
@@ -2868,8 +3579,14 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
                 release.save(update_fields=["build_state", "updated_at"])
         return JsonResponse({"id": str(release.id), "build_run_id": build_run_id})
     if request.method == "DELETE":
+        if release.status == "published" and release.release_plan_id:
+            return JsonResponse(
+                {"error": "published releases linked to a release plan cannot be deleted"},
+                status=400,
+            )
+        cleanup = _delete_release_images(release)
         release.delete()
-        return JsonResponse({"status": "deleted"})
+        return JsonResponse({"status": "deleted", "image_cleanup": cleanup})
     return JsonResponse(
         {
             "id": str(release.id),
@@ -2945,6 +3662,230 @@ def environment_detail(request: HttpRequest, env_id: str) -> JsonResponse:
             "aws_region": environment.aws_region,
             "created_at": environment.created_at,
             "updated_at": environment.updated_at,
+        }
+    )
+
+
+@login_required
+def control_plane_state(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    app_registry = [
+        {
+            "app_id": "xyn-api",
+            "display_name": "Xyn API",
+            "category": "control-plane",
+            "default_health_checks": ["https://<fqdn>/health"],
+        },
+        {
+            "app_id": "xyn-ui",
+            "display_name": "Xyn UI",
+            "category": "control-plane",
+            "default_health_checks": ["https://<fqdn>/", "https://<fqdn>/auth/login"],
+        },
+    ]
+    env_qs = Environment.objects.all().order_by("name")
+    if env_id := request.GET.get("environment_id"):
+        env_qs = env_qs.filter(id=env_id)
+    environments = list(env_qs)
+    states_payload: List[Dict[str, Any]] = []
+    for env in environments:
+        for app in app_registry:
+            app_id = app["app_id"]
+            state = (
+                EnvironmentAppState.objects.filter(environment=env, app_id=app_id)
+                .select_related("current_release", "last_good_release", "last_deploy_run")
+                .first()
+            )
+            last_deployment = (
+                Deployment.objects.filter(environment=env, app_id=app_id)
+                .order_by("-created_at")
+                .first()
+            )
+            states_payload.append(
+                {
+                    "environment_id": str(env.id),
+                    "environment_name": env.name,
+                    "app_id": app_id,
+                    "display_name": app["display_name"],
+                    "category": app["category"],
+                    "current_release_id": str(state.current_release_id) if state and state.current_release_id else None,
+                    "current_release_version": state.current_release.version if state and state.current_release else None,
+                    "last_good_release_id": str(state.last_good_release_id) if state and state.last_good_release_id else None,
+                    "last_good_release_version": (
+                        state.last_good_release.version if state and state.last_good_release else None
+                    ),
+                    "last_deploy_run_id": str(state.last_deploy_run_id) if state and state.last_deploy_run_id else None,
+                    "last_deployed_at": state.last_deployed_at if state else None,
+                    "last_good_at": state.last_good_at if state else None,
+                    "last_deployment_id": str(last_deployment.id) if last_deployment else None,
+                    "last_deployment_status": last_deployment.status if last_deployment else None,
+                    "last_deployment_error": last_deployment.error_message if last_deployment else "",
+                }
+            )
+    release_options: List[Dict[str, Any]] = []
+    for release in Release.objects.filter(status="published", build_state="ready").select_related("blueprint", "release_plan"):
+        release_app_id = infer_app_id(release, release.release_plan)
+        if release_app_id not in {"xyn-api", "xyn-ui", "core.xyn-api", "core.xyn-ui"}:
+            continue
+        release_options.append(
+            {
+                "id": str(release.id),
+                "app_id": "xyn-api" if release_app_id in {"xyn-api", "core.xyn-api"} else "xyn-ui",
+                "version": release.version,
+                "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
+            }
+        )
+    instance_options = [
+        {
+            "id": str(instance.id),
+            "name": instance.name,
+            "environment_id": str(instance.environment_id) if instance.environment_id else None,
+            "status": instance.status,
+        }
+        for instance in ProvisionedInstance.objects.order_by("name")
+    ]
+    return JsonResponse(
+        {
+            "app_registry": app_registry,
+            "states": states_payload,
+            "releases": release_options,
+            "instances": instance_options,
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def control_plane_deploy(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if architect_error := _require_platform_architect(request):
+        return architect_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = _parse_json(request)
+    environment_id = payload.get("environment_id")
+    app_id = payload.get("app_id")
+    release_id = payload.get("release_id")
+    instance_id = payload.get("instance_id")
+    if not environment_id or not app_id or not release_id:
+        return JsonResponse({"error": "environment_id, app_id, and release_id required"}, status=400)
+    environment = get_object_or_404(Environment, id=environment_id)
+    release = get_object_or_404(Release, id=release_id)
+    if release.status != "published":
+        return JsonResponse({"error": "release must be published"}, status=400)
+    if release.build_state != "ready":
+        return JsonResponse({"error": "release build must be ready"}, status=400)
+    release_plan = release.release_plan
+    if release_plan and release_plan.environment_id and str(release_plan.environment_id) != str(environment.id):
+        return JsonResponse({"error": "release plan environment mismatch"}, status=400)
+    inferred = infer_app_id(release, release_plan)
+    canonical_requested = "xyn-api" if app_id in {"xyn-api", "core.xyn-api"} else "xyn-ui"
+    canonical_release = "xyn-api" if inferred in {"xyn-api", "core.xyn-api"} else "xyn-ui"
+    if canonical_requested != canonical_release:
+        return JsonResponse({"error": "release does not belong to requested app"}, status=400)
+    if instance_id:
+        instance = get_object_or_404(ProvisionedInstance, id=instance_id)
+    else:
+        instance = (
+            ProvisionedInstance.objects.filter(environment=environment, status__in=["running", "ready"])
+            .order_by("-updated_at")
+            .first()
+        )
+        if not instance:
+            return JsonResponse({"error": "no eligible instance found for environment"}, status=400)
+    if str(instance.environment_id) != str(environment.id):
+        return JsonResponse({"error": "instance environment mismatch"}, status=400)
+    if not instance.instance_id or not instance.aws_region:
+        return JsonResponse({"error": "instance missing runtime identity"}, status=400)
+    deploy_kind = "release_plan" if release_plan else "release"
+    base_key = compute_idempotency_base(release, instance, release_plan, deploy_kind)
+    deployment = Deployment.objects.create(
+        idempotency_key=hashlib.sha256(f"{base_key}:{uuid.uuid4()}".encode("utf-8")).hexdigest(),
+        idempotency_base=base_key,
+        app_id=canonical_requested,
+        environment=environment,
+        release=release,
+        instance=instance,
+        release_plan=release_plan,
+        deploy_kind=deploy_kind,
+        submitted_by="platform_architect",
+        status="queued",
+    )
+    plan_json = load_release_plan_json(release, release_plan)
+    if not plan_json:
+        deployment.status = "failed"
+        deployment.error_message = "release_plan.json not found for deployment"
+        deployment.finished_at = timezone.now()
+        deployment.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+        return JsonResponse({"deployment_id": str(deployment.id), "status": deployment.status}, status=400)
+    execute_release_plan_deploy(deployment, release, instance, release_plan, plan_json)
+    rollback = maybe_trigger_rollback(deployment)
+    _audit_action(
+        f"Control plane deploy requested for {canonical_requested}",
+        {
+            "deployment_id": str(deployment.id),
+            "environment_id": str(environment.id),
+            "release_id": str(release.id),
+            "rollback_deployment_id": str(rollback.id) if rollback else None,
+        },
+        request,
+    )
+    return JsonResponse(
+        {
+            "deployment_id": str(deployment.id),
+            "status": deployment.status,
+            "rollback_deployment_id": str(rollback.id) if rollback else None,
+            "rollback_status": rollback.status if rollback else None,
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def control_plane_rollback(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if architect_error := _require_platform_architect(request):
+        return architect_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = _parse_json(request)
+    deployment_id = payload.get("deployment_id")
+    if deployment_id:
+        deployment = get_object_or_404(Deployment, id=deployment_id)
+    else:
+        environment_id = payload.get("environment_id")
+        app_id = payload.get("app_id")
+        if not environment_id or not app_id:
+            return JsonResponse({"error": "deployment_id or environment_id+app_id required"}, status=400)
+        deployment = (
+            Deployment.objects.filter(environment_id=environment_id, app_id=app_id)
+            .exclude(status="succeeded")
+            .order_by("-created_at")
+            .first()
+        )
+        if not deployment:
+            return JsonResponse({"error": "no failed deployment found"}, status=404)
+    rollback = maybe_trigger_rollback(deployment)
+    if not rollback:
+        return JsonResponse({"error": "rollback unavailable"}, status=400)
+    _audit_action(
+        "Manual rollback triggered",
+        {
+            "deployment_id": str(deployment.id),
+            "rollback_deployment_id": str(rollback.id),
+            "app_id": deployment.app_id,
+            "environment_id": str(deployment.environment_id) if deployment.environment_id else None,
+        },
+        request,
+    )
+    return JsonResponse(
+        {
+            "deployment_id": str(deployment.id),
+            "rollback_deployment_id": str(rollback.id),
+            "rollback_status": rollback.status,
         }
     )
 
