@@ -285,44 +285,66 @@ def _adapt_compose_for_host_ingress(compose_content: str, release_target: Option
     ingress = ((release_target.config_json if release_target else {}) or {}).get("ingress") or {}
     network = str(ingress.get("network") or "xyn-edge")
     routes = ingress.get("routes") if isinstance(ingress.get("routes"), list) else []
-    ems_web = services.get("ems-web")
-    ems_api = services.get("ems-api")
-    if not isinstance(ems_web, dict):
+    # Select the routed backend service from ingress routes; fallback to ems-web then ems-api.
+    route_entries = routes or [
+        {"host": (release_target.fqdn if release_target else "") or "ems.xyence.io", "service": "ems-web", "port": 8080}
+    ]
+    selected_service_name = ""
+    selected_route: Dict[str, Any] = {}
+    for route in route_entries:
+        if not isinstance(route, dict):
+            continue
+        candidate = str(route.get("service") or "").strip()
+        if candidate and isinstance(services.get(candidate), dict):
+            selected_service_name = candidate
+            selected_route = route
+            break
+    if not selected_service_name:
+        for fallback in ("ems-web", "ems-api"):
+            if isinstance(services.get(fallback), dict):
+                selected_service_name = fallback
+                break
+    if not selected_service_name:
         return compose_content
-    if isinstance(ems_api, dict):
-        api_networks = ems_api.get("networks")
-        if not isinstance(api_networks, list):
-            api_networks = []
+
+    selected_service = services.get(selected_service_name)
+    if not isinstance(selected_service, dict):
+        return compose_content
+
+    # Keep both ems-api and ems-web reachable on the edge network when present.
+    for service_name in ("ems-api", "ems-web"):
+        service_cfg = services.get(service_name)
+        if not isinstance(service_cfg, dict):
+            continue
+        service_cfg.pop("ports", None)
+        cfg_networks = service_cfg.get("networks")
+        if not isinstance(cfg_networks, list):
+            cfg_networks = []
         for required in ("default", network):
-            if required not in api_networks:
-                api_networks.append(required)
-        ems_api["networks"] = api_networks
-    ems_web.pop("ports", None)
-    networks = ems_web.get("networks")
+            if required not in cfg_networks:
+                cfg_networks.append(required)
+        service_cfg["networks"] = cfg_networks
+
+    networks = selected_service.get("networks")
     if not isinstance(networks, list):
         networks = []
     for required in ("default", network):
         if required not in networks:
             networks.append(required)
-    ems_web["networks"] = networks
-    labels = ems_web.get("labels")
+    selected_service["networks"] = networks
+    labels = selected_service.get("labels")
     if not isinstance(labels, list):
         labels = []
     labels = [entry for entry in labels if isinstance(entry, str) and not entry.startswith("traefik.")]
-    route_entries = routes or [
-        {"host": (release_target.fqdn if release_target else "") or "ems.xyence.io", "service": "ems-web", "port": 3000}
-    ]
-    for route in route_entries:
-        if not isinstance(route, dict):
-            continue
-        service_name = str(route.get("service") or "ems-web")
-        if service_name != "ems-web":
-            continue
-        host = str(route.get("host") or "").strip()
-        if not host:
-            continue
+    host = str(selected_route.get("host") or (release_target.fqdn if release_target else "") or "").strip()
+    if host:
         rid = "".join(ch if ch.isalnum() else "-" for ch in host).strip("-").lower() or "ems"
-        port = int(route.get("port") or 3000)
+        # Prefer explicit ingress port; fallback to service-local defaults.
+        default_port = 8080 if selected_service_name == "ems-web" else 8000
+        try:
+            port = int(selected_route.get("port") or default_port)
+        except (TypeError, ValueError):
+            port = default_port
         labels.extend(
             [
                 "traefik.enable=true",
@@ -334,7 +356,7 @@ def _adapt_compose_for_host_ingress(compose_content: str, release_target: Option
                 f"traefik.http.services.{rid}.loadbalancer.server.port={port}",
             ]
         )
-    ems_web["labels"] = labels
+    selected_service["labels"] = labels
     top_networks = data.get("networks")
     if not isinstance(top_networks, dict):
         top_networks = {}
@@ -485,6 +507,34 @@ def _verify_public_https_from_backend(fqdn: str) -> tuple[bool, str]:
     return False, last_err
 
 
+def _verify_public_https_from_instance(
+    instance: ProvisionedInstance,
+    fqdn: str,
+    health_path: str = "/health",
+) -> tuple[bool, str]:
+    path = str(health_path or "/health").strip()
+    if not path.startswith("/"):
+        path = f"/{path}"
+    verify_cmd = (
+        "set -euo pipefail; "
+        "command -v curl >/dev/null 2>&1 || { echo \"curl_missing\"; exit 42; }; "
+        f"for i in $(seq 1 30); do "
+        f"code=$(curl -k -s -o /dev/null -w '%{{http_code}}' --resolve '{fqdn}:443:127.0.0.1' 'https://{fqdn}{path}' || true); "
+        "if [ \"$code\" = \"200\" ] || [ \"$code\" = \"204\" ]; then echo \"ok:$code\"; exit 0; fi; "
+        "sleep 2; "
+        "done; "
+        f"echo \"local_https_bad_status:{path}:$code\"; exit 50"
+    )
+    try:
+        out = _run_ssm_commands(instance.instance_id, instance.aws_region, [verify_cmd])
+    except Exception as exc:
+        return False, f"local_https_probe_error:{exc}"
+    if out.get("invocation_status") == "Success" and out.get("response_code") == 0:
+        return True, ""
+    detail = (out.get("stderr") or out.get("stdout") or "").strip()
+    return False, detail or "local_https_probe_failed"
+
+
 def _extract_tls_error_code(stderr: str) -> str:
     marker = "tls_error_code="
     idx = stderr.rfind(marker)
@@ -623,21 +673,20 @@ def execute_release_plan_deploy(
         if _is_host_ingress_target(release_target):
             ingress = (release_target.config_json or {}).get("ingress") or {}
             network = str(ingress.get("network") or "xyn-edge")
-            tls = (release_target.tls_json or {}) if release_target else {}
-            acme_email = str(tls.get("acme_email") or os.environ.get("XYENCE_ACME_EMAIL", "")).strip()
-            ingress_compose = _render_traefik_ingress_compose(network, acme_email)
+            fqdn = (release_target.fqdn if release_target else "") or os.environ.get("EMS_PUBLIC_FQDN", "")
             _run_ssm_commands(
                 instance.instance_id,
                 instance.aws_region,
                 [
                     f"docker network inspect {network} >/dev/null 2>&1 || docker network create {network}",
-                    "mkdir -p /opt/xyn/ingress/acme",
-                    "touch /opt/xyn/ingress/acme/acme.json",
-                    "chmod 600 /opt/xyn/ingress/acme/acme.json",
-                    f"cat > /opt/xyn/ingress/compose.ingress.yml <<'XYN_TRAEFIK'\n{ingress_compose}\nXYN_TRAEFIK",
-                    "PORT_OWNERS=$(docker ps --format '{{.Names}} {{.Ports}}' | grep -E '(:80->|:443->)' | awk '{print $1}' | grep -v '^xyn-ingress-traefik$' || true); "
-                    "if [ -n \"$PORT_OWNERS\" ]; then echo \"tls_error_code=ingress_port_collision\"; exit 61; fi",
-                    "docker compose -f /opt/xyn/ingress/compose.ingress.yml up -d",
+                    # Host-ingress mode must use the shared Traefik instance.
+                    "docker ps --format '{{.Names}}' | grep -q '^xyn-ingress-traefik$' "
+                    "|| { echo 'tls_error_code=shared_ingress_missing'; exit 62; }",
+                    # Keep ems-web alive when its nginx config still references cert files.
+                    f"mkdir -p \"{cert_dir}\"",
+                    f"[ -f \"{cert_dir}/fullchain.pem\" ] && [ -f \"{cert_dir}/privkey.pem\" ] "
+                    "|| openssl req -x509 -nodes -newkey rsa:2048 -days 365 "
+                    f"-keyout \"{cert_dir}/privkey.pem\" -out \"{cert_dir}/fullchain.pem\" -subj \"/CN={fqdn or 'localhost'}\"",
                 ],
             )
         for step in steps:
@@ -756,7 +805,17 @@ def execute_release_plan_deploy(
                 execution["status"] = "failed"
                 execution["error"] = {"code": "tls_config_missing", "message": deployment.error_message}
             else:
-                ok, detail = _verify_public_https_from_backend(fqdn)
+                ingress_cfg = ((release_target.config_json if release_target else {}) or {}).get("ingress") or {}
+                route_items = ingress_cfg.get("routes") if isinstance(ingress_cfg.get("routes"), list) else []
+                health_path = "/health"
+                for route in route_items:
+                    if not isinstance(route, dict):
+                        continue
+                    host = str(route.get("host") or "").strip().lower()
+                    if host and host == fqdn.lower():
+                        health_path = str(route.get("health_path") or health_path)
+                        break
+                ok, detail = _verify_public_https_from_instance(instance, fqdn, health_path)
                 if not ok:
                     deployment.status = "failed"
                     deployment.error_message = f"verify_public_https_failed: {detail}"
