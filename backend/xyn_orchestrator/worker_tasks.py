@@ -2654,6 +2654,25 @@ def _normalize_generated_blueprint(spec: Optional[Dict[str, Any]]) -> Dict[str, 
                         if "volume" not in mount and "name" in mount:
                             mount["volume"] = mount.get("name")
                         mount.pop("name", None)
+                resources = component.get("resources")
+                if isinstance(resources, dict):
+                    limits = resources.get("limits") if isinstance(resources.get("limits"), dict) else {}
+                    requests = resources.get("requests") if isinstance(resources.get("requests"), dict) else {}
+                    cpu = resources.get("cpu")
+                    memory = resources.get("memory")
+                    if not cpu:
+                        cpu = limits.get("cpu") or requests.get("cpu")
+                    if not memory:
+                        memory = limits.get("memory") or requests.get("memory")
+                    normalized_resources: Dict[str, Any] = {}
+                    if cpu:
+                        normalized_resources["cpu"] = str(cpu)
+                    if memory:
+                        normalized_resources["memory"] = str(memory)
+                    if normalized_resources:
+                        component["resources"] = normalized_resources
+                    else:
+                        component.pop("resources", None)
     return draft
 
 
