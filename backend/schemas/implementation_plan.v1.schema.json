@@ -23,6 +23,9 @@
     "blueprint_name": {
       "type": "string"
     },
+    "release_version": {
+      "type": "string"
+    },
     "generated_at": {
       "type": "string",
       "format": "date-time"
