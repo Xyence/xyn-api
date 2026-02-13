@@ -11,7 +11,7 @@ import fnmatch
 from functools import wraps
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Set
 
 import requests
 import boto3
@@ -3534,6 +3534,64 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
         for release in qs
     ]
     return _paginate(request, data, "releases")
+
+
+@csrf_exempt
+@login_required
+def releases_bulk_delete(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = _parse_json(request)
+    release_ids = payload.get("release_ids")
+    if not isinstance(release_ids, list) or not release_ids:
+        return JsonResponse({"error": "release_ids list is required"}, status=400)
+    if len(release_ids) > 200:
+        return JsonResponse({"error": "at most 200 releases can be deleted per request"}, status=400)
+
+    ordered_ids: List[str] = []
+    seen: Set[str] = set()
+    for value in release_ids:
+        rid = str(value).strip()
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        ordered_ids.append(rid)
+
+    releases_by_id = {
+        str(release.id): release for release in Release.objects.filter(id__in=ordered_ids)
+    }
+    deleted: List[str] = []
+    skipped: List[Dict[str, str]] = []
+    image_cleanup: Dict[str, Any] = {}
+
+    for rid in ordered_ids:
+        release = releases_by_id.get(rid)
+        if not release:
+            skipped.append({"id": rid, "reason": "not_found"})
+            continue
+        if release.status == "published" and release.release_plan_id:
+            skipped.append({"id": rid, "reason": "published_with_release_plan"})
+            continue
+        cleanup = _delete_release_images(release)
+        image_cleanup[rid] = cleanup
+        release.delete()
+        deleted.append(rid)
+
+    status_code = 200 if not skipped else 207
+    return JsonResponse(
+        {
+            "status": "ok",
+            "requested_count": len(ordered_ids),
+            "deleted_count": len(deleted),
+            "skipped_count": len(skipped),
+            "deleted": deleted,
+            "skipped": skipped,
+            "image_cleanup": image_cleanup,
+        },
+        status=status_code,
+    )
 
 
 @csrf_exempt

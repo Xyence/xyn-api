@@ -220,3 +220,55 @@ class ReleaseDeleteTests(TestCase):
         response = self.client.delete(f"/xyn/api/releases/{release.id}")
         self.assertEqual(response.status_code, 200)
         self.assertFalse(Release.objects.filter(id=release.id).exists())
+
+    def test_bulk_delete_mixed_results(self):
+        self._login_admin()
+        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        env = Environment.objects.create(name="Prod", slug="prod-bulk")
+        plan = ReleasePlan.objects.create(
+            name="plan-bulk",
+            target_kind="blueprint",
+            target_fqn="core.ems.platform",
+            to_version="1.0.0",
+            blueprint=blueprint,
+            environment=env,
+        )
+        deletable_draft = Release.objects.create(
+            blueprint=blueprint,
+            version="v901",
+            status="draft",
+            build_state="draft",
+        )
+        deletable_published = Release.objects.create(
+            blueprint=blueprint,
+            version="v902",
+            status="published",
+            build_state="ready",
+        )
+        protected_published = Release.objects.create(
+            blueprint=blueprint,
+            version="v903",
+            status="published",
+            build_state="ready",
+            release_plan=plan,
+        )
+
+        response = self.client.post(
+            "/xyn/api/releases/bulk-delete",
+            data={
+                "release_ids": [
+                    str(deletable_draft.id),
+                    str(deletable_published.id),
+                    str(protected_published.id),
+                    "11111111-1111-1111-1111-111111111111",
+                ]
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 207)
+        payload = response.json()
+        self.assertEqual(payload.get("deleted_count"), 2)
+        self.assertEqual(payload.get("skipped_count"), 2)
+        self.assertFalse(Release.objects.filter(id=deletable_draft.id).exists())
+        self.assertFalse(Release.objects.filter(id=deletable_published.id).exists())
+        self.assertTrue(Release.objects.filter(id=protected_published.id).exists())
