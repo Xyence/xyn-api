@@ -103,6 +103,42 @@ def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _normalize_generated_blueprint(spec: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    draft = dict(spec or {})
+    kind = str(draft.get("kind") or "").strip()
+    if kind == "SolutionBlueprintSpec":
+        draft["kind"] = "SolutionBlueprint"
+    metadata = draft.get("metadata")
+    if isinstance(metadata, dict):
+        metadata.pop("version", None)
+    release_spec = draft.get("releaseSpec")
+    if isinstance(release_spec, dict):
+        components = release_spec.get("components")
+        if isinstance(components, list):
+            for component in components:
+                if not isinstance(component, dict):
+                    continue
+                ports = component.get("ports")
+                if isinstance(ports, list):
+                    for port in ports:
+                        if isinstance(port, dict):
+                            port.pop("public", None)
+                            port.pop("expose", None)
+                            port.pop("hostname", None)
+                            port.pop("http", None)
+                            port.pop("https", None)
+                            port.pop("tls", None)
+                volume_mounts = component.get("volumeMounts")
+                if isinstance(volume_mounts, list):
+                    for mount in volume_mounts:
+                        if not isinstance(mount, dict):
+                            continue
+                        if "volume" not in mount and "name" in mount:
+                            mount["volume"] = mount.get("name")
+                        mount.pop("name", None)
+    return draft
+
+
 def _openai_generate_blueprint(
     transcript: str, kind: str, context_text: str
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -126,9 +162,22 @@ def _openai_generate_blueprint(
         )
     else:
         system_prompt = (
-            "You are generating a SolutionBlueprintSpec JSON for Xyn. "
-            "Return ONLY valid JSON matching SolutionBlueprintSpec schema. "
-            "Use apiVersion xyn.blueprint/v1 and include releaseSpec."
+            "You are generating JSON for Xyn and MUST return a SolutionBlueprintSpec-compatible object.\n"
+            "Return ONLY a JSON object with no markdown, no prose, and no code fences.\n"
+            "STRICT requirements:\n"
+            "- Top-level required fields: apiVersion, kind, metadata, releaseSpec.\n"
+            "- apiVersion must be exactly 'xyn.blueprint/v1'.\n"
+            "- kind must be exactly 'Blueprint' or 'SolutionBlueprint'. NEVER 'SolutionBlueprintSpec'.\n"
+            "- metadata must include only: name, namespace, labels (optional). Do NOT include metadata.version.\n"
+            "- releaseSpec must be a valid Release object:\n"
+            "  releaseSpec.apiVersion='xyn.seed/v1'\n"
+            "  releaseSpec.kind='Release'\n"
+            "  releaseSpec.metadata={name, namespace, labels?}\n"
+            "  releaseSpec.backend={type:'compose'|'k8s', config?}\n"
+            "  releaseSpec.components=[{name, image? or build{context,dockerfile?,imageName?,target?}, env?, ports?, volumeMounts?, dependsOn?, resources?}]\n"
+            "- Do NOT include extra top-level keys.\n"
+            "- If unknown, choose safe defaults and still produce a schema-valid object.\n"
+            "Output JSON only."
         )
     if context_text:
         system_prompt = f"{context_text}\n\n{system_prompt}"
@@ -318,6 +367,7 @@ def generate_blueprint_draft(session_id: str) -> None:
         generation_error = "No prompt input provided."
     if not draft:
         draft = session.current_draft_json or {}
+    draft = _normalize_generated_blueprint(draft)
     errors = _validate_blueprint(draft, session.blueprint_kind) if draft else []
     if generation_error:
         errors = [generation_error, *errors] if generation_error not in errors else errors
@@ -359,6 +409,7 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
     draft, generation_error = _openai_generate_blueprint(combined, session.blueprint_kind, context["effective_context"])
     if not draft:
         draft = session.current_draft_json or {}
+    draft = _normalize_generated_blueprint(draft)
     errors = _validate_blueprint(draft, session.blueprint_kind) if draft else []
     if generation_error:
         errors = [generation_error, *errors] if generation_error not in errors else errors
