@@ -228,14 +228,28 @@ class BlueprintDraftSession(models.Model):
         ("module", "Module"),
         ("bundle", "Bundle"),
     ]
+    DRAFT_KIND_CHOICES = [
+        ("blueprint", "Blueprint"),
+        ("solution", "Solution"),
+    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
+    title = models.CharField(max_length=200, blank=True)
     blueprint = models.ForeignKey(
         Blueprint, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_sessions_source"
     )
+    draft_kind = models.CharField(max_length=20, choices=DRAFT_KIND_CHOICES, default="blueprint")
     blueprint_kind = models.CharField(max_length=20, choices=KIND_CHOICES, default="solution")
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="drafting")
+    namespace = models.CharField(max_length=120, blank=True)
+    project_key = models.CharField(max_length=200, blank=True)
+    initial_prompt = models.TextField(blank=True)
+    revision_instruction = models.TextField(blank=True)
+    selected_context_pack_ids = models.JSONField(default=list, blank=True)
+    source_artifacts = models.JSONField(default=list, blank=True)
+    has_generated_output = models.BooleanField(default=False)
+    submitted_payload_json = models.JSONField(null=True, blank=True)
     current_draft_json = models.JSONField(null=True, blank=True)
     requirements_summary = models.TextField(blank=True)
     validation_errors_json = models.JSONField(null=True, blank=True)

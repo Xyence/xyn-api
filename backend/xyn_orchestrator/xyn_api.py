@@ -35,6 +35,7 @@ from .blueprints import (
     _build_context_artifacts,
     _enqueue_job,
     _enqueue_release_build,
+    _recommended_context_pack_ids,
     internal_release_target_check_drift,
     internal_release_target_deploy_latest,
     internal_release_target_rollback_last_success,
@@ -3239,25 +3240,57 @@ def blueprint_draft_sessions(request: HttpRequest, blueprint_id: str) -> JsonRes
     blueprint = get_object_or_404(Blueprint, id=blueprint_id)
     if request.method == "POST":
         payload = _parse_json(request)
-        name = payload.get("name") or f"{blueprint.namespace}.{blueprint.name} Draft"
-        blueprint_kind = payload.get("blueprint_kind", "solution")
-        context_pack_ids = payload.get("context_pack_ids") or []
+        title = (payload.get("title") or payload.get("name") or "").strip() or "Untitled draft"
+        draft_kind = str(payload.get("kind") or payload.get("draft_kind") or "blueprint").strip().lower()
+        if draft_kind not in {"blueprint", "solution"}:
+            return JsonResponse({"error": "kind must be blueprint or solution"}, status=400)
+        blueprint_kind = str(payload.get("blueprint_kind") or "solution")
+        namespace = (payload.get("namespace") or blueprint.namespace or "").strip()
+        project_key = (payload.get("project_key") or f"{blueprint.namespace}.{blueprint.name}").strip()
+        generate_code = bool(payload.get("generate_code", False))
+        context_pack_ids = payload.get("selected_context_pack_ids")
+        if context_pack_ids is None:
+            context_pack_ids = payload.get("context_pack_ids")
+        if context_pack_ids is None:
+            context_pack_ids = _recommended_context_pack_ids(
+                draft_kind=draft_kind,
+                namespace=namespace or None,
+                project_key=project_key or None,
+                generate_code=generate_code,
+            )
         if not isinstance(context_pack_ids, list):
             return JsonResponse({"error": "context_pack_ids must be a list"}, status=400)
         session = BlueprintDraftSession.objects.create(
-            name=name,
+            name=title,
+            title=title,
             blueprint=blueprint,
+            draft_kind=draft_kind,
             blueprint_kind=blueprint_kind,
+            namespace=namespace,
+            project_key=project_key,
+            initial_prompt=(payload.get("initial_prompt") or "").strip(),
+            revision_instruction=(payload.get("revision_instruction") or "").strip(),
+            selected_context_pack_ids=context_pack_ids,
             context_pack_ids=context_pack_ids,
+            source_artifacts=payload.get("source_artifacts") if isinstance(payload.get("source_artifacts"), list) else [],
             created_by=request.user,
             updated_by=request.user,
         )
-        return JsonResponse({"session_id": str(session.id)})
+        return JsonResponse(
+            {
+                "session_id": str(session.id),
+                "title": session.title or session.name,
+                "kind": session.draft_kind,
+                "selected_context_pack_ids": session.selected_context_pack_ids or session.context_pack_ids or [],
+            }
+        )
     sessions = BlueprintDraftSession.objects.filter(blueprint=blueprint).order_by("-created_at")
     data = [
         {
             "id": str(session.id),
-            "name": session.name,
+            "name": session.title or session.name,
+            "title": session.title or session.name,
+            "kind": session.draft_kind,
             "status": session.status,
             "blueprint_kind": session.blueprint_kind,
             "created_at": session.created_at,

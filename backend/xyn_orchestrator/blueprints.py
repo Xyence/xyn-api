@@ -3179,33 +3179,91 @@ def create_draft_session(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "POST required"}, status=405)
     if staff_error := _require_staff(request):
         return staff_error
-    payload = json.loads(request.body.decode("utf-8"))
-    name = payload.get("name") or f"Blueprint draft {uuid.uuid4()}"
-    blueprint_kind = payload.get("blueprint_kind", "solution")
-    context_pack_ids = payload.get("context_pack_ids") or []
+    payload = _safe_json_body(request)
+    draft_kind = str(payload.get("kind") or payload.get("draft_kind") or "blueprint").strip().lower()
+    if draft_kind not in {"blueprint", "solution"}:
+        return JsonResponse({"error": "kind must be blueprint or solution"}, status=400)
+    title = (payload.get("title") or payload.get("name") or "").strip() or "Untitled draft"
+    blueprint_kind = str(payload.get("blueprint_kind") or "solution")
+    namespace = (payload.get("namespace") or "").strip()
+    project_key = (payload.get("project_key") or "").strip()
+    generate_code = bool(payload.get("generate_code", False))
+    initial_prompt = (payload.get("initial_prompt") or "").strip()
+    revision_instruction = (payload.get("revision_instruction") or "").strip()
+    source_artifacts = _serialize_source_artifacts(payload.get("source_artifacts"))
+    context_pack_ids = payload.get("selected_context_pack_ids")
+    if context_pack_ids is None:
+        context_pack_ids = payload.get("context_pack_ids")
+    if context_pack_ids is None:
+        context_pack_ids = _recommended_context_pack_ids(
+            draft_kind=draft_kind,
+            namespace=namespace or None,
+            project_key=project_key or None,
+            generate_code=generate_code,
+        )
     if not isinstance(context_pack_ids, list):
         return JsonResponse({"error": "context_pack_ids must be a list"}, status=400)
+    blueprint_id = payload.get("blueprint_id")
+    blueprint = None
+    if blueprint_id:
+        blueprint = Blueprint.objects.filter(id=blueprint_id).first()
+        if not blueprint:
+            return JsonResponse({"error": "blueprint_id not found"}, status=404)
+        namespace = namespace or blueprint.namespace
+        project_key = project_key or f"{blueprint.namespace}.{blueprint.name}"
     session = BlueprintDraftSession.objects.create(
-        name=name,
+        name=title,
+        title=title,
+        draft_kind=draft_kind,
         blueprint_kind=blueprint_kind,
-        blueprint_id=payload.get("blueprint_id"),
+        blueprint=blueprint,
+        namespace=namespace,
+        project_key=project_key,
+        initial_prompt=initial_prompt,
+        revision_instruction=revision_instruction,
+        selected_context_pack_ids=context_pack_ids,
         context_pack_ids=context_pack_ids,
+        source_artifacts=source_artifacts,
+        status="drafting",
         created_by=request.user,
         updated_by=request.user,
     )
-    resolved = _resolve_context_packs(session, context_pack_ids)
+    resolved = _resolve_context_packs(
+        session,
+        context_pack_ids,
+        purpose="planner",
+        namespace=namespace or None,
+        project_key=project_key or None,
+    )
     session.context_pack_refs_json = resolved["refs"]
     session.effective_context_hash = resolved["hash"]
     session.effective_context_preview = resolved["preview"]
     session.save(
         update_fields=[
+            "name",
+            "title",
+            "draft_kind",
+            "namespace",
+            "project_key",
+            "initial_prompt",
+            "revision_instruction",
+            "selected_context_pack_ids",
             "context_pack_refs_json",
             "effective_context_hash",
             "effective_context_preview",
             "updated_at",
         ]
     )
-    return JsonResponse({"session_id": str(session.id)})
+    return JsonResponse(
+        {
+            "session_id": str(session.id),
+            "title": session.title or session.name,
+            "kind": session.draft_kind,
+            "namespace": session.namespace or None,
+            "project_key": session.project_key or None,
+            "selected_context_pack_ids": session.selected_context_pack_ids or session.context_pack_ids or [],
+        }
+    )
 
 
 @csrf_exempt
@@ -3378,6 +3436,143 @@ def _coerce_bool(value: Optional[str]) -> Optional[bool]:
     return value.lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _safe_json_body(request: HttpRequest) -> Dict[str, Any]:
+    if not request.body:
+        return {}
+    try:
+        return json.loads(request.body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _required_default_pack_names(draft_kind: str, generate_code: bool) -> List[str]:
+    names = ["xyn-platform-canon", "xyn-planner-canon"]
+    if draft_kind == "solution" or generate_code:
+        names.append("xyn-coder-canon")
+    return names
+
+
+def _recommended_context_pack_ids(
+    *,
+    draft_kind: str,
+    namespace: Optional[str],
+    project_key: Optional[str],
+    generate_code: bool,
+) -> List[str]:
+    required_names = _required_default_pack_names(draft_kind, generate_code)
+    packs = list(ContextPack.objects.filter(is_active=True).order_by("name", "-updated_at"))
+    selected: List[ContextPack] = []
+    selected_ids: set[str] = set()
+
+    def _pick(name: str, scope: Optional[str] = None, purpose: Optional[List[str]] = None) -> None:
+        for pack in packs:
+            if pack.name != name:
+                continue
+            if scope and pack.scope != scope:
+                continue
+            if purpose and pack.purpose not in purpose:
+                continue
+            pid = str(pack.id)
+            if pid in selected_ids:
+                return
+            selected_ids.add(pid)
+            selected.append(pack)
+            return
+
+    # Required global canon packs for planner stage.
+    _pick("xyn-platform-canon", scope="global", purpose=["any", "planner"])
+    _pick("xyn-planner-canon", scope="global", purpose=["any", "planner"])
+
+    # Namespace convention pack only when namespace is known.
+    if namespace:
+        for pack in packs:
+            if pack.name != "xyence-engineering-conventions":
+                continue
+            if pack.scope != "namespace" or pack.namespace != namespace:
+                continue
+            if pack.purpose not in {"any", "planner"}:
+                continue
+            pid = str(pack.id)
+            if pid not in selected_ids:
+                selected_ids.add(pid)
+                selected.append(pack)
+            break
+
+    # Project planner pack only for core.ems.platform.
+    if project_key == "core.ems.platform":
+        for pack in packs:
+            if pack.name != "ems-platform-blueprint":
+                continue
+            if pack.scope != "project" or pack.project_key != project_key:
+                continue
+            if pack.purpose not in {"any", "planner"}:
+                continue
+            pid = str(pack.id)
+            if pid not in selected_ids:
+                selected_ids.add(pid)
+                selected.append(pack)
+            break
+
+    # Coder canon defaults for solution/generate_code only.
+    if draft_kind == "solution" or generate_code:
+        _pick("xyn-coder-canon", scope="global", purpose=["any", "coder"])
+
+    # Guard: if a required pack wasn't found by canonical scope constraints, fall back to any active match by name.
+    names_present = {pack.name for pack in selected}
+    for required in required_names:
+        if required in names_present:
+            continue
+        for pack in packs:
+            if pack.name != required:
+                continue
+            pid = str(pack.id)
+            if pid in selected_ids:
+                continue
+            selected_ids.add(pid)
+            selected.append(pack)
+            break
+    return [str(pack.id) for pack in selected]
+
+
+def _serialize_context_pack(pack: ContextPack) -> Dict[str, Any]:
+    return {
+        "id": str(pack.id),
+        "name": pack.name,
+        "purpose": pack.purpose,
+        "scope": pack.scope,
+        "namespace": pack.namespace,
+        "project_key": pack.project_key,
+        "version": pack.version,
+        "is_active": pack.is_active,
+        "is_default": pack.is_default,
+        "updated_at": pack.updated_at,
+    }
+
+
+def _serialize_source_artifacts(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    artifacts: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        artifact_type = str(item.get("type", "")).strip().lower()
+        if artifact_type not in {"text", "audio_transcript"}:
+            continue
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        meta = item.get("meta")
+        artifacts.append(
+            {
+                "type": artifact_type,
+                "content": content,
+                "meta": meta if isinstance(meta, dict) else {},
+            }
+        )
+    return artifacts
+
+
 def _clear_default_for_scope(scope: str, namespace: str, project_key: str, exclude_id: Optional[str] = None) -> None:
     qs = ContextPack.objects.filter(scope=scope, is_default=True)
     if namespace:
@@ -3453,6 +3648,40 @@ def list_context_packs(request: HttpRequest) -> JsonResponse:
         for pack in qs.order_by("name", "version")
     ]
     return JsonResponse({"context_packs": data})
+
+
+@login_required
+def context_pack_defaults(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    draft_kind = (request.GET.get("draft_kind") or "blueprint").strip().lower()
+    if draft_kind not in {"blueprint", "solution"}:
+        return JsonResponse({"error": "draft_kind must be blueprint or solution"}, status=400)
+    namespace = (request.GET.get("namespace") or "").strip() or None
+    project_key = (request.GET.get("project_key") or "").strip() or None
+    generate_code = _coerce_bool(request.GET.get("generate_code")) or False
+    recommended_ids = _recommended_context_pack_ids(
+        draft_kind=draft_kind,
+        namespace=namespace,
+        project_key=project_key,
+        generate_code=generate_code,
+    )
+    packs = list(ContextPack.objects.filter(id__in=recommended_ids))
+    pack_map = {str(pack.id): pack for pack in packs}
+    ordered = [pack_map[pack_id] for pack_id in recommended_ids if pack_id in pack_map]
+    return JsonResponse(
+        {
+            "draft_kind": draft_kind,
+            "namespace": namespace,
+            "project_key": project_key,
+            "generate_code": generate_code,
+            "recommended_context_pack_ids": recommended_ids,
+            "required_pack_names": _required_default_pack_names(draft_kind, generate_code),
+            "recommended_context_packs": [_serialize_context_pack(pack) for pack in ordered],
+        }
+    )
 
 
 @csrf_exempt
@@ -3626,6 +3855,7 @@ def resolve_draft_session_context(request: HttpRequest, session_id: str) -> Json
     if context_pack_ids is not None:
         if not isinstance(context_pack_ids, list):
             return JsonResponse({"error": "context_pack_ids must be a list"}, status=400)
+        session.selected_context_pack_ids = context_pack_ids
         session.context_pack_ids = context_pack_ids
     resolved = _resolve_context_packs(session, context_pack_ids)
     session.context_pack_refs_json = resolved["refs"]
@@ -3634,6 +3864,7 @@ def resolve_draft_session_context(request: HttpRequest, session_id: str) -> Json
     session.save(
         update_fields=[
             "context_pack_ids",
+            "selected_context_pack_ids",
             "context_pack_refs_json",
             "effective_context_hash",
             "effective_context_preview",
@@ -3645,6 +3876,7 @@ def resolve_draft_session_context(request: HttpRequest, session_id: str) -> Json
             "context_pack_refs": resolved["refs"],
             "effective_context_hash": resolved["hash"],
             "effective_context_preview": resolved["preview"],
+            "selected_context_pack_ids": session.selected_context_pack_ids or session.context_pack_ids or [],
         }
     )
 
@@ -3676,6 +3908,8 @@ def save_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
         errors,
         suggested_fixes=[],
     )
+    session.has_generated_output = bool(draft_json)
+    session.save(update_fields=["has_generated_output", "updated_at"])
     return JsonResponse(
         {"status": session.status, "validation_errors": session.validation_errors_json or []}
     )
@@ -3696,6 +3930,80 @@ def publish_draft_session(request: HttpRequest, session_id: str) -> JsonResponse
             status=400,
         )
     return JsonResponse(result)
+
+
+@csrf_exempt
+@login_required
+def submit_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    payload = _safe_json_body(request)
+    initial_prompt = (payload.get("initial_prompt") or session.initial_prompt or "").strip()
+    if not initial_prompt:
+        return JsonResponse({"error": "initial_prompt is required"}, status=400)
+    selected_pack_ids = (
+        payload.get("selected_context_pack_ids")
+        or session.selected_context_pack_ids
+        or session.context_pack_ids
+        or []
+    )
+    if not isinstance(selected_pack_ids, list):
+        return JsonResponse({"error": "selected_context_pack_ids must be a list"}, status=400)
+    generate_code = bool(payload.get("generate_code", False))
+    required_names = _required_default_pack_names(session.draft_kind or "blueprint", generate_code)
+    selected_packs = ContextPack.objects.filter(id__in=selected_pack_ids)
+    selected_names = {pack.name for pack in selected_packs}
+    missing_required = [name for name in required_names if name not in selected_names]
+    if missing_required:
+        return JsonResponse(
+            {"error": "missing required default packs", "required_pack_names": missing_required},
+            status=400,
+        )
+    source_artifacts = session.source_artifacts or []
+    if "source_artifacts" in payload:
+        source_artifacts = _serialize_source_artifacts(payload.get("source_artifacts"))
+    submission_payload = {
+        "draft_session_id": str(session.id),
+        "kind": session.draft_kind or "blueprint",
+        "title": session.title or session.name or "Untitled draft",
+        "namespace": session.namespace or None,
+        "project_key": session.project_key or None,
+        "initial_prompt": initial_prompt,
+        "revision_instruction": session.revision_instruction or "",
+        "selected_context_pack_ids": selected_pack_ids,
+        "source_artifacts": source_artifacts,
+        "submitted_at": timezone.now().isoformat(),
+    }
+    session.initial_prompt = initial_prompt
+    session.submitted_payload_json = submission_payload
+    session.source_artifacts = source_artifacts
+    session.selected_context_pack_ids = selected_pack_ids
+    session.context_pack_ids = selected_pack_ids
+    session.status = "published"
+    session.updated_by = request.user
+    session.save(
+        update_fields=[
+            "initial_prompt",
+            "source_artifacts",
+            "submitted_payload_json",
+            "selected_context_pack_ids",
+            "context_pack_ids",
+            "status",
+            "updated_by",
+            "updated_at",
+        ]
+    )
+    return JsonResponse(
+        {
+            "ok": True,
+            "status": "submitted",
+            "session_id": str(session.id),
+            "submission_payload": submission_payload,
+        }
+    )
 
 @login_required
 def get_voice_note(request: HttpRequest, voice_note_id: str) -> JsonResponse:
@@ -3719,12 +4027,61 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
     session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    if request.method == "PATCH":
+        payload = _safe_json_body(request)
+        if "title" in payload:
+            title = (payload.get("title") or "").strip() or "Untitled draft"
+            session.title = title
+            session.name = title
+        if "kind" in payload or "draft_kind" in payload:
+            kind = str(payload.get("kind") or payload.get("draft_kind") or "").strip().lower()
+            if kind not in {"blueprint", "solution"}:
+                return JsonResponse({"error": "kind must be blueprint or solution"}, status=400)
+            session.draft_kind = kind
+        if "namespace" in payload:
+            session.namespace = (payload.get("namespace") or "").strip()
+        if "project_key" in payload:
+            session.project_key = (payload.get("project_key") or "").strip()
+        if "initial_prompt" in payload:
+            session.initial_prompt = (payload.get("initial_prompt") or "").strip()
+        if "revision_instruction" in payload:
+            session.revision_instruction = (payload.get("revision_instruction") or "").strip()
+        if "source_artifacts" in payload:
+            session.source_artifacts = _serialize_source_artifacts(payload.get("source_artifacts"))
+        selected_ids = payload.get("selected_context_pack_ids")
+        if selected_ids is None:
+            selected_ids = payload.get("context_pack_ids")
+        if selected_ids is not None:
+            if not isinstance(selected_ids, list):
+                return JsonResponse({"error": "selected_context_pack_ids must be a list"}, status=400)
+            session.selected_context_pack_ids = selected_ids
+            session.context_pack_ids = selected_ids
+            resolved = _resolve_context_packs(
+                session,
+                selected_ids,
+                purpose="planner",
+                namespace=session.namespace or None,
+                project_key=session.project_key or None,
+            )
+            session.context_pack_refs_json = resolved["refs"]
+            session.effective_context_hash = resolved["hash"]
+            session.effective_context_preview = resolved["preview"]
+        session.updated_by = request.user
+        session.save()
     return JsonResponse(
         {
             "id": str(session.id),
+            "title": session.title or session.name,
+            "kind": session.draft_kind,
             "blueprint_kind": session.blueprint_kind,
             "status": session.status,
             "draft": session.current_draft_json,
+            "namespace": session.namespace or None,
+            "project_key": session.project_key or None,
+            "initial_prompt": session.initial_prompt,
+            "revision_instruction": session.revision_instruction,
+            "source_artifacts": session.source_artifacts or [],
+            "has_generated_output": bool(session.has_generated_output or session.current_draft_json),
             "requirements_summary": session.requirements_summary,
             "validation_errors": session.validation_errors_json or [],
             "suggested_fixes": session.suggested_fixes_json or [],
@@ -3732,9 +4089,12 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             "last_error": session.last_error,
             "diff_summary": session.diff_summary,
             "context_pack_refs": session.context_pack_refs_json or [],
-            "context_pack_ids": session.context_pack_ids or [],
+            "context_pack_ids": session.selected_context_pack_ids or session.context_pack_ids or [],
+            "selected_context_pack_ids": session.selected_context_pack_ids or session.context_pack_ids or [],
             "effective_context_hash": session.effective_context_hash,
             "effective_context_preview": session.effective_context_preview,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
         }
     )
 
@@ -3829,7 +4189,11 @@ def internal_draft_session(request: HttpRequest, session_id: str) -> JsonRespons
         {
             "id": str(session.id),
             "blueprint_kind": session.blueprint_kind,
+            "kind": session.draft_kind,
             "context_pack_ids": session.context_pack_ids or [],
+            "selected_context_pack_ids": session.selected_context_pack_ids or session.context_pack_ids or [],
+            "initial_prompt": session.initial_prompt,
+            "source_artifacts": session.source_artifacts or [],
             "requirements_summary": session.requirements_summary,
             "draft": session.current_draft_json,
             "transcripts": transcripts,
@@ -3877,6 +4241,7 @@ def internal_draft_session_update(request: HttpRequest, session_id: str) -> Json
     session.diff_summary = payload.get("diff_summary", "")
     session.status = payload.get("status", session.status)
     session.last_error = payload.get("last_error", "")
+    session.has_generated_output = bool(payload.get("draft_json"))
     session.save(
         update_fields=[
             "current_draft_json",
@@ -3886,6 +4251,7 @@ def internal_draft_session_update(request: HttpRequest, session_id: str) -> Json
             "diff_summary",
             "status",
             "last_error",
+            "has_generated_output",
             "updated_at",
         ]
     )
