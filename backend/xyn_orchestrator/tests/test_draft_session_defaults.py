@@ -144,3 +144,23 @@ class DraftSessionDefaultsTests(TestCase):
         payload = submit.json()["submission_payload"]
         self.assertEqual(payload["initial_prompt"], "Create EMS blueprint")
         self.assertEqual(payload["source_artifacts"][0]["type"], "audio_transcript")
+
+    def test_delete_draft_session(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Delete me",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        self.assertTrue(BlueprintDraftSession.objects.filter(id=session_id).exists())
+
+        deleted = self.client.delete(f"/xyn/api/draft-sessions/{session_id}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertFalse(BlueprintDraftSession.objects.filter(id=session_id).exists())

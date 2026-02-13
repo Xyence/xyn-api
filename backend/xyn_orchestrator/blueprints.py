@@ -4024,6 +4024,9 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
     session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    if request.method == "DELETE":
+        session.delete()
+        return JsonResponse({"status": "deleted"})
     if request.method == "PATCH":
         payload = _safe_json_body(request)
         if "title" in payload:
