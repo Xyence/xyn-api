@@ -4155,6 +4155,7 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
             return JsonResponse({"error": "platform_architect role required for control plane plans"}, status=403)
         if "environment_id" in payload and not payload.get("environment_id"):
             return JsonResponse({"error": "environment_id required"}, status=400)
+        explicit_release_id = payload.get("release_id") or payload.get("selected_release_id")
         for field in ["name", "target_kind", "target_fqn", "from_version", "to_version", "milestones_json"]:
             if field in payload:
                 setattr(plan, field, payload[field])
@@ -4166,10 +4167,16 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
             return JsonResponse({"error": "environment_id required"}, status=400)
         plan.updated_by = request.user
         plan.save()
+        _sync_release_plan_release_link(
+            plan,
+            explicit_release_id=str(explicit_release_id) if explicit_release_id else None,
+            updated_by=request.user,
+        )
         return JsonResponse({"id": str(plan.id)})
     if request.method == "DELETE":
         plan.delete()
         return JsonResponse({"status": "deleted"})
+    current_release = _preferred_release_for_plan(plan)
     deployments = [
         {
             "instance_id": str(dep.instance_id),
@@ -4190,6 +4197,8 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
             "milestones_json": plan.milestones_json,
             "blueprint_id": str(plan.blueprint_id) if plan.blueprint_id else None,
             "environment_id": str(plan.environment_id) if plan.environment_id else None,
+            "current_release_id": str(current_release.id) if current_release else None,
+            "current_release_version": current_release.version if current_release else None,
             "last_run": str(plan.last_run_id) if plan.last_run_id else None,
             "deployments": deployments,
             "created_at": plan.created_at,
@@ -4272,6 +4281,85 @@ def release_plan_deployments(request: HttpRequest, plan_id: str) -> JsonResponse
     return JsonResponse({"status": "ok"})
 
 
+def _preferred_release_for_plan(plan: ReleasePlan, explicit_release_id: Optional[str] = None) -> Optional[Release]:
+    if explicit_release_id:
+        release = Release.objects.filter(id=explicit_release_id).first()
+        if not release:
+            return None
+        if plan.blueprint_id and release.blueprint_id and str(release.blueprint_id) != str(plan.blueprint_id):
+            return None
+        return release
+    if not plan.blueprint_id or not plan.to_version:
+        return None
+    return (
+        Release.objects.filter(blueprint_id=plan.blueprint_id, version=plan.to_version)
+        .order_by(models.Case(models.When(status="published", then=0), default=1), "-updated_at", "-created_at")
+        .first()
+    )
+
+
+def _sync_release_plan_release_link(
+    plan: ReleasePlan,
+    *,
+    explicit_release_id: Optional[str] = None,
+    updated_by=None,
+) -> Optional[Release]:
+    preferred = _preferred_release_for_plan(plan, explicit_release_id=explicit_release_id)
+    if preferred:
+        stale_qs = Release.objects.filter(release_plan_id=plan.id).exclude(id=preferred.id)
+    else:
+        stale_qs = Release.objects.filter(release_plan_id=plan.id).exclude(version=plan.to_version)
+    if stale_qs.exists():
+        stale_qs.update(release_plan_id=None)
+    if preferred and preferred.release_plan_id != plan.id:
+        preferred.release_plan_id = plan.id
+        if updated_by is not None:
+            preferred.updated_by = updated_by
+            preferred.save(update_fields=["release_plan_id", "updated_by", "updated_at"])
+        else:
+            preferred.save(update_fields=["release_plan_id", "updated_at"])
+    return preferred
+
+
+def _build_release_plan_match_index(blueprint_ids: Set[str], versions: Set[str]) -> Dict[tuple[str, str], ReleasePlan]:
+    if not blueprint_ids or not versions:
+        return {}
+    plans = (
+        ReleasePlan.objects.filter(blueprint_id__in=blueprint_ids, to_version__in=versions)
+        .order_by("-updated_at", "-created_at")
+    )
+    index: Dict[tuple[str, str], ReleasePlan] = {}
+    for plan in plans:
+        key = (str(plan.blueprint_id), str(plan.to_version))
+        if key not in index:
+            index[key] = plan
+    return index
+
+
+def _resolved_release_plan_for_release(
+    release: Release,
+    *,
+    plan_index: Optional[Dict[tuple[str, str], ReleasePlan]] = None,
+) -> Optional[ReleasePlan]:
+    if release.release_plan_id and release.release_plan:
+        linked = release.release_plan
+        if (
+            linked.to_version == release.version
+            and (not linked.blueprint_id or not release.blueprint_id or str(linked.blueprint_id) == str(release.blueprint_id))
+        ):
+            return linked
+    if not release.blueprint_id:
+        return None
+    key = (str(release.blueprint_id), str(release.version))
+    if plan_index is not None:
+        return plan_index.get(key)
+    return (
+        ReleasePlan.objects.filter(blueprint_id=release.blueprint_id, to_version=release.version)
+        .order_by("-updated_at", "-created_at")
+        .first()
+    )
+
+
 @csrf_exempt
 @login_required
 def releases_collection(request: HttpRequest) -> JsonResponse:
@@ -4294,25 +4382,31 @@ def releases_collection(request: HttpRequest) -> JsonResponse:
             updated_by=request.user,
         )
         return JsonResponse({"id": str(release.id)})
-    qs = Release.objects.all().order_by("-created_at")
+    qs = Release.objects.all().select_related("release_plan").order_by("-created_at")
     if blueprint_id := request.GET.get("blueprint_id"):
         qs = qs.filter(blueprint_id=blueprint_id)
     if status := request.GET.get("status"):
         qs = qs.filter(status=status)
-    data = [
-        {
-            "id": str(release.id),
-            "version": release.version,
-            "status": release.status,
-            "build_state": release.build_state,
-            "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
-            "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
-            "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
-            "created_at": release.created_at,
-            "updated_at": release.updated_at,
-        }
-        for release in qs
-    ]
+    releases = list(qs)
+    blueprint_ids = {str(release.blueprint_id) for release in releases if release.blueprint_id}
+    versions = {str(release.version) for release in releases if release.version}
+    plan_index = _build_release_plan_match_index(blueprint_ids, versions)
+    data = []
+    for release in releases:
+        resolved_plan = _resolved_release_plan_for_release(release, plan_index=plan_index)
+        data.append(
+            {
+                "id": str(release.id),
+                "version": release.version,
+                "status": release.status,
+                "build_state": release.build_state,
+                "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
+                "release_plan_id": str(resolved_plan.id) if resolved_plan else None,
+                "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
+                "created_at": release.created_at,
+                "updated_at": release.updated_at,
+            }
+        )
     return _paginate(request, data, "releases")
 
 
@@ -4351,7 +4445,8 @@ def releases_bulk_delete(request: HttpRequest) -> JsonResponse:
         if not release:
             skipped.append({"id": rid, "reason": "not_found"})
             continue
-        if release.status == "published" and release.release_plan_id:
+        resolved_plan = _resolved_release_plan_for_release(release)
+        if release.status == "published" and resolved_plan:
             skipped.append({"id": rid, "reason": "published_with_release_plan"})
             continue
         cleanup = _delete_release_images(release)
@@ -4417,7 +4512,7 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
                 release.save(update_fields=["build_state", "updated_at"])
         return JsonResponse({"id": str(release.id), "build_run_id": build_run_id})
     if request.method == "DELETE":
-        if release.status == "published" and release.release_plan_id:
+        if release.status == "published" and _resolved_release_plan_for_release(release):
             return JsonResponse(
                 {"error": "published releases linked to a release plan cannot be deleted"},
                 status=400,
@@ -4425,6 +4520,7 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
         cleanup = _delete_release_images(release)
         release.delete()
         return JsonResponse({"status": "deleted", "image_cleanup": cleanup})
+    resolved_plan = _resolved_release_plan_for_release(release)
     return JsonResponse(
         {
             "id": str(release.id),
@@ -4432,7 +4528,7 @@ def release_detail(request: HttpRequest, release_id: str) -> JsonResponse:
             "status": release.status,
             "build_state": release.build_state,
             "blueprint_id": str(release.blueprint_id) if release.blueprint_id else None,
-            "release_plan_id": str(release.release_plan_id) if release.release_plan_id else None,
+            "release_plan_id": str(resolved_plan.id) if resolved_plan else None,
             "created_from_run_id": str(release.created_from_run_id) if release.created_from_run_id else None,
             "artifacts_json": release.artifacts_json,
             "created_at": release.created_at,
