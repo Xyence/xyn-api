@@ -50,6 +50,8 @@ from .models import (
     PlatformBranding,
     AppBrandingOverride,
     Device,
+    SecretStore,
+    SecretRef,
     VoiceNote,
     VoiceTranscript,
 )
@@ -238,6 +240,20 @@ class DeviceAdmin(admin.ModelAdmin):
     list_display = ("name", "tenant", "device_type", "status", "mgmt_ip", "updated_at")
     search_fields = ("name", "tenant__name", "device_type", "mgmt_ip")
     list_filter = ("status", "tenant")
+
+
+@admin.register(SecretStore)
+class SecretStoreAdmin(admin.ModelAdmin):
+    list_display = ("name", "kind", "is_default", "updated_at")
+    list_filter = ("kind", "is_default")
+    search_fields = ("name",)
+
+
+@admin.register(SecretRef)
+class SecretRefAdmin(admin.ModelAdmin):
+    list_display = ("name", "scope_kind", "scope_id", "store", "type", "updated_at")
+    list_filter = ("scope_kind", "type", "store")
+    search_fields = ("name", "external_ref")
 
 
 @admin.register(ReleasePlan)

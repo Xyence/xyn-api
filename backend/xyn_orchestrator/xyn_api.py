@@ -66,6 +66,8 @@ from .models import (
     ReleaseTarget,
     IdentityProvider,
     AppOIDCClient,
+    SecretStore,
+    SecretRef,
     RoleBinding,
     UserIdentity,
     Tenant,
@@ -95,6 +97,7 @@ from .oidc import (
     resolve_app_client,
     resolve_secret_ref as resolve_oidc_secret_ref,
 )
+from .secret_stores import SecretStoreError, normalize_secret_logical_name, write_secret_value
 
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
@@ -608,6 +611,178 @@ def _extract_tenant_hint(payload: Optional[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _serialize_secret_store(store: SecretStore) -> Dict[str, Any]:
+    return {
+        "id": str(store.id),
+        "name": store.name,
+        "kind": store.kind,
+        "is_default": bool(store.is_default),
+        "config_json": store.config_json or {},
+        "created_at": store.created_at,
+        "updated_at": store.updated_at,
+    }
+
+
+def _serialize_secret_ref(ref: SecretRef) -> Dict[str, Any]:
+    return {
+        "id": str(ref.id),
+        "name": ref.name,
+        "scope_kind": ref.scope_kind,
+        "scope_id": str(ref.scope_id) if ref.scope_id else None,
+        "store_id": str(ref.store_id),
+        "store_name": ref.store.name if ref.store_id else "",
+        "external_ref": ref.external_ref,
+        "type": ref.type,
+        "version": ref.version,
+        "description": ref.description or "",
+        "metadata_json": ref.metadata_json or {},
+        "updated_at": ref.updated_at,
+        "created_at": ref.created_at,
+    }
+
+
+def _resolve_secret_scope_path(scope_kind: str, scope_id: Optional[str], identity: UserIdentity) -> Optional[str]:
+    if scope_kind == "platform":
+        return None
+    if scope_kind == "tenant":
+        if not scope_id:
+            return None
+        tenant = Tenant.objects.filter(id=scope_id).first()
+        if tenant and tenant.slug:
+            return tenant.slug
+        return scope_id
+    if scope_kind == "user":
+        return scope_id or str(identity.id)
+    if scope_kind == "team":
+        return scope_id
+    return scope_id
+
+
+def _scope_read_allowed(identity: UserIdentity, scope_kind: str, scope_id: Optional[str]) -> bool:
+    if _is_platform_admin(identity):
+        return True
+    if scope_kind == "platform":
+        return False
+    if scope_kind == "tenant":
+        if not scope_id:
+            return False
+        return _require_tenant_access(identity, scope_id, "tenant_admin")
+    if scope_kind == "user":
+        return bool(scope_id and str(scope_id) == str(identity.id))
+    return False
+
+
+def _scope_write_allowed(identity: UserIdentity, scope_kind: str, scope_id: Optional[str]) -> bool:
+    if scope_kind == "platform":
+        return _is_platform_admin(identity)
+    return _scope_read_allowed(identity, scope_kind, scope_id)
+
+
+def _resolve_secret_store(store_id: Optional[str]) -> Optional[SecretStore]:
+    if store_id:
+        return SecretStore.objects.filter(id=store_id).first()
+    return SecretStore.objects.filter(is_default=True).first()
+
+
+def _create_or_update_secret_ref(
+    *,
+    identity: UserIdentity,
+    user,
+    name: str,
+    scope_kind: str,
+    scope_id: Optional[str],
+    store: SecretStore,
+    value: str,
+    description: str = "",
+    existing_ref: Optional[SecretRef] = None,
+) -> SecretRef:
+    logical_name = normalize_secret_logical_name(name)
+    if not logical_name:
+        raise SecretStoreError("name is required")
+    if not _scope_write_allowed(identity, scope_kind, scope_id):
+        raise PermissionError("forbidden")
+    normalized_scope_id: Optional[str] = scope_id
+    if scope_kind == "platform":
+        normalized_scope_id = None
+    elif scope_kind == "user":
+        normalized_scope_id = scope_id or str(identity.id)
+    elif scope_kind in {"tenant", "team"} and not scope_id:
+        raise SecretStoreError("scope_id is required for non-platform scope")
+    elif scope_kind not in {"platform", "tenant", "user", "team"}:
+        raise SecretStoreError("invalid scope_kind")
+    if scope_kind == "team":
+        raise SecretStoreError("team scope is not supported in v1")
+
+    with transaction.atomic():
+        ref: Optional[SecretRef]
+        if existing_ref:
+            ref = SecretRef.objects.select_for_update().filter(id=existing_ref.id).first()
+        else:
+            qs = SecretRef.objects.select_for_update().filter(scope_kind=scope_kind, name=logical_name)
+            if normalized_scope_id is None:
+                qs = qs.filter(scope_id__isnull=True)
+            else:
+                qs = qs.filter(scope_id=normalized_scope_id)
+            ref = qs.first()
+        if not ref:
+            ref = SecretRef(
+                name=logical_name,
+                scope_kind=scope_kind,
+                scope_id=normalized_scope_id,
+                store=store,
+                external_ref="pending",
+                type="secrets_manager",
+                created_by=user if getattr(user, "is_authenticated", False) else None,
+            )
+            ref.save()
+        else:
+            ref.store = store
+            if description:
+                ref.description = description
+            ref.save(update_fields=["store", "description", "updated_at"])
+
+        scope_path_id = _resolve_secret_scope_path(scope_kind, normalized_scope_id, identity)
+        external_ref, metadata = write_secret_value(
+            store,
+            logical_name=logical_name,
+            scope_kind=scope_kind,
+            scope_id=normalized_scope_id,
+            scope_path_id=scope_path_id,
+            secret_ref_id=str(ref.id),
+            value=value,
+            description=description or ref.description or logical_name,
+        )
+        ref.external_ref = external_ref
+        ref.type = "secrets_manager"
+        ref.version = None
+        ref.metadata_json = {
+            **(ref.metadata_json or {}),
+            **metadata,
+            "last_written_at": timezone.now().isoformat(),
+        }
+        if description:
+            ref.description = description
+        ref.save(
+            update_fields=[
+                "external_ref",
+                "type",
+                "version",
+                "metadata_json",
+                "description",
+                "updated_at",
+            ]
+        )
+        return ref
+
+
+def _derive_provider_secret_name(provider_id: str, issuer: str) -> str:
+    provider_key = slugify((provider_id or "").strip())
+    if not provider_key:
+        host = urlsplit(issuer or "").hostname or ""
+        provider_key = slugify(host) or "provider"
+    return f"idp/{provider_key}/client_secret"
+
+
 def _status_from_run(run: Optional[Run]) -> str:
     if not run:
         return "unknown"
@@ -873,6 +1048,228 @@ def internal_oidc_config(request: HttpRequest) -> JsonResponse:
 
 @csrf_exempt
 @login_required
+def secret_stores_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method == "GET":
+        stores = SecretStore.objects.all().order_by("-is_default", "name")
+        return JsonResponse({"secret_stores": [_serialize_secret_store(store) for store in stores]})
+    if request.method == "POST":
+        payload = _parse_json(request)
+        name = str(payload.get("name") or "").strip()
+        kind = str(payload.get("kind") or "aws_secrets_manager").strip()
+        if not name:
+            return JsonResponse({"error": "name required"}, status=400)
+        if kind != "aws_secrets_manager":
+            return JsonResponse({"error": "invalid kind"}, status=400)
+        store = SecretStore(
+            name=name,
+            kind=kind,
+            is_default=bool(payload.get("is_default", False)),
+            config_json=payload.get("config_json") if isinstance(payload.get("config_json"), dict) else {},
+        )
+        try:
+            store.save()
+        except Exception as exc:
+            return JsonResponse({"error": "invalid secret store", "details": str(exc)}, status=400)
+        return JsonResponse({"id": str(store.id)})
+    return JsonResponse({"error": "method not allowed"}, status=405)
+
+
+@csrf_exempt
+@login_required
+def secret_store_detail(request: HttpRequest, store_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    store = get_object_or_404(SecretStore, id=store_id)
+    if request.method in {"PATCH", "PUT"}:
+        payload = _parse_json(request)
+        if "name" in payload:
+            store.name = str(payload.get("name") or "").strip() or store.name
+        if "kind" in payload:
+            kind = str(payload.get("kind") or "").strip()
+            if kind != "aws_secrets_manager":
+                return JsonResponse({"error": "invalid kind"}, status=400)
+            store.kind = kind
+        if "is_default" in payload:
+            store.is_default = bool(payload.get("is_default"))
+        if "config_json" in payload:
+            config = payload.get("config_json")
+            if config is not None and not isinstance(config, dict):
+                return JsonResponse({"error": "config_json must be object"}, status=400)
+            store.config_json = config or {}
+        try:
+            store.save()
+        except Exception as exc:
+            return JsonResponse({"error": "invalid secret store", "details": str(exc)}, status=400)
+        return JsonResponse({"id": str(store.id)})
+    if request.method == "DELETE":
+        store.delete()
+        return JsonResponse({"status": "deleted"})
+    return JsonResponse(_serialize_secret_store(store))
+
+
+@csrf_exempt
+@login_required
+def secret_store_set_default(request: HttpRequest, store_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    store = get_object_or_404(SecretStore, id=store_id)
+    with transaction.atomic():
+        SecretStore.objects.filter(is_default=True).exclude(id=store.id).update(is_default=False, updated_at=timezone.now())
+        store.is_default = True
+        try:
+            store.save(update_fields=["is_default", "updated_at"])
+        except Exception as exc:
+            return JsonResponse({"error": "invalid secret store", "details": str(exc)}, status=400)
+    return JsonResponse({"id": str(store.id), "is_default": True})
+
+
+@csrf_exempt
+@login_required
+def secret_refs_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    scope_kind = str(request.GET.get("scope_kind") or "").strip().lower()
+    scope_id = str(request.GET.get("scope_id") or "").strip() or None
+    qs = SecretRef.objects.select_related("store").all()
+    if scope_kind:
+        qs = qs.filter(scope_kind=scope_kind)
+    if scope_id:
+        qs = qs.filter(scope_id=scope_id)
+    if not _is_platform_admin(identity):
+        if scope_kind and not _scope_read_allowed(identity, scope_kind, scope_id):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        allowed_tenants = set(
+            TenantMembership.objects.filter(user_identity=identity, status="active", role__in=["tenant_admin"])
+            .values_list("tenant_id", flat=True)
+        )
+        qs = qs.filter(
+            models.Q(scope_kind="user", scope_id=identity.id)
+            | models.Q(scope_kind="tenant", scope_id__in=allowed_tenants)
+        )
+    refs = qs.order_by("scope_kind", "name")
+    return JsonResponse({"secret_refs": [_serialize_secret_ref(ref) for ref in refs]})
+
+
+@csrf_exempt
+@login_required
+def secrets_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    name = str(payload.get("name") or "").strip()
+    scope_kind = str(payload.get("scope_kind") or "").strip().lower()
+    scope_id = str(payload.get("scope_id") or "").strip() or None
+    store_id = str(payload.get("store_id") or "").strip() or None
+    value = str(payload.get("value") or "")
+    description = str(payload.get("description") or "").strip()
+    if not name or not scope_kind or not value:
+        return JsonResponse({"error": "name, scope_kind, and value are required"}, status=400)
+    store = _resolve_secret_store(store_id)
+    if not store:
+        return JsonResponse({"error": "secret store not found; configure a default store"}, status=400)
+    try:
+        ref = _create_or_update_secret_ref(
+            identity=identity,
+            user=request.user,
+            name=name,
+            scope_kind=scope_kind,
+            scope_id=scope_id,
+            store=store,
+            value=value,
+            description=description,
+        )
+    except PermissionError:
+        return JsonResponse({"error": "forbidden"}, status=403)
+    except SecretStoreError as exc:
+        return JsonResponse({"error": "secret write failed", "details": str(exc)}, status=400)
+    except Exception as exc:
+        return JsonResponse({"error": "secret write failed", "details": exc.__class__.__name__}, status=400)
+    return JsonResponse(
+        {
+            "secret_ref": {
+                "id": str(ref.id),
+                "name": ref.name,
+                "type": ref.type,
+                "ref": ref.external_ref,
+                "scope_kind": ref.scope_kind,
+                "scope_id": str(ref.scope_id) if ref.scope_id else None,
+                "store_id": str(ref.store_id),
+                "updated_at": ref.updated_at,
+            }
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def secret_update(request: HttpRequest, secret_ref_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "PUT":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    ref = get_object_or_404(SecretRef.objects.select_related("store"), id=secret_ref_id)
+    scope_id = str(ref.scope_id) if ref.scope_id else None
+    if not _scope_write_allowed(identity, ref.scope_kind, scope_id):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    value = str(payload.get("value") or "")
+    description = str(payload.get("description") or ref.description or "").strip()
+    if not value:
+        return JsonResponse({"error": "value is required"}, status=400)
+    try:
+        ref = _create_or_update_secret_ref(
+            identity=identity,
+            user=request.user,
+            name=ref.name,
+            scope_kind=ref.scope_kind,
+            scope_id=scope_id,
+            store=ref.store,
+            value=value,
+            description=description,
+            existing_ref=ref,
+        )
+    except SecretStoreError as exc:
+        return JsonResponse({"error": "secret write failed", "details": str(exc)}, status=400)
+    except Exception as exc:
+        return JsonResponse({"error": "secret write failed", "details": exc.__class__.__name__}, status=400)
+    return JsonResponse(
+        {
+            "secret_ref": {
+                "id": str(ref.id),
+                "name": ref.name,
+                "type": ref.type,
+                "ref": ref.external_ref,
+                "scope_kind": ref.scope_kind,
+                "scope_id": str(ref.scope_id) if ref.scope_id else None,
+                "store_id": str(ref.store_id),
+                "updated_at": ref.updated_at,
+            }
+        }
+    )
+
+
+@csrf_exempt
+@login_required
 def identity_providers_collection(request: HttpRequest) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
@@ -884,6 +1281,32 @@ def identity_providers_collection(request: HttpRequest) -> JsonResponse:
         if errors:
             return JsonResponse({"error": "invalid provider", "details": errors}, status=400)
         fields, _schema_payload = _normalize_provider_payload(payload)
+        client_payload = payload.get("client") or {}
+        secret_value = str(client_payload.get("client_secret_value") or payload.get("client_secret_value") or "")
+        store_id = str(client_payload.get("store_id") or payload.get("store_id") or "").strip() or None
+        provider_id = str(fields.get("id") or "")
+        issuer = str(fields.get("issuer") or "")
+        if secret_value:
+            identity = _require_authenticated(request)
+            if not identity:
+                return JsonResponse({"error": "not authenticated"}, status=401)
+            store = _resolve_secret_store(store_id)
+            if not store:
+                return JsonResponse({"error": "secret store not found; configure a default store"}, status=400)
+            try:
+                secret_ref = _create_or_update_secret_ref(
+                    identity=identity,
+                    user=request.user,
+                    name=_derive_provider_secret_name(provider_id, issuer),
+                    scope_kind="platform",
+                    scope_id=None,
+                    store=store,
+                    value=secret_value,
+                    description=f"OIDC client secret for {provider_id}",
+                )
+            except SecretStoreError as exc:
+                return JsonResponse({"error": "invalid provider", "details": [str(exc)]}, status=400)
+            fields["client_secret_ref_json"] = {"type": "aws.secrets_manager", "ref": secret_ref.external_ref}
         provider = IdentityProvider.objects.create(
             **fields,
             created_by=request.user,
@@ -908,6 +1331,30 @@ def identity_provider_detail(request: HttpRequest, provider_id: str) -> JsonResp
         if errors:
             return JsonResponse({"error": "invalid provider", "details": errors}, status=400)
         fields, _schema_payload = _normalize_provider_payload({**provider_to_payload(provider), **payload})
+        client_payload = payload.get("client") or {}
+        secret_value = str(client_payload.get("client_secret_value") or payload.get("client_secret_value") or "")
+        store_id = str(client_payload.get("store_id") or payload.get("store_id") or "").strip() or None
+        if secret_value:
+            identity = _require_authenticated(request)
+            if not identity:
+                return JsonResponse({"error": "not authenticated"}, status=401)
+            store = _resolve_secret_store(store_id)
+            if not store:
+                return JsonResponse({"error": "secret store not found; configure a default store"}, status=400)
+            try:
+                secret_ref = _create_or_update_secret_ref(
+                    identity=identity,
+                    user=request.user,
+                    name=_derive_provider_secret_name(provider.id, fields.get("issuer") or provider.issuer),
+                    scope_kind="platform",
+                    scope_id=None,
+                    store=store,
+                    value=secret_value,
+                    description=f"OIDC client secret for {provider.id}",
+                )
+            except SecretStoreError as exc:
+                return JsonResponse({"error": "invalid provider", "details": [str(exc)]}, status=400)
+            fields["client_secret_ref_json"] = {"type": "aws.secrets_manager", "ref": secret_ref.external_ref}
         for key, value in fields.items():
             setattr(provider, key, value)
         provider.save()

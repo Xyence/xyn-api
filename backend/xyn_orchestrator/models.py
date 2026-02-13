@@ -1,7 +1,8 @@
 import uuid
 
+from django.core.exceptions import ValidationError
 from django.db import models
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.utils import timezone
 from django.utils.text import slugify
 from django_ckeditor_5.fields import CKEditor5Field
@@ -387,6 +388,99 @@ class AppOIDCClient(models.Model):
 
     def __str__(self) -> str:
         return self.app_id
+
+
+class SecretStore(models.Model):
+    KIND_CHOICES = [
+        ("aws_secrets_manager", "AWS Secrets Manager"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=120, unique=True)
+    kind = models.CharField(max_length=60, choices=KIND_CHOICES, default="aws_secrets_manager")
+    is_default = models.BooleanField(default=False)
+    config_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["is_default"],
+                condition=Q(is_default=True),
+                name="xyn_single_default_secret_store",
+            )
+        ]
+
+    def clean(self):
+        if self.is_default:
+            existing = SecretStore.objects.filter(is_default=True)
+            if self.pk:
+                existing = existing.exclude(pk=self.pk)
+            if existing.exists():
+                raise ValidationError({"is_default": "Only one default secret store is allowed."})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class SecretRef(models.Model):
+    SCOPE_CHOICES = [
+        ("platform", "Platform"),
+        ("tenant", "Tenant"),
+        ("user", "User"),
+        ("team", "Team"),
+    ]
+    TYPE_CHOICES = [
+        ("secrets_manager", "Secrets Manager"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=240)
+    scope_kind = models.CharField(max_length=20, choices=SCOPE_CHOICES)
+    scope_id = models.UUIDField(null=True, blank=True)
+    store = models.ForeignKey(SecretStore, on_delete=models.CASCADE, related_name="secret_refs")
+    external_ref = models.CharField(max_length=512)
+    type = models.CharField(max_length=40, choices=TYPE_CHOICES, default="secrets_manager")
+    version = models.CharField(max_length=120, null=True, blank=True)
+    description = models.CharField(max_length=500, blank=True)
+    metadata_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="secret_refs_created"
+    )
+
+    class Meta:
+        ordering = ["scope_kind", "name"]
+        unique_together = ("scope_kind", "scope_id", "name")
+
+    def clean(self):
+        if self.scope_kind == "platform" and self.scope_id is not None:
+            raise ValidationError({"scope_id": "scope_id must be null for platform scope."})
+        if self.scope_kind != "platform" and self.scope_id is None:
+            raise ValidationError({"scope_id": "scope_id is required for non-platform scopes."})
+        existing = SecretRef.objects.filter(scope_kind=self.scope_kind, name=self.name)
+        if self.scope_id is None:
+            existing = existing.filter(scope_id__isnull=True)
+        else:
+            existing = existing.filter(scope_id=self.scope_id)
+        if self.pk:
+            existing = existing.exclude(pk=self.pk)
+        if existing.exists():
+            raise ValidationError({"name": "Secret name already exists for this scope."})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"{self.scope_kind}:{self.name}"
 
 
 class UserIdentity(models.Model):
