@@ -1192,6 +1192,19 @@ def oidc_authorize(request: HttpRequest, provider_id: str) -> HttpResponse:
 def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
     if request.method not in {"POST", "GET"}:
         return JsonResponse({"error": "POST required"}, status=405)
+    callback_error = request.POST.get("error") if request.method == "POST" else request.GET.get("error")
+    callback_error_description = (
+        request.POST.get("error_description") if request.method == "POST" else request.GET.get("error_description")
+    )
+    if callback_error:
+        return JsonResponse(
+            {
+                "error": "oidc_authorize_failed",
+                "provider_error": callback_error,
+                "provider_error_description": callback_error_description or "",
+            },
+            status=400,
+        )
     code = request.POST.get("code") if request.method == "POST" else request.GET.get("code")
     state = request.POST.get("state") if request.method == "POST" else request.GET.get("state")
     app_id = request.POST.get("appId") if request.method == "POST" else request.GET.get("appId")
