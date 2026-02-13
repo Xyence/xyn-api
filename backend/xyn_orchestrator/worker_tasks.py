@@ -7,13 +7,13 @@ import subprocess
 import tempfile
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, RefResolver
 
 
 INTERNAL_BASE_URL = os.environ.get("XYENCE_INTERNAL_BASE_URL", "http://backend:8000").rstrip("/")
@@ -2546,6 +2546,27 @@ def _load_contract_schema(name: str) -> Dict[str, Any]:
         return json.load(handle)
 
 
+def _load_schema_store() -> Dict[str, Dict[str, Any]]:
+    store: Dict[str, Dict[str, Any]] = {}
+    schema_dir = os.path.join(CONTRACTS_ROOT, "schemas")
+    if not os.path.isdir(schema_dir):
+        return store
+    for filename in os.listdir(schema_dir):
+        if not filename.endswith(".json"):
+            continue
+        try:
+            schema = _load_contract_schema(filename)
+        except Exception:
+            continue
+        store[filename] = schema
+        store[f"./{filename}"] = schema
+        store[f"https://xyn.example/schemas/{filename}"] = schema
+        schema_id = str(schema.get("$id") or "").strip()
+        if schema_id:
+            store[schema_id] = schema
+    return store
+
+
 def _schema_for_kind(kind: str) -> str:
     mapping = {
         "solution": "SolutionBlueprintSpec.schema.json",
@@ -2556,24 +2577,61 @@ def _schema_for_kind(kind: str) -> str:
 
 
 def _validate_blueprint(spec: Dict[str, Any], kind: str) -> List[str]:
-    schema = _load_contract_schema(_schema_for_kind(kind))
-    validator = Draft202012Validator(schema)
-    errors = []
-    for error in sorted(validator.iter_errors(spec), key=lambda e: e.path):
-        path = ".".join(str(p) for p in error.path) if error.path else "root"
-        errors.append(f"{path}: {error.message}")
-    return errors
+    try:
+        schema_name = _schema_for_kind(kind)
+        schema = _load_contract_schema(schema_name)
+        resolver = RefResolver.from_schema(schema, store=_load_schema_store())
+        validator = Draft202012Validator(schema, resolver=resolver)
+        errors = []
+        for error in sorted(validator.iter_errors(spec), key=lambda e: e.path):
+            path = ".".join(str(p) for p in error.path) if error.path else "root"
+            errors.append(f"{path}: {error.message}")
+        return errors
+    except Exception as exc:
+        return [f"Schema validation unavailable: {exc}"]
 
 
-def _openai_generate_blueprint(transcript: str, kind: str, context_text: str) -> Optional[Dict[str, Any]]:
+def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        try:
+            parsed = json.loads(fenced.group(1))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return None
+    return None
+
+
+def _openai_generate_blueprint(
+    transcript: str, kind: str, context_text: str
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
         config = _get_json("/xyn/internal/openai-config")
         api_key = config.get("api_key")
         model = config.get("model")
         if not api_key or not model:
-            return None
-    except Exception:
-        return None
+            return None, "OpenAI config missing api_key/model."
+    except Exception as exc:
+        return None, f"Failed to load OpenAI config: {exc}"
     from openai import OpenAI  # type: ignore
 
     client = OpenAI(api_key=api_key)
@@ -2597,17 +2655,21 @@ def _openai_generate_blueprint(transcript: str, kind: str, context_text: str) ->
         )
     if context_text:
         system_prompt = f"{context_text}\n\n{system_prompt}"
-    response = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcript},
-        ],
-    )
     try:
-        return json.loads(response.output_text)
-    except json.JSONDecodeError:
-        return None
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": transcript},
+            ],
+        )
+    except Exception as exc:
+        return None, f"OpenAI request failed: {exc}"
+    output_text = str(getattr(response, "output_text", "") or "")
+    parsed = _extract_json_object(output_text)
+    if parsed is None:
+        return None, "OpenAI response was not valid JSON."
+    return parsed, None
 
 
 def _load_blueprint_metadata(source_run: Optional[str]) -> Dict[str, Any]:
@@ -3774,10 +3836,19 @@ def generate_blueprint_draft(session_id: str) -> None:
         if not combined:
             transcripts = payload.get("transcripts", [])
             combined = "\n".join(transcripts).strip()
-        draft = _openai_generate_blueprint(combined, kind, context_text) if combined else None
+        generation_error = None
+        draft = None
+        if combined:
+            draft, generation_error = _openai_generate_blueprint(combined, kind, context_text)
+        else:
+            generation_error = "No prompt input provided."
         if not draft:
             draft = payload.get("draft") or {}
-        errors = _validate_blueprint(draft, kind) if draft else ["Draft generation failed"]
+        errors = _validate_blueprint(draft, kind) if draft else []
+        if generation_error:
+            errors = [generation_error, *errors] if generation_error not in errors else errors
+        if not errors and not draft:
+            errors = ["Draft generation failed"]
         status = "ready" if not errors else "ready_with_errors"
         _post_json(
             f"/xyn/internal/draft-sessions/{session_id}/draft",
@@ -3806,8 +3877,15 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
         context_text = context_payload.get("effective_context", "")
         base_summary = payload.get("requirements_summary", "")
         combined = (base_summary + "\n" + instruction).strip()
-        draft = _openai_generate_blueprint(combined, kind, context_text) or payload.get("draft") or {}
-        errors = _validate_blueprint(draft, kind) if draft else ["Revision failed"]
+        generation_error = None
+        draft, generation_error = _openai_generate_blueprint(combined, kind, context_text)
+        if not draft:
+            draft = payload.get("draft") or {}
+        errors = _validate_blueprint(draft, kind) if draft else []
+        if generation_error:
+            errors = [generation_error, *errors] if generation_error not in errors else errors
+        if not errors and not draft:
+            errors = ["Revision failed"]
         status = "ready" if not errors else "ready_with_errors"
         _post_json(
             f"/xyn/internal/draft-sessions/{session_id}/draft",
