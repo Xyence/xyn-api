@@ -2391,6 +2391,26 @@ def _generate_implementation_plan(
     if runtime_requested and "runtime-web-static-nginx" not in plan_rationale.get("modules_selected", []):
         plan_rationale.setdefault("modules_selected", []).append("runtime-web-static-nginx")
 
+    # Host-ingress uses Traefik-managed TLS; remove nginx/acme task path entirely.
+    if tls_mode == "host-ingress":
+        removed_ids = {"tls.acme_http01", "ingress.nginx_tls_configure"}
+        work_items = [item for item in work_items if item.get("id") not in removed_ids]
+        fallback_dep = None
+        if any(item.get("id") == "verify.public_http" for item in work_items):
+            fallback_dep = "verify.public_http"
+        elif any(item.get("id") == "deploy.apply_remote_compose.pull" for item in work_items):
+            fallback_dep = "deploy.apply_remote_compose.pull"
+        elif any(item.get("id") == "deploy.apply_remote_compose.ssm" for item in work_items):
+            fallback_dep = "deploy.apply_remote_compose.ssm"
+        for item in work_items:
+            deps = item.get("depends_on")
+            if not isinstance(deps, list):
+                continue
+            filtered = [dep for dep in deps if dep not in removed_ids]
+            if item.get("id") == "verify.public_https" and fallback_dep and fallback_dep not in filtered:
+                filtered.append(fallback_dep)
+            item["depends_on"] = filtered
+
     tasks = [
         {
             "task_type": "codegen",

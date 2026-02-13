@@ -1556,6 +1556,29 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("ingress-traefik-acme", module_ids)
         self.assertNotIn("ingress-nginx-acme", module_ids)
 
+    def test_host_ingress_plan_omits_nginx_tasks_even_when_no_gaps(self):
+        blueprint = Blueprint.objects.create(
+            name="ems.platform",
+            namespace="core",
+            metadata_json={
+                "dns_provider": "route53",
+                "deploy": {"target_instance_id": str(uuid.uuid4()), "primary_fqdn": "bedrock.xyence.io"},
+                "tls": {"mode": "host-ingress", "provider": "traefik", "acme_email": "admin@xyence.io"},
+            },
+        )
+        run_history = {
+            "acceptance_checks_status": [{"id": "remote_https_health", "status": "pass"}],
+            "completed_work_items": [],
+        }
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=_build_module_catalog(),
+            run_history_summary=run_history,
+        )
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertNotIn("tls.acme_http01", ids)
+        self.assertNotIn("ingress.nginx_tls_configure", ids)
+
     def test_planner_uses_release_target_for_remote_slices(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})
         target = ReleaseTarget.objects.create(
