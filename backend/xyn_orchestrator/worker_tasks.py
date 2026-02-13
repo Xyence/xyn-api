@@ -3770,8 +3770,10 @@ def generate_blueprint_draft(session_id: str) -> None:
         kind = payload.get("blueprint_kind", "solution")
         context_payload = _post_json(f"/xyn/internal/draft-sessions/{session_id}/context/resolve", {})
         context_text = context_payload.get("effective_context", "")
-        transcripts = payload.get("transcripts", [])
-        combined = "\n".join(transcripts)
+        combined = str(payload.get("combined_prompt") or "").strip()
+        if not combined:
+            transcripts = payload.get("transcripts", [])
+            combined = "\n".join(transcripts).strip()
         draft = _openai_generate_blueprint(combined, kind, context_text) if combined else None
         if not draft:
             draft = payload.get("draft") or {}
@@ -3784,7 +3786,7 @@ def generate_blueprint_draft(session_id: str) -> None:
                 "requirements_summary": combined[:2000],
                 "validation_errors": errors,
                 "suggested_fixes": [],
-                "diff_summary": "Generated from transcript",
+                "diff_summary": "Generated from prompt inputs",
                 "status": status,
             },
         )

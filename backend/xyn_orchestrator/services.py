@@ -231,7 +231,22 @@ def generate_blueprint_draft(session_id: str) -> None:
         update_fields=["context_pack_refs_json", "effective_context_hash", "effective_context_preview", "updated_at"]
     )
     transcripts = _collect_transcripts(session)
-    combined = "\n".join(transcripts)
+    source_artifacts = session.source_artifacts or []
+    source_texts: List[str] = []
+    for artifact in source_artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_type = str(artifact.get("type", "")).strip().lower()
+        if artifact_type not in {"text", "audio_transcript"}:
+            continue
+        content = str(artifact.get("content", "")).strip()
+        if content:
+            source_texts.append(content)
+    ordered_inputs: List[str] = []
+    for text in [str(session.initial_prompt or "").strip(), *source_texts, *transcripts]:
+        if text and text not in ordered_inputs:
+            ordered_inputs.append(text)
+    combined = "\n\n".join(ordered_inputs).strip()
     draft = (
         _openai_generate_blueprint(combined, session.blueprint_kind, context["effective_context"])
         if combined
@@ -243,7 +258,7 @@ def generate_blueprint_draft(session_id: str) -> None:
     session.current_draft_json = draft
     session.requirements_summary = combined[:2000]
     session.validation_errors_json = errors
-    session.diff_summary = "Generated from transcript"
+    session.diff_summary = "Generated from prompt inputs"
     session.status = "ready" if not errors else "ready_with_errors"
     session.updated_at = timezone.now()
     session.save(

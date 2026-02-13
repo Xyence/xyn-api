@@ -4186,6 +4186,23 @@ def internal_draft_session(request: HttpRequest, session_id: str) -> JsonRespons
         transcript = getattr(link.voice_note, "transcript", None)
         if transcript:
             transcripts.append(transcript.transcript_text)
+    source_artifacts = session.source_artifacts or []
+    source_texts: List[str] = []
+    for artifact in source_artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_type = str(artifact.get("type", "")).strip().lower()
+        if artifact_type not in {"text", "audio_transcript"}:
+            continue
+        content = str(artifact.get("content", "")).strip()
+        if content:
+            source_texts.append(content)
+
+    ordered_inputs: List[str] = []
+    for text in [str(session.initial_prompt or "").strip(), *source_texts, *transcripts]:
+        if text and text not in ordered_inputs:
+            ordered_inputs.append(text)
+    combined_prompt = "\n\n".join(ordered_inputs).strip()
     return JsonResponse(
         {
             "id": str(session.id),
@@ -4198,6 +4215,7 @@ def internal_draft_session(request: HttpRequest, session_id: str) -> JsonRespons
             "requirements_summary": session.requirements_summary,
             "draft": session.current_draft_json,
             "transcripts": transcripts,
+            "combined_prompt": combined_prompt,
         }
     )
 
