@@ -3,7 +3,7 @@ import json
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from xyn_orchestrator.models import Blueprint, Environment, Release, ReleasePlan
+from xyn_orchestrator.models import Blueprint, Environment, EnvironmentAppState, Release, ReleasePlan
 
 
 class ReleasePlanAlignmentTests(TestCase):
@@ -78,3 +78,92 @@ class ReleasePlanAlignmentTests(TestCase):
         new_release.refresh_from_db()
         self.assertIsNone(old_release.release_plan_id)
         self.assertEqual(str(new_release.release_plan_id), str(plan.id))
+
+    def test_release_plan_detail_reconciles_to_environment_current_release(self):
+        plan = ReleasePlan.objects.create(
+            name="Release plan for core.ems.platform",
+            target_kind="blueprint",
+            target_fqn="core.ems.platform",
+            from_version="v44",
+            to_version="v40",
+            blueprint=self.blueprint,
+            environment=self.environment,
+        )
+        stale = Release.objects.create(
+            blueprint=self.blueprint,
+            version="v40",
+            status="published",
+            build_state="ready",
+            release_plan=plan,
+        )
+        current = Release.objects.create(
+            blueprint=self.blueprint,
+            version="v45",
+            status="published",
+            build_state="ready",
+        )
+        EnvironmentAppState.objects.create(
+            environment=self.environment,
+            app_id="core.ems.platform",
+            current_release=current,
+            last_good_release=current,
+        )
+
+        response = self.client.get(f"/xyn/api/release-plans/{plan.id}")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["current_release_version"], "v45")
+        self.assertEqual(body["to_version"], "v45")
+
+        plan.refresh_from_db()
+        stale.refresh_from_db()
+        current.refresh_from_db()
+        self.assertEqual(plan.to_version, "v45")
+        self.assertIsNone(stale.release_plan_id)
+        self.assertEqual(str(current.release_plan_id), str(plan.id))
+
+    def test_release_plan_reconcile_endpoint_updates_stale_plan(self):
+        plan = ReleasePlan.objects.create(
+            name="Release plan for core.ems.platform",
+            target_kind="blueprint",
+            target_fqn="core.ems.platform",
+            from_version="v44",
+            to_version="v40",
+            blueprint=self.blueprint,
+            environment=self.environment,
+        )
+        stale = Release.objects.create(
+            blueprint=self.blueprint,
+            version="v40",
+            status="published",
+            build_state="ready",
+            release_plan=plan,
+        )
+        current = Release.objects.create(
+            blueprint=self.blueprint,
+            version="v45",
+            status="published",
+            build_state="ready",
+        )
+        EnvironmentAppState.objects.create(
+            environment=self.environment,
+            app_id="core.ems.platform",
+            current_release=current,
+            last_good_release=current,
+        )
+
+        response = self.client.post(
+            "/xyn/api/release-plans/reconcile",
+            data=json.dumps({"plan_id": str(plan.id)}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["changed"], 1)
+
+        plan.refresh_from_db()
+        stale.refresh_from_db()
+        current.refresh_from_db()
+        self.assertEqual(plan.to_version, "v45")
+        self.assertIsNone(stale.release_plan_id)
+        self.assertEqual(str(current.release_plan_id), str(plan.id))

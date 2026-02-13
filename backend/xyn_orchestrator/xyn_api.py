@@ -11,7 +11,7 @@ import fnmatch
 from functools import wraps
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Set
+from typing import Any, Dict, Optional, List, Set, Tuple
 
 import requests
 import boto3
@@ -4117,9 +4117,12 @@ def release_plans_collection(request: HttpRequest) -> JsonResponse:
             updated_by=request.user,
         )
         return JsonResponse({"id": str(plan.id)})
-    qs = ReleasePlan.objects.all().order_by("-created_at")
+    qs = ReleasePlan.objects.all().select_related("blueprint").order_by("-created_at")
     if env_id := request.GET.get("environment_id"):
         qs = qs.filter(environment_id=env_id)
+    plans = list(qs)
+    for plan in plans:
+        _reconcile_release_plan_alignment(plan)
     data = [
         {
             "id": str(plan.id),
@@ -4134,7 +4137,7 @@ def release_plans_collection(request: HttpRequest) -> JsonResponse:
             "created_at": plan.created_at,
             "updated_at": plan.updated_at,
         }
-        for plan in qs
+        for plan in plans
     ]
     return _paginate(request, data, "release_plans")
 
@@ -4167,16 +4170,17 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
             return JsonResponse({"error": "environment_id required"}, status=400)
         plan.updated_by = request.user
         plan.save()
-        _sync_release_plan_release_link(
+        _reconcile_release_plan_alignment(
             plan,
             explicit_release_id=str(explicit_release_id) if explicit_release_id else None,
             updated_by=request.user,
+            allow_state_fallback=False,
         )
         return JsonResponse({"id": str(plan.id)})
     if request.method == "DELETE":
         plan.delete()
         return JsonResponse({"status": "deleted"})
-    current_release = _preferred_release_for_plan(plan)
+    current_release, _ = _reconcile_release_plan_alignment(plan)
     deployments = [
         {
             "instance_id": str(dep.instance_id),
@@ -4203,6 +4207,48 @@ def release_plan_detail(request: HttpRequest, plan_id: str) -> JsonResponse:
             "deployments": deployments,
             "created_at": plan.created_at,
             "updated_at": plan.updated_at,
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def release_plan_reconcile(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    payload = _parse_json(request)
+    dry_run = _parse_bool_param(str(payload.get("dry_run")) if payload.get("dry_run") is not None else None, False)
+    qs = ReleasePlan.objects.all().select_related("blueprint").order_by("-updated_at")
+    if plan_id := payload.get("plan_id"):
+        qs = qs.filter(id=plan_id)
+    if blueprint_id := payload.get("blueprint_id"):
+        qs = qs.filter(blueprint_id=blueprint_id)
+    plans = list(qs)
+    changed: List[Dict[str, Any]] = []
+    for plan in plans:
+        release, did_change = _reconcile_release_plan_alignment(
+            plan,
+            updated_by=request.user,
+            apply_changes=not dry_run,
+        )
+        if did_change:
+            changed.append(
+                {
+                    "plan_id": str(plan.id),
+                    "name": plan.name,
+                    "to_version": plan.to_version,
+                    "release_id": str(release.id) if release else None,
+                    "release_version": release.version if release else None,
+                }
+            )
+    return JsonResponse(
+        {
+            "status": "dry_run" if dry_run else "ok",
+            "total": len(plans),
+            "changed": len(changed),
+            "plans": changed,
         }
     )
 
@@ -4296,6 +4342,73 @@ def _preferred_release_for_plan(plan: ReleasePlan, explicit_release_id: Optional
         .order_by(models.Case(models.When(status="published", then=0), default=1), "-updated_at", "-created_at")
         .first()
     )
+
+
+def _preferred_release_for_plan_from_environment_state(plan: ReleasePlan) -> Optional[Release]:
+    if not plan.environment_id:
+        return None
+    app_candidates: List[str] = []
+    if plan.target_fqn:
+        app_candidates.append(str(plan.target_fqn).strip())
+    if plan.blueprint_id and plan.blueprint:
+        app_candidates.append(f"{plan.blueprint.namespace}.{plan.blueprint.name}")
+    app_candidates = [candidate for candidate in app_candidates if candidate]
+    if not app_candidates:
+        return None
+    state = (
+        EnvironmentAppState.objects.filter(environment_id=plan.environment_id, app_id__in=app_candidates)
+        .select_related("current_release")
+        .order_by(
+            models.Case(
+                *[models.When(app_id=app_id, then=idx) for idx, app_id in enumerate(app_candidates)],
+                default=len(app_candidates),
+            )
+        )
+        .first()
+    )
+    if not state or not state.current_release_id or not state.current_release:
+        return None
+    release = state.current_release
+    if plan.blueprint_id and release.blueprint_id and str(release.blueprint_id) != str(plan.blueprint_id):
+        return None
+    return release
+
+
+def _reconcile_release_plan_alignment(
+    plan: ReleasePlan,
+    *,
+    explicit_release_id: Optional[str] = None,
+    updated_by=None,
+    allow_state_fallback: bool = True,
+    apply_changes: bool = True,
+) -> Tuple[Optional[Release], bool]:
+    preferred = _preferred_release_for_plan(plan, explicit_release_id=explicit_release_id)
+    if not preferred and allow_state_fallback:
+        preferred = _preferred_release_for_plan_from_environment_state(plan)
+    selected_release_id = str(preferred.id) if preferred else (str(explicit_release_id) if explicit_release_id else None)
+    to_version_changed = bool(preferred and plan.to_version != preferred.version)
+    if preferred:
+        stale_exists = Release.objects.filter(release_plan_id=plan.id).exclude(id=preferred.id).exists()
+        relink_needed = preferred.release_plan_id != plan.id
+    else:
+        stale_exists = Release.objects.filter(release_plan_id=plan.id).exclude(version=plan.to_version).exists()
+        relink_needed = False
+    changed = to_version_changed or stale_exists or relink_needed
+    if not apply_changes:
+        return preferred, changed
+    if to_version_changed and preferred:
+        plan.to_version = preferred.version
+        if updated_by is not None:
+            plan.updated_by = updated_by
+            plan.save(update_fields=["to_version", "updated_by", "updated_at"])
+        else:
+            plan.save(update_fields=["to_version", "updated_at"])
+    synced = _sync_release_plan_release_link(
+        plan,
+        explicit_release_id=selected_release_id,
+        updated_by=updated_by,
+    )
+    return synced or preferred, changed
 
 
 def _sync_release_plan_release_link(
