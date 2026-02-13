@@ -19,7 +19,7 @@ from django.conf import settings
 from django.utils.text import slugify
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, RefResolver
 
 from .services import (
     generate_blueprint_draft,
@@ -177,9 +177,33 @@ def _schema_for_kind(kind: str) -> str:
     return mapping.get(kind, "SolutionBlueprintSpec.schema.json")
 
 
+def _load_schema_store() -> Dict[str, Dict[str, Any]]:
+    root = _contracts_root()
+    if not root:
+        return {}
+    schema_dir = root / "schemas"
+    store: Dict[str, Dict[str, Any]] = {}
+    if not schema_dir.exists():
+        return store
+    for schema_path in schema_dir.glob("*.json"):
+        try:
+            schema = json.loads(schema_path.read_text())
+        except Exception:
+            continue
+        filename = schema_path.name
+        store[filename] = schema
+        store[f"./{filename}"] = schema
+        store[f"https://xyn.example/schemas/{filename}"] = schema
+        schema_id = str(schema.get("$id") or "").strip()
+        if schema_id:
+            store[schema_id] = schema
+    return store
+
+
 def _validate_blueprint_spec(spec: Dict[str, Any], kind: str = "solution") -> List[str]:
     schema = _load_schema(_schema_for_kind(kind))
-    validator = Draft202012Validator(schema)
+    resolver = RefResolver.from_schema(schema, store=_load_schema_store())
+    validator = Draft202012Validator(schema, resolver=resolver)
     errors = []
     for error in sorted(validator.iter_errors(spec), key=lambda e: e.path):
         path = ".".join(str(p) for p in error.path) if error.path else "root"
@@ -434,7 +458,7 @@ def _write_run_summary(run: Run) -> None:
     _write_run_artifact(run, "run_summary.json", summary, "summary")
 
 
-def _load_schema(name: str) -> Dict[str, Any]:
+def _load_runtime_schema(name: str) -> Dict[str, Any]:
     base_dir = Path(__file__).resolve().parents[1]
     path = base_dir / "schemas" / name
     with open(path, "r", encoding="utf-8") as handle:
@@ -442,7 +466,7 @@ def _load_schema(name: str) -> Dict[str, Any]:
 
 
 def _validate_schema(payload: Dict[str, Any], name: str) -> List[str]:
-    schema = _load_schema(name)
+    schema = _load_runtime_schema(name)
     validator = Draft202012Validator(schema)
     errors = []
     for error in validator.iter_errors(payload):
@@ -3979,7 +4003,7 @@ def submit_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
     session.source_artifacts = source_artifacts
     session.selected_context_pack_ids = selected_pack_ids
     session.context_pack_ids = selected_pack_ids
-    session.status = "published"
+    session.status = "drafting"
     session.updated_by = request.user
     session.save(
         update_fields=[
@@ -3993,12 +4017,24 @@ def submit_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             "updated_at",
         ]
     )
+    publish_result = _publish_draft_session(session, request.user)
+    if not publish_result.get("ok"):
+        return JsonResponse(
+            {
+                "error": publish_result.get("error", "Submit failed"),
+                "validation_errors": publish_result.get("validation_errors", []),
+            },
+            status=400,
+        )
     return JsonResponse(
         {
             "ok": True,
             "status": "submitted",
             "session_id": str(session.id),
             "submission_payload": submission_payload,
+            "entity_type": publish_result.get("entity_type"),
+            "entity_id": publish_result.get("entity_id"),
+            "revision": publish_result.get("revision"),
         }
     )
 

@@ -134,6 +134,20 @@ class DraftSessionDefaultsTests(TestCase):
         )
         self.assertEqual(create.status_code, 200)
         session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = {
+            "apiVersion": "xyn.blueprint/v1",
+            "kind": "SolutionBlueprint",
+            "metadata": {"name": "demo-test", "namespace": "core"},
+            "releaseSpec": {
+                "apiVersion": "xyn.seed/v1",
+                "kind": "Release",
+                "metadata": {"name": "demo-test", "namespace": "core"},
+                "backend": {"type": "compose"},
+                "components": [{"name": "api", "image": "example/demo:latest"}],
+            },
+        }
+        session.save(update_fields=["current_draft_json", "updated_at"])
 
         submit = self.client.post(
             f"/xyn/api/draft-sessions/{session_id}/submit",
@@ -141,9 +155,12 @@ class DraftSessionDefaultsTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(submit.status_code, 200)
-        payload = submit.json()["submission_payload"]
+        submit_data = submit.json()
+        payload = submit_data["submission_payload"]
         self.assertEqual(payload["initial_prompt"], "Create EMS blueprint")
         self.assertEqual(payload["source_artifacts"][0]["type"], "audio_transcript")
+        self.assertEqual(submit_data.get("entity_type"), "blueprint")
+        self.assertTrue(submit_data.get("entity_id"))
 
     def test_delete_draft_session(self):
         create = self.client.post(
