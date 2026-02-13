@@ -450,22 +450,26 @@ def _resolve_secret_ref(ref: Dict[str, Any]) -> Optional[str]:
         return os.environ.get(name)
     if value.startswith("ssm:"):
         name = value[len("ssm:") :]
-        client = boto3.client("ssm")
+        region = (os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "").strip()
+        client = boto3.client("ssm", region_name=region) if region else boto3.client("ssm")
         response = client.get_parameter(Name=name, WithDecryption=True)
         return response.get("Parameter", {}).get("Value")
     if value.startswith("ssm-arn:"):
         name = value[len("ssm-arn:") :]
-        client = boto3.client("ssm")
+        region = (os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "").strip()
+        client = boto3.client("ssm", region_name=region) if region else boto3.client("ssm")
         response = client.get_parameter(Name=name, WithDecryption=True)
         return response.get("Parameter", {}).get("Value")
     if value.startswith("secretsmanager:"):
         name = value[len("secretsmanager:") :]
-        client = boto3.client("secretsmanager")
+        region = (os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "").strip()
+        client = boto3.client("secretsmanager", region_name=region) if region else boto3.client("secretsmanager")
         response = client.get_secret_value(SecretId=name)
         return response.get("SecretString")
     if value.startswith("secretsmanager-arn:"):
         name = value[len("secretsmanager-arn:") :]
-        client = boto3.client("secretsmanager")
+        region = (os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "").strip()
+        client = boto3.client("secretsmanager", region_name=region) if region else boto3.client("secretsmanager")
         response = client.get_secret_value(SecretId=name)
         return response.get("SecretString")
     return None
@@ -1239,17 +1243,33 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
     }
     if code_verifier:
         token_payload["code_verifier"] = code_verifier
-    client_secret = resolve_oidc_secret_ref(provider.client_secret_ref_json)
+    try:
+        client_secret = resolve_oidc_secret_ref(provider.client_secret_ref_json)
+    except Exception as exc:
+        return JsonResponse(
+            {
+                "error": "client_secret_resolve_failed",
+                "details": str(exc),
+                "provider_id": provider.id,
+            },
+            status=400,
+        )
     if client_secret:
         token_payload["client_secret"] = client_secret
-    token_response = requests.post(discovery["token_endpoint"], data=token_payload, timeout=15)
+    try:
+        token_response = requests.post(discovery["token_endpoint"], data=token_payload, timeout=15)
+    except requests.RequestException as exc:
+        return JsonResponse({"error": "token_endpoint_unreachable", "details": str(exc)}, status=502)
     if token_response.status_code >= 400:
         try:
             details = token_response.json()
         except Exception:
             details = token_response.text
         return JsonResponse({"error": "token exchange failed", "details": details}, status=400)
-    token_body = token_response.json()
+    try:
+        token_body = token_response.json()
+    except ValueError:
+        return JsonResponse({"error": "token_response_invalid_json", "details": token_response.text}, status=502)
     id_token = token_body.get("id_token")
     if not id_token:
         return JsonResponse({"error": "id_token missing"}, status=400)

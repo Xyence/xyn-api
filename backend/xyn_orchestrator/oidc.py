@@ -16,6 +16,10 @@ DISCOVERY_TTL_SECONDS = 6 * 60 * 60
 JWKS_TTL_SECONDS = 6 * 60 * 60
 
 
+def _aws_region_name() -> str:
+    return (os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "").strip()
+
+
 def _encode_code_challenge(verifier: str) -> str:
     digest = hashlib.sha256(verifier.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
@@ -37,11 +41,13 @@ def resolve_secret_ref(secret_ref: Optional[Dict[str, Any]]) -> Optional[str]:
     if ref_type == "env":
         return os.environ.get(ref)
     if ref_type == "aws.ssm":
-        client = boto3.client("ssm")
+        region = _aws_region_name()
+        client = boto3.client("ssm", region_name=region) if region else boto3.client("ssm")
         response = client.get_parameter(Name=ref, WithDecryption=True)
         return response.get("Parameter", {}).get("Value")
     if ref_type == "aws.secrets_manager":
-        client = boto3.client("secretsmanager")
+        region = _aws_region_name()
+        client = boto3.client("secretsmanager", region_name=region) if region else boto3.client("secretsmanager")
         response = client.get_secret_value(SecretId=ref)
         return response.get("SecretString")
     return None
