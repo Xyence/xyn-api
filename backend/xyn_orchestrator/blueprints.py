@@ -3483,10 +3483,10 @@ def _recommended_context_pack_ids(
     _pick("xyn-platform-canon", scope="global", purpose=["any", "planner"])
     _pick("xyn-planner-canon", scope="global", purpose=["any", "planner"])
 
-    # Namespace convention pack only when namespace is known.
+    # Scope-matched defaults are driven by ContextPack.is_default metadata.
     if namespace:
         for pack in packs:
-            if pack.name != "xyence-engineering-conventions":
+            if not pack.is_default:
                 continue
             if pack.scope != "namespace" or pack.namespace != namespace:
                 continue
@@ -3496,12 +3496,10 @@ def _recommended_context_pack_ids(
             if pid not in selected_ids:
                 selected_ids.add(pid)
                 selected.append(pack)
-            break
 
-    # Project planner pack only for core.ems.platform.
-    if project_key == "core.ems.platform":
+    if project_key:
         for pack in packs:
-            if pack.name != "ems-platform-blueprint":
+            if not pack.is_default:
                 continue
             if pack.scope != "project" or pack.project_key != project_key:
                 continue
@@ -3511,7 +3509,6 @@ def _recommended_context_pack_ids(
             if pid not in selected_ids:
                 selected_ids.add(pid)
                 selected.append(pack)
-            break
 
     # Coder canon defaults for solution/generate_code only.
     if draft_kind == "solution" or generate_code:

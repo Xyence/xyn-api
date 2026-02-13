@@ -53,6 +53,7 @@ class DraftSessionDefaultsTests(TestCase):
             version="1",
             content_markdown="proj",
             is_active=True,
+            is_default=False,
         )
 
     def test_context_pack_defaults_blueprint_scope_rules(self):
@@ -69,9 +70,28 @@ class DraftSessionDefaultsTests(TestCase):
         ids = set(payload["recommended_context_pack_ids"])
         self.assertIn(str(self.platform.id), ids)
         self.assertIn(str(self.planner.id), ids)
+        self.assertNotIn(str(self.namespace_pack.id), ids)
+        self.assertNotIn(str(self.project_pack.id), ids)
+        self.assertNotIn(str(self.coder.id), ids)
+
+    def test_context_pack_defaults_include_scope_defaults_when_marked_default(self):
+        self.namespace_pack.is_default = True
+        self.namespace_pack.save(update_fields=["is_default", "updated_at"])
+        self.project_pack.is_default = True
+        self.project_pack.save(update_fields=["is_default", "updated_at"])
+
+        response = self.client.get(
+            "/xyn/api/context-pack-defaults",
+            {
+                "draft_kind": "blueprint",
+                "namespace": "core",
+                "project_key": "core.ems.platform",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        ids = set(response.json()["recommended_context_pack_ids"])
         self.assertIn(str(self.namespace_pack.id), ids)
         self.assertIn(str(self.project_pack.id), ids)
-        self.assertNotIn(str(self.coder.id), ids)
 
     def test_context_pack_defaults_solution_includes_coder(self):
         response = self.client.get(
