@@ -330,3 +330,47 @@ class DraftSessionDefaultsTests(TestCase):
         blueprints = response.json()["blueprints"]
         match = next(item for item in blueprints if item["id"] == str(self.blueprint.id))
         self.assertEqual(match["active_draft_count"], 1)
+
+    def test_submit_uses_session_project_key_for_blueprint_name(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Targeted submit",
+                    "namespace": "core",
+                    "project_key": "core.test-josh",
+                    "initial_prompt": "Create EMS blueprint",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = {
+            "apiVersion": "xyn.blueprint/v1",
+            "kind": "SolutionBlueprint",
+            "metadata": {"name": "subscriber-notes-dev-demo", "namespace": "xyence.demo"},
+            "releaseSpec": {
+                "apiVersion": "xyn.seed/v1",
+                "kind": "Release",
+                "metadata": {"name": "subscriber-notes-dev-demo", "namespace": "xyence.demo"},
+                "backend": {"type": "compose"},
+                "components": [{"name": "api", "image": "example/demo:latest"}],
+            },
+        }
+        session.save(update_fields=["current_draft_json", "updated_at"])
+
+        submit = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(submit.status_code, 200)
+        entity_id = submit.json().get("entity_id")
+        self.assertTrue(entity_id)
+        published = Blueprint.objects.get(id=entity_id)
+        self.assertEqual(published.namespace, "core")
+        self.assertEqual(published.name, "test-josh")

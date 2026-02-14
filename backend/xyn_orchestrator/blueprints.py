@@ -2757,6 +2757,28 @@ def _publish_draft_session(session: BlueprintDraftSession, user) -> Dict[str, An
         }
     kind = session.blueprint_kind
     if kind == "solution":
+        target_namespace = (session.namespace or "").strip()
+        target_project_key = (session.project_key or "").strip()
+        target_name = ""
+        if target_project_key:
+            parts = target_project_key.split(".")
+            if len(parts) >= 2:
+                target_namespace = parts[0].strip() or target_namespace
+                target_name = ".".join(parts[1:]).strip()
+            else:
+                target_name = target_project_key
+        metadata = draft.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if target_namespace:
+            metadata["namespace"] = target_namespace
+        if target_name:
+            metadata["name"] = target_name
+        if metadata:
+            draft["metadata"] = metadata
+            session.current_draft_json = draft
+            session.save(update_fields=["current_draft_json", "updated_at"])
+
         spec_text = json.dumps(draft, indent=2, ensure_ascii=False)
         metadata_json = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
         blueprint, created = Blueprint.objects.get_or_create(
