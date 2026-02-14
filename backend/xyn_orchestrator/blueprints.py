@@ -3907,7 +3907,11 @@ def enqueue_draft_generation(request: HttpRequest, session_id: str) -> JsonRespo
         _executor.submit(generate_blueprint_draft, str(session.id))
     session.job_id = job_id
     session.last_error = ""
-    session.save(update_fields=["status", "job_id", "last_error"])
+    update_fields = ["status", "job_id", "last_error"]
+    if not session.initial_prompt_locked and (session.initial_prompt or "").strip():
+        session.initial_prompt_locked = True
+        update_fields.append("initial_prompt_locked")
+    session.save(update_fields=update_fields)
     return JsonResponse({"status": session.status, "job_id": job_id})
 
 
