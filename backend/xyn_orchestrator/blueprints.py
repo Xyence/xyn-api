@@ -3995,10 +3995,9 @@ def submit_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
         return JsonResponse({"error": "POST required"}, status=405)
     session = get_object_or_404(BlueprintDraftSession, id=session_id)
     payload = _safe_json_body(request)
-    submitted_once = bool(session.submitted_payload_json)
     requested_prompt = (payload.get("initial_prompt") or "").strip()
-    if submitted_once and requested_prompt and requested_prompt != (session.initial_prompt or "").strip():
-        return JsonResponse({"error": "initial_prompt is immutable after first submission"}, status=400)
+    if session.initial_prompt_locked and requested_prompt and requested_prompt != (session.initial_prompt or "").strip():
+        return JsonResponse({"error": "initial_prompt is immutable after first generation"}, status=400)
     initial_prompt = (requested_prompt or session.initial_prompt or "").strip()
     if not initial_prompt:
         return JsonResponse({"error": "initial_prompt is required"}, status=400)
@@ -4109,7 +4108,6 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
         return JsonResponse({"status": "deleted"})
     if request.method == "PATCH":
         payload = _safe_json_body(request)
-        submitted_once = bool(session.submitted_payload_json)
         if "title" in payload:
             title = (payload.get("title") or "").strip() or "Untitled draft"
             session.title = title
@@ -4125,8 +4123,8 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             session.project_key = (payload.get("project_key") or "").strip()
         if "initial_prompt" in payload:
             next_prompt = (payload.get("initial_prompt") or "").strip()
-            if submitted_once and next_prompt != (session.initial_prompt or "").strip():
-                return JsonResponse({"error": "initial_prompt is immutable after first submission"}, status=400)
+            if session.initial_prompt_locked and next_prompt != (session.initial_prompt or "").strip():
+                return JsonResponse({"error": "initial_prompt is immutable after first generation"}, status=400)
             session.initial_prompt = next_prompt
         if "revision_instruction" in payload:
             session.revision_instruction = (payload.get("revision_instruction") or "").strip()
@@ -4163,7 +4161,7 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             "namespace": session.namespace or None,
             "project_key": session.project_key or None,
             "initial_prompt": session.initial_prompt,
-            "initial_prompt_locked": bool(session.submitted_payload_json),
+            "initial_prompt_locked": bool(session.initial_prompt_locked),
             "revision_instruction": session.revision_instruction,
             "source_artifacts": session.source_artifacts or [],
             "has_generated_output": bool(session.has_generated_output or session.current_draft_json),
@@ -4384,7 +4382,10 @@ def internal_draft_session_update(request: HttpRequest, session_id: str) -> Json
     session.diff_summary = payload.get("diff_summary", "")
     session.status = payload.get("status", session.status)
     session.last_error = payload.get("last_error", "")
-    session.has_generated_output = bool(payload.get("draft_json"))
+    has_draft = bool(payload.get("draft_json"))
+    session.has_generated_output = has_draft
+    if has_draft and not session.initial_prompt_locked and (session.initial_prompt or "").strip():
+        session.initial_prompt_locked = True
     session.save(
         update_fields=[
             "current_draft_json",
@@ -4395,6 +4396,7 @@ def internal_draft_session_update(request: HttpRequest, session_id: str) -> Json
             "status",
             "last_error",
             "has_generated_output",
+            "initial_prompt_locked",
             "updated_at",
         ]
     )

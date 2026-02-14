@@ -186,7 +186,7 @@ class DraftSessionDefaultsTests(TestCase):
         self.assertEqual(deleted.status_code, 200)
         self.assertFalse(BlueprintDraftSession.objects.filter(id=session_id).exists())
 
-    def test_initial_prompt_locked_after_first_submit(self):
+    def test_initial_prompt_locked_blocks_patch(self):
         create = self.client.post(
             "/xyn/api/draft-sessions",
             data=json.dumps(
@@ -215,12 +215,8 @@ class DraftSessionDefaultsTests(TestCase):
             },
         }
         session.save(update_fields=["current_draft_json", "updated_at"])
-        submit = self.client.post(
-            f"/xyn/api/draft-sessions/{session_id}/submit",
-            data=json.dumps({}),
-            content_type="application/json",
-        )
-        self.assertEqual(submit.status_code, 200)
+        session.initial_prompt_locked = True
+        session.save(update_fields=["initial_prompt_locked", "updated_at"])
         patch = self.client.patch(
             f"/xyn/api/draft-sessions/{session_id}",
             data=json.dumps({"initial_prompt": "Changed later"}),

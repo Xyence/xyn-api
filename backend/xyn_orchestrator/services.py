@@ -179,6 +179,114 @@ def _normalize_generated_blueprint(spec: Optional[Dict[str, Any]]) -> Dict[str, 
     return draft
 
 
+def _merge_missing_fields(baseline: Any, candidate: Any) -> Any:
+    if isinstance(baseline, dict) and isinstance(candidate, dict):
+        merged = {k: _merge_missing_fields(baseline.get(k), v) for k, v in candidate.items()}
+        for key, value in baseline.items():
+            if key not in merged:
+                merged[key] = value
+        return merged
+    if isinstance(baseline, list) and isinstance(candidate, list):
+        if not baseline or not candidate:
+            return candidate
+        merged_list = list(candidate)
+        for idx in range(min(len(baseline), len(merged_list))):
+            merged_list[idx] = _merge_missing_fields(baseline[idx], merged_list[idx])
+        if len(baseline) > len(merged_list):
+            merged_list.extend(baseline[len(merged_list) :])
+        return merged_list
+    return candidate
+
+
+def _schema_guardrails(kind: str) -> str:
+    try:
+        schema = _load_schema(_schema_for_kind(kind))
+        required = schema.get("required") if isinstance(schema, dict) else []
+        required_text = ", ".join(required) if isinstance(required, list) else ""
+        release_required = ""
+        release_spec = schema.get("properties", {}).get("releaseSpec") if isinstance(schema, dict) else None
+        if isinstance(release_spec, dict):
+            release_ref = str(release_spec.get("$ref") or "").replace("./", "")
+            if release_ref:
+                release_schema = _load_schema(release_ref)
+                req = release_schema.get("required")
+                if isinstance(req, list):
+                    release_required = ", ".join(req)
+        return (
+            f"REQUIRED TOP-LEVEL KEYS: {required_text or 'apiVersion, kind, metadata, releaseSpec'}\n"
+            f"RELEASE REQUIRED KEYS: {release_required or 'apiVersion, kind, metadata, backend, components'}\n"
+            "CONSTRAINTS: preserve all existing keys unless instruction explicitly removes them; "
+            "never drop required keys; keep identifiers stable unless explicitly renamed."
+        )
+    except Exception:
+        return (
+            "REQUIRED TOP-LEVEL KEYS: apiVersion, kind, metadata, releaseSpec\n"
+            "RELEASE REQUIRED KEYS: apiVersion, kind, metadata, backend, components\n"
+            "CONSTRAINTS: preserve existing structure and required fields."
+        )
+
+
+def draft_revision_patch_prompt(kind: str, context_text: str, guardrails: str) -> str:
+    base = (
+        "You are updating an existing blueprint draft JSON.\n"
+        "Treat revision_instruction as a delta against baseline_draft_json.\n"
+        "Apply a patch-style update: preserve unknown fields, preserve required fields, and only change what is needed.\n"
+        "Do not remove fields unless explicitly requested.\n"
+        "Return ONLY the full updated JSON object (no markdown, no prose)."
+    )
+    if kind == "module":
+        base += "\nSchema target: ModuleSpec."
+    elif kind == "bundle":
+        base += "\nSchema target: BundleSpec."
+    else:
+        base += "\nSchema target: SolutionBlueprintSpec with valid ReleaseSpec."
+    if context_text:
+        return f"{context_text}\n\n{guardrails}\n\n{base}"
+    return f"{guardrails}\n\n{base}"
+
+
+def _openai_revise_blueprint(
+    *,
+    kind: str,
+    context_text: str,
+    baseline_draft_json: Dict[str, Any],
+    revision_instruction: str,
+    initial_prompt: str,
+    prompt_sources: List[str],
+    validation_errors: Optional[List[str]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    config = OpenAIConfig.objects.first()
+    if not config:
+        return None, "OpenAI config is not configured."
+    from openai import OpenAI  # type: ignore
+
+    client = OpenAI(api_key=config.api_key)
+    guardrails = _schema_guardrails(kind)
+    system_prompt = draft_revision_patch_prompt(kind, context_text, guardrails)
+    user_payload = {
+        "baseline_draft_json": baseline_draft_json,
+        "revision_instruction": revision_instruction,
+        "initial_prompt": initial_prompt,
+        "prompt_sources": prompt_sources,
+    }
+    if validation_errors:
+        user_payload["validation_errors"] = validation_errors[:20]
+    try:
+        response = client.responses.create(
+            model=config.default_model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload)},
+            ],
+        )
+    except Exception as exc:
+        return None, f"OpenAI revision request failed: {exc}"
+    parsed = _extract_json_object(str(getattr(response, "output_text", "") or ""))
+    if parsed is None:
+        return None, "OpenAI revision response was not valid JSON."
+    return parsed, None
+
+
 def _openai_generate_blueprint(
     transcript: str, kind: str, context_text: str
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -418,6 +526,8 @@ def generate_blueprint_draft(session_id: str) -> None:
     session.validation_errors_json = errors
     session.diff_summary = "Generated from prompt inputs"
     session.status = "ready" if not errors else "ready_with_errors"
+    if draft and not session.initial_prompt_locked and session.initial_prompt.strip():
+        session.initial_prompt_locked = True
     session.updated_at = timezone.now()
     session.save(
         update_fields=[
@@ -426,6 +536,7 @@ def generate_blueprint_draft(session_id: str) -> None:
             "validation_errors_json",
             "diff_summary",
             "status",
+            "initial_prompt_locked",
             "updated_at",
         ]
     )
@@ -444,20 +555,54 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
     session.save(
         update_fields=["context_pack_refs_json", "effective_context_hash", "effective_context_preview", "updated_at"]
     )
-    base = session.requirements_summary or ""
-    combined = (base + "\n" + instruction).strip()
+    baseline = session.current_draft_json or {}
+    prompt_sources: List[str] = []
+    for artifact in session.source_artifacts or []:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_type = str(artifact.get("type", "")).strip().lower()
+        if artifact_type not in {"text", "audio_transcript"}:
+            continue
+        content = str(artifact.get("content", "")).strip()
+        if content:
+            prompt_sources.append(content)
     generation_error = None
-    draft, generation_error = _openai_generate_blueprint(combined, session.blueprint_kind, context["effective_context"])
+    draft, generation_error = _openai_revise_blueprint(
+        kind=session.blueprint_kind,
+        context_text=context["effective_context"],
+        baseline_draft_json=baseline,
+        revision_instruction=instruction,
+        initial_prompt=session.initial_prompt or "",
+        prompt_sources=prompt_sources,
+    )
     if not draft:
-        draft = session.current_draft_json or {}
+        draft = baseline
     draft = _normalize_generated_blueprint(draft)
-    errors = _validate_blueprint(draft, session.blueprint_kind) if draft else []
-    if generation_error:
-        errors = [generation_error, *errors] if generation_error not in errors else errors
-    if not errors and not draft:
-        errors = ["Revision failed"]
+    draft = _merge_missing_fields(baseline, draft) if isinstance(draft, dict) else draft
+    errors = _validate_blueprint(draft, session.blueprint_kind) if draft else ["Revision failed"]
+    if errors:
+        retry_draft, retry_error = _openai_revise_blueprint(
+            kind=session.blueprint_kind,
+            context_text=context["effective_context"],
+            baseline_draft_json=baseline,
+            revision_instruction=instruction,
+            initial_prompt=session.initial_prompt or "",
+            prompt_sources=prompt_sources,
+            validation_errors=errors,
+        )
+        if retry_draft:
+            retry_draft = _normalize_generated_blueprint(retry_draft)
+            retry_draft = _merge_missing_fields(baseline, retry_draft) if isinstance(retry_draft, dict) else retry_draft
+            retry_errors = _validate_blueprint(retry_draft, session.blueprint_kind)
+            if not retry_errors:
+                draft = retry_draft
+                errors = []
+        if retry_error and retry_error not in errors:
+            errors = [retry_error, *errors]
+    if generation_error and generation_error not in errors:
+        errors = [generation_error, *errors]
     session.current_draft_json = draft
-    session.requirements_summary = combined[:2000]
+    session.requirements_summary = (session.initial_prompt or "")[:2000]
     session.validation_errors_json = errors
     session.diff_summary = f"Instruction: {instruction}"
     session.status = "ready" if not errors else "ready_with_errors"

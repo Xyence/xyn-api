@@ -245,6 +245,7 @@ class BlueprintDraftSession(models.Model):
     namespace = models.CharField(max_length=120, blank=True)
     project_key = models.CharField(max_length=200, blank=True)
     initial_prompt = models.TextField(blank=True)
+    initial_prompt_locked = models.BooleanField(default=False)
     revision_instruction = models.TextField(blank=True)
     selected_context_pack_ids = models.JSONField(default=list, blank=True)
     source_artifacts = models.JSONField(default=list, blank=True)
