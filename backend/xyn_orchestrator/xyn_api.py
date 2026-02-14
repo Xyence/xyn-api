@@ -2686,10 +2686,16 @@ def contact_detail(request: HttpRequest, contact_id: str) -> JsonResponse:
 @require_role("platform_admin")
 def identities_collection(request: HttpRequest) -> JsonResponse:
     identities = UserIdentity.objects.all().order_by("-last_login_at", "email")
+    provider_names = {
+        provider.id: provider.display_name
+        for provider in IdentityProvider.objects.filter(enabled=True)
+    }
     data = [
         {
             "id": str(i.id),
             "provider": i.provider,
+            "provider_id": i.provider_id or None,
+            "provider_display_name": provider_names.get(i.provider_id or "", ""),
             "issuer": i.issuer,
             "subject": i.subject,
             "email": i.email,
