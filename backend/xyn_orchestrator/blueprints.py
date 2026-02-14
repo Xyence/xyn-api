@@ -300,6 +300,219 @@ def _generate_blueprint_spec(session: BlueprintDraftSession, transcripts: List[s
     return spec
 
 
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+
+def _split_prompt_lines(text: str) -> List[str]:
+    lines: List[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lines.append(line)
+    return lines
+
+
+def _append_unique(values: List[str], item: str) -> None:
+    cleaned = (item or "").strip()
+    if not cleaned:
+        return
+    lowered = cleaned.lower()
+    if any(existing.lower() == lowered for existing in values):
+        return
+    values.append(cleaned)
+
+
+def _extract_requirement_bullets(prompt_text: str, transcripts_text: str) -> Dict[str, List[str]]:
+    combined = "\n".join(part for part in [prompt_text, transcripts_text] if part).strip()
+    lines = _split_prompt_lines(combined)
+    sections: Dict[str, List[str]] = {
+        "functional": [],
+        "ui": [],
+        "dataModel": [],
+        "operational": [],
+        "definitionOfDone": [],
+    }
+    active_section: Optional[str] = None
+    for line in lines:
+        lower = line.lower()
+        if "definition of done" in lower or "acceptance" in lower:
+            active_section = "definitionOfDone"
+            continue
+        if "data model" in lower:
+            active_section = "dataModel"
+            continue
+        if "frontend" in lower or "ui" in lower:
+            active_section = "ui"
+            continue
+        if "backend" in lower or "api" in lower:
+            active_section = "functional"
+            continue
+        if any(token in lower for token in ["operational", "deployment", "migrations", "logging", "secret", "idempotent"]):
+            active_section = "operational"
+            continue
+        if line.startswith(("-", "*")):
+            bullet = line[1:].strip()
+            if active_section:
+                _append_unique(sections[active_section], bullet)
+            continue
+        if active_section and len(line) < 180:
+            _append_unique(sections[active_section], line)
+
+    prompt_lower = combined.lower()
+    if any(token in prompt_lower for token in ["create", "list", "delete", "crud"]):
+        _append_unique(sections["functional"], "Implement create/list/delete API endpoints for the primary entity.")
+    if "health endpoint" in prompt_lower or "/health" in prompt_lower or "health check" in prompt_lower:
+        _append_unique(sections["functional"], "Expose a health endpoint for deployment verification.")
+    if "subscriber notes" in prompt_lower:
+        _append_unique(sections["ui"], "Render header titled 'Subscriber Notes - Dev Demo'.")
+        _append_unique(sections["ui"], "Show a table listing notes from the API.")
+        _append_unique(sections["ui"], "Provide an add-note form.")
+        _append_unique(sections["ui"], "Support deleting notes from the table.")
+        _append_unique(sections["dataModel"], "id (auto-generated)")
+        _append_unique(sections["dataModel"], "subscriber_id (string)")
+        _append_unique(sections["dataModel"], "note_text (string)")
+        _append_unique(sections["dataModel"], "created_at (timestamp)")
+        _append_unique(sections["functional"], "Implement create/list/delete endpoints for subscriber notes.")
+        _append_unique(sections["functional"], "Provide API health endpoint.")
+    if any(token in prompt_lower for token in ["secret", "config", "logging", "migration", "idempotent"]):
+        _append_unique(sections["operational"], "Configure secrets and runtime config through environment/secret refs.")
+        _append_unique(sections["operational"], "Enable structured logging for API and worker flows.")
+        _append_unique(sections["operational"], "Run migrations safely and idempotently on deploy.")
+    if "https://josh.xyence.io" in prompt_lower:
+        _append_unique(
+            sections["definitionOfDone"],
+            "Deploy at https://josh.xyence.io and verify app is reachable with expected UI and APIs.",
+        )
+
+    return sections
+
+
+def _build_draft_intent(session: BlueprintDraftSession, draft: Dict[str, Any]) -> Dict[str, Any]:
+    prompt_text = session.initial_prompt or ""
+    prompt_created_at = (session.created_at or timezone.now()).isoformat()
+    artifacts = session.source_artifacts if isinstance(session.source_artifacts, list) else []
+    transcripts: List[Dict[str, Any]] = []
+    transcript_text_parts: List[str] = []
+    for idx, artifact in enumerate(artifacts):
+        if not isinstance(artifact, dict):
+            continue
+        if str(artifact.get("type") or "").strip().lower() != "audio_transcript":
+            continue
+        transcript_text = str(artifact.get("content") or "").strip()
+        meta = artifact.get("meta") if isinstance(artifact.get("meta"), dict) else {}
+        transcript_id = (
+            str(meta.get("id") or meta.get("voice_note_id") or meta.get("transcript_id") or "").strip()
+            or f"transcript-{idx + 1}"
+        )
+        entry: Dict[str, Any] = {"id": transcript_id}
+        ref = str(meta.get("ref") or meta.get("url") or "").strip()
+        if ref:
+            entry["ref"] = ref
+        if transcript_text:
+            entry["text"] = transcript_text
+            entry["sha256"] = _sha256_text(transcript_text)
+            transcript_text_parts.append(transcript_text)
+        if created_at := meta.get("created_at"):
+            entry["createdAt"] = str(created_at)
+        transcripts.append(entry)
+
+    transcript_text = "\n\n".join(transcript_text_parts)
+    requirements_sections = _extract_requirement_bullets(prompt_text, transcript_text)
+    summary = (session.requirements_summary or "").strip()
+    if not summary:
+        summary_source = prompt_text or transcript_text or "Blueprint generated from draft session."
+        summary = summary_source[:800]
+
+    intent: Dict[str, Any] = {
+        "sourceDraftSessionId": str(session.id),
+        "createdFrom": {"type": "draft", "id": str(session.id)},
+        "prompt": {
+            "text": prompt_text,
+            "sha256": _sha256_text(prompt_text),
+            "createdAt": prompt_created_at,
+        },
+        "requirements": {
+            "summary": summary,
+            "functional": requirements_sections["functional"],
+            "ui": requirements_sections["ui"],
+            "dataModel": requirements_sections["dataModel"],
+            "operational": requirements_sections["operational"],
+            "definitionOfDone": requirements_sections["definitionOfDone"],
+        },
+    }
+    if transcripts:
+        intent["transcripts"] = transcripts
+    intent["codegen"] = {"layout": {"apiPath": "services/api", "webPath": "services/web"}}
+    return intent
+
+
+def _extract_blueprint_intent(blueprint: Blueprint) -> Dict[str, Any]:
+    spec_json: Optional[Dict[str, Any]] = None
+    if blueprint.spec_text:
+        try:
+            parsed = json.loads(blueprint.spec_text)
+            if isinstance(parsed, dict):
+                spec_json = parsed
+        except json.JSONDecodeError:
+            spec_json = None
+    if spec_json is None:
+        latest = blueprint.revisions.order_by("-revision").first()
+        if latest and isinstance(latest.spec_json, dict):
+            spec_json = latest.spec_json
+    if not isinstance(spec_json, dict):
+        return {}
+    intent = spec_json.get("intent")
+    return intent if isinstance(intent, dict) else {}
+
+
+def _apply_intent_context_to_work_items(
+    work_items: List[Dict[str, Any]],
+    intent_requirements: Dict[str, Any],
+    intent_prompt: str,
+) -> None:
+    if not work_items:
+        return
+    summary = str(intent_requirements.get("summary") or "").strip()
+    bullets: List[str] = []
+    for key in ("functional", "ui", "dataModel", "operational", "definitionOfDone"):
+        values = intent_requirements.get(key) or []
+        if isinstance(values, list):
+            for value in values:
+                cleaned = str(value).strip()
+                if cleaned:
+                    _append_unique(bullets, cleaned)
+    for item in work_items:
+        inputs = item.get("inputs")
+        if not isinstance(inputs, dict):
+            inputs = {}
+            item["inputs"] = inputs
+        context = inputs.get("context")
+        if not isinstance(context, list):
+            context = []
+        if "blueprint.intent.requirements" not in context:
+            context.append("blueprint.intent.requirements")
+        inputs["context"] = context
+    first = work_items[0]
+    if summary:
+        first["description"] = summary
+    elif intent_prompt:
+        first["description"] = intent_prompt[:240]
+    if bullets:
+        criteria = first.get("acceptance_criteria")
+        if not isinstance(criteria, list):
+            criteria = []
+        existing = {str(entry).strip().lower() for entry in criteria}
+        for bullet in bullets[:8]:
+            lowered = bullet.lower()
+            if lowered in existing:
+                continue
+            criteria.append(bullet)
+            existing.add(lowered)
+        first["acceptance_criteria"] = criteria
+
+
 def _select_context_packs_deterministic(
     purpose: str,
     namespace: Optional[str],
@@ -1220,6 +1433,13 @@ def _generate_implementation_plan(
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     planned_release_version = _next_release_version_for_blueprint(str(blueprint.id))
     repo_targets = _default_repo_targets()
+    blueprint_intent = _extract_blueprint_intent(blueprint)
+    intent_requirements = blueprint_intent.get("requirements") if isinstance(blueprint_intent.get("requirements"), dict) else {}
+    intent_prompt = (
+        blueprint_intent.get("prompt", {}).get("text")
+        if isinstance(blueprint_intent.get("prompt"), dict)
+        else ""
+    )
     work_items: List[Dict[str, Any]] = []
     if blueprint_fqn == "core.ems.platform":
         work_items = [
@@ -2032,21 +2252,99 @@ def _generate_implementation_plan(
             },
         ]
     else:
-        work_items = [
-            {
-                "id": f"{blueprint.name}-scaffold",
-                "title": f"Scaffold {blueprint_fqn}",
-                "description": "Create initial scaffold for blueprint.",
-                "type": "scaffold",
-                "repo_targets": repo_targets[:1],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-api/README.md"]},
-                "acceptance_criteria": ["Scaffold created."],
-                "verify": [{"name": "scaffold-file", "command": "test -f apps/ems-api/README.md"}],
-                "depends_on": [],
-                "labels": ["scaffold"],
-            }
-        ]
+        functional = [str(item).strip() for item in (intent_requirements.get("functional") or []) if str(item).strip()]
+        ui = [str(item).strip() for item in (intent_requirements.get("ui") or []) if str(item).strip()]
+        data_model = [str(item).strip() for item in (intent_requirements.get("dataModel") or []) if str(item).strip()]
+        operational = [str(item).strip() for item in (intent_requirements.get("operational") or []) if str(item).strip()]
+        dod = [str(item).strip() for item in (intent_requirements.get("definitionOfDone") or []) if str(item).strip()]
+        summary = str(intent_requirements.get("summary") or "").strip()
+        if not summary:
+            summary = (intent_prompt or "Create initial scaffold for blueprint.")[:240]
+
+        work_items = []
+        if functional:
+            work_items.append(
+                {
+                    "id": f"{blueprint.name}-api-features",
+                    "title": f"Implement API features for {blueprint_fqn}",
+                    "description": summary,
+                    "type": "feature",
+                    "repo_targets": repo_targets[:1],
+                    "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
+                    "outputs": {"paths": ["services/api/README.md"]},
+                    "acceptance_criteria": functional,
+                    "verify": [{"name": "api-sanity", "command": "echo 'api checks defined in task output'"}],
+                    "depends_on": [],
+                    "labels": ["api", "feature", "intent-driven"],
+                }
+            )
+        if ui:
+            work_items.append(
+                {
+                    "id": f"{blueprint.name}-ui-features",
+                    "title": f"Implement UI requirements for {blueprint_fqn}",
+                    "description": "Implement UI behavior captured in blueprint intent.",
+                    "type": "feature",
+                    "repo_targets": repo_targets[1:2] or repo_targets[:1],
+                    "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
+                    "outputs": {"paths": ["services/web/README.md"]},
+                    "acceptance_criteria": ui,
+                    "verify": [{"name": "ui-sanity", "command": "echo 'ui checks defined in task output'"}],
+                    "depends_on": [work_items[0]["id"]] if work_items else [],
+                    "labels": ["ui", "feature", "intent-driven"],
+                }
+            )
+        if data_model:
+            work_items.append(
+                {
+                    "id": f"{blueprint.name}-data-model",
+                    "title": f"Implement data model for {blueprint_fqn}",
+                    "description": "Establish entities and persistence required by blueprint intent.",
+                    "type": "integration",
+                    "repo_targets": repo_targets[:1],
+                    "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
+                    "outputs": {"paths": ["services/api/migrations/README.md"]},
+                    "acceptance_criteria": data_model,
+                    "verify": [{"name": "data-sanity", "command": "echo 'data model checks defined in task output'"}],
+                    "depends_on": [item["id"] for item in work_items[:1]],
+                    "labels": ["data", "schema", "intent-driven"],
+                }
+            )
+        if operational or dod:
+            work_items.append(
+                {
+                    "id": f"{blueprint.name}-operational-hardening",
+                    "title": f"Operationalize {blueprint_fqn}",
+                    "description": "Apply deployment and operational requirements from blueprint intent.",
+                    "type": "deploy",
+                    "repo_targets": repo_targets[:1],
+                    "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
+                    "outputs": {"paths": ["services/api/ops/README.md"]},
+                    "acceptance_criteria": operational + dod,
+                    "verify": [{"name": "ops-sanity", "command": "echo 'ops checks defined in task output'"}],
+                    "depends_on": [item["id"] for item in work_items],
+                    "labels": ["deploy", "ops", "intent-driven"],
+                }
+            )
+        if not work_items:
+            work_items = [
+                {
+                    "id": f"{blueprint.name}-scaffold",
+                    "title": f"Scaffold {blueprint_fqn}",
+                    "description": summary or "Create initial scaffold for blueprint.",
+                    "type": "scaffold",
+                    "repo_targets": repo_targets[:1],
+                    "inputs": {"artifacts": ["implementation_plan.json"]},
+                    "outputs": {"paths": ["apps/ems-api/README.md"]},
+                    "acceptance_criteria": ["Scaffold created from blueprint intent."],
+                    "verify": [{"name": "scaffold-file", "command": "test -f apps/ems-api/README.md"}],
+                    "depends_on": [],
+                    "labels": ["scaffold", "intent-driven"],
+                }
+            ]
+
+    if intent_requirements or intent_prompt:
+        _apply_intent_context_to_work_items(work_items, intent_requirements, intent_prompt)
 
     if module_catalog is None:
         module_catalog = _build_module_catalog()
@@ -2927,6 +3225,8 @@ def _publish_draft_session(session: BlueprintDraftSession, user) -> Dict[str, An
     draft = session.current_draft_json
     if not draft:
         return {"ok": False, "error": "No draft to publish.", "validation_errors": []}
+    if isinstance(draft, dict) and session.blueprint_kind == "solution":
+        draft["intent"] = _build_draft_intent(session, draft)
     errors = _validate_blueprint_spec(draft, session.blueprint_kind)
     if errors:
         return {

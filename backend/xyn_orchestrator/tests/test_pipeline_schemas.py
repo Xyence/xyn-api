@@ -919,6 +919,45 @@ class PipelineSchemaTests(TestCase):
         ids = {item.get("id") for item in plan.get("work_items", [])}
         self.assertIn("dns-route53-module", ids)
 
+    def test_non_core_plan_uses_blueprint_intent_requirements(self):
+        spec = {
+            "apiVersion": "xyn.blueprint/v1",
+            "kind": "SolutionBlueprint",
+            "metadata": {"name": "subscriber-notes", "namespace": "core"},
+            "intent": {
+                "sourceDraftSessionId": "draft-1",
+                "createdFrom": {"type": "draft", "id": "draft-1"},
+                "prompt": {"text": "Create subscriber notes", "sha256": "abc", "createdAt": "2026-02-14T00:00:00Z"},
+                "requirements": {
+                    "summary": "Build subscriber notes app",
+                    "functional": ["Implement create/list/delete endpoints", "Expose health endpoint"],
+                    "ui": ["Render Subscriber Notes - Dev Demo header"],
+                    "dataModel": ["subscriber_id", "note_text", "created_at"],
+                    "operational": ["Enable logging", "Run migrations idempotently"],
+                    "definitionOfDone": ["Service reachable at https://josh.xyence.io"],
+                },
+            },
+            "releaseSpec": {
+                "apiVersion": "xyn.seed/v1",
+                "kind": "Release",
+                "metadata": {"name": "subscriber-notes", "namespace": "core"},
+                "backend": {"type": "compose"},
+                "components": [{"name": "api", "image": "example/demo:latest"}],
+            },
+        }
+        blueprint = Blueprint.objects.create(
+            name="subscriber-notes",
+            namespace="core",
+            spec_text=json.dumps(spec),
+        )
+        plan = _generate_implementation_plan(blueprint)
+        self.assertGreaterEqual(len(plan.get("work_items", [])), 1)
+        first = plan["work_items"][0]
+        self.assertEqual(first.get("description"), "Build subscriber notes app")
+        self.assertIn("Implement create/list/delete endpoints", first.get("acceptance_criteria", []))
+        context = (first.get("inputs") or {}).get("context") or []
+        self.assertIn("blueprint.intent.requirements", context)
+
     def test_planner_selects_image_deploy_when_enabled(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
         release_target = {

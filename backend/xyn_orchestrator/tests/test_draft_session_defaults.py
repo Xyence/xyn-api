@@ -530,3 +530,64 @@ class DraftSessionDefaultsTests(TestCase):
         self.assertEqual(submit.status_code, 200)
         self.assertEqual(ReleaseTarget.objects.filter(blueprint=blueprint, environment="Dev").count(), 1)
         self.assertEqual(ReleaseTarget.objects.filter(blueprint=blueprint, auto_generated=True).count(), 0)
+
+    def test_submit_persists_intent_provenance_with_structured_requirements(self):
+        prompt = (
+            "Create a small telecom-oriented demo application called Subscriber Notes.\n"
+            "API requirements: create/list/delete endpoints and a health endpoint.\n"
+            "UI requirements: header 'Subscriber Notes - Dev Demo', notes table, add form, delete action.\n"
+            "Data model: id, subscriber_id, note_text, created_at.\n"
+            "Operational requirements: secrets/config, logging, migrations, idempotent deploy.\n"
+            "Definition of done: app is reachable at https://josh.xyence.io.\n"
+        )
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Subscriber Notes",
+                    "namespace": "core",
+                    "project_key": "core.subscriber-notes",
+                    "initial_prompt": prompt,
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                    "source_artifacts": [{"type": "audio_transcript", "content": "Transcript with deployment notes."}],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = self._build_valid_solution_draft(name="subscriber-notes")
+        session.requirements_summary = "Subscriber Notes app with API, UI, data model and operations requirements."
+        session.save(update_fields=["current_draft_json", "requirements_summary", "updated_at"])
+
+        submit = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(submit.status_code, 200)
+        blueprint = Blueprint.objects.get(id=submit.json()["entity_id"])
+        spec = json.loads(blueprint.spec_text or "{}")
+        intent = spec.get("intent") or {}
+        self.assertEqual(intent.get("sourceDraftSessionId"), session_id)
+        self.assertEqual((intent.get("createdFrom") or {}).get("type"), "draft")
+        self.assertEqual((intent.get("prompt") or {}).get("text"), session.initial_prompt)
+        requirements = intent.get("requirements") or {}
+        functional = " ".join(requirements.get("functional") or []).lower()
+        ui = " ".join(requirements.get("ui") or []).lower()
+        data_model = " ".join(requirements.get("dataModel") or []).lower()
+        operational = " ".join(requirements.get("operational") or []).lower()
+        dod = " ".join(requirements.get("definitionOfDone") or []).lower()
+        self.assertIn("create/list/delete", functional)
+        self.assertIn("health endpoint", functional)
+        self.assertIn("subscriber notes - dev demo", ui)
+        self.assertIn("table", ui)
+        self.assertIn("add", ui)
+        self.assertTrue("delete" in ui or "deleting" in ui)
+        for field in ["id", "subscriber_id", "note_text", "created_at"]:
+            self.assertIn(field, data_model)
+        for term in ["secrets", "config", "logging", "migrations", "idempotent"]:
+            self.assertIn(term, operational)
+        self.assertIn("https://josh.xyence.io", dod)
