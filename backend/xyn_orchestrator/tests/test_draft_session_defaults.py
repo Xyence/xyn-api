@@ -3,7 +3,7 @@ import json
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from xyn_orchestrator.models import Blueprint, ContextPack, BlueprintDraftSession
+from xyn_orchestrator.models import Blueprint, ContextPack, BlueprintDraftSession, DraftSessionRevision
 
 
 class DraftSessionDefaultsTests(TestCase):
@@ -185,3 +185,86 @@ class DraftSessionDefaultsTests(TestCase):
         deleted = self.client.delete(f"/xyn/api/draft-sessions/{session_id}")
         self.assertEqual(deleted.status_code, 200)
         self.assertFalse(BlueprintDraftSession.objects.filter(id=session_id).exists())
+
+    def test_initial_prompt_locked_after_first_submit(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Prompt lock test",
+                    "initial_prompt": "Original prompt",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = {
+            "apiVersion": "xyn.blueprint/v1",
+            "kind": "SolutionBlueprint",
+            "metadata": {"name": "prompt-lock-test", "namespace": "core"},
+            "releaseSpec": {
+                "apiVersion": "xyn.seed/v1",
+                "kind": "Release",
+                "metadata": {"name": "prompt-lock-test", "namespace": "core"},
+                "backend": {"type": "compose"},
+                "components": [{"name": "api", "image": "example/demo:latest"}],
+            },
+        }
+        session.save(update_fields=["current_draft_json", "updated_at"])
+        submit = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(submit.status_code, 200)
+        patch = self.client.patch(
+            f"/xyn/api/draft-sessions/{session_id}",
+            data=json.dumps({"initial_prompt": "Changed later"}),
+            content_type="application/json",
+        )
+        self.assertEqual(patch.status_code, 400)
+        self.assertIn("immutable", patch.json().get("error", ""))
+
+    def test_draft_session_revisions_list_paginated_and_searchable(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Revision history",
+                    "initial_prompt": "Create app",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        for idx in range(7):
+            DraftSessionRevision.objects.create(
+                draft_session=session,
+                revision_number=idx + 1,
+                action="revise" if idx else "generate",
+                instruction=f"change {idx}",
+                draft_json={"kind": "SolutionBlueprint"},
+                requirements_summary=f"summary {idx}",
+                diff_summary=f"diff {idx}",
+                validation_errors_json=[],
+            )
+        page1 = self.client.get(f"/xyn/api/draft-sessions/{session_id}/revisions", {"page": 1, "page_size": 5})
+        self.assertEqual(page1.status_code, 200)
+        payload1 = page1.json()
+        self.assertEqual(payload1["total"], 7)
+        self.assertEqual(len(payload1["revisions"]), 5)
+        self.assertEqual(payload1["revisions"][0]["revision_number"], 7)
+        page2 = self.client.get(f"/xyn/api/draft-sessions/{session_id}/revisions", {"page": 2, "page_size": 5})
+        self.assertEqual(page2.status_code, 200)
+        self.assertEqual(len(page2.json()["revisions"]), 2)
+        search = self.client.get(f"/xyn/api/draft-sessions/{session_id}/revisions", {"q": "change 3"})
+        self.assertEqual(search.status_code, 200)
+        self.assertEqual(search.json()["total"], 1)

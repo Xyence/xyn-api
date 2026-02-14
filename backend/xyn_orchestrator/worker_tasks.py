@@ -3928,6 +3928,7 @@ def generate_blueprint_draft(session_id: str) -> None:
                 "suggested_fixes": [],
                 "diff_summary": "Generated from prompt inputs",
                 "status": status,
+                "action": "generate",
             },
         )
     except Exception as exc:
@@ -3966,6 +3967,8 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
                 "suggested_fixes": [],
                 "diff_summary": f"Instruction: {instruction}",
                 "status": status,
+                "action": "revise",
+                "instruction": instruction,
             },
         )
     except Exception as exc:

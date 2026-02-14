@@ -290,6 +290,35 @@ class DraftSessionVoiceNote(models.Model):
         return f"{self.draft_session} -> {self.voice_note}"
 
 
+class DraftSessionRevision(models.Model):
+    ACTION_CHOICES = [
+        ("generate", "Generate"),
+        ("revise", "Revise"),
+        ("save", "Save"),
+        ("submit", "Submit"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    draft_session = models.ForeignKey(BlueprintDraftSession, on_delete=models.CASCADE, related_name="revisions")
+    revision_number = models.PositiveIntegerField()
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES, default="save")
+    instruction = models.TextField(blank=True)
+    draft_json = models.JSONField(null=True, blank=True)
+    requirements_summary = models.TextField(blank=True)
+    diff_summary = models.TextField(blank=True)
+    validation_errors_json = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_session_revisions_created"
+    )
+
+    class Meta:
+        ordering = ["-revision_number", "-created_at"]
+        unique_together = ("draft_session", "revision_number")
+
+    def __str__(self) -> str:
+        return f"{self.draft_session_id} r{self.revision_number}"
+
 class BlueprintInstance(models.Model):
     STATUS_CHOICES = [
         ("pending", "Pending"),

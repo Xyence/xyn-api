@@ -31,6 +31,7 @@ from .models import (
     AuditLog,
     Capability,
     ContextPack,
+    DraftSessionRevision,
     DraftSessionVoiceNote,
     DevTask,
     Module,
@@ -148,6 +149,12 @@ class BlueprintDraftSessionAdmin(admin.ModelAdmin):
 @admin.register(DraftSessionVoiceNote)
 class DraftSessionVoiceNoteAdmin(admin.ModelAdmin):
     list_display = ("draft_session", "voice_note", "ordering")
+
+
+@admin.register(DraftSessionRevision)
+class DraftSessionRevisionAdmin(admin.ModelAdmin):
+    list_display = ("draft_session", "revision_number", "action", "created_at")
+    search_fields = ("draft_session__name", "instruction", "diff_summary")
 
 
 @admin.register(VoiceNote)

@@ -10,12 +10,33 @@ from jsonschema import Draft202012Validator, RefResolver
 from .models import (
     BlueprintDraftSession,
     ContextPack,
+    DraftSessionRevision,
     DraftSessionVoiceNote,
     OpenAIConfig,
     Run,
     VoiceNote,
     VoiceTranscript,
 )
+
+
+def _record_draft_session_revision(session: BlueprintDraftSession, action: str, instruction: str = "") -> None:
+    latest = (
+        DraftSessionRevision.objects.filter(draft_session=session)
+        .order_by("-revision_number")
+        .first()
+    )
+    next_revision = (latest.revision_number if latest else 0) + 1
+    DraftSessionRevision.objects.create(
+        draft_session=session,
+        revision_number=next_revision,
+        action=action if action in {"generate", "revise", "save", "submit"} else "save",
+        instruction=instruction or "",
+        draft_json=session.current_draft_json,
+        requirements_summary=session.requirements_summary or "",
+        diff_summary=session.diff_summary or "",
+        validation_errors_json=session.validation_errors_json or [],
+        created_by=session.updated_by,
+    )
 
 
 def _contracts_root() -> str:
@@ -408,6 +429,7 @@ def generate_blueprint_draft(session_id: str) -> None:
             "updated_at",
         ]
     )
+    _record_draft_session_revision(session, action="generate")
 
 
 def revise_blueprint_draft(session_id: str, instruction: str) -> None:
@@ -450,3 +472,4 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
             "updated_at",
         ]
     )
+    _record_draft_session_revision(session, action="revise", instruction=instruction)

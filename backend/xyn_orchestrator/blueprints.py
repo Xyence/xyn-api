@@ -29,6 +29,7 @@ from .services import (
 from .models import (
     Blueprint,
     BlueprintDraftSession,
+    DraftSessionRevision,
     BlueprintInstance,
     BlueprintRevision,
     Bundle,
@@ -63,6 +64,31 @@ from .deployments import (
 )
 
 _executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _record_draft_session_revision(
+    session: BlueprintDraftSession,
+    action: str,
+    instruction: str = "",
+    created_by=None,
+) -> None:
+    latest = (
+        DraftSessionRevision.objects.filter(draft_session=session)
+        .order_by("-revision_number")
+        .first()
+    )
+    next_revision = (latest.revision_number if latest else 0) + 1
+    DraftSessionRevision.objects.create(
+        draft_session=session,
+        revision_number=next_revision,
+        action=action if action in {"generate", "revise", "save", "submit"} else "save",
+        instruction=instruction or "",
+        draft_json=session.current_draft_json,
+        requirements_summary=session.requirements_summary or "",
+        diff_summary=session.diff_summary or "",
+        validation_errors_json=session.validation_errors_json or [],
+        created_by=created_by,
+    )
 
 
 def _write_run_artifact(run: Run, filename: str, content: str | dict | list, kind: str) -> RunArtifact:
@@ -3937,6 +3963,7 @@ def save_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
     )
     session.has_generated_output = bool(draft_json)
     session.save(update_fields=["has_generated_output", "updated_at"])
+    _record_draft_session_revision(session, action="save", created_by=request.user)
     return JsonResponse(
         {"status": session.status, "validation_errors": session.validation_errors_json or []}
     )
@@ -3968,7 +3995,11 @@ def submit_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
         return JsonResponse({"error": "POST required"}, status=405)
     session = get_object_or_404(BlueprintDraftSession, id=session_id)
     payload = _safe_json_body(request)
-    initial_prompt = (payload.get("initial_prompt") or session.initial_prompt or "").strip()
+    submitted_once = bool(session.submitted_payload_json)
+    requested_prompt = (payload.get("initial_prompt") or "").strip()
+    if submitted_once and requested_prompt and requested_prompt != (session.initial_prompt or "").strip():
+        return JsonResponse({"error": "initial_prompt is immutable after first submission"}, status=400)
+    initial_prompt = (requested_prompt or session.initial_prompt or "").strip()
     if not initial_prompt:
         return JsonResponse({"error": "initial_prompt is required"}, status=400)
     selected_pack_ids = (
@@ -4032,6 +4063,12 @@ def submit_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             },
             status=400,
         )
+    _record_draft_session_revision(
+        session,
+        action="submit",
+        instruction=session.revision_instruction or "",
+        created_by=request.user,
+    )
     return JsonResponse(
         {
             "ok": True,
@@ -4072,6 +4109,7 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
         return JsonResponse({"status": "deleted"})
     if request.method == "PATCH":
         payload = _safe_json_body(request)
+        submitted_once = bool(session.submitted_payload_json)
         if "title" in payload:
             title = (payload.get("title") or "").strip() or "Untitled draft"
             session.title = title
@@ -4086,7 +4124,10 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
         if "project_key" in payload:
             session.project_key = (payload.get("project_key") or "").strip()
         if "initial_prompt" in payload:
-            session.initial_prompt = (payload.get("initial_prompt") or "").strip()
+            next_prompt = (payload.get("initial_prompt") or "").strip()
+            if submitted_once and next_prompt != (session.initial_prompt or "").strip():
+                return JsonResponse({"error": "initial_prompt is immutable after first submission"}, status=400)
+            session.initial_prompt = next_prompt
         if "revision_instruction" in payload:
             session.revision_instruction = (payload.get("revision_instruction") or "").strip()
         if "source_artifacts" in payload:
@@ -4122,6 +4163,7 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             "namespace": session.namespace or None,
             "project_key": session.project_key or None,
             "initial_prompt": session.initial_prompt,
+            "initial_prompt_locked": bool(session.submitted_payload_json),
             "revision_instruction": session.revision_instruction,
             "source_artifacts": session.source_artifacts or [],
             "has_generated_output": bool(session.has_generated_output or session.current_draft_json),
@@ -4138,6 +4180,46 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             "effective_context_preview": session.effective_context_preview,
             "created_at": session.created_at,
             "updated_at": session.updated_at,
+        }
+    )
+
+
+@login_required
+def list_draft_session_revisions(request: HttpRequest, session_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    query = (request.GET.get("q") or "").strip()
+    page = max(1, int(request.GET.get("page") or 1))
+    page_size = max(1, min(50, int(request.GET.get("page_size") or 5)))
+    revisions = DraftSessionRevision.objects.filter(draft_session=session)
+    if query:
+        revisions = revisions.filter(
+            Q(instruction__icontains=query)
+            | Q(diff_summary__icontains=query)
+            | Q(requirements_summary__icontains=query)
+        )
+    total = revisions.count()
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_items = revisions.order_by("-revision_number", "-created_at")[start:end]
+    return JsonResponse(
+        {
+            "revisions": [
+                {
+                    "id": str(item.id),
+                    "revision_number": item.revision_number,
+                    "action": item.action,
+                    "instruction": item.instruction,
+                    "created_at": item.created_at.isoformat(),
+                    "validation_errors_count": len(item.validation_errors_json or []),
+                    "diff_summary": item.diff_summary or "",
+                }
+                for item in page_items
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
         }
     )
 
@@ -4315,6 +4397,12 @@ def internal_draft_session_update(request: HttpRequest, session_id: str) -> Json
             "has_generated_output",
             "updated_at",
         ]
+    )
+    _record_draft_session_revision(
+        session,
+        action=str(payload.get("action") or "generate").strip().lower(),
+        instruction=str(payload.get("instruction") or ""),
+        created_by=None,
     )
     return JsonResponse({"status": session.status})
 
