@@ -2,8 +2,9 @@ import json
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
 
-from xyn_orchestrator.models import Blueprint, ContextPack, BlueprintDraftSession, DraftSessionRevision
+from xyn_orchestrator.models import Blueprint, ContextPack, BlueprintDraftSession, DraftSessionRevision, DraftSessionVoiceNote
 
 
 class DraftSessionDefaultsTests(TestCase):
@@ -264,3 +265,68 @@ class DraftSessionDefaultsTests(TestCase):
         search = self.client.get(f"/xyn/api/draft-sessions/{session_id}/revisions", {"q": "change 3"})
         self.assertEqual(search.status_code, 200)
         self.assertEqual(search.json()["total"], 1)
+
+    def test_draft_sessions_list_filters(self):
+        s1 = BlueprintDraftSession.objects.create(
+            name="Draft one",
+            title="Draft one",
+            draft_kind="blueprint",
+            status="drafting",
+            namespace="core",
+            project_key="core.ems.platform",
+        )
+        BlueprintDraftSession.objects.create(
+            name="Draft two",
+            title="Draft two",
+            draft_kind="solution",
+            status="published",
+            namespace="lab",
+            project_key="lab.other",
+        )
+        response = self.client.get("/xyn/api/draft-sessions", {"status": "drafting", "project_key": "core.ems.platform"})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload["sessions"]), 1)
+        self.assertEqual(payload["sessions"][0]["id"], str(s1.id))
+
+    def test_upload_voice_note_requires_session_id(self):
+        audio = SimpleUploadedFile("sample.wav", b"RIFF....WAVEfmt ", content_type="audio/wav")
+        response = self.client.post("/xyn/api/voice-notes", {"file": audio})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("session_id", response.json().get("error", ""))
+
+    def test_list_draft_session_voice_notes(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Voice list",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        audio = SimpleUploadedFile("sample.wav", b"RIFF....WAVEfmt ", content_type="audio/wav")
+        upload = self.client.post("/xyn/api/voice-notes", {"file": audio, "session_id": session_id})
+        self.assertEqual(upload.status_code, 200)
+        self.assertEqual(DraftSessionVoiceNote.objects.filter(draft_session_id=session_id).count(), 1)
+        listed = self.client.get(f"/xyn/api/draft-sessions/{session_id}/voice-notes")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(len(listed.json()["voice_notes"]), 1)
+
+    def test_blueprints_list_includes_active_draft_count(self):
+        BlueprintDraftSession.objects.create(
+            name="Draft count",
+            title="Draft count",
+            draft_kind="blueprint",
+            status="drafting",
+            project_key="core.ems",
+        )
+        response = self.client.get("/xyn/api/blueprints")
+        self.assertEqual(response.status_code, 200)
+        blueprints = response.json()["blueprints"]
+        match = next(item for item in blueprints if item["id"] == str(self.blueprint.id))
+        self.assertEqual(match["active_draft_count"], 1)

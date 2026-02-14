@@ -3149,6 +3149,18 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
     qs = Blueprint.objects.all().order_by("namespace", "name")
     if query := request.GET.get("q"):
         qs = qs.filter(models.Q(name__icontains=query) | models.Q(namespace__icontains=query))
+    blueprints = list(qs)
+    project_keys = [f"{item.namespace}.{item.name}" for item in blueprints]
+    active_statuses = {"drafting", "queued", "ready", "ready_with_errors"}
+    draft_counts_by_project: Dict[str, int] = {}
+    if project_keys:
+        draft_rows = (
+            BlueprintDraftSession.objects.filter(project_key__in=project_keys, status__in=active_statuses)
+            .exclude(project_key="")
+            .values("project_key")
+            .annotate(total=models.Count("id"))
+        )
+        draft_counts_by_project = {str(row["project_key"]): int(row["total"]) for row in draft_rows}
     data = [
         {
             "id": str(b.id),
@@ -3160,8 +3172,9 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
             "created_at": b.created_at,
             "updated_at": b.updated_at,
             "latest_revision": b.revisions.order_by("-revision").first().revision if b.revisions.exists() else None,
+            "active_draft_count": draft_counts_by_project.get(f"{b.namespace}.{b.name}", 0),
         }
-        for b in qs
+        for b in blueprints
     ]
     return _paginate(request, data, "blueprints")
 

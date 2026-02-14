@@ -3231,10 +3231,49 @@ def blueprint_studio_view(request: HttpRequest, session_id: str) -> HttpResponse
 @csrf_exempt
 @login_required
 def create_draft_session(request: HttpRequest) -> JsonResponse:
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
     if staff_error := _require_staff(request):
         return staff_error
+    if request.method == "GET":
+        sessions = BlueprintDraftSession.objects.all().order_by("-updated_at", "-created_at")
+        if status := (request.GET.get("status") or "").strip():
+            sessions = sessions.filter(status=status)
+        if kind := (request.GET.get("kind") or request.GET.get("draft_kind") or "").strip().lower():
+            if kind not in {"blueprint", "solution"}:
+                return JsonResponse({"error": "kind must be blueprint or solution"}, status=400)
+            sessions = sessions.filter(draft_kind=kind)
+        if namespace := (request.GET.get("namespace") or "").strip():
+            sessions = sessions.filter(namespace=namespace)
+        if project_key := (request.GET.get("project_key") or "").strip():
+            sessions = sessions.filter(project_key=project_key)
+        if blueprint_id := (request.GET.get("blueprint_id") or "").strip():
+            sessions = sessions.filter(blueprint_id=blueprint_id)
+        if query := (request.GET.get("q") or "").strip():
+            sessions = sessions.filter(
+                Q(title__icontains=query)
+                | Q(name__icontains=query)
+                | Q(namespace__icontains=query)
+                | Q(project_key__icontains=query)
+            )
+        data = [
+            {
+                "id": str(session.id),
+                "name": session.title or session.name,
+                "title": session.title or session.name,
+                "kind": session.draft_kind,
+                "status": session.status,
+                "blueprint_kind": session.blueprint_kind,
+                "namespace": session.namespace or None,
+                "project_key": session.project_key or None,
+                "blueprint_id": str(session.blueprint_id) if session.blueprint_id else None,
+                "linked_blueprint_id": str(session.linked_blueprint_id) if session.linked_blueprint_id else None,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at,
+            }
+            for session in sessions
+        ]
+        return JsonResponse({"sessions": data})
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
     payload = _safe_json_body(request)
     draft_kind = str(payload.get("kind") or payload.get("draft_kind") or "blueprint").strip().lower()
     if draft_kind not in {"blueprint", "solution"}:
@@ -3813,7 +3852,10 @@ def upload_voice_note(request: HttpRequest) -> JsonResponse:
     audio_file = request.FILES.get("file")
     if not audio_file:
         return JsonResponse({"error": "Missing file"}, status=400)
-    session_id = request.POST.get("session_id")
+    session_id = (request.POST.get("session_id") or "").strip()
+    if not session_id:
+        return JsonResponse({"error": "session_id is required"}, status=400)
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
     voice_note = VoiceNote.objects.create(
         title=request.POST.get("title", ""),
         audio_file=audio_file,
@@ -3822,12 +3864,10 @@ def upload_voice_note(request: HttpRequest) -> JsonResponse:
         language_code=request.POST.get("language_code", "en-US"),
         created_by=request.user,
     )
-    if session_id:
-        session = get_object_or_404(BlueprintDraftSession, id=session_id)
-        ordering = DraftSessionVoiceNote.objects.filter(draft_session=session).count()
-        DraftSessionVoiceNote.objects.create(
-            draft_session=session, voice_note=voice_note, ordering=ordering
-        )
+    ordering = DraftSessionVoiceNote.objects.filter(draft_session=session).count()
+    DraftSessionVoiceNote.objects.create(
+        draft_session=session, voice_note=voice_note, ordering=ordering
+    )
     return JsonResponse({"voice_note_id": str(voice_note.id)})
 
 
@@ -4220,6 +4260,36 @@ def list_draft_session_revisions(request: HttpRequest, session_id: str) -> JsonR
             "page_size": page_size,
         }
     )
+
+
+@login_required
+def list_draft_session_voice_notes(request: HttpRequest, session_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    links = (
+        DraftSessionVoiceNote.objects.filter(draft_session=session)
+        .select_related("voice_note", "voice_note__transcript")
+        .order_by("ordering")
+    )
+    data: List[Dict[str, Any]] = []
+    for link in links:
+        note = link.voice_note
+        transcript = getattr(note, "transcript", None)
+        data.append(
+            {
+                "id": str(note.id),
+                "title": note.title,
+                "status": note.status,
+                "created_at": note.created_at,
+                "session_id": str(session.id),
+                "job_id": note.job_id,
+                "last_error": note.error,
+                "transcript_text": transcript.transcript_text if transcript else None,
+                "transcript_confidence": transcript.confidence if transcript else None,
+            }
+        )
+    return JsonResponse({"voice_notes": data})
 
 
 @csrf_exempt
