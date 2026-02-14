@@ -4,7 +4,16 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.core.files.uploadedfile import SimpleUploadedFile
 
-from xyn_orchestrator.models import Blueprint, ContextPack, BlueprintDraftSession, DraftSessionRevision, DraftSessionVoiceNote
+from xyn_orchestrator.models import (
+    Blueprint,
+    BlueprintDraftSession,
+    ContextPack,
+    DraftSessionRevision,
+    DraftSessionVoiceNote,
+    Environment,
+    ProvisionedInstance,
+    ReleaseTarget,
+)
 
 
 class DraftSessionDefaultsTests(TestCase):
@@ -374,3 +383,150 @@ class DraftSessionDefaultsTests(TestCase):
         published = Blueprint.objects.get(id=entity_id)
         self.assertEqual(published.namespace, "core")
         self.assertEqual(published.name, "test-josh")
+
+    def _build_valid_solution_draft(self, name: str = "subscriber-notes-dev-demo", namespace: str = "core") -> dict:
+        return {
+            "apiVersion": "xyn.blueprint/v1",
+            "kind": "SolutionBlueprint",
+            "metadata": {"name": name, "namespace": namespace},
+            "releaseSpec": {
+                "apiVersion": "xyn.seed/v1",
+                "kind": "Release",
+                "metadata": {"name": name, "namespace": namespace},
+                "backend": {"type": "compose"},
+                "components": [{"name": "api", "image": "example/demo:latest"}],
+            },
+        }
+
+    def _create_dev_instance(self, name: str = "xyn-seed-dev-1") -> ProvisionedInstance:
+        env = Environment.objects.create(name="Dev", slug="dev")
+        return ProvisionedInstance.objects.create(
+            name=name,
+            environment=env,
+            aws_region="us-east-1",
+            instance_type="t3.small",
+            ami_id="ami-test",
+            runtime_substrate="ec2",
+            status="running",
+            health_status="healthy",
+        )
+
+    def _create_draft_for_submit(self, title: str = "Auto target draft") -> str:
+        response = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": title,
+                    "namespace": "core",
+                    "project_key": "core.subscriber-notes",
+                    "initial_prompt": "Create EMS blueprint",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()["session_id"]
+
+    def test_finalize_submit_auto_creates_default_release_target(self):
+        instance = self._create_dev_instance()
+        session_id = self._create_draft_for_submit("Auto target")
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = self._build_valid_solution_draft(name="subscriber-notes")
+        session.save(update_fields=["current_draft_json", "updated_at"])
+
+        submit = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps(
+                {
+                    "release_target": {
+                        "environment": "Dev",
+                        "target_instance_id": str(instance.id),
+                        "fqdn": "diwakar.xyence.io",
+                    }
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(submit.status_code, 200)
+        blueprint_id = submit.json()["entity_id"]
+        target = ReleaseTarget.objects.get(blueprint_id=blueprint_id, environment="Dev")
+        self.assertTrue(target.auto_generated)
+        self.assertEqual(target.target_instance_id, instance.id)
+        self.assertEqual(target.fqdn, "diwakar.xyence.io")
+        self.assertEqual(target.name, "subscriber-notes-dev-default")
+        self.assertTrue(target.created_by_id)
+
+    def test_finalize_submit_idempotent_reuses_single_default_release_target(self):
+        instance = self._create_dev_instance()
+        session_id = self._create_draft_for_submit("Idempotent target")
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = self._build_valid_solution_draft(name="idempotent-demo")
+        session.save(update_fields=["current_draft_json", "updated_at"])
+
+        payload = {
+            "release_target": {
+                "environment": "Dev",
+                "target_instance_id": str(instance.id),
+                "fqdn": "idempotent.xyence.io",
+            }
+        }
+        first = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+        self.assertEqual(first.status_code, 200)
+        second = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+        self.assertEqual(second.status_code, 200)
+        blueprint_id = first.json()["entity_id"]
+        self.assertEqual(
+            ReleaseTarget.objects.filter(blueprint_id=blueprint_id, environment="Dev", auto_generated=True).count(),
+            1,
+        )
+
+    def test_finalize_submit_manual_release_target_blocks_auto_generation(self):
+        instance = self._create_dev_instance()
+        blueprint = Blueprint.objects.create(name="manual-existing", namespace="core")
+        ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="manual-existing-dev",
+            environment="Dev",
+            target_instance_ref=str(instance.id),
+            target_instance=instance,
+            fqdn="manual.xyence.io",
+            dns_json={},
+            runtime_json={},
+            tls_json={},
+            env_json={},
+            secret_refs_json=[],
+            config_json={"editable": True},
+            auto_generated=False,
+        )
+        session_id = self._create_draft_for_submit("Manual target")
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.project_key = "core.manual-existing"
+        session.current_draft_json = self._build_valid_solution_draft(name="manual-existing")
+        session.save(update_fields=["project_key", "current_draft_json", "updated_at"])
+
+        submit = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps(
+                {
+                    "release_target": {
+                        "environment": "Dev",
+                        "target_instance_id": str(instance.id),
+                        "fqdn": "manual.xyence.io",
+                    }
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(submit.status_code, 200)
+        self.assertEqual(ReleaseTarget.objects.filter(blueprint=blueprint, environment="Dev").count(), 1)
+        self.assertEqual(ReleaseTarget.objects.filter(blueprint=blueprint, auto_generated=True).count(), 0)
