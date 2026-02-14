@@ -214,6 +214,8 @@ def _normalize_release_target_payload(
         },
         "env": payload.get("env") or {},
         "secret_refs": payload.get("secret_refs") or [],
+        "auto_generated": bool(payload.get("auto_generated", False)),
+        "editable": bool(payload.get("editable", True)),
         "created_at": payload.get("created_at") or timezone.now().isoformat(),
         "updated_at": payload.get("updated_at") or timezone.now().isoformat(),
     }
@@ -242,9 +244,13 @@ def _serialize_release_target(target: ReleaseTarget) -> Dict[str, Any]:
             "ingress": (target.config_json or {}).get("ingress") or {},
             "env": target.env_json or {},
             "secret_refs": target.secret_refs_json or [],
+            "auto_generated": bool(target.auto_generated),
+            "editable": bool((target.config_json or {}).get("editable", True)),
             "created_at": target.created_at.isoformat() if target.created_at else "",
             "updated_at": target.updated_at.isoformat() if target.updated_at else "",
         }
+    payload.setdefault("auto_generated", bool(target.auto_generated))
+    payload.setdefault("editable", bool((target.config_json or {}).get("editable", True)))
     return payload
 
 
@@ -3547,6 +3553,7 @@ def release_targets_collection(request: HttpRequest) -> JsonResponse:
             env_json=normalized.get("env"),
             secret_refs_json=normalized.get("secret_refs"),
             config_json=normalized,
+            auto_generated=bool(normalized.get("auto_generated", False)),
             created_by=request.user,
             updated_by=request.user,
         )
@@ -3599,6 +3606,7 @@ def release_target_detail(request: HttpRequest, target_id: str) -> JsonResponse:
     target.env_json = normalized.get("env")
     target.secret_refs_json = normalized.get("secret_refs")
     target.config_json = normalized
+    target.auto_generated = bool(normalized.get("auto_generated", False))
     target.updated_by = request.user
     target.save()
     return JsonResponse({"id": str(target.id)})

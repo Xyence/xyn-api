@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from django.db import models
+from django.db import transaction
 from django.db.models import Q
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -64,6 +66,7 @@ from .deployments import (
 )
 
 _executor = ThreadPoolExecutor(max_workers=2)
+logger = logging.getLogger(__name__)
 
 
 def _record_draft_session_revision(
@@ -2744,6 +2747,182 @@ def _update_session_from_draft(
     )
 
 
+def _resolve_default_target_environment(value: Any) -> tuple[Optional[str], Optional[Environment]]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None, None
+    environment_obj: Optional[Environment] = None
+    try:
+        parsed_uuid = uuid.UUID(raw)
+    except (TypeError, ValueError, AttributeError):
+        parsed_uuid = None
+    if parsed_uuid:
+        environment_obj = Environment.objects.filter(id=parsed_uuid).first()
+    if not environment_obj:
+        environment_obj = (
+            Environment.objects.filter(slug__iexact=raw).first()
+            or Environment.objects.filter(name__iexact=raw).first()
+        )
+    if environment_obj:
+        return environment_obj.name, environment_obj
+    return raw, None
+
+
+def _resolve_default_target_instance(
+    instance_id: str,
+    instance_name: str,
+    environment: Optional[Environment],
+    environment_name: Optional[str],
+) -> Optional[ProvisionedInstance]:
+    instance: Optional[ProvisionedInstance] = None
+    if instance_id:
+        try:
+            instance = ProvisionedInstance.objects.filter(id=instance_id).first()
+        except (TypeError, ValueError):
+            instance = None
+    if not instance and instance_name:
+        instance = ProvisionedInstance.objects.filter(name=instance_name).order_by("-created_at").first()
+    if not instance:
+        return None
+    if environment and instance.environment_id and instance.environment_id != environment.id:
+        return None
+    if not environment and environment_name:
+        instance_env_name = (instance.environment.name if instance.environment else "").strip()
+        if instance_env_name and instance_env_name.lower() != environment_name.lower():
+            return None
+    return instance
+
+
+def _extract_default_release_target_inputs(
+    session: BlueprintDraftSession,
+) -> tuple[Optional[str], Optional[ProvisionedInstance], Optional[str]]:
+    payload = session.submitted_payload_json if isinstance(session.submitted_payload_json, dict) else {}
+    release_target = payload.get("release_target") if isinstance(payload.get("release_target"), dict) else {}
+    draft = session.current_draft_json if isinstance(session.current_draft_json, dict) else {}
+    metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+    labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
+
+    environment_input = (
+        release_target.get("environment")
+        or release_target.get("environment_name")
+        or payload.get("environment")
+        or payload.get("environment_name")
+        or payload.get("environment_id")
+        or labels.get("xyn.environment")
+        or labels.get("xyn.environment_name")
+        or labels.get("xyn.environment_id")
+    )
+    environment_name, environment_obj = _resolve_default_target_environment(environment_input)
+
+    target_instance_id = str(
+        release_target.get("target_instance_id")
+        or payload.get("target_instance_id")
+        or labels.get("xyn.target_instance_id")
+        or ""
+    ).strip()
+    target_instance_name = str(
+        release_target.get("target_instance_name")
+        or payload.get("target_instance_name")
+        or payload.get("instance_name")
+        or labels.get("xyn.target_instance_name")
+        or labels.get("xyn.instance_name")
+        or ""
+    ).strip()
+    target_instance = _resolve_default_target_instance(
+        target_instance_id,
+        target_instance_name,
+        environment_obj,
+        environment_name,
+    )
+
+    hostname = str(
+        release_target.get("fqdn")
+        or release_target.get("hostname")
+        or payload.get("fqdn")
+        or payload.get("hostname")
+        or labels.get("xyn.fqdn")
+        or labels.get("xyn.hostname")
+        or ""
+    ).strip()
+    if hostname and (" " in hostname or "." not in hostname):
+        hostname = ""
+    return environment_name, target_instance, hostname or None
+
+
+def ensure_default_release_target(
+    blueprint_spec: Blueprint,
+    environment: str,
+    instance: ProvisionedInstance,
+    hostname: str,
+    user,
+) -> tuple[ReleaseTarget, bool]:
+    env_name = str(environment or "").strip()
+    if not env_name:
+        raise ValueError("environment is required")
+    if not instance:
+        raise ValueError("instance is required")
+    fqdn = str(hostname or "").strip()
+    if not fqdn:
+        raise ValueError("hostname is required")
+
+    blueprint_slug = slugify(blueprint_spec.name) or "blueprint"
+    env_slug = slugify(env_name) or "env"
+    target_name = f"{blueprint_slug}-{env_slug}-default"
+
+    with transaction.atomic():
+        existing = (
+            ReleaseTarget.objects.select_for_update()
+            .filter(blueprint=blueprint_spec, environment__iexact=env_name)
+            .order_by("-created_at")
+            .first()
+        )
+        if existing:
+            return existing, False
+
+        target_payload = {
+            "name": target_name,
+            "environment": env_name,
+            "target_instance_id": str(instance.id),
+            "fqdn": fqdn,
+            "dns": {"provider": "route53", "ttl": 60},
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "tls": {"mode": "none", "expose_http": True, "expose_https": True, "redirect_http_to_https": True},
+            "ingress": {"network": "xyn-edge", "routes": []},
+            "env": {},
+            "secret_refs": [],
+            "auto_generated": True,
+            "editable": True,
+        }
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint_spec,
+            name=target_name,
+            environment=env_name,
+            target_instance_ref=str(instance.id),
+            target_instance=instance,
+            fqdn=fqdn,
+            dns_json=target_payload["dns"],
+            runtime_json=target_payload["runtime"],
+            tls_json=target_payload["tls"],
+            env_json=target_payload["env"],
+            secret_refs_json=target_payload["secret_refs"],
+            config_json=target_payload,
+            auto_generated=True,
+            created_by=user,
+            updated_by=user,
+        )
+        logger.info(
+            "auto_release_target_created",
+            extra={
+                "blueprint_spec_id": str(blueprint_spec.id),
+                "release_target_id": str(target.id),
+                "environment": env_name,
+                "instance": str(instance.id),
+                "auto_generated": True,
+            },
+        )
+        return target, True
+
+
 def _publish_draft_session(session: BlueprintDraftSession, user) -> Dict[str, Any]:
     draft = session.current_draft_json
     if not draft:
@@ -2809,6 +2988,23 @@ def _publish_draft_session(session: BlueprintDraftSession, user) -> Dict[str, An
         session.linked_blueprint = blueprint
         session.status = "published"
         session.save(update_fields=["linked_blueprint", "status", "updated_at"])
+        environment_name, target_instance, hostname = _extract_default_release_target_inputs(session)
+        if environment_name and target_instance and hostname:
+            environment_slug = slugify(environment_name)
+            if environment_slug == "dev":
+                try:
+                    ensure_default_release_target(
+                        blueprint_spec=blueprint,
+                        environment=environment_name,
+                        instance=target_instance,
+                        hostname=hostname,
+                        user=user,
+                    )
+                except Exception:
+                    logger.exception(
+                        "auto_release_target_create_failed",
+                        extra={"blueprint_spec_id": str(blueprint.id), "session_id": str(session.id)},
+                    )
         return {
             "ok": True,
             "entity_type": "blueprint",
@@ -4088,6 +4284,12 @@ def submit_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
     source_artifacts = session.source_artifacts or []
     if "source_artifacts" in payload:
         source_artifacts = _serialize_source_artifacts(payload.get("source_artifacts"))
+    release_target_payload = payload.get("release_target")
+    if not isinstance(release_target_payload, dict):
+        release_target_payload = {}
+    for key in ("environment", "environment_name", "environment_id", "target_instance_id", "target_instance_name", "fqdn", "hostname"):
+        if key in payload and key not in release_target_payload:
+            release_target_payload[key] = payload.get(key)
     submission_payload = {
         "draft_session_id": str(session.id),
         "kind": session.draft_kind or "blueprint",
@@ -4100,6 +4302,8 @@ def submit_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
         "source_artifacts": source_artifacts,
         "submitted_at": timezone.now().isoformat(),
     }
+    if release_target_payload:
+        submission_payload["release_target"] = release_target_payload
     session.initial_prompt = initial_prompt
     session.submitted_payload_json = submission_payload
     session.source_artifacts = source_artifacts

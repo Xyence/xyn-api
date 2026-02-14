@@ -361,6 +361,7 @@ class ReleaseTarget(models.Model):
     env_json = models.JSONField(null=True, blank=True)
     secret_refs_json = models.JSONField(null=True, blank=True)
     config_json = models.JSONField(null=True, blank=True)
+    auto_generated = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(
@@ -373,6 +374,13 @@ class ReleaseTarget(models.Model):
     class Meta:
         ordering = ["-created_at"]
         unique_together = ("blueprint", "name")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["blueprint", "environment"],
+                condition=models.Q(auto_generated=True),
+                name="uniq_auto_release_target_per_bp_env",
+            )
+        ]
 
     def __str__(self) -> str:
         return f"{self.blueprint} target {self.name}"

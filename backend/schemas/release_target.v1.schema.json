@@ -112,6 +112,8 @@
         "additionalProperties": false
       }
     },
+    "auto_generated": { "type": "boolean", "default": false },
+    "editable": { "type": "boolean", "default": true },
     "created_at": { "type": "string", "format": "date-time" },
     "updated_at": { "type": "string", "format": "date-time" }
   },
