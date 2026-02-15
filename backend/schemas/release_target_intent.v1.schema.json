@@ -32,7 +32,7 @@
     "fqdn": { "type": "string", "minLength": 3 },
     "tls_mode": {
       "type": "string",
-      "enum": ["none", "nginx+acme"]
+      "enum": ["none", "nginx+acme", "host-ingress"]
     },
     "dns_provider": {
       "type": "string",
@@ -64,4 +64,3 @@
     }
   }
 }
-

@@ -3185,13 +3185,17 @@ def _extract_release_target_intent_from_text(text: str) -> Optional[Dict[str, An
                 fqdn = candidate
             continue
         if lowered.startswith(("tls:", "https:", "acme:")):
-            if "nginx" in lowered and "acme" in lowered:
+            if "traefik" in lowered or "host-ingress" in lowered:
+                tls_mode = "host-ingress"
+            elif "nginx" in lowered and "acme" in lowered:
                 tls_mode = "nginx+acme"
             elif "none" in lowered:
                 tls_mode = "none"
             notes.append(line)
             continue
         if "platform defaults" in lowered and ("tls" in lowered or "network" in lowered or "service exposure" in lowered):
+            if "traefik" in lowered or "host-ingress" in lowered:
+                tls_mode = "host-ingress"
             notes.append(line)
     required_hits = sum(1 for item in [env_selector, instance_selector, fqdn] if item)
     if required_hits == 0:
