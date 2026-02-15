@@ -5833,6 +5833,9 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 "milestones_json": {"work_items": plan_json.get("work_items", [])},
                 "last_run_id": run_id,
             }
+            release_target_environment_id = str(plan_json.get("release_target_environment_id") or "").strip()
+            if release_target_environment_id:
+                release_plan_payload["environment_id"] = release_target_environment_id
             release_plan = _post_json("/xyn/internal/release-plans/upsert", release_plan_payload)
             release_plan_id = release_plan.get("id")
             planned_release_version = str(plan_json.get("release_version") or "").strip()

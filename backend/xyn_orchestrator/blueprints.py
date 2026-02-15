@@ -767,6 +767,11 @@ def _release_target_payload(target: ReleaseTarget) -> Dict[str, Any]:
         "blueprint_id": str(target.blueprint_id),
         "name": target.name,
         "environment": target.environment or "",
+        "environment_id": (
+            str(target.target_instance.environment_id)
+            if target.target_instance and target.target_instance.environment_id
+            else ""
+        ),
         "target_instance_id": (
             str(target.target_instance_id)
             if target.target_instance_id
@@ -2837,6 +2842,8 @@ def _generate_implementation_plan(
     if release_target:
         plan["release_target_id"] = release_target.get("id")
         plan["release_target_name"] = release_target.get("name")
+        plan["release_target_environment"] = release_target.get("environment")
+        plan["release_target_environment_id"] = release_target.get("environment_id")
     if manifest_override:
         plan["manifest_override"] = True
     return plan

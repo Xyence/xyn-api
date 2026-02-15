@@ -15,6 +15,7 @@ from xyn_orchestrator.models import (
     ProvisionedInstance,
     ReleaseTarget,
 )
+from xyn_orchestrator.blueprints import _generate_implementation_plan, _release_target_payload
 
 
 class DraftSessionDefaultsTests(TestCase):
@@ -823,6 +824,36 @@ class DraftSessionDefaultsTests(TestCase):
         self.assertEqual(submit.status_code, 200)
         self.assertEqual(ReleaseTarget.objects.filter(blueprint=blueprint, environment="Dev").count(), 1)
         self.assertEqual(ReleaseTarget.objects.filter(blueprint=blueprint, auto_generated=True).count(), 0)
+
+    def test_implementation_plan_carries_release_target_environment_id(self):
+        instance = self._create_dev_instance()
+        blueprint = Blueprint.objects.create(name="env-carry", namespace="core")
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="env-carry-dev-default",
+            environment="Dev",
+            target_instance_ref=str(instance.id),
+            target_instance=instance,
+            fqdn="env-carry.xyence.io",
+            dns_json={"provider": "route53", "ttl": 60},
+            runtime_json={"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            tls_json={"mode": "host-ingress"},
+            env_json={},
+            secret_refs_json=[],
+            config_json={"editable": True},
+            auto_generated=True,
+        )
+
+        release_target_payload = _release_target_payload(target)
+        self.assertEqual(release_target_payload.get("environment_id"), str(instance.environment_id))
+
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog={"modules": []},
+            run_history_summary={},
+            release_target=release_target_payload,
+        )
+        self.assertEqual(plan.get("release_target_environment_id"), str(instance.environment_id))
 
     def test_submit_persists_intent_provenance_with_structured_requirements(self):
         prompt = (
