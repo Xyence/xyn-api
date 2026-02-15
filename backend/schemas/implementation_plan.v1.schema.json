@@ -66,6 +66,12 @@
     "release_target_name": {
       "type": "string"
     },
+    "release_target_environment": {
+      "type": "string"
+    },
+    "release_target_environment_id": {
+      "type": "string"
+    },
     "manifest_override": {
       "type": "boolean"
     },
