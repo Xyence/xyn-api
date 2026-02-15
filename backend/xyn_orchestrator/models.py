@@ -266,6 +266,7 @@ class BlueprintDraftSession(models.Model):
     linked_blueprint = models.ForeignKey(
         Blueprint, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_sessions"
     )
+    metadata_json = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(

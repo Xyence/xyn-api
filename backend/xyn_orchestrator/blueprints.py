@@ -3127,11 +3127,239 @@ def _resolve_default_target_instance(
     return instance
 
 
+def _selector_from_value(raw: str) -> Dict[str, str]:
+    value = (raw or "").strip()
+    if not value:
+        return {}
+    try:
+        parsed_uuid = uuid.UUID(value)
+        return {"id": str(parsed_uuid)}
+    except (ValueError, TypeError):
+        pass
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]*", value):
+        return {"slug": value}
+    return {"name": value}
+
+
+def _is_valid_fqdn(value: str) -> bool:
+    host = (value or "").strip().lower()
+    if not host or " " in host:
+        return False
+    return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", host))
+
+
+def _extract_release_target_intent_from_text(text: str) -> Optional[Dict[str, Any]]:
+    raw_text = str(text or "")
+    if not raw_text.strip():
+        return None
+    env_selector: Dict[str, str] = {}
+    instance_selector: Dict[str, str] = {}
+    fqdn = ""
+    tls_mode = ""
+    notes: List[str] = []
+    for raw_line in raw_text.splitlines():
+        line = re.sub(r"^\s*[\*\-•]\s*", "", raw_line).strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        env_match = re.match(r"^(?:target\s+environment|environment|env)\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+        if env_match:
+            env_selector = _selector_from_value(env_match.group(1).strip())
+            continue
+        instance_match = re.match(
+            r"^(?:deploy\s+to\s+instance|target\s+instance|instance)\s*:\s*(.+)$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if instance_match:
+            instance_raw = instance_match.group(1).strip()
+            parsed = _selector_from_value(instance_raw)
+            if "slug" in parsed and "id" not in parsed:
+                parsed = {"name": instance_raw}
+            instance_selector = parsed
+            continue
+        fqdn_match = re.match(r"^(?:public\s+hostname|hostname|fqdn)\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+        if fqdn_match:
+            candidate = fqdn_match.group(1).strip()
+            if _is_valid_fqdn(candidate):
+                fqdn = candidate
+            continue
+        if lowered.startswith(("tls:", "https:", "acme:")):
+            if "nginx" in lowered and "acme" in lowered:
+                tls_mode = "nginx+acme"
+            elif "none" in lowered:
+                tls_mode = "none"
+            notes.append(line)
+            continue
+        if "platform defaults" in lowered and ("tls" in lowered or "network" in lowered or "service exposure" in lowered):
+            notes.append(line)
+    required_hits = sum(1 for item in [env_selector, instance_selector, fqdn] if item)
+    if required_hits == 0:
+        return None
+    confidence = min(1.0, 0.2 + (required_hits / 3.0) * 0.8)
+    intent: Dict[str, Any] = {
+        "environment_selector": env_selector,
+        "target_instance_selector": instance_selector,
+        "fqdn": fqdn,
+        "confidence": round(confidence, 2),
+        "extraction_source": "prompt",
+    }
+    if tls_mode:
+        intent["tls_mode"] = tls_mode
+    if notes:
+        intent["notes"] = notes
+    errors = _validate_schema(intent, "release_target_intent.v1.schema.json")
+    if errors:
+        return None
+    return intent
+
+
+def _resolve_environment_selector(selector: Dict[str, Any]) -> tuple[Optional[Environment], List[str]]:
+    warnings: List[str] = []
+    if not isinstance(selector, dict):
+        return None, ["environment selector missing"]
+    if selector.get("id"):
+        env = Environment.objects.filter(id=selector.get("id")).first()
+        if env:
+            return env, warnings
+    for key in ("slug", "name"):
+        value = str(selector.get(key) or "").strip()
+        if not value:
+            continue
+        field_name = "slug__iexact" if key == "slug" else "name__iexact"
+        matches = list(Environment.objects.filter(**{field_name: value}).order_by("name"))
+        if len(matches) == 1:
+            return matches[0], warnings
+        if len(matches) > 1:
+            warnings.append(f"environment selector '{value}' matched multiple environments")
+            return None, warnings
+    fuzzy = str(selector.get("name") or selector.get("slug") or "").strip()
+    if fuzzy:
+        matches = list(Environment.objects.filter(Q(name__icontains=fuzzy) | Q(slug__icontains=fuzzy)).order_by("name"))
+        if len(matches) == 1:
+            return matches[0], warnings
+        if len(matches) > 1:
+            warnings.append(f"environment selector '{fuzzy}' is ambiguous")
+            return None, warnings
+    warnings.append("environment could not be resolved")
+    return None, warnings
+
+
+def _resolve_instance_selector(
+    selector: Dict[str, Any],
+    environment: Optional[Environment],
+) -> tuple[Optional[ProvisionedInstance], List[str]]:
+    warnings: List[str] = []
+    if not isinstance(selector, dict):
+        return None, ["instance selector missing"]
+    if selector.get("id"):
+        instance = ProvisionedInstance.objects.filter(id=selector.get("id")).first()
+        if instance:
+            if environment and instance.environment_id and instance.environment_id != environment.id:
+                return None, [f"instance '{instance.name}' does not belong to environment '{environment.name}'"]
+            return instance, warnings
+    name = str(selector.get("name") or "").strip()
+    if not name:
+        warnings.append("instance could not be resolved")
+        return None, warnings
+    qs = ProvisionedInstance.objects.filter(name__iexact=name).order_by("-created_at")
+    if environment:
+        scoped = list(qs.filter(environment=environment))
+        if len(scoped) == 1:
+            return scoped[0], warnings
+        if len(scoped) > 1:
+            warnings.append(f"instance selector '{name}' is ambiguous in environment '{environment.name}'")
+            return None, warnings
+    matches = list(qs)
+    if len(matches) == 1:
+        return matches[0], warnings
+    if len(matches) > 1:
+        warnings.append(f"instance selector '{name}' matched multiple instances")
+        return None, warnings
+    warnings.append(f"instance '{name}' not found")
+    return None, warnings
+
+
+def _resolve_release_target_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
+    warnings: List[str] = []
+    if not isinstance(intent, dict):
+        return {"environment_id": None, "instance_id": None, "warnings": ["intent missing"], "fqdn": None}
+    env, env_warnings = _resolve_environment_selector(intent.get("environment_selector") or {})
+    warnings.extend(env_warnings)
+    instance, instance_warnings = _resolve_instance_selector(intent.get("target_instance_selector") or {}, env)
+    warnings.extend(instance_warnings)
+    fqdn = str(intent.get("fqdn") or "").strip()
+    if fqdn and not _is_valid_fqdn(fqdn):
+        warnings.append("fqdn is invalid")
+    if not fqdn:
+        warnings.append("fqdn missing")
+    return {
+        "environment_id": str(env.id) if env else None,
+        "environment_name": env.name if env else None,
+        "instance_id": str(instance.id) if instance else None,
+        "instance_name": instance.name if instance else None,
+        "fqdn": fqdn or None,
+        "warnings": warnings,
+    }
+
+
+def _draft_prompt_text_for_target_extraction(session: BlueprintDraftSession) -> str:
+    parts: List[str] = []
+    if (session.initial_prompt or "").strip():
+        parts.append((session.initial_prompt or "").strip())
+    for artifact in session.source_artifacts or []:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_type = str(artifact.get("type", "")).strip().lower()
+        if artifact_type not in {"text", "audio_transcript"}:
+            continue
+        content = str(artifact.get("content", "")).strip()
+        if content:
+            parts.append(content)
+    links = DraftSessionVoiceNote.objects.filter(draft_session=session).select_related("voice_note__transcript")
+    for link in links:
+        transcript = getattr(link.voice_note, "transcript", None)
+        if transcript and (transcript.transcript_text or "").strip():
+            parts.append(transcript.transcript_text.strip())
+    unique_parts: List[str] = []
+    for value in parts:
+        if value not in unique_parts:
+            unique_parts.append(value)
+    return "\n\n".join(unique_parts).strip()
+
+
+def _store_extracted_release_target_intent(
+    session: BlueprintDraftSession,
+    intent: Optional[Dict[str, Any]],
+    source_text: str,
+) -> None:
+    metadata = dict(session.metadata_json or {})
+    if intent:
+        metadata["extracted_release_target_intent"] = intent
+        metadata["extracted_release_target_intent_updated_at"] = timezone.now().isoformat()
+        metadata["extracted_release_target_intent_source"] = str(intent.get("extraction_source") or "prompt")
+        metadata["extracted_release_target_text_hash"] = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+    else:
+        metadata.pop("extracted_release_target_intent", None)
+        metadata.pop("extracted_release_target_intent_updated_at", None)
+        metadata.pop("extracted_release_target_intent_source", None)
+        metadata.pop("extracted_release_target_text_hash", None)
+    session.metadata_json = metadata
+    session.save(update_fields=["metadata_json", "updated_at"])
+
+
 def _extract_default_release_target_inputs(
     session: BlueprintDraftSession,
 ) -> tuple[Optional[str], Optional[ProvisionedInstance], Optional[str]]:
     payload = session.submitted_payload_json if isinstance(session.submitted_payload_json, dict) else {}
     release_target = payload.get("release_target") if isinstance(payload.get("release_target"), dict) else {}
+    metadata_json = session.metadata_json if isinstance(session.metadata_json, dict) else {}
+    extracted_intent = (
+        metadata_json.get("extracted_release_target_intent")
+        if isinstance(metadata_json.get("extracted_release_target_intent"), dict)
+        else {}
+    )
+    resolved_intent = _resolve_release_target_intent(extracted_intent) if extracted_intent else {}
     draft = session.current_draft_json if isinstance(session.current_draft_json, dict) else {}
     metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
     labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
@@ -3139,6 +3367,8 @@ def _extract_default_release_target_inputs(
     environment_input = (
         release_target.get("environment")
         or release_target.get("environment_name")
+        or resolved_intent.get("environment_id")
+        or resolved_intent.get("environment_name")
         or payload.get("environment")
         or payload.get("environment_name")
         or payload.get("environment_id")
@@ -3150,12 +3380,14 @@ def _extract_default_release_target_inputs(
 
     target_instance_id = str(
         release_target.get("target_instance_id")
+        or resolved_intent.get("instance_id")
         or payload.get("target_instance_id")
         or labels.get("xyn.target_instance_id")
         or ""
     ).strip()
     target_instance_name = str(
         release_target.get("target_instance_name")
+        or resolved_intent.get("instance_name")
         or payload.get("target_instance_name")
         or payload.get("instance_name")
         or labels.get("xyn.target_instance_name")
@@ -3172,6 +3404,7 @@ def _extract_default_release_target_inputs(
     hostname = str(
         release_target.get("fqdn")
         or release_target.get("hostname")
+        or resolved_intent.get("fqdn")
         or payload.get("fqdn")
         or payload.get("hostname")
         or labels.get("xyn.fqdn")
@@ -3882,6 +4115,20 @@ def create_draft_session(request: HttpRequest) -> JsonResponse:
         namespace=namespace or None,
         project_key=project_key or None,
     )
+    extraction_text = _draft_prompt_text_for_target_extraction(session)
+    extracted_intent = _extract_release_target_intent_from_text(extraction_text)
+    metadata_json = dict(session.metadata_json or {})
+    if extracted_intent:
+        metadata_json["extracted_release_target_intent"] = extracted_intent
+        metadata_json["extracted_release_target_intent_updated_at"] = timezone.now().isoformat()
+        metadata_json["extracted_release_target_intent_source"] = str(extracted_intent.get("extraction_source") or "prompt")
+        metadata_json["extracted_release_target_text_hash"] = hashlib.sha256(extraction_text.encode("utf-8")).hexdigest()
+    else:
+        metadata_json.pop("extracted_release_target_intent", None)
+        metadata_json.pop("extracted_release_target_intent_updated_at", None)
+        metadata_json.pop("extracted_release_target_intent_source", None)
+        metadata_json.pop("extracted_release_target_text_hash", None)
+    session.metadata_json = metadata_json
     session.context_pack_refs_json = resolved["refs"]
     session.effective_context_hash = resolved["hash"]
     session.effective_context_preview = resolved["preview"]
@@ -3900,6 +4147,7 @@ def create_draft_session(request: HttpRequest) -> JsonResponse:
             "effective_context_hash",
             "effective_context_preview",
             "context_resolved_at",
+            "metadata_json",
             "updated_at",
         ]
     )
@@ -4459,6 +4707,20 @@ def enqueue_draft_generation(request: HttpRequest, session_id: str) -> JsonRespo
         session.status = "drafting"
         job_id = str(uuid.uuid4())
         _executor.submit(generate_blueprint_draft, str(session.id))
+    extraction_text = _draft_prompt_text_for_target_extraction(session)
+    extracted_intent = _extract_release_target_intent_from_text(extraction_text)
+    metadata_json = dict(session.metadata_json or {})
+    if extracted_intent:
+        metadata_json["extracted_release_target_intent"] = extracted_intent
+        metadata_json["extracted_release_target_intent_updated_at"] = timezone.now().isoformat()
+        metadata_json["extracted_release_target_intent_source"] = str(extracted_intent.get("extraction_source") or "prompt")
+        metadata_json["extracted_release_target_text_hash"] = hashlib.sha256(extraction_text.encode("utf-8")).hexdigest()
+    else:
+        metadata_json.pop("extracted_release_target_intent", None)
+        metadata_json.pop("extracted_release_target_intent_updated_at", None)
+        metadata_json.pop("extracted_release_target_intent_source", None)
+        metadata_json.pop("extracted_release_target_text_hash", None)
+    session.metadata_json = metadata_json
     if _is_draft_context_stale(session):
         resolved = _resolve_context_packs(
             session,
@@ -4473,7 +4735,7 @@ def enqueue_draft_generation(request: HttpRequest, session_id: str) -> JsonRespo
         session.context_resolved_at = timezone.now()
     session.job_id = job_id
     session.last_error = ""
-    update_fields = ["status", "job_id", "last_error"]
+    update_fields = ["status", "job_id", "last_error", "metadata_json"]
     if session.context_resolved_at:
         update_fields.extend(
             ["context_pack_refs_json", "effective_context_hash", "effective_context_preview", "context_resolved_at"]
@@ -4489,6 +4751,7 @@ def enqueue_draft_generation(request: HttpRequest, session_id: str) -> JsonRespo
             "effective_context_hash": session.effective_context_hash,
             "context_resolved_at": session.context_resolved_at.isoformat() if session.context_resolved_at else None,
             "context_stale": _is_draft_context_stale(session),
+            "extracted_release_target_intent": extracted_intent,
         }
     )
 
@@ -4533,6 +4796,20 @@ def resolve_draft_session_context(request: HttpRequest, session_id: str) -> Json
         session.selected_context_pack_ids = context_pack_ids
         session.context_pack_ids = context_pack_ids
     resolved = _resolve_context_packs(session, context_pack_ids)
+    extraction_text = _draft_prompt_text_for_target_extraction(session)
+    extracted_intent = _extract_release_target_intent_from_text(extraction_text)
+    metadata_json = dict(session.metadata_json or {})
+    if extracted_intent:
+        metadata_json["extracted_release_target_intent"] = extracted_intent
+        metadata_json["extracted_release_target_intent_updated_at"] = timezone.now().isoformat()
+        metadata_json["extracted_release_target_intent_source"] = str(extracted_intent.get("extraction_source") or "prompt")
+        metadata_json["extracted_release_target_text_hash"] = hashlib.sha256(extraction_text.encode("utf-8")).hexdigest()
+    else:
+        metadata_json.pop("extracted_release_target_intent", None)
+        metadata_json.pop("extracted_release_target_intent_updated_at", None)
+        metadata_json.pop("extracted_release_target_intent_source", None)
+        metadata_json.pop("extracted_release_target_text_hash", None)
+    session.metadata_json = metadata_json
     session.context_pack_refs_json = resolved["refs"]
     session.effective_context_hash = resolved["hash"]
     session.effective_context_preview = resolved["preview"]
@@ -4545,9 +4822,11 @@ def resolve_draft_session_context(request: HttpRequest, session_id: str) -> Json
             "effective_context_hash",
             "effective_context_preview",
             "context_resolved_at",
+            "metadata_json",
             "updated_at",
         ]
     )
+    resolved_intent = _resolve_release_target_intent(extracted_intent or {})
     return JsonResponse(
         {
             "context_pack_refs": resolved["refs"],
@@ -4556,6 +4835,39 @@ def resolve_draft_session_context(request: HttpRequest, session_id: str) -> Json
             "context_resolved_at": session.context_resolved_at.isoformat() if session.context_resolved_at else None,
             "context_stale": _is_draft_context_stale(session),
             "selected_context_pack_ids": session.selected_context_pack_ids or session.context_pack_ids or [],
+            "extracted_release_target_intent": extracted_intent,
+            "extracted_release_target_resolution": resolved_intent,
+            "extracted_release_target_warnings": resolved_intent.get("warnings", []),
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def extract_release_target(request: HttpRequest, session_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    payload = _safe_json_body(request)
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        text = _draft_prompt_text_for_target_extraction(session)
+    intent = _extract_release_target_intent_from_text(text)
+    _store_extracted_release_target_intent(session, intent, text)
+    resolved = _resolve_release_target_intent(intent or {})
+    return JsonResponse(
+        {
+            "intent": intent,
+            "resolved": {
+                "environment_id": resolved.get("environment_id"),
+                "environment_name": resolved.get("environment_name"),
+                "instance_id": resolved.get("instance_id"),
+                "instance_name": resolved.get("instance_name"),
+                "fqdn": resolved.get("fqdn"),
+            },
+            "warnings": resolved.get("warnings", []),
         }
     )
 
@@ -4691,6 +5003,41 @@ def submit_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
     for key in ("environment", "environment_name", "environment_id", "target_instance_id", "target_instance_name", "fqdn", "hostname"):
         if key in payload and key not in release_target_payload:
             release_target_payload[key] = payload.get(key)
+    if not release_target_payload:
+        metadata_json = session.metadata_json if isinstance(session.metadata_json, dict) else {}
+        extracted_intent = (
+            metadata_json.get("extracted_release_target_intent")
+            if isinstance(metadata_json.get("extracted_release_target_intent"), dict)
+            else {}
+        )
+        if extracted_intent:
+            resolved_intent = _resolve_release_target_intent(extracted_intent)
+            missing_fields: List[str] = []
+            if not resolved_intent.get("environment_id"):
+                missing_fields.append("environment")
+            if not resolved_intent.get("instance_id"):
+                missing_fields.append("target_instance")
+            if not resolved_intent.get("fqdn"):
+                missing_fields.append("fqdn")
+            if missing_fields:
+                return JsonResponse(
+                    {
+                        "error": "release target intent incomplete",
+                        "code": "release_target_intent_incomplete",
+                        "fields_missing": missing_fields,
+                        "warnings": resolved_intent.get("warnings", []),
+                        "intent": extracted_intent,
+                        "resolved": resolved_intent,
+                    },
+                    status=400,
+                )
+            release_target_payload = {
+                "environment_id": resolved_intent.get("environment_id"),
+                "environment_name": resolved_intent.get("environment_name"),
+                "target_instance_id": resolved_intent.get("instance_id"),
+                "target_instance_name": resolved_intent.get("instance_name"),
+                "fqdn": resolved_intent.get("fqdn"),
+            }
     submission_payload = {
         "draft_session_id": str(session.id),
         "kind": session.draft_kind or "blueprint",
@@ -4823,6 +5170,13 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
         session.updated_by = request.user
         session.save()
     context_stale = _is_draft_context_stale(session)
+    metadata_json = session.metadata_json if isinstance(session.metadata_json, dict) else {}
+    extracted_intent = (
+        metadata_json.get("extracted_release_target_intent")
+        if isinstance(metadata_json.get("extracted_release_target_intent"), dict)
+        else None
+    )
+    extracted_resolution = _resolve_release_target_intent(extracted_intent or {})
     return JsonResponse(
         {
             "id": str(session.id),
@@ -4851,6 +5205,11 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             "effective_context_preview": session.effective_context_preview,
             "context_resolved_at": session.context_resolved_at.isoformat() if session.context_resolved_at else None,
             "context_stale": context_stale,
+            "extracted_release_target_intent": extracted_intent,
+            "extracted_release_target_intent_updated_at": metadata_json.get("extracted_release_target_intent_updated_at"),
+            "extracted_release_target_intent_source": metadata_json.get("extracted_release_target_intent_source"),
+            "extracted_release_target_resolution": extracted_resolution,
+            "extracted_release_target_warnings": extracted_resolution.get("warnings", []),
             "created_at": session.created_at,
             "updated_at": session.updated_at,
         }

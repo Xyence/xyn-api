@@ -525,6 +525,158 @@ class DraftSessionDefaultsTests(TestCase):
         self.assertTrue(session.effective_context_hash)
         self.assertIsNotNone(session.context_resolved_at)
 
+    def test_extract_release_target_intent_from_prompt_bullets(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Intent parse",
+                    "namespace": "core",
+                    "project_key": "core.intent-parse",
+                    "initial_prompt": (
+                        "* Target environment: Dev\n"
+                        "* Deploy to instance: xyn-seed-dev-1\n"
+                        "* Public hostname: josh-test-b.xyence.io\n"
+                    ),
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        env = Environment.objects.create(name="Dev", slug="dev")
+        instance = ProvisionedInstance.objects.create(
+            name="xyn-seed-dev-1",
+            environment=env,
+            aws_region="us-east-1",
+            instance_type="t3.small",
+            ami_id="ami-test",
+            runtime_substrate="ec2",
+            status="running",
+            health_status="healthy",
+        )
+        response = self.client.post(f"/xyn/api/draft-sessions/{session_id}/extract_release_target", data=json.dumps({}), content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        intent = payload.get("intent") or {}
+        self.assertEqual(intent.get("fqdn"), "josh-test-b.xyence.io")
+        self.assertEqual((payload.get("resolved") or {}).get("environment_id"), str(env.id))
+        self.assertEqual((payload.get("resolved") or {}).get("instance_id"), str(instance.id))
+
+    def test_extract_returns_400_when_ambiguous_environment(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Intent ambiguous env",
+                    "namespace": "core",
+                    "project_key": "core.intent-ambiguous",
+                    "initial_prompt": (
+                        "* Target environment: Dev\n"
+                        "* Deploy to instance: xyn-seed-dev-1\n"
+                        "* Public hostname: ambiguous.xyence.io\n"
+                    ),
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        Environment.objects.create(name="Dev", slug="dev-a")
+        Environment.objects.create(name="Dev", slug="dev-b")
+        response = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        payload = response.json()
+        self.assertEqual(payload.get("code"), "release_target_intent_incomplete")
+        self.assertIn("environment", payload.get("fields_missing", []))
+
+    def test_submit_uses_extracted_intent_when_submit_payload_missing(self):
+        env = Environment.objects.create(name="Dev", slug="dev")
+        instance = ProvisionedInstance.objects.create(
+            name="xyn-seed-dev-1",
+            environment=env,
+            aws_region="us-east-1",
+            instance_type="t3.small",
+            ami_id="ami-test",
+            runtime_substrate="ec2",
+            status="running",
+            health_status="healthy",
+        )
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Intent submit fallback",
+                    "namespace": "core",
+                    "project_key": "core.intent-submit",
+                    "initial_prompt": (
+                        "* Target environment: Dev\n"
+                        "* Deploy to instance: xyn-seed-dev-1\n"
+                        "* Public hostname: fallback.xyence.io\n"
+                    ),
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = self._build_valid_solution_draft(name="intent-submit")
+        session.save(update_fields=["current_draft_json", "updated_at"])
+        self.client.post(f"/xyn/api/draft-sessions/{session_id}/extract_release_target", data=json.dumps({}), content_type="application/json")
+
+        response = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        blueprint_id = response.json().get("entity_id")
+        self.assertTrue(blueprint_id)
+        target = ReleaseTarget.objects.get(blueprint_id=blueprint_id, environment="Dev")
+        self.assertEqual(target.target_instance_id, instance.id)
+        self.assertEqual(target.fqdn, "fallback.xyence.io")
+
+    def test_submit_does_not_create_target_without_confirmation_fields(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Intent incomplete",
+                    "namespace": "core",
+                    "project_key": "core.intent-incomplete",
+                    "initial_prompt": "* Public hostname: incomplete.xyence.io",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = self._build_valid_solution_draft(name="intent-incomplete")
+        session.save(update_fields=["current_draft_json", "updated_at"])
+        self.client.post(f"/xyn/api/draft-sessions/{session_id}/extract_release_target", data=json.dumps({}), content_type="application/json")
+
+        response = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json().get("code"), "release_target_intent_incomplete")
+
     def _build_valid_solution_draft(self, name: str = "subscriber-notes-dev-demo", namespace: str = "core") -> dict:
         return {
             "apiVersion": "xyn.blueprint/v1",
