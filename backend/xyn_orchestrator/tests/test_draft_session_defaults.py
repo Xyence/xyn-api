@@ -16,15 +16,18 @@ from xyn_orchestrator.models import (
     ReleaseTarget,
 )
 from xyn_orchestrator.blueprints import (
+    ensure_default_release_target,
     _generate_implementation_plan,
     _release_target_payload,
     _sanitize_release_spec_for_xynseed,
 )
+from xyn_orchestrator.services import _normalize_generated_blueprint
 
 
 class DraftSessionDefaultsTests(TestCase):
     def setUp(self):
         user = get_user_model().objects.create_user(username="staff", password="pass", is_staff=True)
+        self.user = user
         self.client.force_login(user)
         self.blueprint = Blueprint.objects.create(name="ems", namespace="core", description="")
 
@@ -754,6 +757,8 @@ class DraftSessionDefaultsTests(TestCase):
         self.assertEqual(target.target_instance_id, instance.id)
         self.assertEqual(target.fqdn, "diwakar.xyence.io")
         self.assertEqual(target.name, "subscriber-notes-dev-default")
+        self.assertEqual((target.tls_json or {}).get("mode"), "host-ingress")
+        self.assertEqual((target.tls_json or {}).get("provider"), "traefik")
         self.assertTrue(target.created_by_id)
 
     def test_finalize_submit_idempotent_reuses_single_default_release_target(self):
@@ -787,6 +792,8 @@ class DraftSessionDefaultsTests(TestCase):
             ReleaseTarget.objects.filter(blueprint_id=blueprint_id, environment="Dev", auto_generated=True).count(),
             1,
         )
+        target = ReleaseTarget.objects.get(blueprint_id=blueprint_id, environment="Dev", auto_generated=True)
+        self.assertEqual((target.tls_json or {}).get("mode"), "host-ingress")
 
     def test_finalize_submit_manual_release_target_blocks_auto_generation(self):
         instance = self._create_dev_instance()
@@ -828,6 +835,30 @@ class DraftSessionDefaultsTests(TestCase):
         self.assertEqual(submit.status_code, 200)
         self.assertEqual(ReleaseTarget.objects.filter(blueprint=blueprint, environment="Dev").count(), 1)
         self.assertEqual(ReleaseTarget.objects.filter(blueprint=blueprint, auto_generated=True).count(), 0)
+
+    def test_finalize_submit_updates_existing_auto_target(self):
+        instance = self._create_dev_instance()
+        blueprint = Blueprint.objects.create(name="auto-update", namespace="core")
+        target = ReleaseTarget.objects.create(
+            blueprint=blueprint,
+            name="stale-target",
+            environment="Dev",
+            target_instance_ref=str(instance.id),
+            target_instance=instance,
+            fqdn="old.xyence.io",
+            dns_json={"provider": "route53", "ttl": 60},
+            runtime_json={"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            tls_json={"mode": "none"},
+            env_json={},
+            secret_refs_json=[],
+            config_json={"editable": True},
+            auto_generated=True,
+        )
+        updated, created = ensure_default_release_target(blueprint, "Dev", instance, "new.xyence.io", self.user)
+        self.assertFalse(created)
+        self.assertEqual(updated.id, target.id)
+        self.assertEqual(updated.fqdn, "new.xyence.io")
+        self.assertEqual((updated.tls_json or {}).get("mode"), "host-ingress")
 
     def test_implementation_plan_carries_release_target_environment_id(self):
         instance = self._create_dev_instance()
@@ -907,8 +938,27 @@ class DraftSessionDefaultsTests(TestCase):
             release_target=release_target,
         )
         ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("dns.ensure_record.route53", ids)
         self.assertIn("build.publish_images.container", ids)
         self.assertIn("deploy.apply_remote_compose.pull", ids)
+
+    def test_normalize_generated_blueprint_prefers_build_over_image_when_both_present(self):
+        draft = {
+            "kind": "SolutionBlueprint",
+            "releaseSpec": {
+                "components": [
+                    {
+                        "name": "db-migrate",
+                        "image": "flyway/flyway:10-alpine",
+                        "build": {"context": "./apps/subscriber-notes/db", "dockerfile": "Dockerfile"},
+                    }
+                ]
+            },
+        }
+        normalized = _normalize_generated_blueprint(draft)
+        component = normalized["releaseSpec"]["components"][0]
+        self.assertIn("build", component)
+        self.assertNotIn("image", component)
 
     def test_submit_persists_intent_provenance_with_structured_requirements(self):
         prompt = (

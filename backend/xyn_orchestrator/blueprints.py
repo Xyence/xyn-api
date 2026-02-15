@@ -2469,6 +2469,31 @@ def _generate_implementation_plan(
     preferred_ingress_module = "ingress-traefik-acme" if tls_mode == "host-ingress" else "ingress-nginx-acme"
     if not tls_acme_requested:
         tls_acme_requested = tls_mode in {"nginx+acme", "acme", "letsencrypt", "host-ingress"}
+    if route53_requested and not any(item.get("id") == "dns.ensure_record.route53" for item in work_items):
+        work_items.append(
+            {
+                "id": "dns.ensure_record.route53",
+                "title": "Ensure Route53 DNS record",
+                "description": "Ensure the public hostname resolves to the target instance via Route53.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "release_target.json"]},
+                "outputs": {"paths": [], "artifacts": ["dns_change_result.json"]},
+                "acceptance_criteria": ["DNS record exists and resolves to target public IP."],
+                "verify": [{"name": "dns-ensure", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": [],
+                "labels": ["deploy", "dns", "module:dns-route53", "capability:dns.route53.records"],
+            }
+        )
     if image_deploy_enabled:
         work_items = [item for item in work_items if item.get("id") != "deploy.apply_remote_compose.ssm"]
         for item in work_items:
@@ -3488,6 +3513,63 @@ def ensure_default_release_target(
             .first()
         )
         if existing:
+            if existing.auto_generated:
+                existing.name = target_name
+                existing.environment = env_name
+                existing.target_instance_ref = str(instance.id)
+                existing.target_instance = instance
+                existing.fqdn = fqdn
+                existing.dns_json = {"provider": "route53", "ttl": 60}
+                existing.runtime_json = {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"}
+                existing.tls_json = {
+                    "mode": "host-ingress",
+                    "provider": "traefik",
+                    "termination": "host",
+                    "acme_email": os.environ.get("XYENCE_ACME_EMAIL", "admin@xyence.io"),
+                    "expose_http": True,
+                    "expose_https": True,
+                    "redirect_http_to_https": True,
+                }
+                existing.config_json = {
+                    **(existing.config_json or {}),
+                    "name": target_name,
+                    "environment": env_name,
+                    "target_instance_id": str(instance.id),
+                    "fqdn": fqdn,
+                    "dns": {"provider": "route53", "ttl": 60},
+                    "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+                    "tls": existing.tls_json,
+                    "ingress": {
+                        "network": "xyn-edge",
+                        "routes": [
+                            {
+                                "host": fqdn,
+                                "service": "ems-web",
+                                "port": 3000,
+                                "protocol": "http",
+                                "health_path": "/health",
+                            }
+                        ],
+                    },
+                    "auto_generated": True,
+                    "editable": True,
+                }
+                existing.updated_by = user
+                existing.save(
+                    update_fields=[
+                        "name",
+                        "environment",
+                        "target_instance_ref",
+                        "target_instance",
+                        "fqdn",
+                        "dns_json",
+                        "runtime_json",
+                        "tls_json",
+                        "config_json",
+                        "updated_by",
+                        "updated_at",
+                    ]
+                )
             return existing, False
 
         target_payload = {
@@ -3497,8 +3579,27 @@ def ensure_default_release_target(
             "fqdn": fqdn,
             "dns": {"provider": "route53", "ttl": 60},
             "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
-            "tls": {"mode": "none", "expose_http": True, "expose_https": True, "redirect_http_to_https": True},
-            "ingress": {"network": "xyn-edge", "routes": []},
+            "tls": {
+                "mode": "host-ingress",
+                "provider": "traefik",
+                "termination": "host",
+                "acme_email": os.environ.get("XYENCE_ACME_EMAIL", "admin@xyence.io"),
+                "expose_http": True,
+                "expose_https": True,
+                "redirect_http_to_https": True,
+            },
+            "ingress": {
+                "network": "xyn-edge",
+                "routes": [
+                    {
+                        "host": fqdn,
+                        "service": "ems-web",
+                        "port": 3000,
+                        "protocol": "http",
+                        "health_path": "/health",
+                    }
+                ],
+            },
             "env": {},
             "secret_refs": [],
             "auto_generated": True,

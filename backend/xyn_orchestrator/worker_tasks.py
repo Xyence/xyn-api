@@ -5743,11 +5743,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 f"/xyn/internal/dev-tasks/{task_id}/complete",
                 {
                     "status": "succeeded" if success else "failed",
-                    **(
-                        {"error": deployment.get("error_message") or f"Deploy failed with status {status}"}
-                        if not success
-                        else {}
-                    ),
+                    **({"error": (errors[0].get("message") if errors else "Codegen failed")} if not success else {}),
                 },
             )
             return

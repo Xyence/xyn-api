@@ -157,6 +157,11 @@ def _normalize_generated_blueprint(spec: Optional[Dict[str, Any]]) -> Dict[str, 
                         if "volume" not in mount and "name" in mount:
                             mount["volume"] = mount.get("name")
                         mount.pop("name", None)
+                # releaseSpec component schema allows either image or build, not both.
+                has_build = isinstance(component.get("build"), dict) and bool(component.get("build"))
+                has_image = isinstance(component.get("image"), str) and bool(component.get("image").strip())
+                if has_build and has_image:
+                    component.pop("image", None)
                 resources = component.get("resources")
                 if isinstance(resources, dict):
                     limits = resources.get("limits") if isinstance(resources.get("limits"), dict) else {}
