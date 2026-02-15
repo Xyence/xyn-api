@@ -276,6 +276,22 @@ def _validate_blueprint_spec(spec: Dict[str, Any], kind: str = "solution") -> Li
     return errors
 
 
+_SECRET_REF_INTERPOLATION_RE = re.compile(r"(?<!\$)\$\{secretRef:[^}]+\}")
+
+
+def _sanitize_release_spec_for_xynseed(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _sanitize_release_spec_for_xynseed(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_release_spec_for_xynseed(item) for item in value]
+    if isinstance(value, str):
+        return _SECRET_REF_INTERPOLATION_RE.sub(
+            lambda match: "$" + match.group(0),
+            value,
+        )
+    return value
+
+
 def _load_runner_release_spec() -> Optional[Dict[str, Any]]:
     root = _contracts_root()
     if not root:
@@ -3869,7 +3885,8 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
         plan = None
         op = None
         if release_spec:
-            plan = _xynseed_request("post", "/releases/plan", {"release_spec": release_spec})
+            safe_release_spec = _sanitize_release_spec_for_xynseed(release_spec)
+            plan = _xynseed_request("post", "/releases/plan", {"release_spec": safe_release_spec})
             _write_run_artifact(run, "plan.json", plan, "plan")
             run.log_text += "Release plan created\n"
             if mode == "apply":

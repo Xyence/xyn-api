@@ -15,7 +15,11 @@ from xyn_orchestrator.models import (
     ProvisionedInstance,
     ReleaseTarget,
 )
-from xyn_orchestrator.blueprints import _generate_implementation_plan, _release_target_payload
+from xyn_orchestrator.blueprints import (
+    _generate_implementation_plan,
+    _release_target_payload,
+    _sanitize_release_spec_for_xynseed,
+)
 
 
 class DraftSessionDefaultsTests(TestCase):
@@ -854,6 +858,23 @@ class DraftSessionDefaultsTests(TestCase):
             release_target=release_target_payload,
         )
         self.assertEqual(plan.get("release_target_environment_id"), str(instance.environment_id))
+
+    def test_sanitize_release_spec_escapes_secret_ref_interpolation(self):
+        release_spec = {
+            "components": [
+                {
+                    "name": "api",
+                    "env": {
+                        "DB_PASSWORD": "${secretRef:dev/subscriber-notes/db.password}",
+                        "UNCHANGED": "${POSTGRES_PASSWORD:-ems}",
+                    },
+                }
+            ]
+        }
+        sanitized = _sanitize_release_spec_for_xynseed(release_spec)
+        env = sanitized["components"][0]["env"]
+        self.assertEqual(env["DB_PASSWORD"], "$${secretRef:dev/subscriber-notes/db.password}")
+        self.assertEqual(env["UNCHANGED"], "${POSTGRES_PASSWORD:-ems}")
 
     def test_submit_persists_intent_provenance_with_structured_requirements(self):
         prompt = (
