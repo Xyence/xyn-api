@@ -2673,6 +2673,40 @@ def _normalize_generated_blueprint(spec: Optional[Dict[str, Any]]) -> Dict[str, 
                         component["resources"] = normalized_resources
                     else:
                         component.pop("resources", None)
+                env_entries = component.get("env")
+                if isinstance(env_entries, list):
+                    normalized_env: Dict[str, str] = {}
+                    normalized_secret_refs = (
+                        list(component.get("secretRefs")) if isinstance(component.get("secretRefs"), list) else []
+                    )
+                    for item in env_entries:
+                        if not isinstance(item, dict):
+                            continue
+                        env_name = str(item.get("name") or "").strip()
+                        if not env_name:
+                            continue
+                        env_value = item.get("value")
+                        if env_value is not None:
+                            normalized_env[env_name] = str(env_value)
+                            continue
+                        value_from = item.get("valueFrom")
+                        if not isinstance(value_from, dict):
+                            continue
+                        secret_ref = value_from.get("secretRef")
+                        if not isinstance(secret_ref, dict):
+                            continue
+                        secret_name = str(secret_ref.get("name") or "").strip()
+                        secret_key = str(secret_ref.get("key") or "").strip()
+                        if not secret_name:
+                            continue
+                        secret_payload: Dict[str, str] = {"name": secret_name}
+                        if secret_key:
+                            secret_payload["key"] = secret_key
+                        secret_payload["targetEnv"] = env_name
+                        normalized_secret_refs.append(secret_payload)
+                    component["env"] = normalized_env
+                    if normalized_secret_refs:
+                        component["secretRefs"] = normalized_secret_refs
     return draft
 
 

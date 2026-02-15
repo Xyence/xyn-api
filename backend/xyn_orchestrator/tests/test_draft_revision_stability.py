@@ -5,6 +5,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from xyn_orchestrator import services
+from xyn_orchestrator import worker_tasks
 from xyn_orchestrator.models import BlueprintDraftSession
 
 
@@ -82,3 +83,32 @@ class DraftRevisionStabilityTests(TestCase):
         self.session.refresh_from_db()
         self.assertTrue(self.session.initial_prompt_locked)
 
+    def test_normalize_generated_blueprint_converts_env_list_to_object_and_secret_refs(self):
+        draft = _baseline_draft()
+        draft["releaseSpec"]["components"][0]["env"] = [
+            {"name": "APP_ENV", "value": "dev"},
+            {"name": "DB_USER", "valueFrom": {"secretRef": {"name": "db-secret", "key": "username"}}},
+        ]
+
+        normalized = services._normalize_generated_blueprint(draft)
+        env_payload = normalized["releaseSpec"]["components"][0]["env"]
+        self.assertEqual(env_payload, {"APP_ENV": "dev"})
+        self.assertEqual(
+            normalized["releaseSpec"]["components"][0]["secretRefs"],
+            [{"name": "db-secret", "key": "username", "targetEnv": "DB_USER"}],
+        )
+
+    def test_worker_normalize_generated_blueprint_converts_env_list_to_object_and_secret_refs(self):
+        draft = _baseline_draft()
+        draft["releaseSpec"]["components"][0]["env"] = [
+            {"name": "APP_ENV", "value": "dev"},
+            {"name": "DB_PASS", "valueFrom": {"secretRef": {"name": "db-secret", "key": "password"}}},
+        ]
+
+        normalized = worker_tasks._normalize_generated_blueprint(draft)
+        env_payload = normalized["releaseSpec"]["components"][0]["env"]
+        self.assertEqual(env_payload, {"APP_ENV": "dev"})
+        self.assertEqual(
+            normalized["releaseSpec"]["components"][0]["secretRefs"],
+            [{"name": "db-secret", "key": "password", "targetEnv": "DB_PASS"}],
+        )
