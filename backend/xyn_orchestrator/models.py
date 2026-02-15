@@ -262,6 +262,7 @@ class BlueprintDraftSession(models.Model):
     context_pack_refs_json = models.JSONField(null=True, blank=True)
     effective_context_hash = models.CharField(max_length=64, blank=True)
     effective_context_preview = models.TextField(blank=True)
+    context_resolved_at = models.DateTimeField(null=True, blank=True)
     linked_blueprint = models.ForeignKey(
         Blueprint, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_sessions"
     )
@@ -296,6 +297,7 @@ class DraftSessionRevision(models.Model):
         ("generate", "Generate"),
         ("revise", "Revise"),
         ("save", "Save"),
+        ("snapshot", "Snapshot"),
         ("submit", "Submit"),
     ]
 

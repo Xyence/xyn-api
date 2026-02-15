@@ -521,8 +521,15 @@ def generate_blueprint_draft(session_id: str) -> None:
     session.context_pack_refs_json = context["refs"]
     session.effective_context_hash = context["hash"]
     session.effective_context_preview = context["preview"]
+    session.context_resolved_at = timezone.now()
     session.save(
-        update_fields=["context_pack_refs_json", "effective_context_hash", "effective_context_preview", "updated_at"]
+        update_fields=[
+            "context_pack_refs_json",
+            "effective_context_hash",
+            "effective_context_preview",
+            "context_resolved_at",
+            "updated_at",
+        ]
     )
     transcripts = _collect_transcripts(session)
     source_artifacts = session.source_artifacts or []
@@ -586,8 +593,15 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
     session.context_pack_refs_json = context["refs"]
     session.effective_context_hash = context["hash"]
     session.effective_context_preview = context["preview"]
+    session.context_resolved_at = timezone.now()
     session.save(
-        update_fields=["context_pack_refs_json", "effective_context_hash", "effective_context_preview", "updated_at"]
+        update_fields=[
+            "context_pack_refs_json",
+            "effective_context_hash",
+            "effective_context_preview",
+            "context_resolved_at",
+            "updated_at",
+        ]
     )
     baseline = session.current_draft_json or {}
     prompt_sources: List[str] = []

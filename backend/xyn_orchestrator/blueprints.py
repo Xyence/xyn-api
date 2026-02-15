@@ -81,15 +81,51 @@ def _record_draft_session_revision(
         .first()
     )
     next_revision = (latest.revision_number if latest else 0) + 1
-    DraftSessionRevision.objects.create(
+    return DraftSessionRevision.objects.create(
         draft_session=session,
         revision_number=next_revision,
-        action=action if action in {"generate", "revise", "save", "submit"} else "save",
+        action=action if action in {"generate", "revise", "save", "snapshot", "submit"} else "save",
         instruction=instruction or "",
         draft_json=session.current_draft_json,
         requirements_summary=session.requirements_summary or "",
         diff_summary=session.diff_summary or "",
         validation_errors_json=session.validation_errors_json or [],
+        created_by=created_by,
+    )
+
+
+def _is_draft_context_stale(session: BlueprintDraftSession) -> bool:
+    selected_ids = {
+        str(pack_id)
+        for pack_id in (session.selected_context_pack_ids or session.context_pack_ids or [])
+        if str(pack_id).strip()
+    }
+    refs = session.context_pack_refs_json if isinstance(session.context_pack_refs_json, list) else []
+    ref_ids = {
+        str(ref.get("id"))
+        for ref in refs
+        if isinstance(ref, dict) and str(ref.get("id", "")).strip()
+    }
+    if not (session.effective_context_hash or "").strip():
+        return True
+    if selected_ids and not ref_ids:
+        return True
+    if selected_ids and ref_ids and not selected_ids.issubset(ref_ids):
+        return True
+    return False
+
+
+def _snapshot_draft_session(
+    session: BlueprintDraftSession,
+    created_by=None,
+    note: str = "",
+    action: str = "snapshot",
+) -> DraftSessionRevision:
+    snapshot_note = (note or "").strip() or "manual snapshot"
+    return _record_draft_session_revision(
+        session,
+        action=action,
+        instruction=snapshot_note,
         created_by=created_by,
     )
 
@@ -3438,11 +3474,13 @@ def new_draft_session_view(request: HttpRequest) -> HttpResponse:
         session.context_pack_refs_json = resolved["refs"]
         session.effective_context_hash = resolved["hash"]
         session.effective_context_preview = resolved["preview"]
+        session.context_resolved_at = timezone.now()
         session.save(
             update_fields=[
                 "context_pack_refs_json",
                 "effective_context_hash",
                 "effective_context_preview",
+                "context_resolved_at",
                 "updated_at",
             ]
         )
@@ -3696,11 +3734,13 @@ def blueprint_studio_view(request: HttpRequest, session_id: str) -> HttpResponse
         session.context_pack_refs_json = resolved["refs"]
         session.effective_context_hash = resolved["hash"]
         session.effective_context_preview = resolved["preview"]
+        session.context_resolved_at = timezone.now()
         session.save(
             update_fields=[
                 "context_pack_refs_json",
                 "effective_context_hash",
                 "effective_context_preview",
+                "context_resolved_at",
                 "updated_at",
             ]
         )
@@ -3724,19 +3764,13 @@ def blueprint_studio_view(request: HttpRequest, session_id: str) -> HttpResponse
                 )
                 messages.success(request, "Draft saved.")
         elif action == "publish":
-            result = _publish_draft_session(session, request.user)
-            if not result.get("ok"):
-                messages.error(request, result.get("error", "Publish failed"))
-            else:
-                if result.get("entity_type") == "blueprint":
-                    messages.success(request, "Blueprint published.")
-                    return redirect("blueprint-detail", blueprint_id=result.get("entity_id"))
-                if result.get("entity_type") == "module":
-                    messages.success(request, "Module published to registry.")
-                    return redirect("module-detail", module_id=result.get("entity_id"))
-                if result.get("entity_type") == "bundle":
-                    messages.success(request, "Bundle published to registry.")
-                    return redirect("bundle-detail", bundle_id=result.get("entity_id"))
+            _snapshot_draft_session(
+                session,
+                created_by=request.user,
+                note="publish action is deprecated; snapshot saved",
+                action="snapshot",
+            )
+            messages.success(request, "Draft snapshot saved.")
 
     context = {
         "session": session,
@@ -3851,6 +3885,7 @@ def create_draft_session(request: HttpRequest) -> JsonResponse:
     session.context_pack_refs_json = resolved["refs"]
     session.effective_context_hash = resolved["hash"]
     session.effective_context_preview = resolved["preview"]
+    session.context_resolved_at = timezone.now()
     session.save(
         update_fields=[
             "name",
@@ -3864,6 +3899,7 @@ def create_draft_session(request: HttpRequest) -> JsonResponse:
             "context_pack_refs_json",
             "effective_context_hash",
             "effective_context_preview",
+            "context_resolved_at",
             "updated_at",
         ]
     )
@@ -4423,14 +4459,38 @@ def enqueue_draft_generation(request: HttpRequest, session_id: str) -> JsonRespo
         session.status = "drafting"
         job_id = str(uuid.uuid4())
         _executor.submit(generate_blueprint_draft, str(session.id))
+    if _is_draft_context_stale(session):
+        resolved = _resolve_context_packs(
+            session,
+            session.selected_context_pack_ids or session.context_pack_ids or None,
+            purpose="planner",
+            namespace=session.namespace or None,
+            project_key=session.project_key or None,
+        )
+        session.context_pack_refs_json = resolved["refs"]
+        session.effective_context_hash = resolved["hash"]
+        session.effective_context_preview = resolved["preview"]
+        session.context_resolved_at = timezone.now()
     session.job_id = job_id
     session.last_error = ""
     update_fields = ["status", "job_id", "last_error"]
+    if session.context_resolved_at:
+        update_fields.extend(
+            ["context_pack_refs_json", "effective_context_hash", "effective_context_preview", "context_resolved_at"]
+        )
     if not session.initial_prompt_locked and (session.initial_prompt or "").strip():
         session.initial_prompt_locked = True
         update_fields.append("initial_prompt_locked")
     session.save(update_fields=update_fields)
-    return JsonResponse({"status": session.status, "job_id": job_id})
+    return JsonResponse(
+        {
+            "status": session.status,
+            "job_id": job_id,
+            "effective_context_hash": session.effective_context_hash,
+            "context_resolved_at": session.context_resolved_at.isoformat() if session.context_resolved_at else None,
+            "context_stale": _is_draft_context_stale(session),
+        }
+    )
 
 
 @csrf_exempt
@@ -4476,6 +4536,7 @@ def resolve_draft_session_context(request: HttpRequest, session_id: str) -> Json
     session.context_pack_refs_json = resolved["refs"]
     session.effective_context_hash = resolved["hash"]
     session.effective_context_preview = resolved["preview"]
+    session.context_resolved_at = timezone.now()
     session.save(
         update_fields=[
             "context_pack_ids",
@@ -4483,6 +4544,7 @@ def resolve_draft_session_context(request: HttpRequest, session_id: str) -> Json
             "context_pack_refs_json",
             "effective_context_hash",
             "effective_context_preview",
+            "context_resolved_at",
             "updated_at",
         ]
     )
@@ -4491,6 +4553,8 @@ def resolve_draft_session_context(request: HttpRequest, session_id: str) -> Json
             "context_pack_refs": resolved["refs"],
             "effective_context_hash": resolved["hash"],
             "effective_context_preview": resolved["preview"],
+            "context_resolved_at": session.context_resolved_at.isoformat() if session.context_resolved_at else None,
+            "context_stale": _is_draft_context_stale(session),
             "selected_context_pack_ids": session.selected_context_pack_ids or session.context_pack_ids or [],
         }
     )
@@ -4538,14 +4602,51 @@ def publish_draft_session(request: HttpRequest, session_id: str) -> JsonResponse
         return staff_error
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
+    logger.warning("draft_publish_endpoint_deprecated", extra={"session_id": str(session_id)})
     session = get_object_or_404(BlueprintDraftSession, id=session_id)
-    result = _publish_draft_session(session, request.user)
-    if not result.get("ok"):
-        return JsonResponse(
-            {"error": result.get("error", "Publish failed"), "validation_errors": result.get("validation_errors", [])},
-            status=400,
-        )
-    return JsonResponse(result)
+    payload = _safe_json_body(request)
+    snapshot = _snapshot_draft_session(
+        session,
+        created_by=request.user,
+        note=str(payload.get("note") or "").strip() or "publish endpoint alias",
+        action="snapshot",
+    )
+    return JsonResponse(
+        {
+            "ok": True,
+            "deprecated": True,
+            "snapshot_id": str(snapshot.id),
+            "session_id": str(session.id),
+            "status": session.status,
+            "updated_at": session.updated_at.isoformat(),
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def snapshot_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    session = get_object_or_404(BlueprintDraftSession, id=session_id)
+    payload = _safe_json_body(request)
+    snapshot = _snapshot_draft_session(
+        session,
+        created_by=request.user,
+        note=str(payload.get("note") or "").strip() or "manual snapshot",
+        action="snapshot",
+    )
+    return JsonResponse(
+        {
+            "ok": True,
+            "snapshot_id": str(snapshot.id),
+            "session_id": str(session.id),
+            "status": session.status,
+            "updated_at": session.updated_at.isoformat(),
+        }
+    )
 
 
 @csrf_exempt
@@ -4718,8 +4819,10 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             session.context_pack_refs_json = resolved["refs"]
             session.effective_context_hash = resolved["hash"]
             session.effective_context_preview = resolved["preview"]
+            session.context_resolved_at = timezone.now()
         session.updated_by = request.user
         session.save()
+    context_stale = _is_draft_context_stale(session)
     return JsonResponse(
         {
             "id": str(session.id),
@@ -4746,6 +4849,8 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
             "selected_context_pack_ids": session.selected_context_pack_ids or session.context_pack_ids or [],
             "effective_context_hash": session.effective_context_hash,
             "effective_context_preview": session.effective_context_preview,
+            "context_resolved_at": session.context_resolved_at.isoformat() if session.context_resolved_at else None,
+            "context_stale": context_stale,
             "created_at": session.created_at,
             "updated_at": session.updated_at,
         }
@@ -4951,11 +5056,13 @@ def internal_draft_session_context(request: HttpRequest, session_id: str) -> Jso
     session.context_pack_refs_json = resolved["refs"]
     session.effective_context_hash = resolved["hash"]
     session.effective_context_preview = resolved["preview"]
+    session.context_resolved_at = timezone.now()
     session.save(
         update_fields=[
             "context_pack_refs_json",
             "effective_context_hash",
             "effective_context_preview",
+            "context_resolved_at",
             "updated_at",
         ]
     )
@@ -4965,6 +5072,7 @@ def internal_draft_session_context(request: HttpRequest, session_id: str) -> Jso
             "context_pack_refs": resolved["refs"],
             "effective_context_hash": resolved["hash"],
             "effective_context_preview": resolved["preview"],
+            "context_resolved_at": session.context_resolved_at.isoformat() if session.context_resolved_at else None,
         }
     )
 

@@ -1,4 +1,5 @@
 import json
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
@@ -383,6 +384,146 @@ class DraftSessionDefaultsTests(TestCase):
         published = Blueprint.objects.get(id=entity_id)
         self.assertEqual(published.namespace, "core")
         self.assertEqual(published.name, "test-josh")
+
+    def test_publish_no_longer_creates_blueprint(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Publish alias snapshot",
+                    "namespace": "core",
+                    "project_key": "core.publish-alias",
+                    "initial_prompt": "Create EMS blueprint",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = self._build_valid_solution_draft(name="publish-alias")
+        session.save(update_fields=["current_draft_json", "updated_at"])
+        before = Blueprint.objects.count()
+
+        response = self.client.post(f"/xyn/api/draft-sessions/{session_id}/publish", content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload.get("ok"))
+        self.assertTrue(payload.get("deprecated"))
+        self.assertTrue(payload.get("snapshot_id"))
+        self.assertEqual(Blueprint.objects.count(), before)
+        latest_revision = DraftSessionRevision.objects.filter(draft_session_id=session_id).order_by("-revision_number").first()
+        self.assertIsNotNone(latest_revision)
+        self.assertEqual(latest_revision.action, "snapshot")
+
+    def test_snapshot_creates_history_entry_and_no_blueprint(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Snapshot test",
+                    "namespace": "core",
+                    "project_key": "core.snapshot-test",
+                    "initial_prompt": "Create EMS blueprint",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = self._build_valid_solution_draft(name="snapshot-test")
+        session.save(update_fields=["current_draft_json", "updated_at"])
+        before = Blueprint.objects.count()
+
+        response = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/snapshot",
+            data=json.dumps({"note": "manual snapshot"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload.get("ok"))
+        self.assertTrue(payload.get("snapshot_id"))
+        self.assertEqual(Blueprint.objects.count(), before)
+        revision = DraftSessionRevision.objects.get(id=payload["snapshot_id"])
+        self.assertEqual(revision.action, "snapshot")
+        self.assertIn("manual snapshot", revision.instruction)
+
+    def test_submit_is_only_endpoint_that_writes_blueprint(self):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Submit only writes",
+                    "namespace": "core",
+                    "project_key": "core.submit-only",
+                    "initial_prompt": "Create EMS blueprint",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        session.current_draft_json = self._build_valid_solution_draft(name="submit-only")
+        session.save(update_fields=["current_draft_json", "updated_at"])
+        before = Blueprint.objects.count()
+
+        publish_response = self.client.post(f"/xyn/api/draft-sessions/{session_id}/publish")
+        self.assertEqual(publish_response.status_code, 200)
+        snapshot_response = self.client.post(f"/xyn/api/draft-sessions/{session_id}/snapshot")
+        self.assertEqual(snapshot_response.status_code, 200)
+        self.assertEqual(Blueprint.objects.count(), before)
+
+        submit_response = self.client.post(
+            f"/xyn/api/draft-sessions/{session_id}/submit",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(submit_response.status_code, 200)
+        self.assertEqual(Blueprint.objects.count(), before + 1)
+
+    @mock.patch("xyn_orchestrator.blueprints._enqueue_job", return_value="job-123")
+    @mock.patch("xyn_orchestrator.blueprints._async_mode", return_value="redis")
+    def test_generate_auto_resolves_context_when_missing(self, _mock_mode, _mock_enqueue):
+        create = self.client.post(
+            "/xyn/api/draft-sessions",
+            data=json.dumps(
+                {
+                    "kind": "blueprint",
+                    "title": "Context auto resolve",
+                    "namespace": "core",
+                    "project_key": "core.context-auto",
+                    "initial_prompt": "Create EMS blueprint",
+                    "selected_context_pack_ids": [str(self.platform.id), str(self.planner.id)],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200)
+        session_id = create.json()["session_id"]
+        BlueprintDraftSession.objects.filter(id=session_id).update(
+            context_pack_refs_json=[],
+            effective_context_hash="",
+            effective_context_preview="",
+            context_resolved_at=None,
+        )
+        response = self.client.post(f"/xyn/api/draft-sessions/{session_id}/enqueue-draft-generation")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload.get("context_stale"))
+        self.assertTrue(payload.get("effective_context_hash"))
+        self.assertTrue(payload.get("context_resolved_at"))
+        session = BlueprintDraftSession.objects.get(id=session_id)
+        self.assertTrue(session.effective_context_hash)
+        self.assertIsNotNone(session.context_resolved_at)
 
     def _build_valid_solution_draft(self, name: str = "subscriber-notes-dev-demo", namespace: str = "core") -> dict:
         return {
