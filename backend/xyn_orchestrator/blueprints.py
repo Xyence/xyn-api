@@ -277,11 +277,28 @@ def _validate_blueprint_spec(spec: Dict[str, Any], kind: str = "solution") -> Li
 
 
 _SECRET_REF_INTERPOLATION_RE = re.compile(r"(?<!\$)\$\{secretRef:[^}]+\}")
+_NAMESPACE_PROJECT_SEGMENT_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+def _sanitize_release_namespace(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return raw
+    normalized = raw.replace(".", "-")
+    normalized = _NAMESPACE_PROJECT_SEGMENT_RE.sub("-", normalized)
+    normalized = normalized.strip("-_")
+    return normalized or "core"
 
 
 def _sanitize_release_spec_for_xynseed(value: Any) -> Any:
     if isinstance(value, dict):
-        return {k: _sanitize_release_spec_for_xynseed(v) for k, v in value.items()}
+        sanitized = {k: _sanitize_release_spec_for_xynseed(v) for k, v in value.items()}
+        metadata = sanitized.get("metadata")
+        if isinstance(metadata, dict):
+            namespace = metadata.get("namespace")
+            if isinstance(namespace, str):
+                metadata["namespace"] = _sanitize_release_namespace(namespace)
+        return sanitized
     if isinstance(value, list):
         return [_sanitize_release_spec_for_xynseed(item) for item in value]
     if isinstance(value, str):
@@ -2452,7 +2469,7 @@ def _generate_implementation_plan(
     preferred_ingress_module = "ingress-traefik-acme" if tls_mode == "host-ingress" else "ingress-nginx-acme"
     if not tls_acme_requested:
         tls_acme_requested = tls_mode in {"nginx+acme", "acme", "letsencrypt", "host-ingress"}
-    if image_deploy_enabled and blueprint_fqn == "core.ems.platform":
+    if image_deploy_enabled:
         work_items = [item for item in work_items if item.get("id") != "deploy.apply_remote_compose.ssm"]
         for item in work_items:
             if "depends_on" in item:

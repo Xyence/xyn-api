@@ -876,6 +876,40 @@ class DraftSessionDefaultsTests(TestCase):
         self.assertEqual(env["DB_PASSWORD"], "$${secretRef:dev/subscriber-notes/db.password}")
         self.assertEqual(env["UNCHANGED"], "${POSTGRES_PASSWORD:-ems}")
 
+    def test_sanitize_release_spec_normalizes_namespace_for_compose_project(self):
+        release_spec = {
+            "metadata": {
+                "name": "subscriber-notes-dev-demo",
+                "namespace": "xyence.demo",
+            }
+        }
+        sanitized = _sanitize_release_spec_for_xynseed(release_spec)
+        self.assertEqual(sanitized["metadata"]["namespace"], "xyence-demo")
+
+    def test_non_ems_blueprint_with_image_deploy_includes_remote_deploy_tasks(self):
+        blueprint = Blueprint.objects.create(name="test-b", namespace="core", metadata_json={})
+        release_target = {
+            "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "name": "test-b-dev-default",
+            "environment": "Dev",
+            "environment_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "target_instance_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "fqdn": "test-b.xyence.io",
+            "dns": {"provider": "route53", "ttl": 60},
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "tls": {"mode": "host-ingress"},
+        }
+
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog={"modules": []},
+            run_history_summary={"acceptance_checks_status": []},
+            release_target=release_target,
+        )
+        ids = {item.get("id") for item in plan.get("work_items", [])}
+        self.assertIn("build.publish_images.container", ids)
+        self.assertIn("deploy.apply_remote_compose.pull", ids)
+
     def test_submit_persists_intent_provenance_with_structured_requirements(self):
         prompt = (
             "Create a small telecom-oriented demo application called Subscriber Notes.\n"
