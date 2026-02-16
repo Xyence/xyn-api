@@ -2448,6 +2448,16 @@ def _generate_implementation_plan(
         if isinstance(blueprint_spec_json.get("releaseSpec"), dict)
         else {}
     )
+    release_spec_metadata = (
+        release_spec_payload.get("metadata")
+        if isinstance(release_spec_payload.get("metadata"), dict)
+        else {}
+    )
+    release_namespace = str(
+        release_spec_metadata.get("namespace")
+        or blueprint.namespace
+        or "core"
+    ).strip() or "core"
     release_components = (
         release_spec_payload.get("components")
         if isinstance(release_spec_payload.get("components"), list)
@@ -2680,6 +2690,9 @@ def _generate_implementation_plan(
                     "config": {
                         "images": build_images,
                         "release_components": release_components,
+                        "blueprint_id": str(blueprint.id),
+                        "blueprint_namespace": release_namespace,
+                        "blueprint_repo_slug": str(getattr(blueprint, "repo_slug", "") or "") or slugify(blueprint.name or "") or "blueprint",
                     },
                 }
             )
@@ -2956,6 +2969,12 @@ def _generate_implementation_plan(
         if item.get("id") in {"build.publish_images.container", "build.publish_images.components"}:
             config = item.setdefault("config", {})
             config.setdefault("release_version", planned_release_version)
+            config.setdefault("blueprint_id", str(blueprint.id))
+            config.setdefault("blueprint_namespace", release_namespace)
+            config.setdefault(
+                "blueprint_repo_slug",
+                str(getattr(blueprint, "repo_slug", "") or "") or slugify(blueprint.name or "") or "blueprint",
+            )
 
     plan_rationale = {"gaps_detected": [], "modules_selected": [], "why_next": ["Default plan generated."]}
     if run_history_summary.get("acceptance_checks_status"):
@@ -3703,6 +3722,13 @@ def ensure_default_release_target(
                     "transport": "ssm",
                     "mode": "compose_images",
                     "remote_root": default_remote_root,
+                    "registry": {
+                        "provider": "ecr",
+                        "region": instance.aws_region,
+                        "repository_prefix": "xyn",
+                        "naming_strategy": "ns_blueprint_component",
+                        "ensure_repo_exists": True,
+                    },
                 }
                 existing.tls_json = {
                     "mode": "host-ingress",
@@ -3725,6 +3751,13 @@ def ensure_default_release_target(
                         "transport": "ssm",
                         "mode": "compose_images",
                         "remote_root": default_remote_root,
+                        "registry": {
+                            "provider": "ecr",
+                            "region": instance.aws_region,
+                            "repository_prefix": "xyn",
+                            "naming_strategy": "ns_blueprint_component",
+                            "ensure_repo_exists": True,
+                        },
                     },
                     "tls": existing.tls_json,
                     "ingress": {
@@ -3771,6 +3804,13 @@ def ensure_default_release_target(
                 "transport": "ssm",
                 "mode": "compose_images",
                 "remote_root": default_remote_root,
+                "registry": {
+                    "provider": "ecr",
+                    "region": instance.aws_region,
+                    "repository_prefix": "xyn",
+                    "naming_strategy": "ns_blueprint_component",
+                    "ensure_repo_exists": True,
+                },
             },
             "tls": {
                 "mode": "host-ingress",

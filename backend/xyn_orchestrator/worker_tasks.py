@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -26,6 +27,7 @@ CODEGEN_GIT_NAME = os.environ.get("XYN_CODEGEN_GIT_NAME", "xyn-codegen")
 CODEGEN_GIT_EMAIL = os.environ.get("XYN_CODEGEN_GIT_EMAIL", "codegen@xyn.local")
 CODEGEN_GIT_TOKEN = os.environ.get("XYENCE_CODEGEN_GIT_TOKEN", "").strip()
 CODEGEN_PUSH = os.environ.get("XYN_CODEGEN_PUSH", os.environ.get("XYENCE_CODEGEN_PUSH", "")).strip() == "1"
+logger = logging.getLogger(__name__)
 
 
 def _headers() -> Dict[str, str]:
@@ -3277,11 +3279,56 @@ def _ecr_repo_uri(account_id: str, region: str, repo_name: str) -> str:
     return f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repo_name}"
 
 
-def _ensure_ecr_repo(client, repo_name: str) -> None:
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug or "default"
+
+
+def _compute_repo_name(
+    repository_prefix: str,
+    namespace: str,
+    blueprint_slug: str,
+    component_name: str,
+) -> str:
+    # Deterministic naming policy for release artifacts:
+    # <repository_prefix>/<namespace>/<blueprint_slug>/<component_name>
+    prefix = _slugify(repository_prefix or "xyn")
+    ns = _slugify(namespace or "core")
+    bp_slug = _slugify(blueprint_slug or "blueprint")
+    component = _slugify(component_name or "component")
+    return f"{prefix}/{ns}/{bp_slug}/{component}"
+
+
+def _ecr_ensure_repo(
+    client,
+    repo_name: str,
+    tags: Optional[Dict[str, str]] = None,
+    scan_on_push: bool = True,
+    encryption: Optional[Dict[str, Any]] = None,
+) -> None:
     try:
         client.describe_repositories(repositoryNames=[repo_name])
+        return
     except client.exceptions.RepositoryNotFoundException:
-        client.create_repository(repositoryName=repo_name)
+        pass
+
+    create_payload: Dict[str, Any] = {"repositoryName": repo_name}
+    create_payload["imageScanningConfiguration"] = {"scanOnPush": bool(scan_on_push)}
+    if encryption:
+        create_payload["encryptionConfiguration"] = encryption
+    if tags:
+        create_payload["tags"] = [
+            {"Key": str(key), "Value": str(value)}
+            for key, value in tags.items()
+            if str(key).strip() and value is not None
+        ]
+    try:
+        client.create_repository(**create_payload)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code != "RepositoryAlreadyExistsException":
+            raise
 
 
 def _docker_login_ecr(region: str) -> str:
@@ -3343,6 +3390,9 @@ def _build_publish_images(
     images: List[Dict[str, Any]],
     registry_cfg: Dict[str, Any],
     repo_sources: Dict[str, Dict[str, Any]],
+    blueprint_id: str = "",
+    blueprint_namespace: str = "",
+    blueprint_repo_slug: str = "",
 ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Dict[str, str]]]:
     started_at = datetime.utcnow().isoformat() + "Z"
     outcome = "succeeded"
@@ -3360,6 +3410,13 @@ def _build_publish_images(
     if not account_id:
         raise RuntimeError("Unable to resolve AWS account id for ECR")
     repo_prefix = registry_cfg.get("repository_prefix") or "xyn"
+    naming_strategy = str(registry_cfg.get("naming_strategy") or "ns_blueprint_component").strip().lower()
+    if naming_strategy not in {"ns_blueprint_component"}:
+        raise RuntimeError(f"Unsupported registry naming strategy: {naming_strategy}")
+    ensure_repo_exists = registry_cfg.get("ensure_repo_exists", True) is not False
+    namespace = str(blueprint_namespace or registry_cfg.get("namespace") or "core").strip() or "core"
+    blueprint_slug = str(blueprint_repo_slug or registry_cfg.get("blueprint_slug") or "blueprint").strip() or "blueprint"
+    scan_on_push = registry_cfg.get("scan_on_push", True) is not False
     registry = _docker_login_ecr(registry_region)
     ecr = boto3.client("ecr", region_name=registry_region)
     workspace = tempfile.mkdtemp(prefix="xyn-build-")
@@ -3368,6 +3425,18 @@ def _build_publish_images(
         for image in images:
             name = image.get("name")
             service = image.get("service") or name
+            repo_component_name = str(service or name or "component")
+            repo_name = _compute_repo_name(repo_prefix, namespace, blueprint_slug, repo_component_name)
+            repo_tags = {
+                "xyn:managed": "true",
+                "xyn:namespace": namespace,
+                "xyn:blueprint_id": str(blueprint_id or ""),
+                "xyn:blueprint_slug": blueprint_slug,
+                "xyn:component": _slugify(repo_component_name),
+            }
+            logger.info("ECR repo for component %s: %s", repo_component_name, repo_name)
+            if ensure_repo_exists:
+                _ecr_ensure_repo(ecr, repo_name, tags=repo_tags, scan_on_push=scan_on_push)
             explicit_image_uri = str(image.get("image_uri") or "").strip()
             if explicit_image_uri:
                 _docker_login_source_registry_if_needed(explicit_image_uri)
@@ -3380,8 +3449,6 @@ def _build_publish_images(
                     raise RuntimeError(
                         f"Unable to pull source image {explicit_image_uri}: {pull_proc.stderr or pull_proc.stdout}"
                     )
-                repo_name = f"{repo_prefix}/{name}"
-                _ensure_ecr_repo(ecr, repo_name)
                 image_uri = f"{_ecr_repo_uri(account_id, registry_region, repo_name)}:{release_id}"
                 tag_proc = subprocess.run(
                     ["docker", "tag", explicit_image_uri, image_uri],
@@ -3433,8 +3500,6 @@ def _build_publish_images(
                 raise RuntimeError(f"Build context escapes repo root for {name}")
             if not dockerfile_path.startswith(os.path.normpath(repo_dir)):
                 raise RuntimeError(f"Dockerfile path escapes repo root for {name}")
-            repo_name = f"{repo_prefix}/{name}"
-            _ensure_ecr_repo(ecr, repo_name)
             repo_uri = _ecr_repo_uri(account_id, registry_region, repo_name)
             tag = release_id
             image_uri = f"{repo_uri}:{tag}"
@@ -5039,7 +5104,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             "xyn-ui": {"url": "https://github.com/Xyence/xyn-ui", "ref": "main", "path_root": "."},
                         }
                     build_result, release_manifest, images_map = _build_publish_images(
-                        release_id, images, registry_cfg, repo_sources
+                        release_id,
+                        images,
+                        registry_cfg,
+                        repo_sources,
+                        blueprint_id=str(work_config.get("blueprint_id") or blueprint_id or ""),
+                        blueprint_namespace=str(work_config.get("blueprint_namespace") or "core"),
+                        blueprint_repo_slug=str(work_config.get("blueprint_repo_slug") or "blueprint"),
                     )
                     release_manifest["blueprint_id"] = blueprint_id or ""
                     release_manifest["release_target_id"] = (release_target or {}).get("id") or ""

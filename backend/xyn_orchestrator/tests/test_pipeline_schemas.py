@@ -40,10 +40,13 @@ from xyn_orchestrator.xyn_api import _validate_release_target_payload
 from xyn_orchestrator import xyn_api as xyn_api_module
 from xyn_orchestrator.worker_tasks import (
     _apply_scaffold_for_work_item,
+    _build_publish_images,
     _collect_git_diff,
+    _compute_repo_name,
     _build_deploy_manifest,
     _build_deploy_state_metadata,
     _build_remote_pull_apply_commands,
+    _ecr_ensure_repo,
     _render_compose_for_images,
     _render_compose_for_release_components,
     _build_ssm_service_digest_commands,
@@ -56,6 +59,7 @@ from xyn_orchestrator.worker_tasks import (
     _normalize_digest,
     _validate_release_manifest_pinned,
     _route53_ensure_with_noop,
+    _slugify,
     _run_remote_deploy,
     _work_item_capabilities,
 )
@@ -1783,6 +1787,72 @@ class PipelineSchemaTests(TestCase):
         errors = list(Draft202012Validator(schema).iter_errors(plan))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
 
+    def test_planner_build_images_from_components(self):
+        blueprint = Blueprint.objects.create(
+            name="subscriber-notes",
+            namespace="xyence.demo",
+            spec_text=json.dumps(
+                {
+                    "releaseSpec": {
+                        "metadata": {"namespace": "xyence.demo"},
+                        "repoTargets": [
+                            {
+                                "name": "xyn-ui",
+                                "url": "https://github.com/Xyence/xyn-ui",
+                                "ref": "main",
+                                "path_root": ".",
+                            },
+                            {
+                                "name": "xyn-api",
+                                "url": "https://github.com/Xyence/xyn-api",
+                                "ref": "main",
+                                "path_root": ".",
+                            },
+                        ],
+                        "components": [
+                            {
+                                "name": "web",
+                                "build": {
+                                    "repoTarget": "xyn-ui",
+                                    "context": "apps/notes-ui",
+                                    "dockerfile": "apps/notes-ui/Dockerfile",
+                                },
+                            },
+                            {
+                                "name": "api",
+                                "build": {
+                                    "repoTarget": "xyn-api",
+                                    "context": "apps/notes-api",
+                                    "dockerfile": "apps/notes-api/Dockerfile",
+                                },
+                            },
+                        ],
+                    }
+                }
+            ),
+        )
+        release_target = {
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "dns": {"provider": "route53"},
+            "tls": {"mode": "host-ingress"},
+            "fqdn": "subscriber-notes.xyence.io",
+            "target_instance_id": str(uuid.uuid4()),
+        }
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=_build_module_catalog(),
+            run_history_summary=_build_run_history_summary(blueprint, release_target),
+            release_target=release_target,
+        )
+        build_item = next(
+            item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.components"
+        )
+        self.assertEqual(len(build_item.get("repo_targets", [])), 2)
+        build_images = build_item.get("config", {}).get("images", [])
+        self.assertEqual({entry.get("service") for entry in build_images}, {"web", "api"})
+        self.assertEqual(build_item.get("config", {}).get("blueprint_namespace"), "xyence.demo")
+        self.assertEqual(build_item.get("config", {}).get("blueprint_repo_slug"), blueprint.repo_slug)
+
     def test_planner_does_not_require_blueprint_metadata_deploy(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})
         target = ReleaseTarget.objects.create(
@@ -1856,6 +1926,98 @@ class PipelineSchemaTests(TestCase):
         self.assertEqual(metadata.get("namespace"), "core")
         module_spec = data.get("module", {})
         self.assertIn("runtime.compose.apply_remote", module_spec.get("capabilitiesProvided", []))
+
+    def test_compute_repo_name_slugify(self):
+        self.assertEqual(_slugify("  XYENCE.Demo  "), "xyence-demo")
+        repo_name = _compute_repo_name("XYN", "xyence.demo", "Subscriber Notes", "Web/API")
+        self.assertEqual(repo_name, "xyn/xyence-demo/subscriber-notes/web-api")
+
+    def test_ecr_ensure_repo_creates_when_missing(self):
+        class _MissingRepo(Exception):
+            pass
+
+        fake_client = mock.Mock()
+        fake_client.exceptions = type("Exceptions", (), {"RepositoryNotFoundException": _MissingRepo})
+        fake_client.describe_repositories.side_effect = _MissingRepo()
+
+        _ecr_ensure_repo(
+            fake_client,
+            "xyn/core/subscriber-notes/web",
+            tags={"xyn:managed": "true", "xyn:component": "web"},
+            scan_on_push=True,
+        )
+
+        fake_client.create_repository.assert_called_once()
+        create_kwargs = fake_client.create_repository.call_args.kwargs
+        self.assertEqual(create_kwargs.get("repositoryName"), "xyn/core/subscriber-notes/web")
+        self.assertEqual(create_kwargs.get("imageScanningConfiguration"), {"scanOnPush": True})
+        self.assertIn({"Key": "xyn:managed", "Value": "true"}, create_kwargs.get("tags", []))
+
+    @mock.patch("xyn_orchestrator.worker_tasks.subprocess.run")
+    @mock.patch("xyn_orchestrator.worker_tasks._docker_login_source_registry_if_needed")
+    @mock.patch("xyn_orchestrator.worker_tasks._docker_login_ecr")
+    @mock.patch("xyn_orchestrator.worker_tasks.boto3.client")
+    def test_build_publish_uses_deterministic_repo_name(
+        self,
+        boto_client,
+        docker_login_ecr,
+        source_registry_login,
+        subprocess_run,
+    ):
+        class _RepoMissing(Exception):
+            pass
+
+        class _FakeEcr:
+            def __init__(self):
+                self.exceptions = type("Exceptions", (), {"RepositoryNotFoundException": _RepoMissing})
+                self.created = []
+                self.described_images = []
+
+            def describe_repositories(self, repositoryNames):
+                repo_name = repositoryNames[0]
+                if repo_name not in self.created:
+                    raise _RepoMissing()
+                return {"repositories": [{"repositoryName": repo_name}]}
+
+            def create_repository(self, **kwargs):
+                self.created.append(kwargs["repositoryName"])
+                return {"repository": {"repositoryName": kwargs["repositoryName"]}}
+
+            def describe_images(self, repositoryName, imageIds):
+                self.described_images.append((repositoryName, imageIds))
+                return {"imageDetails": [{"imageDigest": "sha256:abc123"}]}
+
+        fake_sts = mock.Mock()
+        fake_sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        fake_ecr = _FakeEcr()
+        boto_client.side_effect = lambda service, region_name=None: fake_sts if service == "sts" else fake_ecr
+        docker_login_ecr.return_value = "123456789012.dkr.ecr.us-east-1.amazonaws.com"
+        source_registry_login.return_value = None
+        subprocess_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+
+        build_result, _manifest, _images_map = _build_publish_images(
+            release_id="v101",
+            images=[{"name": "web", "service": "web", "image_uri": "public.ecr.aws/nginx/nginx:latest"}],
+            registry_cfg={"provider": "ecr", "region": "us-east-1", "repository_prefix": "xyn"},
+            repo_sources={},
+            blueprint_id="bp-123",
+            blueprint_namespace="xyence.demo",
+            blueprint_repo_slug="subscriber-notes",
+        )
+
+        expected_repo = "xyn/xyence-demo/subscriber-notes/web"
+        self.assertTrue(any(repo == expected_repo for repo, _ in fake_ecr.described_images))
+        image_entry = build_result.get("images", [])[0]
+        self.assertEqual(image_entry.get("repository"), expected_repo)
+        self.assertIn(expected_repo, image_entry.get("image_uri", ""))
+
+    def test_repo_slug_stable_on_blueprint_rename(self):
+        blueprint = Blueprint.objects.create(name="Subscriber Notes", namespace="xyence.demo")
+        original_slug = blueprint.repo_slug
+        blueprint.name = "Subscriber Notes Renamed"
+        blueprint.save(update_fields=["name", "updated_at"])
+        blueprint.refresh_from_db()
+        self.assertEqual(blueprint.repo_slug, original_slug)
 
     def test_ingress_nginx_acme_module_spec_fields(self):
         spec_path = (

@@ -170,6 +170,7 @@ class Blueprint(models.Model):
     namespace = models.CharField(max_length=120, default="core")
     description = models.TextField(blank=True)
     spec_text = models.TextField(blank=True)
+    repo_slug = models.CharField(max_length=120, blank=True, default="")
     metadata_json = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -182,6 +183,16 @@ class Blueprint(models.Model):
 
     class Meta:
         unique_together = ("name", "namespace")
+
+    @staticmethod
+    def _default_repo_slug(name: str) -> str:
+        value = slugify(name or "") or "blueprint"
+        return value[:120] or "blueprint"
+
+    def save(self, *args, **kwargs):
+        if not self.repo_slug:
+            self.repo_slug = self._default_repo_slug(self.name)
+        super().save(*args, **kwargs)
 
     def __str__(self) -> str:
         return f"{self.namespace}.{self.name}"
