@@ -962,6 +962,49 @@ def _ensure_repo_target_complete(target: Dict[str, Any], context: str = "repo ta
     return target
 
 
+def _guess_repo_target_name_for_component(
+    comp_name: str,
+    context_hint: str,
+    repo_target_map: Dict[str, Dict[str, Any]],
+) -> str:
+    names = list(repo_target_map.keys())
+    if not names:
+        return ""
+    normalized_comp = comp_name.lower()
+    context_hint = context_hint.lower()
+    api_tokens = ("api", "backend", "migrate", "db-migrate")
+    web_tokens = ("web", "ui", "frontend", "site")
+    wants_web = any(token in normalized_comp for token in web_tokens) or any(
+        token in context_hint for token in ("/web", "frontend", "/ui")
+    )
+    wants_api = any(token in normalized_comp for token in api_tokens) or any(
+        token in context_hint for token in ("/api", "/migrate", "backend")
+    )
+
+    def _contains_any(value: str, tokens: tuple[str, ...]) -> bool:
+        value = value.lower()
+        return any(token in value for token in tokens)
+
+    for name, target in repo_target_map.items():
+        haystack = " ".join(
+            [
+                str(name or ""),
+                str(target.get("path_root") or ""),
+                str(target.get("url") or ""),
+            ]
+        )
+        if wants_web and _contains_any(haystack, web_tokens):
+            return name
+        if wants_api and _contains_any(haystack, api_tokens):
+            return name
+
+    if wants_web and "xyn-ui" in repo_target_map:
+        return "xyn-ui"
+    if wants_api and "xyn-api" in repo_target_map:
+        return "xyn-api"
+    return ""
+
+
 def _build_module_catalog() -> Dict[str, Any]:
     repo_targets = _default_repo_targets()
     catalog: List[Dict[str, Any]] = []
@@ -2564,12 +2607,11 @@ def _generate_implementation_plan(
                 # Heuristic fallback for generated drafts that omit explicit repoTarget.
                 # Keeps planner resilient while still deterministic.
                 context_hint = str(build_cfg.get("context") or "").strip().lower()
-                comp_hint = comp_name.lower()
-                preferred_name = ""
-                if comp_hint in {"web", "frontend", "ui"} or "/web" in context_hint or "frontend" in context_hint:
-                    preferred_name = "xyn-ui"
-                elif comp_hint in {"api", "backend", "migrate", "db-migrate"} or "/api" in context_hint:
-                    preferred_name = "xyn-api"
+                preferred_name = _guess_repo_target_name_for_component(
+                    comp_name=comp_name,
+                    context_hint=context_hint,
+                    repo_target_map=repo_target_map,
+                )
                 if preferred_name and preferred_name in repo_target_map:
                     repo_target_name = preferred_name
                     selected_repo_target = repo_target_map.get(repo_target_name)
