@@ -1517,6 +1517,10 @@ def _generate_implementation_plan(
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     planned_release_version = _next_release_version_for_blueprint(str(blueprint.id))
     repo_targets = _default_repo_targets()
+    if blueprint_fqn != "core.ems.platform":
+        # Non-EMS blueprints should default to repo-root paths so generated
+        # component build contexts (e.g. apps/<app>/api) resolve correctly.
+        repo_targets = [{**target, "path_root": "."} for target in repo_targets]
     blueprint_intent = _extract_blueprint_intent(blueprint)
     intent_requirements = blueprint_intent.get("requirements") if isinstance(blueprint_intent.get("requirements"), dict) else {}
     intent_prompt = (
@@ -2468,6 +2472,27 @@ def _generate_implementation_plan(
         if isinstance(release_spec_payload.get("repoTargets"), list)
         else []
     )
+    if not release_repo_targets and release_components:
+        # Backward-compatible default repo target map for generated drafts/specs
+        # that do not yet include releaseSpec.repoTargets.
+        release_repo_targets = [
+            {
+                "name": "xyn-api",
+                "url": "https://github.com/Xyence/xyn-api",
+                "ref": "main",
+                "path_root": ".",
+                "auth": "https_token",
+                "allow_write": False,
+            },
+            {
+                "name": "xyn-ui",
+                "url": "https://github.com/Xyence/xyn-ui",
+                "ref": "main",
+                "path_root": ".",
+                "auth": "https_token",
+                "allow_write": False,
+            },
+        ]
     repo_target_map: Dict[str, Dict[str, Any]] = {}
     for target in release_repo_targets:
         if not isinstance(target, dict):
@@ -2500,6 +2525,19 @@ def _generate_implementation_plan(
                     raise RuntimeError(
                         f"component {comp_name} has build config but repoTarget '{repo_target_name}' is not defined in releaseSpec.repoTargets"
                     )
+            elif len(repo_target_map) > 1:
+                # Heuristic fallback for generated drafts that omit explicit repoTarget.
+                # Keeps planner resilient while still deterministic.
+                context_hint = str(build_cfg.get("context") or "").strip().lower()
+                comp_hint = comp_name.lower()
+                preferred_name = ""
+                if comp_hint in {"web", "frontend", "ui"} or "/web" in context_hint or "frontend" in context_hint:
+                    preferred_name = "xyn-ui"
+                elif comp_hint in {"api", "backend", "migrate", "db-migrate"} or "/api" in context_hint:
+                    preferred_name = "xyn-api"
+                if preferred_name and preferred_name in repo_target_map:
+                    repo_target_name = preferred_name
+                    selected_repo_target = repo_target_map.get(repo_target_name)
             elif len(repo_target_map) == 1 and str(build_cfg.get("context") or "").strip().startswith("services/"):
                 # Fallback for simple single-repo blueprints.
                 repo_target_name, selected_repo_target = next(iter(repo_target_map.items()))
