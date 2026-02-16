@@ -2487,6 +2487,12 @@ def _validate_branding_payload(payload: Dict[str, Any], partial: bool = True) ->
 def _default_post_login_redirect(client: Optional[AppOIDCClient], app_id: str) -> str:
     if app_id == "xyn-ui":
         return "/app"
+    if client:
+        post_logout_uris = client.post_logout_redirect_uris_json or []
+        if post_logout_uris:
+            first = str(post_logout_uris[0] or "").strip()
+            if first:
+                return first
     return "/"
 
 
@@ -2507,6 +2513,11 @@ def _sanitize_return_to(raw_value: str, request: HttpRequest, client: Optional[A
         for host in os.environ.get("XYENCE_ALLOWED_RETURN_HOSTS", "").split(",")
         if host.strip()
     }
+    allowed_host_suffixes = {
+        suffix.strip().lower().lstrip(".")
+        for suffix in os.environ.get("XYENCE_ALLOWED_RETURN_HOST_SUFFIXES", "xyence.io").split(",")
+        if suffix.strip()
+    }
     allowed_hosts = {request.get_host().lower(), *env_hosts}
     if client:
         for uri in (client.redirect_uris_json or []) + (client.post_logout_redirect_uris_json or []):
@@ -2516,7 +2527,14 @@ def _sanitize_return_to(raw_value: str, request: HttpRequest, client: Optional[A
                 netloc = ""
             if netloc:
                 allowed_hosts.add(netloc)
-    if split.netloc.lower() not in allowed_hosts:
+    target_netloc = split.netloc.lower()
+    target_host = (split.hostname or "").lower()
+    exact_allowed = target_netloc in allowed_hosts or target_host in allowed_hosts
+    suffix_allowed = any(
+        target_host == suffix or target_host.endswith(f".{suffix}")
+        for suffix in allowed_host_suffixes
+    )
+    if not exact_allowed and not suffix_allowed:
         return fallback
     return urlunsplit(split)
 

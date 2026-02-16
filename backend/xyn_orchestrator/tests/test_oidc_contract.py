@@ -405,3 +405,30 @@ class OidcContractTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Continue with Google")
         self.assertContains(response, "returnTo=/app/releases")
+
+    @mock.patch("xyn_orchestrator.xyn_api.get_discovery_doc")
+    def test_authorize_allows_xyence_subdomain_return_to(self, mock_discovery):
+        provider = IdentityProvider.objects.create(
+            id="google",
+            display_name="Google",
+            issuer="https://accounts.google.com",
+            client_id="abc",
+            enabled=True,
+        )
+        AppOIDCClient.objects.create(
+            app_id="ems.platform",
+            login_mode="redirect",
+            default_provider=provider,
+            allowed_providers_json=["google"],
+            redirect_uris_json=["https://xyence.io/auth/callback"],
+        )
+        mock_discovery.return_value = {"authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth"}
+        response = self.client.get(
+            "/xyn/api/auth/oidc/google/authorize",
+            {"appId": "ems.platform", "returnTo": "https://josh-test-b.xyence.io/auth/callback"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            self.client.session.get("post_login_redirect"),
+            "https://josh-test-b.xyence.io/auth/callback",
+        )
