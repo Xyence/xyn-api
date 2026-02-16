@@ -2465,6 +2465,8 @@ export function readIdTokenFromHash(hash: string): string {
 def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dict[str, Any]:
     ssm = boto3.client("ssm", region_name=region)
     max_wait_seconds = int(os.environ.get("XYENCE_SSM_WAIT_SECONDS", "600") or "600")
+    poll_interval_seconds = max(1, int(os.environ.get("XYENCE_SSM_POLL_INTERVAL_SECONDS", "2") or "2"))
+    grace_seconds = max(0, int(os.environ.get("XYENCE_SSM_WAIT_GRACE_SECONDS", "20") or "20"))
     cmd = ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
@@ -2475,8 +2477,10 @@ def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dic
     out: Optional[Dict[str, Any]] = None
     last_error: Optional[Exception] = None
     started_at = datetime.utcnow().isoformat() + "Z"
-    polls = max(1, max_wait_seconds // 2)
-    for _ in range(polls):
+    started_monotonic = time.monotonic()
+    deadline = started_monotonic + max_wait_seconds
+    terminal_seen = False
+    while time.monotonic() < deadline:
         try:
             out = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
         except ClientError as exc:
@@ -2485,17 +2489,34 @@ def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dic
             continue
         status = out.get("Status")
         if status in {"Success", "Failed", "TimedOut", "Cancelled"}:
+            terminal_seen = True
             break
-        time.sleep(2)
+        time.sleep(poll_interval_seconds)
+    if not terminal_seen:
+        end_of_grace = time.monotonic() + grace_seconds
+        while time.monotonic() < end_of_grace:
+            try:
+                out = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+            except ClientError:
+                time.sleep(1)
+                continue
+            status = out.get("Status")
+            if status in {"Success", "Failed", "TimedOut", "Cancelled"}:
+                terminal_seen = True
+                break
+            time.sleep(1)
     if out is None:
         raise last_error or RuntimeError("SSM command invocation not found yet")
-    if out.get("Status") not in {"Success", "Failed", "TimedOut", "Cancelled"}:
+    timed_out = False
+    if not terminal_seen and out.get("Status") not in {"Success", "Failed", "TimedOut", "Cancelled"}:
+        timed_out = True
         out["Status"] = "TimedOut"
         out["ResponseCode"] = -1
         out["StandardErrorContent"] = (
             (out.get("StandardErrorContent") or "")
             + f"\nSSM command did not complete within {max_wait_seconds}s."
         ).strip()
+    elapsed_seconds = round(max(0.0, time.monotonic() - started_monotonic), 3)
     finished_at = datetime.utcnow().isoformat() + "Z"
     stdout = (out.get("StandardOutputContent") or "")[-4000:]
     stderr = (out.get("StandardErrorContent") or "")[-4000:]
@@ -2505,6 +2526,9 @@ def _run_ssm_commands(instance_id: str, region: str, commands: List[str]) -> Dic
         "response_code": out.get("ResponseCode"),
         "stdout": stdout,
         "stderr": stderr,
+        "timed_out": timed_out or out.get("Status") == "TimedOut",
+        "max_wait_seconds": max_wait_seconds,
+        "elapsed_seconds": elapsed_seconds,
         "started_at": started_at,
         "finished_at": finished_at,
     }
@@ -2654,6 +2678,11 @@ def _normalize_generated_blueprint(spec: Optional[Dict[str, Any]]) -> Dict[str, 
                         if "volume" not in mount and "name" in mount:
                             mount["volume"] = mount.get("name")
                         mount.pop("name", None)
+                # releaseSpec component schema allows either image or build, not both.
+                has_build = isinstance(component.get("build"), dict) and bool(component.get("build"))
+                has_image = isinstance(component.get("image"), str) and bool(component.get("image").strip())
+                if has_build and has_image:
+                    component.pop("image", None)
                 resources = component.get("resources")
                 if isinstance(resources, dict):
                     limits = resources.get("limits") if isinstance(resources.get("limits"), dict) else {}
@@ -3012,6 +3041,11 @@ def _build_remote_deploy_commands(root_dir: str, compose_file: str, extra_env: D
         f"export EMS_CERTS_PATH=\"{root_dir}/certs/current\"",
         f"export EMS_ACME_WEBROOT_PATH=\"{root_dir}/acme-webroot\"",
         f"mkdir -p \"{root_dir}/certs/current\" \"{root_dir}/acme-webroot\"",
+        "if [ ! -f \"$EMS_CERTS_PATH/fullchain.pem\" ] || [ ! -f \"$EMS_CERTS_PATH/privkey.pem\" ]; then "
+        "if command -v openssl >/dev/null 2>&1; then "
+        "openssl req -x509 -nodes -newkey rsa:2048 -days 30 -subj \"/CN=localhost\" "
+        "-keyout \"$EMS_CERTS_PATH/privkey.pem\" -out \"$EMS_CERTS_PATH/fullchain.pem\" >/dev/null 2>&1 || true; "
+        "fi; fi",
         f"cd \"{root_dir}/xyn-api\"",
         *env_exports,
         (
@@ -3026,8 +3060,10 @@ def _build_remote_deploy_commands(root_dir: str, compose_file: str, extra_env: D
             "EMS_CERTS_PATH=\"$EMS_CERTS_PATH\" EMS_ACME_WEBROOT_PATH=\"$EMS_ACME_WEBROOT_PATH\" "
             f"docker compose -f {compose_file} up -d --build --remove-orphans"
         ),
-        "for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 2; done",
-        "for i in $(seq 1 30); do curl -fsS http://localhost:8080/api/health && break; sleep 2; done",
+        "ok=0; for i in $(seq 1 30); do if curl -fsS http://localhost:8080/ >/dev/null; then ok=1; break; fi; sleep 2; done; "
+        "[ \"$ok\" -eq 1 ] || { echo \"post_deploy_health_failed:/\"; exit 71; }",
+        "ok=0; for i in $(seq 1 30); do if curl -fsS http://localhost:8080/api/health >/dev/null; then ok=1; break; fi; sleep 2; done; "
+        "[ \"$ok\" -eq 1 ] || { echo \"post_deploy_health_failed:/api/health\"; exit 72; }",
     ]
 
 
@@ -3413,6 +3449,23 @@ def _release_target_ingress(release_target: Optional[Dict[str, Any]]) -> Dict[st
     }
 
 
+def _default_remote_root(release_target: Optional[Dict[str, Any]]) -> str:
+    target = release_target or {}
+    runtime = target.get("runtime") if isinstance(target.get("runtime"), dict) else {}
+    configured = str(runtime.get("remote_root") or "").strip()
+    if configured:
+        return configured
+    base = (
+        str(target.get("project_key") or "").strip()
+        or str(target.get("fqdn") or "").strip()
+        or str(target.get("name") or "").strip()
+        or str(target.get("id") or "").strip()
+        or "default"
+    )
+    slug = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "default"
+    return f"/opt/xyn/apps/{slug}"
+
+
 def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target: Optional[Dict[str, Any]] = None) -> str:
     api_image = images.get("ems-api", {}).get("image_uri")
     web_image = images.get("ems-web", {}).get("image_uri")
@@ -3435,7 +3488,13 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target
         service = str(route.get("service") or "").strip()
         if service and service != "ems-web":
             continue
-        port = int(route.get("port") or 3000)
+        try:
+            port = int(route.get("port") or 8080)
+        except Exception:
+            port = 8080
+        # Legacy drafts may still carry ems-web:3000 from pre-traefik defaults; normalize to ems-web runtime port.
+        if service in {"", "ems-web"} and port == 3000:
+            port = 8080
         rid = _sanitize_route_id(host)
         route_labels += (
             "    labels:\n"
@@ -3481,7 +3540,7 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target
                 "      - \"traefik.http.routers.ems.entrypoints=websecure\"\n"
                 "      - \"traefik.http.routers.ems.tls=true\"\n"
                 "      - \"traefik.http.routers.ems.tls.certresolver=le\"\n"
-                "      - \"traefik.http.services.ems.loadbalancer.server.port=3000\"\n"
+                "      - \"traefik.http.services.ems.loadbalancer.server.port=8080\"\n"
             )
     return "".join(
         [
@@ -3594,6 +3653,16 @@ def _build_remote_pull_apply_commands(
     ingress_compose_path = "/opt/xyn/ingress/compose.ingress.yml"
     safe_fqdn = str(fqdn or "").replace("\"", "\\\"")
     ingress_mode = str(tls_mode or "none").strip().lower() == "host-ingress"
+    cert_bootstrap_cmds = [
+        "export EMS_CERTS_PATH=\"${EMS_CERTS_PATH:-/opt/xyn/certs/current}\"",
+        "mkdir -p \"$EMS_CERTS_PATH\"",
+        "if [ ! -f \"$EMS_CERTS_PATH/fullchain.pem\" ] || [ ! -f \"$EMS_CERTS_PATH/privkey.pem\" ]; then "
+        "if command -v openssl >/dev/null 2>&1; then "
+        "openssl req -x509 -nodes -newkey rsa:2048 -days 30 "
+        "-subj \"/CN=${EMS_FQDN:-localhost}\" "
+        "-keyout \"$EMS_CERTS_PATH/privkey.pem\" -out \"$EMS_CERTS_PATH/fullchain.pem\" >/dev/null 2>&1 || true; "
+        "fi; fi",
+    ]
     ingress_compose = _render_traefik_ingress_compose(ingress_network, acme_email)
     ingress_cmds: List[str] = []
     if ingress_mode:
@@ -3630,18 +3699,23 @@ def _build_remote_pull_apply_commands(
         f"aws ecr get-login-password --region {registry_region} | docker login --username AWS --password-stdin {registry_host}",
         f"export EMS_FQDN=\"{safe_fqdn}\"",
         *env_exports,
+        *cert_bootstrap_cmds,
         *ingress_cmds,
         f"docker compose -f \"{compose_path}\" pull",
         f"docker compose -f \"{compose_path}\" up -d --remove-orphans",
         (
-            "for i in $(seq 1 60); do curl -fsS https://${EMS_FQDN}/health && break; sleep 5; done"
+            "ok=0; for i in $(seq 1 60); do if curl -fsS https://${EMS_FQDN}/ >/dev/null; then ok=1; break; fi; sleep 5; done; "
+            "[ \"$ok\" -eq 1 ] || { echo \"post_deploy_health_failed:/\"; exit 71; }"
             if ingress_mode
-            else "for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 2; done"
+            else "ok=0; for i in $(seq 1 30); do if curl -fsS http://localhost:8080/ >/dev/null; then ok=1; break; fi; sleep 2; done; "
+            "[ \"$ok\" -eq 1 ] || { echo \"post_deploy_health_failed:/\"; exit 71; }"
         ),
         (
-            "for i in $(seq 1 60); do curl -fsS https://${EMS_FQDN}/api/health && break; sleep 5; done"
+            "ok=0; for i in $(seq 1 60); do if curl -fsS https://${EMS_FQDN}/api/health >/dev/null; then ok=1; break; fi; sleep 5; done; "
+            "[ \"$ok\" -eq 1 ] || { echo \"post_deploy_health_failed:/api/health\"; exit 72; }"
             if ingress_mode
-            else "for i in $(seq 1 30); do curl -fsS http://localhost:8080/api/health && break; sleep 2; done"
+            else "ok=0; for i in $(seq 1 30); do if curl -fsS http://localhost:8080/api/health >/dev/null; then ok=1; break; fi; sleep 2; done; "
+            "[ \"$ok\" -eq 1 ] || { echo \"post_deploy_health_failed:/api/health\"; exit 72; }"
         ),
     ]
 
@@ -3848,12 +3922,22 @@ def _build_deploy_state_metadata(
 def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
     checks = []
     ok = True
-    for path, name in [("/health", "public_health"), ("/api/health", "public_api_health")]:
+    for path, name, expected in [
+        ("/", "public_root", {200, 301, 302, 307, 308}),
+        ("/health", "public_health", {200}),
+        ("/api/health", "public_api_health", {200}),
+    ]:
         url = f"http://{fqdn}{path}"
         try:
-            response = requests.get(url, timeout=10)
-            status_ok = response.status_code == 200
-            checks.append({"name": name, "ok": status_ok, "detail": str(response.status_code)})
+            response = requests.get(url, timeout=10, allow_redirects=True)
+            detail = {
+                "status_code": response.status_code,
+                "url": response.url,
+                "content_type": response.headers.get("content-type", ""),
+                "body_preview": (response.text or "").strip().replace("\n", " ")[:200],
+            }
+            status_ok = response.status_code in expected
+            checks.append({"name": name, "ok": status_ok, "detail": detail})
             ok = ok and status_ok
         except Exception as exc:
             checks.append({"name": name, "ok": False, "detail": str(exc)})
@@ -3956,7 +4040,7 @@ def _run_remote_deploy(
             "exec_result": {},
         }
     runtime = (release_target or {}).get("runtime") or {}
-    remote_root = runtime.get("remote_root") or "/opt/xyn/apps/ems"
+    remote_root = _default_remote_root(release_target)
     compose_file = runtime.get("compose_file_path") or "compose.release.yml"
     commands = _build_remote_deploy_commands(remote_root, compose_file, extra_env)
     exec_result = _run_ssm_commands(
@@ -3967,6 +4051,15 @@ def _run_remote_deploy(
     finished_at = datetime.utcnow().isoformat() + "Z"
     ssm_ok = exec_result.get("invocation_status") == "Success"
     public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
+    errors: List[Dict[str, Any]] = []
+    if ssm_ok and not public_ok and fqdn:
+        errors.append(
+            {
+                "code": "post_deploy_smoke_failed",
+                "message": "Post-deploy smoke checks failed for public endpoints.",
+                "detail": {"fqdn": fqdn, "checks": public_checks},
+            }
+        )
     return {
         "deploy_result": {
             "schema_version": "deploy_result.v1",
@@ -3978,7 +4071,7 @@ def _run_remote_deploy(
             "verification": public_checks,
             "started_at": started_at,
             "finished_at": finished_at,
-            "errors": [],
+            "errors": errors,
         },
         "public_checks": public_checks,
         "ssm_invoked": True,
@@ -3993,11 +4086,43 @@ def _ssm_preflight_check(exec_result: Dict[str, Any]) -> tuple[bool, str, Option
         ("missing_compose", "missing_compose"),
         ("missing_git", "missing_git"),
         ("missing_curl", "missing_curl"),
+        ("post_deploy_health_failed:/", "post_deploy_health_failed"),
+        ("post_deploy_health_failed:/api/health", "post_deploy_api_health_failed"),
     ]:
         if token in output:
             return False, token, code
     ok = exec_result.get("invocation_status") == "Success"
     return ok, "ok" if ok else "failed", None
+
+
+def _build_ssm_failure_error(exec_result: Dict[str, Any], redacted_stderr: str, redacted_stdout: str) -> Dict[str, Any]:
+    is_timeout = bool(exec_result.get("timed_out")) or exec_result.get("invocation_status") == "TimedOut"
+    response_code = exec_result.get("response_code")
+    if is_timeout:
+        code = "ssm_timeout"
+        message = f"SSM command timed out after {exec_result.get('max_wait_seconds')}s"
+    elif response_code == 71:
+        code = "post_deploy_health_failed"
+        message = "Post-deploy /health check failed on target."
+    elif response_code == 72:
+        code = "post_deploy_api_health_failed"
+        message = "Post-deploy /api/health check failed on target."
+    else:
+        code = "ssm_failed"
+        message = "SSM command failed"
+    return {
+        "code": code,
+        "message": message,
+        "detail": {
+            "ssm_command_id": exec_result.get("ssm_command_id", ""),
+            "invocation_status": exec_result.get("invocation_status", ""),
+            "response_code": exec_result.get("response_code"),
+            "max_wait_seconds": exec_result.get("max_wait_seconds"),
+            "elapsed_seconds": exec_result.get("elapsed_seconds"),
+            "stderr": redacted_stderr,
+            "stdout": redacted_stdout,
+        },
+    }
 
 
 def _build_deploy_verification(
@@ -4925,7 +5050,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         success = True
                     else:
                         runtime = (release_target or {}).get("runtime") or {}
-                        remote_root = runtime.get("remote_root") or "/opt/xyn/apps/ems"
+                        remote_root = _default_remote_root(release_target)
                         compose_file = runtime.get("compose_file_path") or "compose.release.yml"
                         env_public = {k: v for k, v in effective_env.items() if k not in secret_keys}
                         deploy_manifest = _build_deploy_manifest(
@@ -4964,6 +5089,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             success = False
                             preflight_ok, _, preflight_code = _ssm_preflight_check(exec_result)
                             error_detail = _redact_secrets(exec_result.get("stderr", "") or "", secret_values)
+                            stdout_detail = _redact_secrets(exec_result.get("stdout", "") or "", secret_values)
                             top_error_code = preflight_code or ("ssm_preflight_failed" if not preflight_ok else "ssm_failed")
                             if preflight_code:
                                 deploy_result.setdefault("errors", []).append(
@@ -4981,18 +5107,13 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                         "detail": error_detail,
                                     }
                                 )
-                            deploy_result.setdefault("errors", []).append(
-                                {
-                                    "code": "ssm_failed",
-                                    "message": "SSM command failed",
-                                    "detail": error_detail,
-                                }
-                            )
+                            ssm_failure = _build_ssm_failure_error(exec_result, error_detail, stdout_detail)
+                            deploy_result.setdefault("errors", []).append(ssm_failure)
                             errors.append(
                                 {
-                                    "code": top_error_code,
+                                    "code": ssm_failure.get("code") or top_error_code,
                                     "message": "Remote deploy via SSM failed.",
-                                    "detail": {"error": error_detail},
+                                    "detail": ssm_failure.get("detail") or {"error": error_detail},
                                 }
                             )
                         deploy_url = _write_artifact(
@@ -5167,7 +5288,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                                 remote_hash = _ssm_fetch_compose_hash(
                                     target_instance.get("instance_id"),
                                     target_instance.get("aws_region"),
-                                    f"{(release_target or {}).get('runtime', {}).get('remote_root') or '/opt/xyn/apps/ems'}/compose.release.sha256",
+                                    f"{_default_remote_root(release_target)}/compose.release.sha256",
                                 )
                                 if _normalize_sha256(remote_hash or "") != _normalize_sha256(compose_hash):
                                     match = False
@@ -5235,7 +5356,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         deploy_manifest = _build_deploy_manifest(
                             fqdn,
                             target_instance,
-                            (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
+                            _default_remote_root(release_target),
                             "compose.release.yml",
                             env_public,
                             secret_keys,
@@ -5249,7 +5370,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             {"name": "deploy_manifest.json", "kind": "deploy", "url": manifest_url},
                         )
                         commands = _build_remote_pull_apply_commands(
-                            (release_target or {}).get("runtime", {}).get("remote_root") or "/opt/xyn/apps/ems",
+                            _default_remote_root(release_target),
                             compose_content,
                             compose_hash,
                             manifest_json,
@@ -5296,6 +5417,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             "finished_at": datetime.utcnow().isoformat() + "Z",
                             "errors": [],
                         }
+                        if exec_result.get("invocation_status") == "Success" and fqdn and not public_ok:
+                            deploy_result.setdefault("errors", []).append(
+                                {
+                                    "code": "post_deploy_smoke_failed",
+                                    "message": "Post-deploy smoke checks failed for public endpoints.",
+                                    "detail": {"fqdn": fqdn, "checks": public_checks},
+                                }
+                            )
                         if noop_debug:
                             deploy_result.setdefault("errors", []).append(
                                 {
@@ -5307,18 +5436,14 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                         if exec_result.get("invocation_status") != "Success":
                             success = False
                             error_detail = _redact_secrets(exec_result.get("stderr", "") or "", secret_values)
-                            deploy_result.setdefault("errors", []).append(
-                                {
-                                    "code": "ssm_failed",
-                                    "message": "SSM command failed",
-                                    "detail": error_detail,
-                                }
-                            )
+                            stdout_detail = _redact_secrets(exec_result.get("stdout", "") or "", secret_values)
+                            ssm_failure = _build_ssm_failure_error(exec_result, error_detail, stdout_detail)
+                            deploy_result.setdefault("errors", []).append(ssm_failure)
                             errors.append(
                                 {
-                                    "code": "ssm_failed",
+                                    "code": ssm_failure.get("code") or "ssm_failed",
                                     "message": "Remote deploy via image pull failed.",
-                                    "detail": {"error": error_detail},
+                                    "detail": ssm_failure.get("detail") or {"error": error_detail},
                                 }
                             )
                         deploy_url = _write_artifact(
@@ -5426,7 +5551,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     if not target_instance or not target_instance.get("instance_id"):
                         raise RuntimeError("Target instance missing for TLS bootstrap")
                     runtime = (release_target or {}).get("runtime") or {}
-                    root_dir = runtime.get("remote_root") or "/opt/xyn/apps/ems"
+                    root_dir = _default_remote_root(release_target)
                     compose_file = runtime.get("compose_file_path") or "compose.release.yml"
                     exec_result = _run_ssm_commands(
                         target_instance.get("instance_id"),
@@ -5508,7 +5633,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     if not target_instance or not target_instance.get("instance_id"):
                         raise RuntimeError("Target instance missing for TLS nginx configure")
                     runtime = (release_target or {}).get("runtime") or {}
-                    root_dir = runtime.get("remote_root") or "/opt/xyn/apps/ems"
+                    root_dir = _default_remote_root(release_target)
                     compose_file = runtime.get("compose_file_path") or "compose.release.yml"
                     exec_result = _run_ssm_commands(
                         target_instance.get("instance_id"),

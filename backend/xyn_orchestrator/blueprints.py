@@ -3504,6 +3504,9 @@ def ensure_default_release_target(
     blueprint_slug = slugify(blueprint_spec.name) or "blueprint"
     env_slug = slugify(env_name) or "env"
     target_name = f"{blueprint_slug}-{env_slug}-default"
+    project_key = f"{blueprint_spec.namespace}.{blueprint_spec.name}"
+    remote_root_slug = re.sub(r"[^a-z0-9]+", "-", project_key.lower()).strip("-") or "default"
+    default_remote_root = f"/opt/xyn/apps/{remote_root_slug}"
 
     with transaction.atomic():
         existing = (
@@ -3520,7 +3523,12 @@ def ensure_default_release_target(
                 existing.target_instance = instance
                 existing.fqdn = fqdn
                 existing.dns_json = {"provider": "route53", "ttl": 60}
-                existing.runtime_json = {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"}
+                existing.runtime_json = {
+                    "type": "docker-compose",
+                    "transport": "ssm",
+                    "mode": "compose_images",
+                    "remote_root": default_remote_root,
+                }
                 existing.tls_json = {
                     "mode": "host-ingress",
                     "provider": "traefik",
@@ -3537,7 +3545,12 @@ def ensure_default_release_target(
                     "target_instance_id": str(instance.id),
                     "fqdn": fqdn,
                     "dns": {"provider": "route53", "ttl": 60},
-                    "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+                    "runtime": {
+                        "type": "docker-compose",
+                        "transport": "ssm",
+                        "mode": "compose_images",
+                        "remote_root": default_remote_root,
+                    },
                     "tls": existing.tls_json,
                     "ingress": {
                         "network": "xyn-edge",
@@ -3545,7 +3558,7 @@ def ensure_default_release_target(
                             {
                                 "host": fqdn,
                                 "service": "ems-web",
-                                "port": 3000,
+                                "port": 8080,
                                 "protocol": "http",
                                 "health_path": "/health",
                             }
@@ -3578,7 +3591,12 @@ def ensure_default_release_target(
             "target_instance_id": str(instance.id),
             "fqdn": fqdn,
             "dns": {"provider": "route53", "ttl": 60},
-            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "runtime": {
+                "type": "docker-compose",
+                "transport": "ssm",
+                "mode": "compose_images",
+                "remote_root": default_remote_root,
+            },
             "tls": {
                 "mode": "host-ingress",
                 "provider": "traefik",
@@ -3594,7 +3612,7 @@ def ensure_default_release_target(
                     {
                         "host": fqdn,
                         "service": "ems-web",
-                        "port": 3000,
+                        "port": 8080,
                         "protocol": "http",
                         "health_path": "/health",
                     }
@@ -6328,7 +6346,12 @@ def internal_release_target_check_drift(request: HttpRequest, target_id: str) ->
         "compose_sha256": (state.get("compose") or {}).get("content_hash") if state else "",
     }
     runtime = (release_target.config_json or {}).get("runtime") if hasattr(release_target, "config_json") else {}
-    remote_root = (runtime or {}).get("remote_root") or "/opt/xyn/apps/ems"
+    if (runtime or {}).get("remote_root"):
+        remote_root = str((runtime or {}).get("remote_root"))
+    else:
+        project_key = f"{blueprint.namespace}.{blueprint.name}" if blueprint else ""
+        remote_root_slug = re.sub(r"[^a-z0-9]+", "-", project_key.lower()).strip("-") or "default"
+        remote_root = f"/opt/xyn/apps/{remote_root_slug}"
     actual = _ssm_fetch_runtime_marker(instance.instance_id, instance.aws_region or "", remote_root)
     drift = False
     if expected.get("release_uuid") and expected.get("release_uuid") != actual.get("release_uuid"):
