@@ -50,8 +50,12 @@ def _load_oidc_config(force: bool = False) -> Dict[str, Any]:
 def _provider_by_issuer(issuer: str) -> Dict[str, Any]:
     config = _load_oidc_config()
     providers = config.get("allowed_providers") or []
+    normalized = issuer.rstrip("/")
+    normalized_alt = normalized.replace("https://", "", 1)
     for provider in providers:
-        if str(provider.get("issuer", "")).rstrip("/") == issuer.rstrip("/"):
+        provider_issuer = str(provider.get("issuer", "")).rstrip("/")
+        provider_alt = provider_issuer.replace("https://", "", 1)
+        if provider_issuer in {normalized, normalized_alt} or provider_alt in {normalized, normalized_alt}:
             return provider
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown OIDC issuer")
 
@@ -86,22 +90,39 @@ def _decode_oidc_token(token: str) -> Dict[str, Any]:
             token,
             signing_key.key,
             algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
-            issuer=issuer,
-            audience=client_id,
+            options={"verify_aud": False},
         )
-        return claims
     except Exception:
         # Unknown KID or rotated key; refresh discovery/JWKS and retry once.
         jwks_uri = _jwks_for_issuer(issuer, force=True)
         jwk_client = jwt.PyJWKClient(jwks_uri)
         signing_key = jwk_client.get_signing_key_from_jwt(token)
-        return jwt.decode(
+        claims = jwt.decode(
             token,
             signing_key.key,
             algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
-            issuer=issuer,
-            audience=client_id,
+            options={"verify_aud": False},
         )
+
+    token_issuer = str(claims.get("iss") or "").rstrip("/")
+    token_issuer_alt = token_issuer.replace("https://", "", 1)
+    provider_issuer = str(provider.get("issuer") or issuer).rstrip("/")
+    provider_issuer_alt = provider_issuer.replace("https://", "", 1)
+    if token_issuer not in {provider_issuer, provider_issuer_alt} and token_issuer_alt not in {
+        provider_issuer,
+        provider_issuer_alt,
+    }:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token issuer")
+
+    aud = claims.get("aud")
+    if isinstance(aud, list):
+        aud_ok = client_id in aud
+    else:
+        aud_ok = str(aud or "") == client_id
+    if not aud_ok:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token audience")
+
+    return claims
 
 
 def decode_token(token: str) -> Dict[str, Any]:
