@@ -3153,6 +3153,7 @@ def _work_item_capabilities(work_item: Dict[str, Any], work_item_id: str) -> set
             "tls-nginx-configure": ["ingress.nginx.tls_configure"],
             "remote-deploy-verify-https": ["deploy.verify.public_https"],
             "build.publish_images.container": ["build.container.image", "publish.container.registry"],
+            "build.publish_images.components": ["build.container.image", "publish.container.registry"],
             "deploy.apply_remote_compose.pull": ["runtime.compose.pull_apply_remote"],
         }
         caps = legacy_caps.get(work_item_id, [])
@@ -3313,8 +3314,8 @@ def _build_publish_images(
     release_id: str,
     images: List[Dict[str, Any]],
     registry_cfg: Dict[str, Any],
-    repo_sources: Dict[str, Dict[str, str]],
-) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, str]]:
+    repo_sources: Dict[str, Dict[str, Any]],
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Dict[str, str]]]:
     started_at = datetime.utcnow().isoformat() + "Z"
     outcome = "succeeded"
     errors: List[Dict[str, Any]] = []
@@ -3336,6 +3337,50 @@ def _build_publish_images(
         for image in images:
             name = image.get("name")
             service = image.get("service") or name
+            explicit_image_uri = str(image.get("image_uri") or "").strip()
+            if explicit_image_uri:
+                digest = ""
+                image_uri = explicit_image_uri
+                if "@sha256:" in explicit_image_uri:
+                    image_uri, digest = explicit_image_uri.split("@", 1)
+                    digest = digest.strip()
+                    if not digest.startswith("sha256:"):
+                        digest = f"sha256:{digest}"
+                if not digest:
+                    pull_proc = subprocess.run(
+                        ["docker", "pull", explicit_image_uri],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if pull_proc.returncode == 0:
+                        inspect_proc = subprocess.run(
+                            ["docker", "image", "inspect", explicit_image_uri, "--format", "{{json .RepoDigests}}"],
+                            capture_output=True,
+                            text=True,
+                        )
+                        if inspect_proc.returncode == 0:
+                            try:
+                                repo_digests = json.loads((inspect_proc.stdout or "[]").strip() or "[]")
+                            except Exception:
+                                repo_digests = []
+                            if isinstance(repo_digests, list) and repo_digests:
+                                first = str(repo_digests[0] or "")
+                                if "@sha256:" in first:
+                                    digest = "sha256:" + first.split("@sha256:", 1)[1]
+                image_results.append(
+                    {
+                        "name": name,
+                        "repository": explicit_image_uri.split("/", 1)[-1].split(":", 1)[0],
+                        "tag": release_id,
+                        "image_uri": image_uri,
+                        "digest": digest,
+                        "built_at": datetime.utcnow().isoformat() + "Z",
+                        "pushed": True,
+                        "source": "prebuilt",
+                    }
+                )
+                images_map[service] = {"image_uri": image_uri, "digest": digest}
+                continue
             repo_key = image.get("repo") or "xyn-api"
             source = repo_sources.get(repo_key)
             if not source:
@@ -3345,18 +3390,32 @@ def _build_publish_images(
                 _checkout_repo(source["url"], source.get("ref", "main"), repo_dir)
                 checked_out[repo_key] = repo_dir
             repo_dir = checked_out[repo_key]
-            context_path = os.path.join(repo_dir, image.get("context_path", ""))
-            dockerfile_path = os.path.join(repo_dir, image.get("dockerfile_path", "Dockerfile"))
+            base_root = os.path.join(repo_dir, str(source.get("path_root") or "").strip())
+            context_rel = str(image.get("context_path") or "").strip()
+            dockerfile_rel = str(image.get("dockerfile_path") or "Dockerfile").strip()
+            context_path = os.path.normpath(os.path.join(base_root, context_rel))
+            dockerfile_path = os.path.normpath(os.path.join(base_root, dockerfile_rel))
+            if not context_path.startswith(os.path.normpath(repo_dir)):
+                raise RuntimeError(f"Build context escapes repo root for {name}")
+            if not dockerfile_path.startswith(os.path.normpath(repo_dir)):
+                raise RuntimeError(f"Dockerfile path escapes repo root for {name}")
             repo_name = f"{repo_prefix}/{name}"
             _ensure_ecr_repo(ecr, repo_name)
             repo_uri = _ecr_repo_uri(account_id, registry_region, repo_name)
             tag = release_id
             image_uri = f"{repo_uri}:{tag}"
-            build_proc = subprocess.run(
-                ["docker", "build", "-f", dockerfile_path, "-t", image_uri, context_path],
-                capture_output=True,
-                text=True,
-            )
+            build_cmd = ["docker", "build", "-f", dockerfile_path, "-t", image_uri]
+            if image.get("target"):
+                build_cmd.extend(["--target", str(image.get("target"))])
+            build_args = image.get("build_args")
+            if isinstance(build_args, dict):
+                for key in sorted(build_args.keys()):
+                    value = build_args.get(key)
+                    if value is None:
+                        continue
+                    build_cmd.extend(["--build-arg", f"{key}={value}"])
+            build_cmd.append(context_path)
+            build_proc = subprocess.run(build_cmd, capture_output=True, text=True)
             if build_proc.returncode != 0:
                 outcome = "failed"
                 image_results.append(
@@ -3583,6 +3642,165 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target
     )
 
 
+def _render_compose_for_release_components(
+    components: List[Dict[str, Any]],
+    images: Dict[str, Dict[str, str]],
+    release_target: Optional[Dict[str, Any]] = None,
+) -> str:
+    ingress = _release_target_ingress(release_target)
+    tls_mode = ingress["tls_mode"]
+    host_ingress = tls_mode == "host-ingress"
+    route_network = ingress["network"]
+    route_defs = ingress["routes"] if isinstance(ingress["routes"], list) else []
+
+    component_by_name = {
+        str(component.get("name") or "").strip(): component
+        for component in components
+        if isinstance(component, dict) and str(component.get("name") or "").strip()
+    }
+    selected_service = ""
+    selected_port = 8080
+    for route in route_defs:
+        if not isinstance(route, dict):
+            continue
+        candidate = str(route.get("service") or "").strip()
+        if candidate and candidate in component_by_name:
+            selected_service = candidate
+            try:
+                selected_port = int(route.get("port") or selected_port)
+            except Exception:
+                selected_port = 8080
+            break
+    if not selected_service:
+        for candidate in ("web", "frontend", "ui", "ems-web", "api", "ems-api"):
+            if candidate in component_by_name:
+                selected_service = candidate
+                break
+    if selected_service:
+        ports = component_by_name.get(selected_service, {}).get("ports")
+        if isinstance(ports, list):
+            for port in ports:
+                if isinstance(port, dict) and port.get("containerPort"):
+                    try:
+                        selected_port = int(port.get("containerPort"))
+                    except Exception:
+                        pass
+                    break
+
+    compose_lines: List[str] = ["services:\n"]
+    volume_names: List[str] = []
+    has_edge_network = False
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        name = str(component.get("name") or "").strip()
+        if not name:
+            continue
+        image_info = images.get(name) if isinstance(images, dict) else {}
+        image_uri = str((image_info or {}).get("image_uri") or component.get("image") or "").strip()
+        digest = str((image_info or {}).get("digest") or "").strip()
+        if digest and image_uri and "@sha256:" not in image_uri:
+            image_uri = f"{image_uri.split('@', 1)[0]}@{digest}"
+        if not image_uri:
+            continue
+
+        compose_lines.append(f"  {name}:\n")
+        compose_lines.append(f"    image: {image_uri}\n")
+
+        env = component.get("env")
+        if isinstance(env, dict) and env:
+            compose_lines.append("    environment:\n")
+            for key in sorted(env.keys()):
+                value = env.get(key)
+                if value is None:
+                    continue
+                safe = str(value).replace("\"", "\\\"")
+                compose_lines.append(f"      {key}: \"{safe}\"\n")
+
+        depends_on = component.get("dependsOn")
+        if isinstance(depends_on, list):
+            depends = [str(dep).strip() for dep in depends_on if str(dep).strip()]
+            if depends:
+                compose_lines.append("    depends_on:\n")
+                for dep in depends:
+                    compose_lines.append(f"      - {dep}\n")
+
+        ports = component.get("ports")
+        exposed: List[int] = []
+        if isinstance(ports, list):
+            for port in ports:
+                if not isinstance(port, dict):
+                    continue
+                try:
+                    container_port = int(port.get("containerPort"))
+                except Exception:
+                    continue
+                exposed.append(container_port)
+        if exposed:
+            compose_lines.append("    expose:\n")
+            for port in exposed:
+                compose_lines.append(f"      - \"{port}\"\n")
+
+        mounts = component.get("volumeMounts")
+        if isinstance(mounts, list):
+            mount_lines: List[str] = []
+            for mount in mounts:
+                if not isinstance(mount, dict):
+                    continue
+                volume = str(mount.get("volume") or "").strip()
+                mount_path = str(mount.get("mountPath") or "").strip()
+                if not volume or not mount_path:
+                    continue
+                slug = re.sub(r"[^a-z0-9_-]+", "-", volume.lower()).strip("-") or "data"
+                volume_name = f"{name}_{slug}"
+                if volume_name not in volume_names:
+                    volume_names.append(volume_name)
+                mount_lines.append(f"      - {volume_name}:{mount_path}\n")
+            if mount_lines:
+                compose_lines.append("    volumes:\n")
+                compose_lines.extend(mount_lines)
+
+        networks = ["      - default\n"]
+        needs_edge = host_ingress and (
+            name == selected_service
+            or any((route.get("service") or "") == name for route in route_defs if isinstance(route, dict))
+        )
+        if needs_edge:
+            has_edge_network = True
+            networks.append(f"      - {route_network}\n")
+        compose_lines.append("    networks:\n")
+        compose_lines.extend(networks)
+
+        if host_ingress and name == selected_service:
+            for route in route_defs:
+                if not isinstance(route, dict):
+                    continue
+                host = str(route.get("host") or "").strip()
+                if not host:
+                    continue
+                rid = _sanitize_route_id(host)
+                compose_lines.append("    labels:\n")
+                compose_lines.append("      - \"traefik.enable=true\"\n")
+                compose_lines.append(f"      - \"traefik.docker.network={route_network}\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}.rule=Host(`{host}`)\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}.entrypoints=websecure\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}.tls=true\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}.tls.certresolver=le\"\n")
+                compose_lines.append(f"      - \"traefik.http.services.{rid}.loadbalancer.server.port={selected_port}\"\n")
+                break
+        compose_lines.append("\n")
+
+    if volume_names:
+        compose_lines.append("volumes:\n")
+        for volume in volume_names:
+            compose_lines.append(f"  {volume}: {{}}\n")
+    if has_edge_network:
+        compose_lines.append("networks:\n")
+        compose_lines.append(f"  {route_network}:\n")
+        compose_lines.append("    external: true\n")
+    return "".join(compose_lines)
+
+
 def _render_traefik_ingress_compose(network: str, acme_email: str) -> str:
     email = acme_email or "admin@xyence.io"
     return (
@@ -3676,6 +3894,12 @@ def _build_remote_pull_apply_commands(
             "if [ -n \"$PORT_OWNERS\" ]; then echo \"ingress_port_collision:$PORT_OWNERS\"; exit 61; fi",
             f"docker compose -f \"{ingress_compose_path}\" up -d",
         ]
+    registry_login_cmds: List[str] = []
+    registry_host_value = str(registry_host or "").strip()
+    if registry_host_value and "amazonaws.com" in registry_host_value:
+        registry_login_cmds.append(
+            f"aws ecr get-login-password --region {registry_region} | docker login --username AWS --password-stdin {registry_host_value}"
+        )
     return [
         "set -euo pipefail",
         "command -v docker >/dev/null 2>&1 || { echo \"missing_docker\"; exit 10; }",
@@ -3696,7 +3920,7 @@ def _build_remote_pull_apply_commands(
         f"mv \"{release_id_tmp}\" \"{release_id_path}\"",
         f"echo \"{release_uuid}\" > \"{release_uuid_tmp}\"",
         f"mv \"{release_uuid_tmp}\" \"{release_uuid_path}\"",
-        f"aws ecr get-login-password --region {registry_region} | docker login --username AWS --password-stdin {registry_host}",
+        *registry_login_cmds,
         f"export EMS_FQDN=\"{safe_fqdn}\"",
         *env_exports,
         *cert_bootstrap_cmds,
@@ -3842,7 +4066,10 @@ def _normalize_digest(value: str) -> Optional[str]:
     return f"sha256:{normalized}"
 
 
-def _validate_release_manifest_pinned(manifest: Dict[str, Any]) -> tuple[bool, List[Dict[str, str]]]:
+def _validate_release_manifest_pinned(
+    manifest: Dict[str, Any],
+    compose_content: Optional[str] = None,
+) -> tuple[bool, List[Dict[str, str]]]:
     errors: List[Dict[str, str]] = []
     images = manifest.get("images") or {}
     if not isinstance(images, dict) or not images:
@@ -3859,7 +4086,11 @@ def _validate_release_manifest_pinned(manifest: Dict[str, Any]) -> tuple[bool, L
                 }
             )
         normalized = _normalize_sha256(str(digest))
-        if not digest:
+        host = ""
+        if image_uri and "/" in image_uri:
+            host = image_uri.split("/", 1)[0].lower()
+        requires_digest = "amazonaws.com" in host
+        if not digest and requires_digest:
             errors.append(
                 {
                     "code": "digest_missing",
@@ -3867,7 +4098,7 @@ def _validate_release_manifest_pinned(manifest: Dict[str, Any]) -> tuple[bool, L
                     "path": f"images.{service}.digest",
                 }
             )
-        elif not normalized:
+        elif digest and not normalized:
             errors.append(
                 {
                     "code": "digest_invalid",
@@ -3885,6 +4116,35 @@ def _validate_release_manifest_pinned(manifest: Dict[str, Any]) -> tuple[bool, L
                 "path": "compose.content_hash",
             }
         )
+    if compose_content:
+        try:
+            import yaml  # type: ignore
+
+            compose_data = yaml.safe_load(compose_content) or {}
+            services = compose_data.get("services") if isinstance(compose_data, dict) else {}
+            compose_services = (
+                {str(name) for name in services.keys()}
+                if isinstance(services, dict)
+                else set()
+            )
+            manifest_services = {str(name) for name in images.keys()} if isinstance(images, dict) else set()
+            missing = sorted(manifest_services - compose_services)
+            if missing:
+                errors.append(
+                    {
+                        "code": "compose_services_missing",
+                        "message": f"compose missing services for manifest images: {', '.join(missing)}",
+                        "path": "compose.services",
+                    }
+                )
+        except Exception as exc:
+            errors.append(
+                {
+                    "code": "compose_parse_failed",
+                    "message": f"unable to parse compose content: {exc}",
+                    "path": "compose",
+                }
+            )
     return len(errors) == 0, errors
 
 
@@ -4702,7 +4962,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 work_item,
                 work_item_id,
                 caps,
-                {"build.publish_images.container"},
+                {"build.publish_images.container", "build.publish_images.components"},
                 "build.container.image",
             ):
                 try:
@@ -4726,22 +4986,42 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     images = (work_item.get("config") or {}).get("images") or []
                     if not images:
                         raise RuntimeError("No images configured for build.")
-                    repo_sources = {
-                        "xyn-api": {"url": "https://github.com/Xyence/xyn-api", "ref": "main"},
-                        "xyn-ui": {"url": "https://github.com/Xyence/xyn-ui", "ref": "main"},
-                    }
+                    repo_sources: Dict[str, Dict[str, str]] = {}
+                    for repo in (work_item.get("repo_targets") or []):
+                        if not isinstance(repo, dict):
+                            continue
+                        repo_name = str(repo.get("name") or "").strip()
+                        repo_url = str(repo.get("url") or "").strip()
+                        if not repo_name or not repo_url:
+                            continue
+                        repo_sources[repo_name] = {
+                            "url": repo_url,
+                            "ref": str(repo.get("ref") or "main"),
+                            "path_root": str(repo.get("path_root") or "").strip(),
+                        }
+                    if not repo_sources:
+                        repo_sources = {
+                            "xyn-api": {"url": "https://github.com/Xyence/xyn-api", "ref": "main", "path_root": "."},
+                            "xyn-ui": {"url": "https://github.com/Xyence/xyn-ui", "ref": "main", "path_root": "."},
+                        }
                     build_result, release_manifest, images_map = _build_publish_images(
                         release_id, images, registry_cfg, repo_sources
                     )
                     release_manifest["blueprint_id"] = blueprint_id or ""
                     release_manifest["release_target_id"] = (release_target or {}).get("id") or ""
-                    compose_content = _canonicalize_compose_content(
-                        _render_compose_for_images(images_map, release_target)
-                    )
+                    release_components = work_config.get("release_components")
+                    if isinstance(release_components, list) and release_components:
+                        compose_rendered = _render_compose_for_release_components(
+                            release_components, images_map, release_target
+                        )
+                    else:
+                        compose_rendered = _render_compose_for_images(images_map, release_target)
+                    compose_content = _canonicalize_compose_content(compose_rendered)
                     compose_hash = _sha256_hex(compose_content)
                     release_manifest["compose"] = {
                         "file_path": "compose.release.yml",
                         "content_hash": compose_hash,
+                        "content": compose_content,
                     }
                     build_url = _write_artifact(run_id, "build_result.json", json.dumps(build_result, indent=2))
                     _post_json(
@@ -4898,11 +5178,16 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
             ):
                 try:
                     manifest = None
+                    compose_content = None
                     if source_run:
                         manifest = _download_artifact_json(source_run, "release_manifest.json")
+                        try:
+                            compose_content = _download_artifact_text(source_run, "compose.release.yml")
+                        except Exception:
+                            compose_content = None
                     if not manifest:
                         raise RuntimeError("release_manifest.json not found for validation")
-                    ok, validation_errors = _validate_release_manifest_pinned(manifest)
+                    ok, validation_errors = _validate_release_manifest_pinned(manifest, compose_content)
                     validation_payload = {
                         "ok": ok,
                         "errors": validation_errors,
@@ -5256,10 +5541,18 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     )
                     if not registry_region:
                         raise RuntimeError("registry.region missing for deploy")
-                    image_uri = ""
+                    registry_host = ""
                     if isinstance(images_map, dict) and images_map:
-                        image_uri = next(iter(images_map.values())).get("image_uri", "")
-                    registry_host = image_uri.split("/")[0] if image_uri else ""
+                        for image_meta in images_map.values():
+                            image_uri = str((image_meta or {}).get("image_uri") or "").strip()
+                            if not image_uri:
+                                continue
+                            head = image_uri.split("/", 1)[0]
+                            # Docker Hub short refs (e.g. postgres:16-alpine) are not registry hosts.
+                            if "/" not in image_uri or ("." not in head and ":" not in head and head != "localhost"):
+                                continue
+                            registry_host = head
+                            break
                     public_ok, public_checks = _public_verify(fqdn) if fqdn else (False, [])
                     noop_done = False
                     noop_debug = ""

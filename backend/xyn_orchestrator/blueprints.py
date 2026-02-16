@@ -880,7 +880,7 @@ def _enqueue_release_build(release: Release, user) -> Dict[str, Any]:
     build_items = [
         item
         for item in implementation_plan.get("work_items", [])
-        if item.get("id") == "build.publish_images.container"
+        if item.get("id") in {"build.publish_images.container", "build.publish_images.components"}
     ]
     if not build_items:
         run.status = "succeeded"
@@ -1291,16 +1291,24 @@ def _select_next_slice(
         if entry.get("outcome") == "succeeded"
     }
     image_deploy_present = any(item.get("id") == "deploy.apply_remote_compose.pull" for item in work_items)
-    build_present = any(item.get("id") == "build.publish_images.container" for item in work_items)
+    build_present = any(
+        item.get("id") in {"build.publish_images.container", "build.publish_images.components"}
+        for item in work_items
+    )
     metadata = blueprint.metadata_json or {}
     tls_meta = metadata.get("tls") or {}
     if release_target:
         tls_meta = release_target.get("tls") or tls_meta
     tls_mode = str(tls_meta.get("mode") or "").lower()
     host_ingress = tls_mode == "host-ingress"
+    build_item_id = (
+        "build.publish_images.components"
+        if any(item.get("id") == "build.publish_images.components" for item in work_items)
+        else "build.publish_images.container"
+    )
     remote_http_items = (
         [
-            "build.publish_images.container",
+            build_item_id,
             "release.validate_manifest.pinned",
             "dns.ensure_record.route53",
             "deploy.apply_remote_compose.pull",
@@ -1323,7 +1331,7 @@ def _select_next_slice(
         if host_ingress
         else (
             [
-                "build.publish_images.container",
+                build_item_id,
                 "release.validate_manifest.pinned",
                 "dns.ensure_record.route53",
                 "deploy.apply_remote_compose.pull",
@@ -1429,6 +1437,7 @@ def _annotate_work_items(
         "remote-deploy-compose-ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
         "deploy.apply_remote_compose.ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
         "build.publish_images.container": ["build.container.image", "publish.container.registry"],
+        "build.publish_images.components": ["build.container.image", "publish.container.registry"],
         "release.validate_manifest.pinned": ["release.manifest.pinned"],
         "deploy.apply_remote_compose.pull": ["runtime.compose.pull_apply_remote"],
         "remote-deploy-verify-public": ["deploy.verify.public_http"],
@@ -1469,6 +1478,7 @@ def _annotate_work_items(
         "remote-deploy-compose-ssm": ["deploy-ssm-compose"],
         "deploy.apply_remote_compose.ssm": ["deploy-ssm-compose"],
         "build.publish_images.container": ["build-container-publish"],
+        "build.publish_images.components": ["build-container-publish"],
         "release.validate_manifest.pinned": ["build-container-publish"],
         "deploy.apply_remote_compose.pull": ["runtime-compose-pull-apply"],
         "remote-deploy-verify-public": ["deploy-ssm-compose"],
@@ -2425,6 +2435,96 @@ def _generate_implementation_plan(
     if run_history_summary is None:
         run_history_summary = _build_run_history_summary(blueprint, release_target)
 
+    blueprint_spec_json: Dict[str, Any] = {}
+    if blueprint.spec_text:
+        try:
+            parsed_spec = json.loads(blueprint.spec_text)
+            if isinstance(parsed_spec, dict):
+                blueprint_spec_json = parsed_spec
+        except json.JSONDecodeError:
+            blueprint_spec_json = {}
+    release_spec_payload = (
+        blueprint_spec_json.get("releaseSpec")
+        if isinstance(blueprint_spec_json.get("releaseSpec"), dict)
+        else {}
+    )
+    release_components = (
+        release_spec_payload.get("components")
+        if isinstance(release_spec_payload.get("components"), list)
+        else []
+    )
+    release_repo_targets = (
+        release_spec_payload.get("repoTargets")
+        if isinstance(release_spec_payload.get("repoTargets"), list)
+        else []
+    )
+    repo_target_map: Dict[str, Dict[str, Any]] = {}
+    for target in release_repo_targets:
+        if not isinstance(target, dict):
+            continue
+        target_name = str(target.get("name") or "").strip()
+        if target_name:
+            repo_target_map[target_name] = target
+    release_image_inputs: List[Dict[str, Any]] = []
+    release_build_inputs: List[Dict[str, Any]] = []
+    selected_repo_targets: Dict[str, Dict[str, Any]] = {}
+    for component in release_components:
+        if not isinstance(component, dict):
+            continue
+        comp_name = str(component.get("name") or "").strip()
+        if not comp_name:
+            continue
+        image_name = re.sub(r"[^a-z0-9._-]+", "-", comp_name.lower()).strip("-") or "component"
+        comp_image = str(component.get("image") or "").strip()
+        build_cfg = component.get("build") if isinstance(component.get("build"), dict) else {}
+        if build_cfg:
+            repo_target_name = str(
+                build_cfg.get("repoTarget")
+                or component.get("repoTarget")
+                or ""
+            ).strip()
+            selected_repo_target: Optional[Dict[str, Any]] = None
+            if repo_target_name:
+                selected_repo_target = repo_target_map.get(repo_target_name)
+                if not selected_repo_target:
+                    raise RuntimeError(
+                        f"component {comp_name} has build config but repoTarget '{repo_target_name}' is not defined in releaseSpec.repoTargets"
+                    )
+            elif len(repo_target_map) == 1 and str(build_cfg.get("context") or "").strip().startswith("services/"):
+                # Fallback for simple single-repo blueprints.
+                repo_target_name, selected_repo_target = next(iter(repo_target_map.items()))
+            else:
+                raise RuntimeError(
+                    f"component {comp_name} has build config but no repoTarget mapping. Add releaseSpec.repoTargets and component.build.repoTarget."
+                )
+            build_context = str(build_cfg.get("context") or "").strip()
+            if not build_context:
+                raise RuntimeError(f"component {comp_name} build.context is required")
+            dockerfile_path = str(build_cfg.get("dockerfile") or "Dockerfile").strip()
+            image_name_override = str(build_cfg.get("imageName") or image_name).strip()
+            build_entry: Dict[str, Any] = {
+                "name": image_name_override,
+                "service": comp_name,
+                "repo": repo_target_name,
+                "context_path": build_context,
+                "dockerfile_path": dockerfile_path,
+            }
+            if build_cfg.get("target"):
+                build_entry["target"] = str(build_cfg.get("target"))
+            if isinstance(build_cfg.get("args"), dict):
+                build_entry["build_args"] = build_cfg.get("args")
+            release_build_inputs.append(build_entry)
+            selected_repo_targets[repo_target_name] = selected_repo_target or {}
+            continue
+        if comp_image:
+            release_image_inputs.append(
+                {
+                    "name": image_name,
+                    "service": comp_name,
+                    "image_uri": comp_image,
+                }
+            )
+
     module_ids = {entry.get("id") for entry in module_catalog.get("modules", [])}
     metadata = blueprint.metadata_json or {}
     modules_required = metadata.get("modules_required") or []
@@ -2502,15 +2602,22 @@ def _generate_implementation_plan(
                     "deploy.apply_remote_compose.pull" if dep == "deploy.apply_remote_compose.ssm" else dep
                     for dep in item["depends_on"]
                 ]
-        build_present = any(item.get("id") == "build.publish_images.container" for item in work_items)
+        build_present = any(
+            item.get("id") in {"build.publish_images.container", "build.publish_images.components"}
+            for item in work_items
+        )
         if not manifest_override and not build_present:
-            work_items.append(
-                {
-                    "id": "build.publish_images.container",
-                    "title": "Build and publish container images",
-                    "description": "Build EMS images and publish to the container registry.",
-                    "type": "deploy",
-                    "repo_targets": [
+            build_images = release_build_inputs + release_image_inputs
+            build_repo_targets = list(selected_repo_targets.values())
+            build_id = "build.publish_images.components"
+            if release_build_inputs and not build_repo_targets:
+                raise RuntimeError("build.publish_images.components requires non-empty repo_targets")
+            if release_image_inputs and not release_build_inputs:
+                build_id = "build.publish_images.container"
+                if isinstance(release_repo_targets, list) and release_repo_targets:
+                    build_repo_targets = [target for target in release_repo_targets if isinstance(target, dict)]
+                if not build_repo_targets:
+                    build_repo_targets = [
                         {
                             "name": "xyn-api",
                             "url": "https://github.com/Xyence/xyn-api",
@@ -2518,16 +2625,52 @@ def _generate_implementation_plan(
                             "path_root": ".",
                             "auth": "https_token",
                             "allow_write": False,
-                        },
-                        {
-                            "name": "xyn-ui",
-                            "url": "https://github.com/Xyence/xyn-ui",
-                            "ref": "main",
-                            "path_root": ".",
-                            "auth": "https_token",
-                            "allow_write": False,
-                        },
-                    ],
+                        }
+                    ]
+            if not build_images:
+                # Backward-compatible EMS fallback when blueprint does not define releaseSpec.components.
+                build_images = [
+                    {
+                        "name": "ems-api",
+                        "service": "ems-api",
+                        "repo": "xyn-api",
+                        "context_path": "apps/ems-api",
+                        "dockerfile_path": "apps/ems-api/Dockerfile",
+                    },
+                    {
+                        "name": "ems-web",
+                        "service": "ems-web",
+                        "repo": "xyn-ui",
+                        "context_path": "apps/ems-ui",
+                        "dockerfile_path": "apps/ems-ui/Dockerfile",
+                    },
+                ]
+                build_repo_targets = [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    },
+                    {
+                        "name": "xyn-ui",
+                        "url": "https://github.com/Xyence/xyn-ui",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    },
+                ]
+                build_id = "build.publish_images.container"
+            work_items.append(
+                {
+                    "id": build_id,
+                    "title": "Build and publish container images",
+                    "description": "Build or resolve container images and publish release artifacts.",
+                    "type": "deploy",
+                    "repo_targets": build_repo_targets,
                     "inputs": {"artifacts": ["implementation_plan.json", "release_target.json"]},
                     "outputs": {"paths": [], "artifacts": ["build_result.json", "release_manifest.json"]},
                     "acceptance_criteria": ["Images are built and pushed to registry with digests."],
@@ -2535,26 +2678,15 @@ def _generate_implementation_plan(
                     "depends_on": [],
                     "labels": ["deploy", "build", "publish", "module:build-container-publish"],
                     "config": {
-                        "images": [
-                            {
-                                "name": "ems-api",
-                                "service": "ems-api",
-                                "repo": "xyn-api",
-                                "context_path": "apps/ems-api",
-                                "dockerfile_path": "apps/ems-api/Dockerfile",
-                            },
-                            {
-                                "name": "ems-web",
-                                "service": "ems-web",
-                                "repo": "xyn-ui",
-                                "context_path": "apps/ems-ui",
-                                "dockerfile_path": "apps/ems-ui/Dockerfile",
-                            },
-                        ]
+                        "images": build_images,
+                        "release_components": release_components,
                     },
                 }
             )
-        build_present = any(item.get("id") == "build.publish_images.container" for item in work_items)
+        build_present = any(
+            item.get("id") in {"build.publish_images.container", "build.publish_images.components"}
+            for item in work_items
+        )
         if not any(item.get("id") == "release.validate_manifest.pinned" for item in work_items):
             work_items.append(
                 {
@@ -2576,7 +2708,15 @@ def _generate_implementation_plan(
                     "outputs": {"paths": [], "artifacts": ["validation_result.json"]},
                     "acceptance_criteria": ["Release manifest uses digest-pinned images."],
                     "verify": [{"name": "validate-manifest", "command": "echo 'handled by runner'", "cwd": "."}],
-                    "depends_on": ["build.publish_images.container"] if build_present else [],
+                    "depends_on": (
+                        [
+                            "build.publish_images.components"
+                            if any(item.get("id") == "build.publish_images.components" for item in work_items)
+                            else "build.publish_images.container"
+                        ]
+                        if build_present
+                        else []
+                    ),
                     "labels": ["deploy", "validate", "release"],
                 }
             )
@@ -2813,7 +2953,7 @@ def _generate_implementation_plan(
                 artifacts.append(artifact_name)
         if release_target and "release_target.json" not in artifacts:
             artifacts.append("release_target.json")
-        if item.get("id") == "build.publish_images.container":
+        if item.get("id") in {"build.publish_images.container", "build.publish_images.components"}:
             config = item.setdefault("config", {})
             config.setdefault("release_version", planned_release_version)
 
@@ -3507,6 +3647,41 @@ def ensure_default_release_target(
     project_key = f"{blueprint_spec.namespace}.{blueprint_spec.name}"
     remote_root_slug = re.sub(r"[^a-z0-9]+", "-", project_key.lower()).strip("-") or "default"
     default_remote_root = f"/opt/xyn/apps/{remote_root_slug}"
+    ingress_service = "ems-web"
+    ingress_port = 8080
+    if blueprint_spec.spec_text:
+        try:
+            parsed_spec = json.loads(blueprint_spec.spec_text)
+        except json.JSONDecodeError:
+            parsed_spec = {}
+        if isinstance(parsed_spec, dict):
+            release_spec = parsed_spec.get("releaseSpec")
+            components = release_spec.get("components") if isinstance(release_spec, dict) else []
+            if isinstance(components, list):
+                component_names = {
+                    str(component.get("name") or "").strip()
+                    for component in components
+                    if isinstance(component, dict)
+                }
+                for candidate in ("web", "frontend", "ui", "ems-web"):
+                    if candidate in component_names:
+                        ingress_service = candidate
+                        break
+                for component in components:
+                    if not isinstance(component, dict):
+                        continue
+                    if str(component.get("name") or "").strip() != ingress_service:
+                        continue
+                    ports = component.get("ports")
+                    if isinstance(ports, list):
+                        for port in ports:
+                            if isinstance(port, dict) and port.get("containerPort"):
+                                try:
+                                    ingress_port = int(port.get("containerPort"))
+                                except Exception:
+                                    ingress_port = 8080
+                                break
+                    break
 
     with transaction.atomic():
         existing = (
@@ -3557,8 +3732,8 @@ def ensure_default_release_target(
                         "routes": [
                             {
                                 "host": fqdn,
-                                "service": "ems-web",
-                                "port": 8080,
+                                "service": ingress_service,
+                                "port": ingress_port,
                                 "protocol": "http",
                                 "health_path": "/health",
                             }
@@ -3611,8 +3786,8 @@ def ensure_default_release_target(
                 "routes": [
                     {
                         "host": fqdn,
-                        "service": "ems-web",
-                        "port": 8080,
+                        "service": ingress_service,
+                        "port": ingress_port,
                         "protocol": "http",
                         "health_path": "/health",
                     }
@@ -6336,6 +6511,7 @@ def internal_release_target_check_drift(request: HttpRequest, target_id: str) ->
     if request.method != "GET":
         return JsonResponse({"error": "GET required"}, status=405)
     release_target = get_object_or_404(ReleaseTarget, id=target_id)
+    blueprint = release_target.blueprint
     instance = ProvisionedInstance.objects.filter(id=release_target.target_instance_id).first()
     if not instance or not instance.instance_id:
         return JsonResponse({"error": "target instance missing"}, status=400)

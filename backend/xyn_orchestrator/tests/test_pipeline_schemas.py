@@ -45,6 +45,7 @@ from xyn_orchestrator.worker_tasks import (
     _build_deploy_state_metadata,
     _build_remote_pull_apply_commands,
     _render_compose_for_images,
+    _render_compose_for_release_components,
     _build_ssm_service_digest_commands,
     _parse_service_digest_lines,
     _merge_release_env,
@@ -1034,7 +1035,7 @@ class PipelineSchemaTests(TestCase):
         self.assertNotIn("ingress.nginx_tls_configure", selected_ids)
 
     def test_manifest_validation_fails_when_digest_missing(self):
-        manifest = {"images": {"ems-api": {"image_uri": "repo:tag"}}}
+        manifest = {"images": {"api": {"image_uri": "123456789012.dkr.ecr.us-west-2.amazonaws.com/xyn/api:v1"}}}
         ok, errors = _validate_release_manifest_pinned(manifest)
         self.assertFalse(ok)
         self.assertTrue(errors)
@@ -1076,6 +1077,125 @@ class PipelineSchemaTests(TestCase):
         self.assertNotIn("build.publish_images.container", ids)
         self.assertIn("release.validate_manifest.pinned", ids)
         self.assertIn("deploy.apply_remote_compose.pull", ids)
+
+    def test_planner_build_images_from_components(self):
+        spec = {
+            "apiVersion": "xyn.blueprint/v1",
+            "kind": "SolutionBlueprint",
+            "metadata": {"name": "generic-app", "namespace": "core"},
+            "releaseSpec": {
+                "apiVersion": "xyn.seed/v1",
+                "kind": "Release",
+                "metadata": {"name": "generic-app", "namespace": "core"},
+                "backend": {"type": "compose"},
+                "repoTargets": [
+                    {"name": "api-repo", "url": "https://github.com/Xyence/xyn-api", "ref": "main", "path_root": "."},
+                    {"name": "web-repo", "url": "https://github.com/Xyence/xyn-ui", "ref": "main", "path_root": "."},
+                ],
+                "components": [
+                    {
+                        "name": "api",
+                        "build": {"repoTarget": "api-repo", "context": "services/api", "dockerfile": "Dockerfile"},
+                        "ports": [{"containerPort": 8080}],
+                    },
+                    {
+                        "name": "web",
+                        "build": {"repoTarget": "web-repo", "context": "services/web", "dockerfile": "Dockerfile"},
+                        "dependsOn": ["api"],
+                        "ports": [{"containerPort": 3000}],
+                    },
+                ],
+            },
+        }
+        blueprint = Blueprint.objects.create(name="generic-app", namespace="core", spec_text=json.dumps(spec))
+        release_target = {
+            "schema_version": "release_target.v1",
+            "id": str(uuid.uuid4()),
+            "blueprint_id": str(blueprint.id),
+            "name": "generic-dev",
+            "target_instance_id": str(uuid.uuid4()),
+            "fqdn": "generic.xyence.io",
+            "dns": {"provider": "route53"},
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "tls": {"mode": "host-ingress"},
+            "ingress": {"network": "xyn-edge", "routes": [{"host": "generic.xyence.io", "service": "web", "port": 3000}]},
+            "created_at": "2026-02-07T00:00:00Z",
+            "updated_at": "2026-02-07T00:00:00Z",
+        }
+        plan = _generate_implementation_plan(blueprint, release_target=release_target)
+        build_item = next(
+            (item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.components"),
+            None,
+        )
+        self.assertIsNotNone(build_item)
+        config = (build_item or {}).get("config") or {}
+        image_services = {img.get("service") for img in config.get("images", [])}
+        repo_names = {repo.get("name") for repo in (build_item or {}).get("repo_targets", [])}
+        self.assertEqual(image_services, {"api", "web"})
+        self.assertEqual(repo_names, {"api-repo", "web-repo"})
+
+    def test_render_compose_generic_from_components(self):
+        components = [
+            {
+                "name": "api",
+                "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/xyn/api:v1",
+                "env": {"PORT": "8080"},
+                "ports": [{"containerPort": 8080}],
+            },
+            {
+                "name": "web",
+                "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/xyn/web:v1",
+                "dependsOn": ["api"],
+                "ports": [{"containerPort": 3000}],
+            },
+        ]
+        images_map = {
+            "api": {
+                "image_uri": "123456789012.dkr.ecr.us-west-2.amazonaws.com/xyn/api:v1",
+                "digest": "sha256:" + "a" * 64,
+            },
+            "web": {
+                "image_uri": "123456789012.dkr.ecr.us-west-2.amazonaws.com/xyn/web:v1",
+                "digest": "sha256:" + "b" * 64,
+            },
+        }
+        release_target = {
+            "tls": {"mode": "host-ingress"},
+            "ingress": {"network": "xyn-edge", "routes": [{"host": "demo.xyence.io", "service": "web", "port": 3000}]},
+        }
+        compose = _render_compose_for_release_components(components, images_map, release_target)
+        self.assertIn("services:", compose)
+        self.assertIn("  api:", compose)
+        self.assertIn("  web:", compose)
+        self.assertIn("@sha256:" + "a" * 64, compose)
+        self.assertIn("@sha256:" + "b" * 64, compose)
+        self.assertIn("depends_on:", compose)
+        self.assertIn("traefik.http.routers.demo-xyence-io.rule=Host(`demo.xyence.io`)", compose)
+
+    def test_manifest_validation_fails_if_component_digest_missing_for_ecr(self):
+        manifest = {
+            "images": {
+                "api": {"image_uri": "123456789012.dkr.ecr.us-west-2.amazonaws.com/xyn/api:v1", "digest": ""},
+                "web": {"image_uri": "123456789012.dkr.ecr.us-west-2.amazonaws.com/xyn/web:v1", "digest": "sha256:" + "b" * 64},
+            },
+            "compose": {"content_hash": "a" * 64},
+        }
+        compose = "services:\n  api:\n    image: x\n  web:\n    image: y\n"
+        ok, errors = _validate_release_manifest_pinned(manifest, compose)
+        self.assertFalse(ok)
+        self.assertTrue(any(error.get("code") == "digest_missing" for error in errors))
+
+    def test_manifest_validation_accepts_non_ecr_without_digest(self):
+        manifest = {
+            "images": {
+                "api": {"image_uri": "ghcr.io/example/api:1.0.0", "digest": ""},
+                "web": {"image_uri": "ghcr.io/example/web:1.0.0", "digest": ""},
+            },
+            "compose": {"content_hash": "a" * 64},
+        }
+        compose = "services:\n  api:\n    image: x\n  web:\n    image: y\n"
+        ok, errors = _validate_release_manifest_pinned(manifest, compose)
+        self.assertTrue(ok, errors)
 
     def test_deploy_state_metadata_payload(self):
         payload = _build_deploy_state_metadata(
@@ -1649,9 +1769,16 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("verify.public_https", ids)
         self.assertEqual(plan.get("release_target_id"), str(target.id))
         self.assertEqual(plan.get("release_target_name"), target.name)
-        build_publish = next((item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.container"), None)
-        self.assertIsNotNone(build_publish)
-        self.assertIn("config", build_publish)
+        build_publish = next(
+            (
+                item
+                for item in plan.get("work_items", [])
+                if item.get("id") in {"build.publish_images.container", "build.publish_images.components"}
+            ),
+            None,
+        )
+        if build_publish is not None:
+            self.assertIn("config", build_publish)
         schema = self._load_schema("implementation_plan.v1.schema.json")
         errors = list(Draft202012Validator(schema).iter_errors(plan))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
@@ -1912,8 +2039,8 @@ class PipelineSchemaTests(TestCase):
                 "main.tsx",
                 "routes.tsx",
                 "auth/Login.tsx",
-                "devices/DeviceList.tsx",
-                "reports/Reports.tsx",
+                "auth/Callback.tsx",
+                "auth/session.ts",
             ]
             for rel in expected:
                 self.assertTrue((app_root / rel).exists(), rel)
