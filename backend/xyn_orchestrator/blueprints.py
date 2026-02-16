@@ -972,7 +972,7 @@ def _guess_repo_target_name_for_component(
         return ""
     normalized_comp = comp_name.lower()
     context_hint = context_hint.lower()
-    api_tokens = ("api", "backend", "migrate", "db-migrate")
+    api_tokens = ("api", "backend", "worker", "job", "migrate", "db-migrate")
     web_tokens = ("web", "ui", "frontend", "site")
     wants_web = any(token in normalized_comp for token in web_tokens) or any(
         token in context_hint for token in ("/web", "frontend", "/ui")
@@ -1002,7 +1002,20 @@ def _guess_repo_target_name_for_component(
         return "xyn-ui"
     if wants_api and "xyn-api" in repo_target_map:
         return "xyn-api"
-    return ""
+    # Deterministic fallback for backend-ish components when no better signal exists.
+    if wants_api:
+        for name, target in repo_target_map.items():
+            haystack = " ".join(
+                [
+                    str(name or ""),
+                    str(target.get("path_root") or ""),
+                    str(target.get("url") or ""),
+                ]
+            ).lower()
+            if "api" in haystack or "backend" in haystack:
+                return name
+    # Last-resort deterministic fallback to avoid empty repo target names.
+    return sorted(repo_target_map.keys())[0]
 
 
 def _build_module_catalog() -> Dict[str, Any]:
