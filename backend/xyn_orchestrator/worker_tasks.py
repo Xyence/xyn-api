@@ -3864,6 +3864,19 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
         return True
 
     if is_web_like:
+        api_upstream = "api"
+        if "web" in service_name:
+            candidate = service_name.replace("web", "api")
+            if candidate and candidate != service_name:
+                api_upstream = candidate
+        elif "frontend" in service_name:
+            candidate = service_name.replace("frontend", "api")
+            if candidate and candidate != service_name:
+                api_upstream = candidate
+        elif service_name.endswith("-ui"):
+            candidate = f"{service_name[:-3]}-api"
+            if candidate and candidate != service_name:
+                api_upstream = candidate
         needs_override = created
         if os.path.exists(dockerfile_path):
             try:
@@ -3876,15 +3889,13 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
             needs_override = True
         if not needs_override:
             return False
-        _write_file(
-            os.path.join(context_path, "nginx.conf"),
-            """server {
+        nginx_conf = """server {
   listen 3000;
   server_name _;
   root /usr/share/nginx/html;
   index index.html;
   location /api/ {
-    proxy_pass http://api:8080/;
+    proxy_pass http://__API_UPSTREAM__:8080/;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
@@ -3893,8 +3904,8 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
     try_files $uri $uri/ /index.html;
   }
 }
-""",
-        )
+"""
+        _write_file(os.path.join(context_path, "nginx.conf"), nginx_conf.replace("__API_UPSTREAM__", api_upstream))
         _write_file(
             os.path.join(context_path, "public/index.html"),
             """<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Subscriber Notes - Dev Demo</title><script>(function(){var appKey=(window.__XYN_APP_KEY||((location.hostname||'').split('.')[0])||'web');var link=document.createElement('link');link.rel='stylesheet';link.href='https://xyence.io/xyn/api/branding/theme.css?app='+encodeURIComponent(appKey);document.head.appendChild(link);})();</script><style>:root{--xyn-color-primary:#0f4c81;--xyn-color-text:#10203a;--xyn-color-muted:#475569;--xyn-color-bg:#f5f7fb;--xyn-color-surface:#fff;--xyn-color-border:#dbe3ef;--xyn-radius-button:12px;--xyn-radius-card:16px;--xyn-font-ui:Space Grotesk,Source Sans 3,sans-serif;--xyn-shadow-card:0 10px 28px rgba(2,6,23,.08)}*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--xyn-bg-gradient,var(--xyn-color-bg));color:var(--xyn-color-text);font-family:var(--xyn-font-ui)}.shell{max-width:1120px;margin:0 auto}.card{background:var(--xyn-color-surface);border:1px solid var(--xyn-color-border);border-radius:var(--xyn-radius-card);box-shadow:var(--xyn-shadow-card);padding:16px}h1{margin:0 0 12px}p{margin:0 0 14px;color:var(--xyn-color-muted)}.grid{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-bottom:12px}input,button{border:1px solid var(--xyn-color-border);border-radius:var(--xyn-radius-button);padding:9px 12px;font:inherit}button{background:var(--xyn-color-primary);color:#fff;border-color:transparent;cursor:pointer}.table-wrap{overflow:auto;border:1px solid var(--xyn-color-border);border-radius:12px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--xyn-color-border);text-align:left}th{font-size:.86rem;letter-spacing:.03em;text-transform:uppercase;color:var(--xyn-color-muted)}</style></head><body><div class="shell"><section class="card"><h1>Subscriber Notes - Dev Demo</h1><p>Create and track subscriber support notes.</p><form id="f" class="grid"><input id="sid" placeholder="Subscriber ID" required/><input id="txt" placeholder="Note text" required/><button type="submit">Add note</button></form><div class="table-wrap"><table><thead><tr><th>ID</th><th>Subscriber</th><th>Note</th><th>Created</th><th>Action</th></tr></thead><tbody id="rows"></tbody></table></div></section></div><script src="/app.js"></script></body></html>""",
