@@ -3753,11 +3753,14 @@ def _checkout_repo(repo_url: str, ref: str, dest_dir: str) -> None:
 
 def _ensure_fallback_component_context(service: str, context_path: str, dockerfile_path: str) -> bool:
     service_name = str(service or "").strip().lower()
+    is_api_like = any(token in service_name for token in ("api", "backend", "worker", "job"))
+    is_web_like = any(token in service_name for token in ("web", "frontend", "ui", "site"))
+    is_migrate_like = any(token in service_name for token in ("migrate", "db-migrate"))
     created = False
     if not os.path.isdir(context_path):
         os.makedirs(context_path, exist_ok=True)
         created = True
-    if service_name in {"api", "backend"}:
+    if is_api_like:
         if not created and os.path.exists(os.path.join(context_path, "app/main.py")):
             return False
         _write_file(
@@ -3860,7 +3863,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
             )
         return True
 
-    if service_name in {"web", "frontend", "ui"}:
+    if is_web_like:
         needs_override = created
         if os.path.exists(dockerfile_path):
             try:
@@ -3910,7 +3913,7 @@ EXPOSE 3000
         )
         return True
 
-    if service_name in {"migrate", "db-migrate"}:
+    if is_migrate_like:
         if not os.path.exists(dockerfile_path):
             _write_file(
                 dockerfile_path,
@@ -4121,9 +4124,10 @@ def _build_publish_images(
             context_rel = str(image.get("context_path") or "").strip()
             dockerfile_rel = str(image.get("dockerfile_path") or "Dockerfile").strip()
             context_path = os.path.normpath(os.path.join(base_root, context_rel))
-            dockerfile_path = os.path.normpath(os.path.join(base_root, dockerfile_rel))
+            dockerfile_from_base = os.path.normpath(os.path.join(base_root, dockerfile_rel))
+            dockerfile_from_context = os.path.normpath(os.path.join(context_path, dockerfile_rel))
+            dockerfile_path = dockerfile_from_context if os.path.exists(dockerfile_from_context) else dockerfile_from_base
             if not os.path.exists(dockerfile_path):
-                dockerfile_from_context = os.path.normpath(os.path.join(context_path, dockerfile_rel))
                 if dockerfile_from_context.startswith(os.path.normpath(repo_dir)) and os.path.exists(dockerfile_from_context):
                     dockerfile_path = dockerfile_from_context
             if not context_path.startswith(os.path.normpath(repo_dir)):
