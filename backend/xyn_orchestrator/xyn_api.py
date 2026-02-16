@@ -9,7 +9,7 @@ import uuid
 import hashlib
 import fnmatch
 from functools import wraps
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, quote
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Set, Tuple
 
@@ -2283,6 +2283,29 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
 def auth_logout(request: HttpRequest) -> JsonResponse:
     request.session.flush()
     return JsonResponse({"status": "ok"})
+
+
+@csrf_exempt
+def auth_session_check(request: HttpRequest) -> HttpResponse:
+    app_id = (request.GET.get("appId") or "xyn-ui").strip() or "xyn-ui"
+    client = _resolve_app_config(app_id)
+    forwarded_proto = (request.META.get("HTTP_X_FORWARDED_PROTO") or "https").split(",")[0].strip() or "https"
+    forwarded_host = (
+        (request.META.get("HTTP_X_FORWARDED_HOST") or request.get_host() or "").split(",")[0].strip()
+    )
+    forwarded_uri = (
+        (request.META.get("HTTP_X_FORWARDED_URI") or request.get_full_path() or "/").split(",")[0].strip()
+    )
+    if not forwarded_uri.startswith("/"):
+        forwarded_uri = f"/{forwarded_uri}"
+    return_to_candidate = f"{forwarded_proto}://{forwarded_host}{forwarded_uri}" if forwarded_host else forwarded_uri
+    return_to = _sanitize_return_to(return_to_candidate, request, client, app_id)
+
+    if request.user.is_authenticated and request.session.get("user_identity_id"):
+        return JsonResponse({"status": "ok"})
+
+    login_url = f"/auth/login?appId={quote(app_id, safe='')}&returnTo={quote(return_to, safe='')}"
+    return redirect(login_url)
 
 
 def api_me(request: HttpRequest) -> JsonResponse:

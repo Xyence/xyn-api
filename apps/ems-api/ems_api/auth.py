@@ -1,6 +1,7 @@
 import os
 import time
 from typing import Any, Dict
+import logging
 
 import jwt
 import requests
@@ -11,6 +12,7 @@ _OIDC_CACHE: Dict[str, Any] = {
     "config": None,
     "jwks_by_issuer": {},
 }
+logger = logging.getLogger(__name__)
 
 
 def _get_required_env(name: str) -> str:
@@ -91,6 +93,7 @@ def _decode_oidc_token(token: str) -> Dict[str, Any]:
             signing_key.key,
             algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
             options={"verify_aud": False},
+            leeway=120,
         )
     except Exception:
         # Unknown KID or rotated key; refresh discovery/JWKS and retry once.
@@ -102,6 +105,7 @@ def _decode_oidc_token(token: str) -> Dict[str, Any]:
             signing_key.key,
             algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
             options={"verify_aud": False},
+            leeway=120,
         )
 
     token_issuer = str(claims.get("iss") or "").rstrip("/")
@@ -149,19 +153,25 @@ def decode_token(token: str) -> Dict[str, Any]:
 def require_user(request: Request) -> Dict[str, Any]:
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
+        logger.warning("ems auth rejected: missing bearer token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing bearer token",
         )
     token = auth_header.replace("Bearer ", "", 1).strip()
     if not token:
+        logger.warning("ems auth rejected: empty bearer token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing bearer token",
         )
     try:
         claims = decode_token(token)
+    except HTTPException as exc:
+        logger.warning("ems auth rejected: %s", exc.detail)
+        raise
     except jwt.PyJWTError as exc:
+        logger.warning("ems auth rejected: invalid token: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid token: {exc}",

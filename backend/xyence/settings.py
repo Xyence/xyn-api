@@ -9,6 +9,8 @@ DEBUG = False
 ALLOWED_HOSTS = [host.strip() for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",") if host.strip()]
 if "*" not in ALLOWED_HOSTS and "backend" not in ALLOWED_HOSTS:
     ALLOWED_HOSTS.append("backend")
+if "*" not in ALLOWED_HOSTS and ".xyence.io" not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(".xyence.io")
 
 # Respect proxy headers from nginx so OAuth redirects use https.
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
@@ -119,6 +121,8 @@ SESSION_COOKIE_SECURE = True
 SESSION_COOKIE_SAMESITE = "None"
 CSRF_COOKIE_SECURE = True
 CSRF_COOKIE_SAMESITE = "None"
+SESSION_COOKIE_DOMAIN = os.environ.get("SESSION_COOKIE_DOMAIN", ".xyence.io").strip() or None
+CSRF_COOKIE_DOMAIN = os.environ.get("CSRF_COOKIE_DOMAIN", SESSION_COOKIE_DOMAIN or "").strip() or None
 
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"

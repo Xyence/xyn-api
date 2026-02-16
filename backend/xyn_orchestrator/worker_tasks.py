@@ -4068,10 +4068,13 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target
             "    labels:\n"
             "      - \"traefik.enable=true\"\n"
             f"      - \"traefik.docker.network={route_network}\"\n"
+            "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId=ems.platform\"\n"
+            "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.trustForwardHeader=true\"\n"
             f"      - \"traefik.http.routers.{rid}.rule=Host(`{host}`)\"\n"
             f"      - \"traefik.http.routers.{rid}.entrypoints=websecure\"\n"
             f"      - \"traefik.http.routers.{rid}.tls=true\"\n"
             f"      - \"traefik.http.routers.{rid}.tls.certresolver=le\"\n"
+            f"      - \"traefik.http.routers.{rid}.middlewares=xyn-auth-ems@docker\"\n"
             f"      - \"traefik.http.services.{rid}.loadbalancer.server.port={port}\"\n"
         )
     api_service_networks = ""
@@ -4104,10 +4107,13 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target
                 "    labels:\n"
                 "      - \"traefik.enable=true\"\n"
                 f"      - \"traefik.docker.network={route_network}\"\n"
+                "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId=ems.platform\"\n"
+                "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.trustForwardHeader=true\"\n"
                 "      - \"traefik.http.routers.ems.rule=Host(`${EMS_FQDN:-ems.xyence.io}`)\"\n"
                 "      - \"traefik.http.routers.ems.entrypoints=websecure\"\n"
                 "      - \"traefik.http.routers.ems.tls=true\"\n"
                 "      - \"traefik.http.routers.ems.tls.certresolver=le\"\n"
+                "      - \"traefik.http.routers.ems.middlewares=xyn-auth-ems@docker\"\n"
                 "      - \"traefik.http.services.ems.loadbalancer.server.port=8080\"\n"
             )
     return "".join(
@@ -4327,10 +4333,15 @@ def _render_compose_for_release_components(
                 compose_lines.append("    labels:\n")
                 compose_lines.append("      - \"traefik.enable=true\"\n")
                 compose_lines.append(f"      - \"traefik.docker.network={route_network}\"\n")
+                compose_lines.append(
+                    "      - \"traefik.http.middlewares.xyn-auth-app.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId=xyn-ui\"\n"
+                )
+                compose_lines.append("      - \"traefik.http.middlewares.xyn-auth-app.forwardauth.trustForwardHeader=true\"\n")
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.rule=Host(`{host}`)\"\n")
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.entrypoints=websecure\"\n")
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.tls=true\"\n")
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.tls.certresolver=le\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}.middlewares=xyn-auth-app@docker\"\n")
                 compose_lines.append(f"      - \"traefik.http.services.{rid}.loadbalancer.server.port={selected_port}\"\n")
                 break
         compose_lines.append("\n")
