@@ -3958,6 +3958,27 @@ def _build_publish_images(
     ecr = boto3.client("ecr", region_name=registry_region)
     workspace = tempfile.mkdtemp(prefix="xyn-build-")
     checked_out: Dict[str, str] = {}
+
+    def _build_placeholder_image(image_uri: str, service_name: str) -> tuple[bool, str]:
+        context_dir = os.path.join(workspace, "placeholders", _slugify(service_name or "component"))
+        os.makedirs(context_dir, exist_ok=True)
+        _write_file(
+            os.path.join(context_dir, "Dockerfile"),
+            (
+                "FROM alpine:3.20\n"
+                f'LABEL org.xyence.placeholder.service="{_slugify(service_name or "component")}"\n'
+                "CMD [\"sh\", \"-c\", \"echo xyn placeholder service; sleep infinity\"]\n"
+            ),
+        )
+        proc = subprocess.run(
+            ["docker", "build", "-t", image_uri, context_dir],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout or "placeholder build failed")
+        return True, ""
+
     try:
         for image in images:
             name = image.get("name")
@@ -3983,9 +4004,77 @@ def _build_publish_images(
                     text=True,
                 )
                 if pull_proc.returncode != 0:
-                    raise RuntimeError(
-                        f"Unable to pull source image {explicit_image_uri}: {pull_proc.stderr or pull_proc.stdout}"
+                    pull_error = pull_proc.stderr or pull_proc.stdout or "pull failed"
+                    if explicit_image_uri.startswith("xyence/") and explicit_image_uri.endswith(":dev"):
+                        ok, build_error = _build_placeholder_image(
+                            image_uri=f"{_ecr_repo_uri(account_id, registry_region, repo_name)}:{release_id}",
+                            service_name=str(service or name or "component"),
+                        )
+                        if not ok:
+                            outcome = "failed"
+                            image_results.append(
+                                {
+                                    "name": name,
+                                    "repository": repo_name,
+                                    "tag": release_id,
+                                    "image_uri": f"{_ecr_repo_uri(account_id, registry_region, repo_name)}:{release_id}",
+                                    "pushed": False,
+                                    "errors": [
+                                        f"Unable to pull source image {explicit_image_uri}: {pull_error}",
+                                        build_error,
+                                    ],
+                                }
+                            )
+                            continue
+                        image_uri = f"{_ecr_repo_uri(account_id, registry_region, repo_name)}:{release_id}"
+                        push_proc = subprocess.run(
+                            ["docker", "push", image_uri],
+                            capture_output=True,
+                            text=True,
+                        )
+                        if push_proc.returncode != 0:
+                            outcome = "failed"
+                            image_results.append(
+                                {
+                                    "name": name,
+                                    "repository": repo_name,
+                                    "tag": release_id,
+                                    "image_uri": image_uri,
+                                    "pushed": False,
+                                    "errors": [push_proc.stderr or push_proc.stdout or "push failed"],
+                                }
+                            )
+                            continue
+                        describe = ecr.describe_images(repositoryName=repo_name, imageIds=[{"imageTag": release_id}])
+                        detail = (describe.get("imageDetails") or [{}])[0]
+                        digest = detail.get("imageDigest", "")
+                        image_results.append(
+                            {
+                                "name": name,
+                                "repository": repo_name,
+                                "tag": release_id,
+                                "image_uri": image_uri,
+                                "digest": digest,
+                                "built_at": datetime.utcnow().isoformat() + "Z",
+                                "pushed": True,
+                                "source": "placeholder",
+                                "source_image_uri": explicit_image_uri,
+                            }
+                        )
+                        images_map[service] = {"image_uri": image_uri, "digest": digest}
+                        continue
+                    outcome = "failed"
+                    image_results.append(
+                        {
+                            "name": name,
+                            "repository": repo_name,
+                            "tag": release_id,
+                            "image_uri": f"{_ecr_repo_uri(account_id, registry_region, repo_name)}:{release_id}",
+                            "pushed": False,
+                            "errors": [f"Unable to pull source image {explicit_image_uri}: {pull_error}"],
+                        }
                     )
+                    continue
                 image_uri = f"{_ecr_repo_uri(account_id, registry_region, repo_name)}:{release_id}"
                 tag_proc = subprocess.run(
                     ["docker", "tag", explicit_image_uri, image_uri],
@@ -4033,6 +4122,10 @@ def _build_publish_images(
             dockerfile_rel = str(image.get("dockerfile_path") or "Dockerfile").strip()
             context_path = os.path.normpath(os.path.join(base_root, context_rel))
             dockerfile_path = os.path.normpath(os.path.join(base_root, dockerfile_rel))
+            if not os.path.exists(dockerfile_path):
+                dockerfile_from_context = os.path.normpath(os.path.join(context_path, dockerfile_rel))
+                if dockerfile_from_context.startswith(os.path.normpath(repo_dir)) and os.path.exists(dockerfile_from_context):
+                    dockerfile_path = dockerfile_from_context
             if not context_path.startswith(os.path.normpath(repo_dir)):
                 raise RuntimeError(f"Build context escapes repo root for {name}")
             if not dockerfile_path.startswith(os.path.normpath(repo_dir)):
@@ -4054,6 +4147,20 @@ def _build_publish_images(
                     build_cmd.extend(["--build-arg", f"{key}={value}"])
             build_cmd.append(context_path)
             build_proc = subprocess.run(build_cmd, capture_output=True, text=True)
+            if build_proc.returncode != 0 and image.get("target"):
+                build_error_text = f"{build_proc.stderr or ''}\n{build_proc.stdout or ''}".lower()
+                if "target stage" in build_error_text and "could not be found" in build_error_text:
+                    retry_cmd: List[str] = []
+                    skip_next = False
+                    for part in build_cmd:
+                        if skip_next:
+                            skip_next = False
+                            continue
+                        if part == "--target":
+                            skip_next = True
+                            continue
+                        retry_cmd.append(part)
+                    build_proc = subprocess.run(retry_cmd, capture_output=True, text=True)
             if build_proc.returncode != 0:
                 outcome = "failed"
                 image_results.append(
