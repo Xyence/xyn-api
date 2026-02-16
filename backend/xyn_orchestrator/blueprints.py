@@ -2547,7 +2547,7 @@ def _generate_implementation_plan(
         image_name = re.sub(r"[^a-z0-9._-]+", "-", comp_name.lower()).strip("-") or "component"
         comp_image = str(component.get("image") or "").strip()
         build_cfg = component.get("build") if isinstance(component.get("build"), dict) else {}
-            if build_cfg:
+        if build_cfg:
             repo_target_name = str(
                 build_cfg.get("repoTarget")
                 or component.get("repoTarget")
