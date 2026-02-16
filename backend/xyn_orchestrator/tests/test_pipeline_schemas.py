@@ -1853,6 +1853,56 @@ class PipelineSchemaTests(TestCase):
         self.assertEqual(build_item.get("config", {}).get("blueprint_namespace"), "xyence.demo")
         self.assertEqual(build_item.get("config", {}).get("blueprint_repo_slug"), blueprint.repo_slug)
 
+    def test_planner_normalizes_partial_repo_targets_for_build_components(self):
+        blueprint = Blueprint.objects.create(
+            name="home-ems",
+            namespace="core",
+            spec_text=json.dumps(
+                {
+                    "releaseSpec": {
+                        "metadata": {"namespace": "core"},
+                        "repoTargets": [
+                            {"name": "xyn-ui"},
+                            {"name": "xyn-api"},
+                        ],
+                        "components": [
+                            {
+                                "name": "web",
+                                "build": {"repoTarget": "xyn-ui", "context": "services/web", "dockerfile": "Dockerfile"},
+                            },
+                            {
+                                "name": "api",
+                                "build": {"repoTarget": "xyn-api", "context": "services/api", "dockerfile": "Dockerfile"},
+                            },
+                        ],
+                    }
+                }
+            ),
+        )
+        release_target = {
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "dns": {"provider": "route53"},
+            "tls": {"mode": "host-ingress"},
+            "fqdn": "home-ems.xyence.io",
+            "target_instance_id": str(uuid.uuid4()),
+        }
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=_build_module_catalog(),
+            run_history_summary=_build_run_history_summary(blueprint, release_target),
+            release_target=release_target,
+        )
+        build_item = next(
+            item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.components"
+        )
+        for repo in build_item.get("repo_targets", []):
+            self.assertTrue(repo.get("name"))
+            self.assertTrue(repo.get("url"))
+            self.assertTrue(repo.get("ref"))
+            self.assertTrue(repo.get("path_root"))
+            self.assertTrue(repo.get("auth"))
+            self.assertIn("allow_write", repo)
+
     def test_planner_does_not_require_blueprint_metadata_deploy(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})
         target = ReleaseTarget.objects.create(

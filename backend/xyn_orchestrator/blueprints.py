@@ -933,6 +933,35 @@ def _default_repo_targets() -> List[Dict[str, Any]]:
     ]
 
 
+def _normalize_repo_target_entry(target: Dict[str, Any]) -> Dict[str, Any]:
+    default_map = {entry["name"]: entry for entry in _default_repo_targets()}
+    name = str(target.get("name") or "").strip()
+    base = default_map.get(name, {})
+    url = str(target.get("url") or base.get("url") or "").strip()
+    ref = str(target.get("ref") or base.get("ref") or "main").strip() or "main"
+    path_root = str(target.get("path_root") or base.get("path_root") or ".").strip() or "."
+    auth = str(target.get("auth") or base.get("auth") or "https_token").strip() or "https_token"
+    allow_write_raw = target.get("allow_write")
+    if allow_write_raw is None:
+        allow_write_raw = base.get("allow_write")
+    allow_write = bool(allow_write_raw) if allow_write_raw is not None else False
+    return {
+        "name": name,
+        "url": url,
+        "ref": ref,
+        "path_root": path_root,
+        "auth": auth,
+        "allow_write": allow_write,
+    }
+
+
+def _ensure_repo_target_complete(target: Dict[str, Any], context: str = "repo target") -> Dict[str, Any]:
+    missing = [field for field in ("name", "url", "ref", "path_root", "auth") if not str(target.get(field) or "").strip()]
+    if missing:
+        raise RuntimeError(f"{context} missing required fields: {', '.join(missing)}")
+    return target
+
+
 def _build_module_catalog() -> Dict[str, Any]:
     repo_targets = _default_repo_targets()
     catalog: List[Dict[str, Any]] = []
@@ -2493,13 +2522,19 @@ def _generate_implementation_plan(
                 "allow_write": False,
             },
         ]
+    release_repo_targets = [
+        _normalize_repo_target_entry(target)
+        for target in release_repo_targets
+        if isinstance(target, dict) and str(target.get("name") or "").strip()
+    ]
     repo_target_map: Dict[str, Dict[str, Any]] = {}
     for target in release_repo_targets:
         if not isinstance(target, dict):
             continue
-        target_name = str(target.get("name") or "").strip()
+        normalized = _normalize_repo_target_entry(target)
+        target_name = str(normalized.get("name") or "").strip()
         if target_name:
-            repo_target_map[target_name] = target
+            repo_target_map[target_name] = normalized
     release_image_inputs: List[Dict[str, Any]] = []
     release_build_inputs: List[Dict[str, Any]] = []
     selected_repo_targets: Dict[str, Dict[str, Any]] = {}
@@ -2512,7 +2547,7 @@ def _generate_implementation_plan(
         image_name = re.sub(r"[^a-z0-9._-]+", "-", comp_name.lower()).strip("-") or "component"
         comp_image = str(component.get("image") or "").strip()
         build_cfg = component.get("build") if isinstance(component.get("build"), dict) else {}
-        if build_cfg:
+            if build_cfg:
             repo_target_name = str(
                 build_cfg.get("repoTarget")
                 or component.get("repoTarget")
@@ -2562,7 +2597,10 @@ def _generate_implementation_plan(
             if isinstance(build_cfg.get("args"), dict):
                 build_entry["build_args"] = build_cfg.get("args")
             release_build_inputs.append(build_entry)
-            selected_repo_targets[repo_target_name] = selected_repo_target or {}
+            selected_repo_targets[repo_target_name] = _ensure_repo_target_complete(
+                selected_repo_target or {},
+                context=f"component {comp_name} repoTarget '{repo_target_name}'",
+            )
             continue
         if comp_image:
             release_image_inputs.append(
@@ -2712,6 +2750,10 @@ def _generate_implementation_plan(
                     },
                 ]
                 build_id = "build.publish_images.container"
+            build_repo_targets = [
+                _ensure_repo_target_complete(target, context=f"build repo_target[{index}]")
+                for index, target in enumerate(build_repo_targets)
+            ]
             work_items.append(
                 {
                     "id": build_id,
