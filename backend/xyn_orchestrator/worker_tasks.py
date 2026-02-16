@@ -3302,6 +3302,34 @@ def _docker_login_ecr(region: str) -> str:
     return endpoint.replace("https://", "").replace("http://", "")
 
 
+def _registry_host_from_image(image_uri: str) -> str:
+    candidate = str(image_uri or "").strip()
+    if not candidate or "/" not in candidate:
+        return ""
+    head = candidate.split("/", 1)[0].strip().lower()
+    if "." in head or ":" in head or head == "localhost":
+        return head
+    return ""
+
+
+def _docker_login_source_registry_if_needed(image_uri: str) -> None:
+    host = _registry_host_from_image(image_uri)
+    if host != "ghcr.io":
+        return
+    username = os.environ.get("GHCR_USERNAME", "").strip()
+    token = os.environ.get("GHCR_TOKEN", "").strip()
+    if not username or not token:
+        return
+    login_proc = subprocess.run(
+        ["docker", "login", host, "--username", username, "--password-stdin"],
+        input=token,
+        text=True,
+        capture_output=True,
+    )
+    if login_proc.returncode != 0:
+        raise RuntimeError(login_proc.stderr or login_proc.stdout or "docker login ghcr failed")
+
+
 def _checkout_repo(repo_url: str, ref: str, dest_dir: str) -> None:
     if not os.path.exists(dest_dir):
         subprocess.run(["git", "clone", repo_url, dest_dir], check=True, capture_output=True, text=True)
@@ -3324,6 +3352,9 @@ def _build_publish_images(
     registry_region = registry_cfg.get("region") or os.environ.get("AWS_REGION") or ""
     if not registry_region:
         raise RuntimeError("registry.region missing for build/publish")
+    registry_provider = str(registry_cfg.get("provider") or "ecr").strip().lower()
+    if registry_provider != "ecr":
+        raise RuntimeError(f"registry.provider '{registry_provider}' is not supported yet")
     sts = boto3.client("sts", region_name=registry_region)
     account_id = registry_cfg.get("account_id") or sts.get_caller_identity().get("Account")
     if not account_id:
@@ -3339,44 +3370,47 @@ def _build_publish_images(
             service = image.get("service") or name
             explicit_image_uri = str(image.get("image_uri") or "").strip()
             if explicit_image_uri:
-                digest = ""
-                image_uri = explicit_image_uri
-                if "@sha256:" in explicit_image_uri:
-                    image_uri, digest = explicit_image_uri.split("@", 1)
-                    digest = digest.strip()
-                    if not digest.startswith("sha256:"):
-                        digest = f"sha256:{digest}"
-                if not digest:
-                    pull_proc = subprocess.run(
-                        ["docker", "pull", explicit_image_uri],
-                        capture_output=True,
-                        text=True,
+                _docker_login_source_registry_if_needed(explicit_image_uri)
+                pull_proc = subprocess.run(
+                    ["docker", "pull", explicit_image_uri],
+                    capture_output=True,
+                    text=True,
+                )
+                if pull_proc.returncode != 0:
+                    raise RuntimeError(
+                        f"Unable to pull source image {explicit_image_uri}: {pull_proc.stderr or pull_proc.stdout}"
                     )
-                    if pull_proc.returncode == 0:
-                        inspect_proc = subprocess.run(
-                            ["docker", "image", "inspect", explicit_image_uri, "--format", "{{json .RepoDigests}}"],
-                            capture_output=True,
-                            text=True,
-                        )
-                        if inspect_proc.returncode == 0:
-                            try:
-                                repo_digests = json.loads((inspect_proc.stdout or "[]").strip() or "[]")
-                            except Exception:
-                                repo_digests = []
-                            if isinstance(repo_digests, list) and repo_digests:
-                                first = str(repo_digests[0] or "")
-                                if "@sha256:" in first:
-                                    digest = "sha256:" + first.split("@sha256:", 1)[1]
+                repo_name = f"{repo_prefix}/{name}"
+                _ensure_ecr_repo(ecr, repo_name)
+                image_uri = f"{_ecr_repo_uri(account_id, registry_region, repo_name)}:{release_id}"
+                tag_proc = subprocess.run(
+                    ["docker", "tag", explicit_image_uri, image_uri],
+                    capture_output=True,
+                    text=True,
+                )
+                if tag_proc.returncode != 0:
+                    raise RuntimeError(tag_proc.stderr or tag_proc.stdout or f"Unable to tag image {explicit_image_uri}")
+                push_proc = subprocess.run(
+                    ["docker", "push", image_uri],
+                    capture_output=True,
+                    text=True,
+                )
+                if push_proc.returncode != 0:
+                    raise RuntimeError(push_proc.stderr or push_proc.stdout or f"Unable to push image {image_uri}")
+                describe = ecr.describe_images(repositoryName=repo_name, imageIds=[{"imageTag": release_id}])
+                detail = (describe.get("imageDetails") or [{}])[0]
+                digest = detail.get("imageDigest", "")
                 image_results.append(
                     {
                         "name": name,
-                        "repository": explicit_image_uri.split("/", 1)[-1].split(":", 1)[0],
+                        "repository": repo_name,
                         "tag": release_id,
                         "image_uri": image_uri,
                         "digest": digest,
                         "built_at": datetime.utcnow().isoformat() + "Z",
                         "pushed": True,
-                        "source": "prebuilt",
+                        "source": "mirrored",
+                        "source_image_uri": explicit_image_uri,
                     }
                 )
                 images_map[service] = {"image_uri": image_uri, "digest": digest}
@@ -5488,6 +5522,16 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             secret_keys.append("EMS_JWT_SECRET")
                     if secret_failed:
                         raise RuntimeError("Secret resolution failed.")
+                    if source_run:
+                        try:
+                            build_result = _download_artifact_json(source_run, "build_result.json")
+                        except Exception:
+                            build_result = None
+                        if isinstance(build_result, dict):
+                            if str(build_result.get("outcome") or "").lower() == "failed":
+                                raise RuntimeError(
+                                    "deploy failed; leaving previous release running (build_result indicates failed)"
+                                )
                     release_manifest = None
                     compose_content = None
                     if release_uuid or release_version:
@@ -5735,7 +5779,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                             errors.append(
                                 {
                                     "code": ssm_failure.get("code") or "ssm_failed",
-                                    "message": "Remote deploy via image pull failed.",
+                                    "message": "Deploy failed; leaving previous release running.",
                                     "detail": ssm_failure.get("detail") or {"error": error_detail},
                                 }
                             )
@@ -5783,7 +5827,7 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                     errors.append(
                         {
                             "code": "deploy_failed",
-                            "message": "Remote deploy via image pull failed.",
+                            "message": "Deploy failed; leaving previous release running.",
                             "detail": {"error": str(exc)},
                         }
                     )
