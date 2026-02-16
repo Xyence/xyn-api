@@ -9,7 +9,7 @@ import tempfile
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunsplit
 
 import boto3
 import requests
@@ -4156,6 +4156,21 @@ def _render_compose_for_release_components(
     images: Dict[str, Dict[str, str]],
     release_target: Optional[Dict[str, Any]] = None,
 ) -> str:
+    def _normalize_component_env(key: str, raw_value: Any) -> str:
+        value = str(raw_value)
+        if str(key).strip().upper() != "DATABASE_URL":
+            return value
+        parsed = urlparse(value)
+        if not parsed.scheme:
+            return value
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        if not query_pairs:
+            return value
+        filtered = [(k, v) for (k, v) in query_pairs if str(k).lower() not in {"schema", "currentschema"}]
+        if len(filtered) == len(query_pairs):
+            return value
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(filtered, doseq=True), parsed.fragment))
+
     ingress = _release_target_ingress(release_target)
     tls_mode = ingress["tls_mode"]
     host_ingress = tls_mode == "host-ingress"
@@ -4199,6 +4214,21 @@ def _render_compose_for_release_components(
     compose_lines: List[str] = ["services:\n"]
     volume_names: List[str] = []
     has_edge_network = False
+    placeholder_secret_values: Dict[str, str] = {}
+
+    def _materialize_secret_ref_placeholders(raw: str) -> str:
+        text = str(raw or "")
+        pattern = re.compile(r"\$\$?\{secretRef:([^}]+)\}")
+
+        def _replace(match: re.Match[str]) -> str:
+            token = str(match.group(1) or "").strip().lower()
+            if token not in placeholder_secret_values:
+                base = os.environ.get("XYN_DEFAULT_COMPONENT_SECRET", "xyn-secret").strip() or "xyn-secret"
+                suffix = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+                placeholder_secret_values[token] = f"{base}-{suffix}"
+            return placeholder_secret_values[token]
+
+        return pattern.sub(_replace, text)
     for component in components:
         if not isinstance(component, dict):
             continue
@@ -4215,6 +4245,7 @@ def _render_compose_for_release_components(
 
         compose_lines.append(f"  {name}:\n")
         compose_lines.append(f"    image: {image_uri}\n")
+        compose_lines.append("    restart: unless-stopped\n")
 
         env = component.get("env")
         if isinstance(env, dict) and env:
@@ -4223,7 +4254,8 @@ def _render_compose_for_release_components(
                 value = env.get(key)
                 if value is None:
                     continue
-                safe = str(value)
+                normalized_value = _normalize_component_env(str(key), value)
+                safe = _materialize_secret_ref_placeholders(normalized_value)
                 # Keep secretRef placeholders literal in compose instead of
                 # triggering docker variable interpolation.
                 safe = safe.replace("${secretRef:", "$${secretRef:")
@@ -4383,6 +4415,17 @@ def _build_remote_pull_apply_commands(
     release_uuid_tmp = f"{release_uuid_path}.tmp"
     ingress_compose_path = "/opt/xyn/ingress/compose.ingress.yml"
     safe_fqdn = str(fqdn or "").replace("\"", "\\\"")
+    current_project = _slugify(os.path.basename(str(root_dir or "").strip()) or "")
+    legacy_project = _sanitize_route_id(str(fqdn or ""))
+    cleanup_legacy_cmds: List[str] = []
+    if legacy_project and legacy_project != current_project:
+        cleanup_legacy_cmds = [
+            f"LEGACY_PROJECT=\"{legacy_project}\"",
+            "LEGACY_IDS=$(docker ps -aq --filter \"name=^${LEGACY_PROJECT}-\" || true)",
+            "if [ -n \"$LEGACY_IDS\" ]; then docker rm -f $LEGACY_IDS || true; fi",
+            "LEGACY_NETS=$(docker network ls --format '{{.Name}}' | grep -E \"^${LEGACY_PROJECT}_\" || true)",
+            "if [ -n \"$LEGACY_NETS\" ]; then echo \"$LEGACY_NETS\" | xargs -r docker network rm || true; fi",
+        ]
     ingress_mode = str(tls_mode or "none").strip().lower() == "host-ingress"
     cert_bootstrap_cmds = [
         "export EMS_CERTS_PATH=\"${EMS_CERTS_PATH:-/opt/xyn/certs/current}\"",
@@ -4437,6 +4480,7 @@ def _build_remote_pull_apply_commands(
         f"export EMS_FQDN=\"{safe_fqdn}\"",
         *env_exports,
         *cert_bootstrap_cmds,
+        *cleanup_legacy_cmds,
         *ingress_cmds,
         f"docker compose -f \"{compose_path}\" pull",
         f"docker compose -f \"{compose_path}\" up -d --remove-orphans",
