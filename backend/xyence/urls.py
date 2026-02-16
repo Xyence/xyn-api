@@ -192,6 +192,8 @@ from xyn_orchestrator.xyn_api import (
     platform_branding,
     platform_app_branding,
     public_branding,
+    branding_tokens,
+    branding_theme_css,
 )
 from web.public_views import (
     public_home,
@@ -255,6 +257,8 @@ urlpatterns = [
     path("xyn/api/platform/branding", platform_branding),
     path("xyn/api/platform/branding/apps/<str:app_id>", platform_app_branding),
     path("xyn/api/public/branding", public_branding),
+    path("xyn/api/branding/tokens", branding_tokens),
+    path("xyn/api/branding/theme.css", branding_theme_css),
     path("xyn/internal/identities", identities_collection),
     path("xyn/internal/role_bindings", role_bindings_collection),
     path("xyn/internal/role_bindings/<uuid:binding_id>", role_binding_detail),

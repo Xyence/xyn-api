@@ -202,3 +202,14 @@ Overrides (optional):
 - If no S3 provider is configured, local storage is used.
 - Default local attachment path:
   - `/tmp/xyn-uploads`
+
+## Branding Tokens and Theme CSS
+- New endpoints for generated app theming:
+  - `GET /xyn/api/branding/tokens?app=<app_key>`
+  - `GET /xyn/api/branding/theme.css?app=<app_key>`
+- `tokens` returns merged global + per-app branding values in a normalized token shape.
+- `theme.css` returns CSS variables (`--xyn-*`) with:
+  - `ETag`
+  - `Cache-Control: public, max-age=300`
+  - `Access-Control-Allow-Origin: *`
+- Generated web apps can load this stylesheet directly from the control-plane domain and keep local fallbacks for resilience.

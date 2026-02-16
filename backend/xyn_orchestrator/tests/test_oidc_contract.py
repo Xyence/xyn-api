@@ -311,6 +311,69 @@ class OidcContractTests(TestCase):
         self.assertEqual(payload["primary_color"], "#654321")
         self.assertEqual(payload["logo_url"], "https://cdn.example.com/logo.png")
 
+    def test_branding_tokens_merge_global_and_override(self):
+        self.client.put(
+            "/xyn/api/platform/branding",
+            data=json.dumps(
+                {
+                    "brand_name": "Xyn Platform",
+                    "primary_color": "#123456",
+                    "background_color": "#fafafa",
+                    "text_color": "#111111",
+                    "button_radius_px": 10,
+                    "font_family": "Space Grotesk, Source Sans 3, sans-serif",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.client.put(
+            "/xyn/api/platform/branding/apps/ems.platform",
+            data=json.dumps({"display_name": "EMS", "primary_color": "#654321"}),
+            content_type="application/json",
+        )
+        response = self.client.get("/xyn/api/branding/tokens?app=ems.platform")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["brandName"], "EMS")
+        self.assertEqual(payload["colors"]["primary"], "#654321")
+        self.assertEqual(payload["colors"]["text"], "#111111")
+
+    def test_branding_theme_css_contains_expected_vars(self):
+        self.client.put(
+            "/xyn/api/platform/branding",
+            data=json.dumps(
+                {
+                    "brand_name": "Xyn Platform",
+                    "primary_color": "#123456",
+                    "background_color": "#fafafa",
+                    "text_color": "#111111",
+                    "button_radius_px": 14,
+                }
+            ),
+            content_type="application/json",
+        )
+        response = self.client.get("/xyn/api/branding/theme.css?app=xyn-ui")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "text/css; charset=utf-8")
+        body = response.content.decode("utf-8")
+        self.assertIn("--xyn-color-primary: #123456;", body)
+        self.assertIn("--xyn-radius-button: 14px;", body)
+        self.assertIn("--xyn-font-ui:", body)
+        self.assertIn("ETag", response)
+
+    def test_branding_theme_css_etag_changes_on_update(self):
+        initial = self.client.get("/xyn/api/branding/theme.css?app=xyn-ui")
+        self.assertEqual(initial.status_code, 200)
+        initial_etag = initial["ETag"]
+        self.client.put(
+            "/xyn/api/platform/branding",
+            data=json.dumps({"brand_name": "Xyn", "primary_color": "#335577"}),
+            content_type="application/json",
+        )
+        updated = self.client.get("/xyn/api/branding/theme.css?app=xyn-ui")
+        self.assertEqual(updated.status_code, 200)
+        self.assertNotEqual(initial_etag, updated["ETag"])
+
     @mock.patch("xyn_orchestrator.xyn_api.get_discovery_doc")
     def test_authorize_blocks_untrusted_return_to(self, mock_discovery):
         provider = IdentityProvider.objects.create(

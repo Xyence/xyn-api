@@ -456,26 +456,61 @@ EXPOSE 3000
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Subscriber Notes - Dev Demo</title>
+    <script>
+      (function () {
+        var appKey = (window.__XYN_APP_KEY || ((location.hostname || "").split(".")[0]) || "web");
+        var link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = "https://xyence.io/xyn/api/branding/theme.css?app=" + encodeURIComponent(appKey);
+        document.head.appendChild(link);
+      })();
+    </script>
     <style>
-      body { font-family: sans-serif; margin: 24px; }
-      table { border-collapse: collapse; width: 100%%; margin-top: 16px; }
-      th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-      form { display: flex; gap: 8px; flex-wrap: wrap; }
-      input { padding: 8px; min-width: 220px; }
-      button { padding: 8px 12px; }
+      :root {
+        --xyn-color-primary: #0f4c81;
+        --xyn-color-text: #10203a;
+        --xyn-color-muted: #475569;
+        --xyn-color-bg: #f5f7fb;
+        --xyn-color-surface: #ffffff;
+        --xyn-color-border: #dbe3ef;
+        --xyn-radius-button: 12px;
+        --xyn-radius-card: 16px;
+        --xyn-font-ui: Space Grotesk, Source Sans 3, sans-serif;
+        --xyn-shadow-card: 0 10px 28px rgba(2, 6, 23, 0.08);
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 24px; font-family: var(--xyn-font-ui); background: var(--xyn-bg-gradient, var(--xyn-color-bg)); color: var(--xyn-color-text); }
+      .shell { max-width: 1120px; margin: 0 auto; }
+      .card { background: var(--xyn-color-surface); border: 1px solid var(--xyn-color-border); border-radius: var(--xyn-radius-card); box-shadow: var(--xyn-shadow-card); padding: 18px; }
+      h1 { margin: 0 0 12px; }
+      p { margin: 0 0 16px; color: var(--xyn-color-muted); }
+      form { display: grid; gap: 10px; grid-template-columns: 1fr 1fr auto; margin-bottom: 14px; }
+      input { border: 1px solid var(--xyn-color-border); border-radius: var(--xyn-radius-button); padding: 10px 12px; min-width: 220px; }
+      button { border: 1px solid transparent; border-radius: var(--xyn-radius-button); padding: 10px 12px; background: var(--xyn-color-primary); color: #fff; cursor: pointer; }
+      .table-wrap { overflow: auto; border: 1px solid var(--xyn-color-border); border-radius: 12px; }
+      table { border-collapse: collapse; width: 100%%; }
+      th, td { border-bottom: 1px solid var(--xyn-color-border); padding: 10px 12px; text-align: left; }
+      th { color: var(--xyn-color-muted); font-size: 0.86rem; letter-spacing: .03em; text-transform: uppercase; }
     </style>
   </head>
   <body>
-    <h1>Subscriber Notes - Dev Demo</h1>
-    <form id="note-form">
-      <input id="subscriber_id" placeholder="subscriber_id" required />
-      <input id="note_text" placeholder="note text" required />
-      <button type="submit">Add note</button>
-    </form>
-    <table>
-      <thead><tr><th>ID</th><th>Subscriber</th><th>Note</th><th>Created</th><th>Action</th></tr></thead>
-      <tbody id="notes-body"></tbody>
-    </table>
+    <div class="shell">
+      <section class="card">
+        <h1>Subscriber Notes - Dev Demo</h1>
+        <p>Create and track subscriber support notes.</p>
+        <form id="note-form">
+          <input id="subscriber_id" placeholder="subscriber_id" required />
+          <input id="note_text" placeholder="note text" required />
+          <button type="submit">Add note</button>
+        </form>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>Subscriber</th><th>Note</th><th>Created</th><th>Action</th></tr></thead>
+            <tbody id="notes-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
     <script src="/app.js"></script>
   </body>
 </html>
@@ -2256,6 +2291,16 @@ server {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>EMS UI</title>
+    <script>
+      (function () {
+        var parts = (window.location.hostname || "").split(".");
+        var appKey = (window.__XYN_APP_KEY || parts[0] || "ems-web");
+        var link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = "https://xyence.io/xyn/api/branding/theme.css?app=" + encodeURIComponent(appKey);
+        document.head.appendChild(link);
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
@@ -2481,7 +2526,77 @@ export function readIdTokenFromHash(hash: string): string {
         )
         _write_file(
             p("src/styles.css"),
-            """body { font-family: sans-serif; margin: 0; padding: 0; }
+            """:root {
+  --xyn-color-primary: #0f4c81;
+  --xyn-color-text: #10203a;
+  --xyn-color-muted: #475569;
+  --xyn-color-bg: #f5f7fb;
+  --xyn-color-surface: #ffffff;
+  --xyn-color-border: #dbe3ef;
+  --xyn-radius-button: 12px;
+  --xyn-radius-card: 16px;
+  --xyn-font-ui: Space Grotesk, Source Sans 3, sans-serif;
+  --xyn-spacing-page-max: 1120px;
+  --xyn-spacing-gutter: 24px;
+  --xyn-shadow-card: 0 10px 28px rgba(2, 6, 23, 0.08);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: var(--xyn-font-ui);
+  color: var(--xyn-color-text);
+  background: var(--xyn-bg-gradient, var(--xyn-color-bg));
+}
+
+section {
+  width: min(100%, var(--xyn-spacing-page-max));
+  margin: 0 auto;
+  padding: 24px var(--xyn-spacing-gutter) 36px;
+}
+
+h2, h3 { margin: 0 0 12px; }
+p { color: var(--xyn-color-muted); }
+
+button {
+  border: 1px solid var(--xyn-color-border);
+  border-radius: var(--xyn-radius-button);
+  padding: 9px 14px;
+  background: var(--xyn-color-surface);
+  color: var(--xyn-color-text);
+  cursor: pointer;
+}
+
+button[type="submit"],
+button.primary {
+  background: var(--xyn-color-primary);
+  color: #fff;
+  border-color: transparent;
+}
+
+input, select, textarea {
+  border: 1px solid var(--xyn-color-border);
+  border-radius: calc(var(--xyn-radius-button) - 2px);
+  padding: 10px 12px;
+  font: inherit;
+  width: 100%;
+}
+
+pre {
+  background: var(--xyn-color-surface);
+  border: 1px solid var(--xyn-color-border);
+  border-radius: var(--xyn-radius-card);
+  padding: 12px;
+  overflow: auto;
+}
+
+.panel {
+  background: var(--xyn-color-surface);
+  border: 1px solid var(--xyn-color-border);
+  border-radius: var(--xyn-radius-card);
+  box-shadow: var(--xyn-shadow-card);
+  padding: 16px;
+}
 """,
         )
         changed.extend(
@@ -2677,7 +2792,14 @@ export function readIdTokenFromHash(hash: string): string {
         _write_file(
             p("src/devices/DeviceList.tsx"),
             """export default function DeviceList() {
-  return <div>Devices</div>;
+  return (
+    <section>
+      <div className="panel">
+        <h2>Devices</h2>
+        <p>Manage provisioned devices and runtime state.</p>
+      </div>
+    </section>
+  );
 }
 """,
         )
@@ -2693,7 +2815,14 @@ export function readIdTokenFromHash(hash: string): string {
         _write_file(
             p("src/reports/Reports.tsx"),
             """export default function Reports() {
-  return <div>Reports</div>;
+  return (
+    <section>
+      <div className="panel">
+        <h2>Reports</h2>
+        <p>Review operational and subscriber reports.</p>
+      </div>
+    </section>
+  );
 }
 """,
         )
@@ -3765,7 +3894,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
         )
         _write_file(
             os.path.join(context_path, "public/index.html"),
-            """<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Subscriber Notes - Dev Demo</title></head><body><h1>Subscriber Notes - Dev Demo</h1><form id="f"><input id="sid" placeholder="subscriber_id" required/><input id="txt" placeholder="note text" required/><button type="submit">Add note</button></form><table border="1"><thead><tr><th>ID</th><th>Subscriber</th><th>Note</th><th>Created</th><th>Action</th></tr></thead><tbody id="rows"></tbody></table><script src="/app.js"></script></body></html>""",
+            """<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Subscriber Notes - Dev Demo</title><script>(function(){var appKey=(window.__XYN_APP_KEY||((location.hostname||'').split('.')[0])||'web');var link=document.createElement('link');link.rel='stylesheet';link.href='https://xyence.io/xyn/api/branding/theme.css?app='+encodeURIComponent(appKey);document.head.appendChild(link);})();</script><style>:root{--xyn-color-primary:#0f4c81;--xyn-color-text:#10203a;--xyn-color-muted:#475569;--xyn-color-bg:#f5f7fb;--xyn-color-surface:#fff;--xyn-color-border:#dbe3ef;--xyn-radius-button:12px;--xyn-radius-card:16px;--xyn-font-ui:Space Grotesk,Source Sans 3,sans-serif;--xyn-shadow-card:0 10px 28px rgba(2,6,23,.08)}*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--xyn-bg-gradient,var(--xyn-color-bg));color:var(--xyn-color-text);font-family:var(--xyn-font-ui)}.shell{max-width:1120px;margin:0 auto}.card{background:var(--xyn-color-surface);border:1px solid var(--xyn-color-border);border-radius:var(--xyn-radius-card);box-shadow:var(--xyn-shadow-card);padding:16px}h1{margin:0 0 12px}p{margin:0 0 14px;color:var(--xyn-color-muted)}.grid{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-bottom:12px}input,button{border:1px solid var(--xyn-color-border);border-radius:var(--xyn-radius-button);padding:9px 12px;font:inherit}button{background:var(--xyn-color-primary);color:#fff;border-color:transparent;cursor:pointer}.table-wrap{overflow:auto;border:1px solid var(--xyn-color-border);border-radius:12px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--xyn-color-border);text-align:left}th{font-size:.86rem;letter-spacing:.03em;text-transform:uppercase;color:var(--xyn-color-muted)}</style></head><body><div class="shell"><section class="card"><h1>Subscriber Notes - Dev Demo</h1><p>Create and track subscriber support notes.</p><form id="f" class="grid"><input id="sid" placeholder="Subscriber ID" required/><input id="txt" placeholder="Note text" required/><button type="submit">Add note</button></form><div class="table-wrap"><table><thead><tr><th>ID</th><th>Subscriber</th><th>Note</th><th>Created</th><th>Action</th></tr></thead><tbody id="rows"></tbody></table></div></section></div><script src="/app.js"></script></body></html>""",
         )
         _write_file(
             os.path.join(context_path, "public/app.js"),
@@ -4254,10 +4383,16 @@ def _render_compose_for_release_components(
         compose_lines.append("    restart: unless-stopped\n")
 
         env = component.get("env")
-        if isinstance(env, dict) and env:
+        env_payload: Dict[str, Any] = {}
+        if isinstance(env, dict):
+            env_payload.update(env)
+        if name in {"web", "frontend", "ui", selected_service}:
+            env_payload.setdefault("XYN_APP_KEY", name)
+            env_payload.setdefault("XYN_THEME_URL", f"https://xyence.io/xyn/api/branding/theme.css?app={name}")
+        if env_payload:
             compose_lines.append("    environment:\n")
-            for key in sorted(env.keys()):
-                value = env.get(key)
+            for key in sorted(env_payload.keys()):
+                value = env_payload.get(key)
                 if value is None:
                     continue
                 normalized_value = _normalize_component_env(str(key), value)

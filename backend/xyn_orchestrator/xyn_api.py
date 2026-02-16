@@ -2483,6 +2483,92 @@ def _merge_branding_for_app(app_id: str) -> Dict[str, Any]:
     return merged
 
 
+def _branding_tokens_for_app(app_id: str) -> Dict[str, Any]:
+    merged = _merge_branding_for_app(app_id)
+    radius = int(merged.get("button_radius_px") or 12)
+    brand_name = str(merged.get("display_name") or merged.get("brand_name") or "Xyn").strip() or "Xyn"
+    return {
+        "appKey": app_id,
+        "brandName": brand_name,
+        "logoUrl": merged.get("logo_url") or "",
+        "faviconUrl": merged.get("favicon_url") or "",
+        "colors": {
+            "primary": merged.get("primary_color") or "#0f4c81",
+            "text": merged.get("text_color") or "#10203a",
+            "mutedText": "#475569",
+            "bg": merged.get("background_color") or "#f5f7fb",
+            "surface": "#ffffff",
+            "border": "#dbe3ef",
+        },
+        "radii": {
+            "button": radius,
+            "card": max(radius + 4, 16),
+        },
+        "fonts": {
+            "ui": merged.get("font_family") or "Space Grotesk, Source Sans 3, sans-serif",
+        },
+        "spacing": {
+            "pageMaxWidth": 1120,
+            "gutter": 24,
+        },
+        "shadows": {
+            "card": "0 10px 28px rgba(2, 6, 23, 0.08)",
+        },
+    }
+
+
+def _branding_theme_css(tokens: Dict[str, Any]) -> str:
+    colors = tokens.get("colors") or {}
+    radii = tokens.get("radii") or {}
+    fonts = tokens.get("fonts") or {}
+    spacing = tokens.get("spacing") or {}
+    shadows = tokens.get("shadows") or {}
+    gradient = ""
+    app_id = str(tokens.get("appKey") or "xyn-ui").strip() or "xyn-ui"
+    merged = _merge_branding_for_app(app_id)
+    if merged.get("background_gradient"):
+        gradient = str(merged["background_gradient"])
+    safe_brand_name = str(tokens.get("brandName") or "Xyn").replace('"', '\\"')
+    safe_logo_url = str(tokens.get("logoUrl") or "").replace('"', '\\"')
+    lines = [
+        ":root {",
+        f"  --xyn-brand-name: \"{safe_brand_name}\";",
+        f"  --xyn-logo-url: \"{safe_logo_url}\";",
+        f"  --xyn-color-primary: {colors.get('primary') or '#0f4c81'};",
+        f"  --xyn-color-text: {colors.get('text') or '#10203a'};",
+        f"  --xyn-color-muted: {colors.get('mutedText') or '#475569'};",
+        f"  --xyn-color-bg: {colors.get('bg') or '#f5f7fb'};",
+        f"  --xyn-color-surface: {colors.get('surface') or '#ffffff'};",
+        f"  --xyn-color-border: {colors.get('border') or '#dbe3ef'};",
+        f"  --xyn-radius-button: {int(radii.get('button') or 12)}px;",
+        f"  --xyn-radius-card: {int(radii.get('card') or 16)}px;",
+        f"  --xyn-font-ui: {fonts.get('ui') or 'Space Grotesk, Source Sans 3, sans-serif'};",
+        f"  --xyn-spacing-page-max: {int(spacing.get('pageMaxWidth') or 1120)}px;",
+        f"  --xyn-spacing-gutter: {int(spacing.get('gutter') or 24)}px;",
+        f"  --xyn-shadow-card: {shadows.get('card') or '0 10px 28px rgba(2, 6, 23, 0.08)'};",
+        f"  --brand-primary: {colors.get('primary') or '#0f4c81'};",
+        f"  --brand-bg: {colors.get('bg') or '#f5f7fb'};",
+        f"  --brand-text: {colors.get('text') or '#10203a'};",
+        f"  --brand-radius: {int(radii.get('button') or 12)}px;",
+        f"  --brand-font: {fonts.get('ui') or 'Space Grotesk, Source Sans 3, sans-serif'};",
+    ]
+    if gradient:
+        lines.append(f"  --xyn-bg-gradient: {gradient};")
+        lines.append(f"  --brand-bg-gradient: {gradient};")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def _set_theme_headers(response: HttpResponse, body: str) -> HttpResponse:
+    etag = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    response["ETag"] = f"\"{etag}\""
+    response["Cache-Control"] = "public, max-age=300"
+    response["Access-Control-Allow-Origin"] = "*"
+    response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+
 def _validate_branding_payload(payload: Dict[str, Any], partial: bool = True) -> Dict[str, str]:
     errors: Dict[str, str] = {}
     color_fields = ("primary_color", "background_color", "text_color")
@@ -3088,6 +3174,25 @@ def platform_app_branding(request: HttpRequest, app_id: str) -> JsonResponse:
 def public_branding(request: HttpRequest) -> JsonResponse:
     app_id = request.GET.get("appId") or request.GET.get("app_id") or "xyn-ui"
     return JsonResponse(_merge_branding_for_app(app_id))
+
+
+def branding_tokens(request: HttpRequest) -> JsonResponse:
+    app_id = request.GET.get("app") or request.GET.get("appId") or request.GET.get("app_id") or "xyn-ui"
+    return JsonResponse(_branding_tokens_for_app(str(app_id)))
+
+
+def branding_theme_css(request: HttpRequest) -> HttpResponse:
+    if request.method == "OPTIONS":
+        response = HttpResponse("", content_type="text/css")
+        return _set_theme_headers(response, "")
+    app_id = request.GET.get("app") or request.GET.get("appId") or request.GET.get("app_id") or "xyn-ui"
+    css = _branding_theme_css(_branding_tokens_for_app(str(app_id)))
+    etag = hashlib.sha256(css.encode("utf-8")).hexdigest()
+    if request.headers.get("If-None-Match", "").strip('"') == etag:
+        response = HttpResponse(status=304)
+        return _set_theme_headers(response, css)
+    response = HttpResponse(css, content_type="text/css; charset=utf-8")
+    return _set_theme_headers(response, css)
 
 
 @csrf_exempt
