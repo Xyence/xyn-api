@@ -3936,6 +3936,21 @@ CMD ["sh", "-c", "echo migrate noop && exit 0"]
     return False
 
 
+def _resolve_context_alias(repo_key: str, service: str, context_rel: str) -> str:
+    repo = str(repo_key or "").strip().lower()
+    svc = str(service or "").strip().lower()
+    ctx = str(context_rel or "").strip()
+    if not ctx:
+        return ctx
+    normalized = ctx.replace("\\", "/").lstrip("./")
+    if normalized.startswith("services/"):
+        if repo == "xyn-api" and svc in {"ems-api", "ems-worker"}:
+            return "apps/ems-api"
+        if repo == "xyn-ui" and svc == "ems-web":
+            return "apps/ems-ui"
+    return ctx
+
+
 def _build_publish_images(
     release_id: str,
     images: List[Dict[str, Any]],
@@ -4133,6 +4148,7 @@ def _build_publish_images(
             repo_dir = checked_out[repo_key]
             base_root = os.path.join(repo_dir, str(source.get("path_root") or "").strip())
             context_rel = str(image.get("context_path") or "").strip()
+            context_rel = _resolve_context_alias(repo_key, str(service or name), context_rel)
             dockerfile_rel = str(image.get("dockerfile_path") or "Dockerfile").strip()
             context_path = os.path.normpath(os.path.join(base_root, context_rel))
             dockerfile_from_base = os.path.normpath(os.path.join(base_root, dockerfile_rel))
@@ -4550,6 +4566,11 @@ def _render_compose_for_release_components(
                 compose_lines.append(f"      - \"{port}\"\n")
 
         mounts = component.get("volumeMounts")
+        extra_mount_lines: List[str] = []
+        if host_ingress and name == "ems-web":
+            # EMS web nginx config includes an HTTPS server block that expects certs at this path.
+            # In host-ingress mode, these certs are bootstrapped on the target host.
+            extra_mount_lines.append("      - /opt/xyn/certs/current:/etc/nginx/certs/current:ro\n")
         if isinstance(mounts, list):
             mount_lines: List[str] = []
             for mount in mounts:
@@ -4564,9 +4585,13 @@ def _render_compose_for_release_components(
                 if volume_name not in volume_names:
                     volume_names.append(volume_name)
                 mount_lines.append(f"      - {volume_name}:{mount_path}\n")
+            mount_lines.extend(extra_mount_lines)
             if mount_lines:
                 compose_lines.append("    volumes:\n")
                 compose_lines.extend(mount_lines)
+        elif extra_mount_lines:
+            compose_lines.append("    volumes:\n")
+            compose_lines.extend(extra_mount_lines)
 
         networks = ["      - default\n"]
         needs_edge = host_ingress and (
