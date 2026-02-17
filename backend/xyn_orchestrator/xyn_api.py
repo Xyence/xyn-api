@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import html
 import secrets
 import time
 import uuid
@@ -1865,6 +1866,29 @@ def _load_oidc_flow(request: HttpRequest, state: str) -> Dict[str, Any]:
     return {}
 
 
+def _render_post_login_bridge(target_url: str) -> HttpResponse:
+    safe_target = html.escape(target_url, quote=True)
+    body = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="refresh" content="0;url={safe_target}" />
+    <title>Signing in...</title>
+  </head>
+  <body>
+    <p>Signing you in…</p>
+    <p><a href="{safe_target}">Continue</a></p>
+    <script>
+      window.location.replace("{safe_target}");
+    </script>
+  </body>
+</html>"""
+    response = HttpResponse(body, content_type="text/html; charset=utf-8")
+    response["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response["Pragma"] = "no-cache"
+    return response
+
+
 @csrf_exempt
 def oidc_authorize(request: HttpRequest, provider_id: str) -> HttpResponse:
     app_id = request.GET.get("appId") or request.GET.get("app_id") or ""
@@ -2115,6 +2139,7 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
         fragment_params["id_token"] = id_token
         rebuilt = split._replace(fragment=urlencode(fragment_params))
         redirect_to = urlunsplit(rebuilt)
+        return _render_post_login_bridge(redirect_to)
     return redirect(redirect_to)
 
 
