@@ -4310,127 +4310,17 @@ def _default_remote_root(release_target: Optional[Dict[str, Any]]) -> str:
 
 
 def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target: Optional[Dict[str, Any]] = None) -> str:
-    auth_app_id = "ems.platform"
-    api_image = images.get("ems-api", {}).get("image_uri")
-    web_image = images.get("ems-web", {}).get("image_uri")
-    api_digest = images.get("ems-api", {}).get("digest")
-    web_digest = images.get("ems-web", {}).get("digest")
-    if api_digest and api_image:
-        api_image = f"{api_image.rsplit(':', 1)[0]}@{api_digest}"
-    if web_digest and web_image:
-        web_image = f"{web_image.rsplit(':', 1)[0]}@{web_digest}"
-    ingress = _release_target_ingress(release_target)
-    tls_mode = ingress["tls_mode"]
-    host_ingress = tls_mode == "host-ingress"
-    route_labels = ""
-    route_network = ingress["network"]
-    route_defs = ingress["routes"] if isinstance(ingress["routes"], list) else []
-    for route in route_defs:
-        if not isinstance(route, dict):
+    components: List[Dict[str, Any]] = []
+    for service, image_info in sorted((images or {}).items()):
+        if not isinstance(image_info, dict):
             continue
-        host = str(route.get("host") or "").strip()
-        service = str(route.get("service") or "").strip()
-        if service and service != "ems-web":
+        image_uri = str(image_info.get("image_uri") or "").strip()
+        if not image_uri:
             continue
-        try:
-            port = int(route.get("port") or 8080)
-        except Exception:
-            port = 8080
-        # Legacy drafts may still carry ems-web:3000 from pre-traefik defaults; normalize to ems-web runtime port.
-        if service in {"", "ems-web"} and port == 3000:
-            port = 8080
-        rid = _sanitize_route_id(host)
-        route_labels += (
-            "    labels:\n"
-            "      - \"traefik.enable=true\"\n"
-            f"      - \"traefik.docker.network={route_network}\"\n"
-            f"      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId={auth_app_id}\"\n"
-            "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.trustForwardHeader=true\"\n"
-            f"      - \"traefik.http.routers.{rid}.rule=Host(`{host}`)\"\n"
-            f"      - \"traefik.http.routers.{rid}.entrypoints=websecure\"\n"
-            f"      - \"traefik.http.routers.{rid}.tls=true\"\n"
-            f"      - \"traefik.http.routers.{rid}.tls.certresolver=le\"\n"
-            f"      - \"traefik.http.routers.{rid}.middlewares=xyn-auth-ems@docker\"\n"
-            f"      - \"traefik.http.services.{rid}.loadbalancer.server.port={port}\"\n"
-        )
-    api_service_networks = ""
-    web_service_networks = ""
-    tail_networks = ""
-    web_ports_block = (
-        "    ports:\n"
-        "      - \"${EMS_PUBLIC_PORT:-80}:8080\"\n"
-        "      - \"${EMS_PUBLIC_TLS_PORT:-443}:8443\"\n"
-    )
-    if host_ingress:
-        web_ports_block = ""
-        api_service_networks = (
-            "    networks:\n"
-            "      - default\n"
-            f"      - {route_network}\n"
-        )
-        web_service_networks = (
-            "    networks:\n"
-            "      - default\n"
-            f"      - {route_network}\n"
-        )
-        tail_networks = (
-            "networks:\n"
-            f"  {route_network}:\n"
-            "    external: true\n\n"
-        )
-        if not route_labels:
-            route_labels = (
-                "    labels:\n"
-                "      - \"traefik.enable=true\"\n"
-                f"      - \"traefik.docker.network={route_network}\"\n"
-                f"      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId={auth_app_id}\"\n"
-                "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.trustForwardHeader=true\"\n"
-                "      - \"traefik.http.routers.ems.rule=Host(`${EMS_FQDN:-ems.xyence.io}`)\"\n"
-                "      - \"traefik.http.routers.ems.entrypoints=websecure\"\n"
-                "      - \"traefik.http.routers.ems.tls=true\"\n"
-                "      - \"traefik.http.routers.ems.tls.certresolver=le\"\n"
-                "      - \"traefik.http.routers.ems.middlewares=xyn-auth-ems@docker\"\n"
-                "      - \"traefik.http.services.ems.loadbalancer.server.port=8080\"\n"
-            )
-    return "".join(
-        [
-            "services:\n",
-            "  postgres:\n",
-            "    image: postgres:16-alpine\n",
-            "    environment:\n",
-            "      POSTGRES_USER: ${POSTGRES_USER:-ems}\n",
-            "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ems}\n",
-            "      POSTGRES_DB: ${POSTGRES_DB:-ems}\n",
-            "    volumes:\n",
-            "      - ems_pgdata:/var/lib/postgresql/data\n\n",
-            "  ems-api:\n",
-            f"    image: {api_image}\n",
-            "    environment:\n",
-            "      DATABASE_URL: postgres://${POSTGRES_USER:-ems}:${POSTGRES_PASSWORD:-ems}@postgres:5432/${POSTGRES_DB:-ems}\n",
-            "      EMS_JWT_SECRET: ${EMS_JWT_SECRET}\n",
-            "      EMS_JWT_ISSUER: ${EMS_JWT_ISSUER:-xyn-ems}\n",
-            "      EMS_JWT_AUDIENCE: ${EMS_JWT_AUDIENCE:-ems}\n",
-            "    depends_on:\n",
-            "      - postgres\n",
-            "    expose:\n",
-            "      - \"8000\"\n\n",
-            api_service_networks,
-            "  ems-web:\n",
-            f"    image: {web_image}\n",
-            web_ports_block,
-            "    volumes:\n",
-            "      - ${EMS_ACME_WEBROOT_PATH:-./acme-webroot}:/var/www/acme\n",
-            "      - ${EMS_CERTS_PATH:-./certs/current}:/etc/nginx/certs/current:ro\n",
-            "    depends_on:\n",
-            "      - ems-api\n\n",
-            web_service_networks,
-            route_labels,
-            "\n" if (web_service_networks or route_labels) else "",
-            "volumes:\n",
-            "  ems_pgdata: {}\n",
-            tail_networks,
-        ]
-    )
+        components.append({"name": str(service or "").strip(), "image": image_uri})
+    if not components:
+        return "services:\n"
+    return _render_compose_for_release_components(components, images, release_target)
 
 
 def _render_compose_for_release_components(
@@ -4460,15 +4350,9 @@ def _render_compose_for_release_components(
                     explicit = str(auth.get("app_id") or auth.get("appId") or "").strip()
                     if explicit:
                         return explicit
-        component_names = {
-            str(component.get("name") or "").strip().lower()
-            for component in components
-            if isinstance(component, dict)
-        }
-        if "ems-web" in component_names or "ems-api" in component_names or any(
-            name.startswith("ems-") for name in component_names
-        ):
-            return "ems.platform"
+            project_key = str(release_target.get("project_key") or "").strip()
+            if project_key:
+                return project_key
         return "xyn-ui"
 
     auth_app_id = _infer_forward_auth_app_id()
@@ -4513,10 +4397,12 @@ def _render_compose_for_release_components(
                 selected_port = 8080
             break
     if not selected_service:
-        for candidate in ("web", "frontend", "ui", "ems-web", "api", "ems-api"):
+        for candidate in ("web", "frontend", "ui", "api"):
             if candidate in component_by_name:
                 selected_service = candidate
                 break
+    if not selected_service and component_by_name:
+        selected_service = next(iter(component_by_name.keys()))
     if selected_service:
         ports = component_by_name.get(selected_service, {}).get("ports")
         if isinstance(ports, list):
@@ -4527,10 +4413,6 @@ def _render_compose_for_release_components(
                     except Exception:
                         pass
                     break
-    # Legacy EMS specs commonly describe ems-web on 3000, while the real container
-    # serves via nginx on 8080 behind Traefik.
-    if selected_service == "ems-web" and selected_port == 3000:
-        selected_port = 8080
 
     compose_lines: List[str] = ["services:\n"]
     volume_names: List[str] = []
@@ -4578,7 +4460,7 @@ def _render_compose_for_release_components(
             env_payload.setdefault("POSTGRES_PASSWORD", "${EMS_DB_PASSWORD:-ems}")
             env_payload.setdefault("POSTGRES_USER", "ems")
             env_payload.setdefault("POSTGRES_DB", "ems")
-        # Normalize EMS DB password placeholder so missing env still has a deterministic default.
+        # Normalize legacy DB password placeholder so missing env still has a deterministic default.
         db_url_value = env_payload.get("DATABASE_URL")
         if isinstance(db_url_value, str):
             env_payload["DATABASE_URL"] = db_url_value.replace("${EMS_DB_PASSWORD}", "${EMS_DB_PASSWORD:-ems}")
@@ -4625,10 +4507,6 @@ def _render_compose_for_release_components(
 
         mounts = component.get("volumeMounts")
         extra_mount_lines: List[str] = []
-        if host_ingress and name == "ems-web":
-            # EMS web nginx config includes an HTTPS server block that expects certs at this path.
-            # In host-ingress mode, these certs are bootstrapped on the target host.
-            extra_mount_lines.append("      - /opt/xyn/certs/current:/etc/nginx/certs/current:ro\n")
         if isinstance(mounts, list):
             mount_lines: List[str] = []
             for mount in mounts:

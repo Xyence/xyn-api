@@ -912,38 +912,34 @@ def _enqueue_release_build(release: Release, user) -> Dict[str, Any]:
     return {"ok": True, "run_id": str(run.id), "queued": True}
 
 
-def _default_repo_targets() -> List[Dict[str, Any]]:
+def _generic_repo_targets() -> List[Dict[str, Any]]:
     return [
         {
             "name": "xyn-api",
             "url": "https://github.com/Xyence/xyn-api",
             "ref": "main",
-            "path_root": "apps/ems-api",
+            "path_root": ".",
             "auth": "https_token",
-            "allow_write": True,
+            "allow_write": False,
         },
         {
             "name": "xyn-ui",
             "url": "https://github.com/Xyence/xyn-ui",
             "ref": "main",
-            "path_root": "apps/ems-ui",
+            "path_root": ".",
             "auth": "https_token",
-            "allow_write": True,
+            "allow_write": False,
         },
     ]
 
 
 def _normalize_repo_target_entry(target: Dict[str, Any]) -> Dict[str, Any]:
-    default_map = {entry["name"]: entry for entry in _default_repo_targets()}
     name = str(target.get("name") or "").strip()
-    base = default_map.get(name, {})
-    url = str(target.get("url") or base.get("url") or "").strip()
-    ref = str(target.get("ref") or base.get("ref") or "main").strip() or "main"
-    path_root = str(target.get("path_root") or base.get("path_root") or ".").strip() or "."
-    auth = str(target.get("auth") or base.get("auth") or "https_token").strip() or "https_token"
+    url = str(target.get("url") or "").strip()
+    ref = str(target.get("ref") or "main").strip() or "main"
+    path_root = str(target.get("path_root") or ".").strip() or "."
+    auth = str(target.get("auth") or "https_token").strip() or "https_token"
     allow_write_raw = target.get("allow_write")
-    if allow_write_raw is None:
-        allow_write_raw = base.get("allow_write")
     allow_write = bool(allow_write_raw) if allow_write_raw is not None else False
     return {
         "name": name,
@@ -1019,7 +1015,7 @@ def _guess_repo_target_name_for_component(
 
 
 def _build_module_catalog() -> Dict[str, Any]:
-    repo_targets = _default_repo_targets()
+    repo_targets = _generic_repo_targets()
     catalog: List[Dict[str, Any]] = []
     seen: set[str] = set()
     registry_root = Path(__file__).resolve().parents[1] / "registry" / "modules"
@@ -1048,86 +1044,7 @@ def _build_module_catalog() -> Dict[str, Any]:
             catalog.append(entry)
             seen.add(module_id)
 
-    curated = [
-        {
-            "id": "ems-api",
-            "version": "0.1.0",
-            "capabilities": [
-                "app.api.fastapi",
-                "ems.devices.api",
-                "ems.reports.api",
-                "authn.jwt.validate",
-                "authz.rbac.enforce",
-                "storage.postgres",
-                "storage.migrations.alembic",
-            ],
-            "repo": {
-                "name": repo_targets[0]["name"],
-                "url": repo_targets[0]["url"],
-                "ref": repo_targets[0]["ref"],
-                "path_root": "apps/ems-api",
-            },
-            "templates": [
-                "fastapi-scaffold",
-                "jwt-protect",
-                "devices-rbac",
-                "devices-persistence",
-            ],
-            "default_work_items": ["ems-api-scaffold"],
-        },
-        {
-            "id": "ems-ui",
-            "version": "0.1.0",
-            "capabilities": ["app.ui.react", "ems.devices.ui", "ems.reports.ui"],
-            "repo": {
-                "name": repo_targets[1]["name"],
-                "url": repo_targets[1]["url"],
-                "ref": repo_targets[1]["ref"],
-                "path_root": "apps/ems-ui",
-            },
-            "templates": ["react-scaffold", "ems-ui-devices"],
-            "default_work_items": ["ems-ui-scaffold"],
-        },
-        {
-            "id": "ems-stack",
-            "version": "0.1.0",
-            "capabilities": ["deploy.compose.local", "proxy.nginx"],
-            "repo": {
-                "name": repo_targets[0]["name"],
-                "url": repo_targets[0]["url"],
-                "ref": repo_targets[0]["ref"],
-                "path_root": "apps/ems-stack",
-            },
-            "templates": ["compose-chassis", "verify-stack"],
-            "default_work_items": ["ems-stack-prod-web"],
-        },
-        {
-            "id": "storage-postgres",
-            "version": "0.1.0",
-            "capabilities": ["storage.postgres"],
-            "repo": {
-                "name": repo_targets[0]["name"],
-                "url": repo_targets[0]["url"],
-                "ref": repo_targets[0]["ref"],
-                "path_root": "apps/ems-api",
-            },
-            "templates": ["db-foundation"],
-            "default_work_items": ["ems-api-db-foundation"],
-        },
-        {
-            "id": "migrations-alembic",
-            "version": "0.1.0",
-            "capabilities": ["storage.migrations.alembic"],
-            "repo": {
-                "name": repo_targets[0]["name"],
-                "url": repo_targets[0]["url"],
-                "ref": repo_targets[0]["ref"],
-                "path_root": "apps/ems-api",
-            },
-            "templates": ["alembic-migrations"],
-            "default_work_items": ["ems-api-alembic-migrations"],
-        },
-    ]
+    curated: List[Dict[str, Any]] = []
     for entry in curated:
         if entry["id"] in seen:
             continue
@@ -1601,11 +1518,7 @@ def _generate_implementation_plan(
 ) -> Dict[str, Any]:
     blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
     planned_release_version = _next_release_version_for_blueprint(str(blueprint.id))
-    repo_targets = _default_repo_targets()
-    if blueprint_fqn != "core.ems.platform":
-        # Non-EMS blueprints should default to repo-root paths so generated
-        # component build contexts (e.g. apps/<app>/api) resolve correctly.
-        repo_targets = [{**target, "path_root": "."} for target in repo_targets]
+    repo_targets = _generic_repo_targets()
     blueprint_intent = _extract_blueprint_intent(blueprint)
     intent_requirements = blueprint_intent.get("requirements") if isinstance(blueprint_intent.get("requirements"), dict) else {}
     intent_prompt = (
@@ -1614,7 +1527,8 @@ def _generate_implementation_plan(
         else ""
     )
     work_items: List[Dict[str, Any]] = []
-    if blueprint_fqn == "core.ems.platform":
+    legacy_ems_planner = bool((blueprint.metadata_json or {}).get("legacy_ems_planner"))
+    if legacy_ems_planner and blueprint_fqn == "core.ems.platform":
         work_items = [
             {
                 "id": "ems-api-scaffold",
@@ -2508,9 +2422,9 @@ def _generate_implementation_plan(
                     "type": "scaffold",
                     "repo_targets": repo_targets[:1],
                     "inputs": {"artifacts": ["implementation_plan.json"]},
-                    "outputs": {"paths": ["apps/ems-api/README.md"]},
+                    "outputs": {"paths": ["services/app/README.md"]},
                     "acceptance_criteria": ["Scaffold created from blueprint intent."],
-                    "verify": [{"name": "scaffold-file", "command": "test -f apps/ems-api/README.md"}],
+                    "verify": [{"name": "scaffold-file", "command": "test -f services/app/README.md"}],
                     "depends_on": [],
                     "labels": ["scaffold", "intent-driven"],
                 }
@@ -2557,27 +2471,6 @@ def _generate_implementation_plan(
         if isinstance(release_spec_payload.get("repoTargets"), list)
         else []
     )
-    if not release_repo_targets and release_components:
-        # Backward-compatible default repo target map for generated drafts/specs
-        # that do not yet include releaseSpec.repoTargets.
-        release_repo_targets = [
-            {
-                "name": "xyn-api",
-                "url": "https://github.com/Xyence/xyn-api",
-                "ref": "main",
-                "path_root": ".",
-                "auth": "https_token",
-                "allow_write": False,
-            },
-            {
-                "name": "xyn-ui",
-                "url": "https://github.com/Xyence/xyn-ui",
-                "ref": "main",
-                "path_root": ".",
-                "auth": "https_token",
-                "allow_write": False,
-            },
-        ]
     release_repo_targets = [
         _normalize_repo_target_entry(target)
         for target in release_repo_targets
@@ -2610,30 +2503,14 @@ def _generate_implementation_plan(
                 or ""
             ).strip()
             selected_repo_target: Optional[Dict[str, Any]] = None
-            if repo_target_name:
-                selected_repo_target = repo_target_map.get(repo_target_name)
-                if not selected_repo_target:
-                    raise RuntimeError(
-                        f"component {comp_name} has build config but repoTarget '{repo_target_name}' is not defined in releaseSpec.repoTargets"
-                    )
-            elif len(repo_target_map) > 1:
-                # Heuristic fallback for generated drafts that omit explicit repoTarget.
-                # Keeps planner resilient while still deterministic.
-                context_hint = str(build_cfg.get("context") or "").strip().lower()
-                preferred_name = _guess_repo_target_name_for_component(
-                    comp_name=comp_name,
-                    context_hint=context_hint,
-                    repo_target_map=repo_target_map,
-                )
-                if preferred_name and preferred_name in repo_target_map:
-                    repo_target_name = preferred_name
-                    selected_repo_target = repo_target_map.get(repo_target_name)
-            elif len(repo_target_map) == 1 and str(build_cfg.get("context") or "").strip().startswith("services/"):
-                # Fallback for simple single-repo blueprints.
-                repo_target_name, selected_repo_target = next(iter(repo_target_map.items()))
-            else:
+            if not repo_target_name:
                 raise RuntimeError(
                     f"component {comp_name} has build config but no repoTarget mapping. Add releaseSpec.repoTargets and component.build.repoTarget."
+                )
+            selected_repo_target = repo_target_map.get(repo_target_name)
+            if not selected_repo_target:
+                raise RuntimeError(
+                    f"component {comp_name} has build config but repoTarget '{repo_target_name}' is not defined in releaseSpec.repoTargets"
                 )
             build_context = str(build_cfg.get("context") or "").strip()
             if not build_context:
@@ -2757,54 +2634,10 @@ def _generate_implementation_plan(
                 build_id = "build.publish_images.container"
                 if isinstance(release_repo_targets, list) and release_repo_targets:
                     build_repo_targets = [target for target in release_repo_targets if isinstance(target, dict)]
-                if not build_repo_targets:
-                    build_repo_targets = [
-                        {
-                            "name": "xyn-api",
-                            "url": "https://github.com/Xyence/xyn-api",
-                            "ref": "main",
-                            "path_root": ".",
-                            "auth": "https_token",
-                            "allow_write": False,
-                        }
-                    ]
             if not build_images:
-                # Backward-compatible EMS fallback when blueprint does not define releaseSpec.components.
-                build_images = [
-                    {
-                        "name": "ems-api",
-                        "service": "ems-api",
-                        "repo": "xyn-api",
-                        "context_path": "apps/ems-api",
-                        "dockerfile_path": "apps/ems-api/Dockerfile",
-                    },
-                    {
-                        "name": "ems-web",
-                        "service": "ems-web",
-                        "repo": "xyn-ui",
-                        "context_path": "apps/ems-ui",
-                        "dockerfile_path": "apps/ems-ui/Dockerfile",
-                    },
-                ]
-                build_repo_targets = [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": ".",
-                        "auth": "https_token",
-                        "allow_write": False,
-                    },
-                    {
-                        "name": "xyn-ui",
-                        "url": "https://github.com/Xyence/xyn-ui",
-                        "ref": "main",
-                        "path_root": ".",
-                        "auth": "https_token",
-                        "allow_write": False,
-                    },
-                ]
-                build_id = "build.publish_images.container"
+                raise RuntimeError(
+                    "runtime.mode=compose_images requires releaseSpec.components with either build or image entries"
+                )
             build_repo_targets = [
                 _ensure_repo_target_complete(target, context=f"build repo_target[{index}]")
                 for index, target in enumerate(build_repo_targets)
@@ -3801,7 +3634,7 @@ def ensure_default_release_target(
     project_key = f"{blueprint_spec.namespace}.{blueprint_spec.name}"
     remote_root_slug = re.sub(r"[^a-z0-9]+", "-", project_key.lower()).strip("-") or "default"
     default_remote_root = f"/opt/xyn/apps/{remote_root_slug}"
-    ingress_service = "ems-web"
+    ingress_service = "web"
     ingress_port = 8080
     if blueprint_spec.spec_text:
         try:
@@ -3817,7 +3650,7 @@ def ensure_default_release_target(
                     for component in components
                     if isinstance(component, dict)
                 }
-                for candidate in ("web", "frontend", "ui", "ems-web"):
+                for candidate in ("web", "frontend", "ui"):
                     if candidate in component_names:
                         ingress_service = candidate
                         break

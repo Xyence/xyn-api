@@ -1260,21 +1260,39 @@ class PipelineSchemaTests(TestCase):
     def test_render_compose_for_images_host_ingress_adds_labels_and_no_host_ports(self):
         content = _render_compose_for_images(
             {
-                "ems-api": {"image_uri": "repo/ems-api:v40"},
-                "ems-web": {"image_uri": "repo/ems-web:v40"},
+                "api": {"image_uri": "repo/api:v40"},
+                "web": {"image_uri": "repo/web:v40"},
             },
             {
                 "tls": {"mode": "host-ingress"},
                 "ingress": {
                     "network": "xyn-edge",
-                    "routes": [{"host": "ems.xyence.io", "service": "ems-web", "port": 3000}],
+                    "routes": [{"host": "home.xyence.io", "service": "web", "port": 3000}],
                 },
             },
         )
-        self.assertNotIn("${EMS_PUBLIC_TLS_PORT:-443}:8443", content)
+        self.assertNotIn("ports:", content)
         self.assertIn("traefik.docker.network=xyn-edge", content)
-        self.assertIn("traefik.http.routers.ems-xyence-io.rule=Host(`ems.xyence.io`)", content)
+        self.assertIn("traefik.http.routers.home-xyence-io.rule=Host(`home.xyence.io`)", content)
         self.assertIn("external: true", content)
+
+    def test_core_planner_and_renderer_do_not_hardcode_ems_services(self):
+        planner_path = Path(__file__).resolve().parents[1] / "blueprints.py"
+        worker_path = Path(__file__).resolve().parents[1] / "worker_tasks.py"
+        planner_content = planner_path.read_text(encoding="utf-8")
+        worker_content = worker_path.read_text(encoding="utf-8")
+
+        planner_start = planner_content.index("def _generate_implementation_plan(")
+        planner_end = planner_content.index("def _validate_solution_blueprint")
+        planner_slice = planner_content[planner_start:planner_end]
+
+        render_start = worker_content.index("def _render_compose_for_images(")
+        render_end = worker_content.index("def _extract_compose_health_paths(")
+        render_slice = worker_content[render_start:render_end]
+
+        self.assertNotIn("apps/ems-", planner_slice)
+        self.assertNotIn("ems-api", render_slice)
+        self.assertNotIn("ems-web", render_slice)
 
     def test_ssm_service_digest_commands_include_label_filter(self):
         commands = _build_ssm_service_digest_commands(["api", "web"])
@@ -1903,7 +1921,7 @@ class PipelineSchemaTests(TestCase):
             self.assertTrue(repo.get("auth"))
             self.assertIn("allow_write", repo)
 
-    def test_planner_heuristic_maps_ems_named_repos_for_component_builds(self):
+    def test_planner_requires_component_repo_target_mapping(self):
         blueprint = Blueprint.objects.create(
             name="home-ems",
             namespace="core",
@@ -1936,20 +1954,15 @@ class PipelineSchemaTests(TestCase):
             "fqdn": "home-ems.xyence.io",
             "target_instance_id": str(uuid.uuid4()),
         }
-        plan = _generate_implementation_plan(
-            blueprint,
-            module_catalog=_build_module_catalog(),
-            run_history_summary=_build_run_history_summary(blueprint, release_target),
-            release_target=release_target,
-        )
-        build_item = next(
-            item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.components"
-        )
-        repos = {entry.get("repo") for entry in (build_item.get("config", {}).get("images") or [])}
-        self.assertIn("ems-api", repos)
-        self.assertIn("ems-ui", repos)
+        with self.assertRaisesRegex(RuntimeError, "no repoTarget mapping"):
+            _generate_implementation_plan(
+                blueprint,
+                module_catalog=_build_module_catalog(),
+                run_history_summary=_build_run_history_summary(blueprint, release_target),
+                release_target=release_target,
+            )
 
-    def test_planner_heuristic_maps_worker_component_to_backend_repo(self):
+    def test_planner_fails_when_runtime_mode_compose_images_without_components(self):
         blueprint = Blueprint.objects.create(
             name="home-ems",
             namespace="core",
@@ -1957,16 +1970,7 @@ class PipelineSchemaTests(TestCase):
                 {
                     "releaseSpec": {
                         "metadata": {"namespace": "core"},
-                        "repoTargets": [
-                            {"name": "ems-api", "url": "https://github.com/Xyence/xyn-api", "ref": "main", "path_root": "."},
-                            {"name": "ems-ui", "url": "https://github.com/Xyence/xyn-ui", "ref": "main", "path_root": "."},
-                        ],
-                        "components": [
-                            {
-                                "name": "ems-worker",
-                                "build": {"context": "apps/ems-worker", "dockerfile": "Dockerfile"},
-                            }
-                        ],
+                        "components": [],
                     }
                 }
             ),
@@ -1978,18 +1982,13 @@ class PipelineSchemaTests(TestCase):
             "fqdn": "home-ems.xyence.io",
             "target_instance_id": str(uuid.uuid4()),
         }
-        plan = _generate_implementation_plan(
-            blueprint,
-            module_catalog=_build_module_catalog(),
-            run_history_summary=_build_run_history_summary(blueprint, release_target),
-            release_target=release_target,
-        )
-        build_item = next(
-            item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.components"
-        )
-        image_entries = build_item.get("config", {}).get("images") or []
-        worker_entry = next(entry for entry in image_entries if entry.get("service") == "ems-worker")
-        self.assertEqual(worker_entry.get("repo"), "ems-api")
+        with self.assertRaisesRegex(RuntimeError, "requires releaseSpec.components"):
+            _generate_implementation_plan(
+                blueprint,
+                module_catalog=_build_module_catalog(),
+                run_history_summary=_build_run_history_summary(blueprint, release_target),
+                release_target=release_target,
+            )
 
     def test_planner_does_not_require_blueprint_metadata_deploy(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})

@@ -285,10 +285,8 @@ def _adapt_compose_for_host_ingress(compose_content: str, release_target: Option
     ingress = ((release_target.config_json if release_target else {}) or {}).get("ingress") or {}
     network = str(ingress.get("network") or "xyn-edge")
     routes = ingress.get("routes") if isinstance(ingress.get("routes"), list) else []
-    # Select the routed backend service from ingress routes; fallback to ems-web then ems-api.
-    route_entries = routes or [
-        {"host": (release_target.fqdn if release_target else "") or "ems.xyence.io", "service": "ems-web", "port": 8080}
-    ]
+    # Select the routed backend service from ingress routes; fallback to first declared service.
+    route_entries = routes or [{"host": (release_target.fqdn if release_target else "") or "", "service": "", "port": 8080}]
     selected_service_name = ""
     selected_route: Dict[str, Any] = {}
     for route in route_entries:
@@ -300,9 +298,9 @@ def _adapt_compose_for_host_ingress(compose_content: str, release_target: Option
             selected_route = route
             break
     if not selected_service_name:
-        for fallback in ("ems-web", "ems-api"):
-            if isinstance(services.get(fallback), dict):
-                selected_service_name = fallback
+        for service_name, service_cfg in services.items():
+            if isinstance(service_cfg, dict):
+                selected_service_name = str(service_name or "").strip()
                 break
     if not selected_service_name:
         return compose_content
@@ -311,19 +309,11 @@ def _adapt_compose_for_host_ingress(compose_content: str, release_target: Option
     if not isinstance(selected_service, dict):
         return compose_content
 
-    # Keep both ems-api and ems-web reachable on the edge network when present.
-    for service_name in ("ems-api", "ems-web"):
-        service_cfg = services.get(service_name)
+    # Keep all declared services off host ports while wiring selected routed service to edge network.
+    for service_cfg in services.values():
         if not isinstance(service_cfg, dict):
             continue
         service_cfg.pop("ports", None)
-        cfg_networks = service_cfg.get("networks")
-        if not isinstance(cfg_networks, list):
-            cfg_networks = []
-        for required in ("default", network):
-            if required not in cfg_networks:
-                cfg_networks.append(required)
-        service_cfg["networks"] = cfg_networks
 
     networks = selected_service.get("networks")
     if not isinstance(networks, list):
@@ -338,9 +328,9 @@ def _adapt_compose_for_host_ingress(compose_content: str, release_target: Option
     labels = [entry for entry in labels if isinstance(entry, str) and not entry.startswith("traefik.")]
     host = str(selected_route.get("host") or (release_target.fqdn if release_target else "") or "").strip()
     if host:
-        rid = "".join(ch if ch.isalnum() else "-" for ch in host).strip("-").lower() or "ems"
+        rid = "".join(ch if ch.isalnum() else "-" for ch in host).strip("-").lower() or "app"
         # Prefer explicit ingress port; fallback to service-local defaults.
-        default_port = 8080 if selected_service_name == "ems-web" else 8000
+        default_port = 8080
         try:
             port = int(selected_route.get("port") or default_port)
         except (TypeError, ValueError):
@@ -723,76 +713,8 @@ def execute_release_plan_deploy(
                     raise RuntimeError(f"SSM command failed in step {step_name}")
             execution["steps"].append(step_record)
     except Exception as exc:
-        # Fallback path: if ECR auth is unavailable, deploy directly from source and local builds.
-        fallback_error = ""
-        if "no basic auth credentials" in f"{exc}\n{last_stderr}".lower():
-            fallback_root = f"/opt/xyence/deploy-{deployment.id}"
-            fallback_state_root = "/opt/xyence"
-            fallback_commands = [
-                "set -euo pipefail",
-                f"ROOT={fallback_root}",
-                f"STATE={fallback_state_root}",
-                "mkdir -p \"$ROOT\"",
-                "mkdir -p \"$STATE/certs/current\" \"$STATE/acme-webroot\"",
-                "rm -rf \"$ROOT/xyn-api\" \"$ROOT/xyn-ui\"",
-                "git clone --depth 1 --branch main https://github.com/Xyence/xyn-api \"$ROOT/xyn-api\"",
-                "git clone --depth 1 --branch main https://github.com/Xyence/xyn-ui \"$ROOT/xyn-ui\"",
-                "cd \"$ROOT/xyn-api\"",
-                "XYN_UI_PATH=\"$ROOT/xyn-ui/apps/ems-ui\" "
-                "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
-                "EMS_CERTS_PATH=\"$STATE/certs/current\" EMS_ACME_WEBROOT_PATH=\"$STATE/acme-webroot\" "
-                "EMS_PLATFORM_API_BASE=https://xyence.io EMS_OIDC_APP_ID=ems.platform EMS_OIDC_ENABLED=true "
-                "EMS_JWT_SECRET=\"${EMS_JWT_SECRET:-dev-secret-change-me}\" "
-                "docker compose -f apps/ems-stack/docker-compose.yml down -v --remove-orphans",
-                "XYN_UI_PATH=\"$ROOT/xyn-ui/apps/ems-ui\" "
-                "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
-                "EMS_CERTS_PATH=\"$STATE/certs/current\" EMS_ACME_WEBROOT_PATH=\"$STATE/acme-webroot\" "
-                "EMS_PLATFORM_API_BASE=https://xyence.io EMS_OIDC_APP_ID=ems.platform EMS_OIDC_ENABLED=true "
-                "EMS_JWT_SECRET=\"${EMS_JWT_SECRET:-dev-secret-change-me}\" "
-                "docker compose -f apps/ems-stack/docker-compose.yml up -d --build --remove-orphans",
-            ]
-            try:
-                fallback = _run_ssm_commands(instance.instance_id, instance.aws_region, fallback_commands)
-                fallback_status = (
-                    "succeeded"
-                    if fallback.get("invocation_status") == "Success" and fallback.get("response_code") == 0
-                    else "failed"
-                )
-                last_stdout = _redact_output(fallback.get("stdout", ""))
-                last_stderr = _redact_output(fallback.get("stderr", ""))
-                ssm_command_ids.append(fallback.get("ssm_command_id", ""))
-                execution["steps"].append(
-                    {
-                        "name": "fallback_source_build_apply",
-                        "commands": [
-                            {
-                                "command": "fallback_source_build_apply",
-                                "status": fallback_status,
-                                "exit_code": fallback.get("response_code"),
-                                "started_at": fallback.get("started_at"),
-                                "finished_at": fallback.get("finished_at"),
-                                "ssm_command_id": fallback.get("ssm_command_id", ""),
-                                "stdout": last_stdout,
-                                "stderr": last_stderr,
-                            }
-                        ],
-                    }
-                )
-                if fallback_status == "succeeded":
-                    execution["status"] = "succeeded"
-                    deployment.status = "succeeded"
-                    deployment.error_message = ""
-                    deploy_workdir = f"{fallback_root}/xyn-api"
-                    deploy_compose_file = "apps/ems-stack/docker-compose.yml"
-                    cert_dir = "/opt/xyence/certs/current"
-                    acme_webroot = "/opt/xyence/acme-webroot"
-                else:
-                    fallback_error = "source-build fallback failed"
-            except Exception as fallback_exc:
-                fallback_error = str(fallback_exc)
-        if deployment.status != "succeeded":
-            deployment.status = "failed"
-            deployment.error_message = fallback_error or str(exc)
+        deployment.status = "failed"
+        deployment.error_message = str(exc)
     if deployment.status == "running":
         deployment.status = "succeeded"
     if deployment.status == "succeeded" and expects_tls:
