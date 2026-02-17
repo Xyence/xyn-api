@@ -3761,8 +3761,16 @@ def _ensure_fallback_component_context(service: str, context_path: str, dockerfi
         os.makedirs(context_path, exist_ok=True)
         created = True
     if is_api_like:
-        if not created and os.path.exists(os.path.join(context_path, "app/main.py")):
-            return False
+        if not created:
+            existing_markers = [
+                os.path.join(context_path, "app/main.py"),
+                os.path.join(context_path, "ems_api"),
+                os.path.join(context_path, "requirements.txt"),
+                os.path.join(context_path, "pyproject.toml"),
+                os.path.join(context_path, "setup.py"),
+            ]
+            if any(os.path.exists(marker) for marker in existing_markers):
+                return False
         _write_file(
             os.path.join(context_path, "requirements.txt"),
             "fastapi==0.115.0\nuvicorn==0.30.6\npsycopg[binary]==3.2.1\n",
@@ -4483,6 +4491,10 @@ def _render_compose_for_release_components(
                     except Exception:
                         pass
                     break
+    # Legacy EMS specs commonly describe ems-web on 3000, while the real container
+    # serves via nginx on 8080 behind Traefik.
+    if selected_service == "ems-web" and selected_port == 3000:
+        selected_port = 8080
 
     compose_lines: List[str] = ["services:\n"]
     volume_names: List[str] = []
@@ -4524,6 +4536,16 @@ def _render_compose_for_release_components(
         env_payload: Dict[str, Any] = {}
         if isinstance(env, dict):
             env_payload.update(env)
+        # Ensure Postgres containers always get a password; official images fail hard without it.
+        lower_image = image_uri.lower()
+        if name == "db-postgres" or "/postgres" in lower_image or "postgres:" in lower_image:
+            env_payload.setdefault("POSTGRES_PASSWORD", "${EMS_DB_PASSWORD:-ems}")
+            env_payload.setdefault("POSTGRES_USER", "ems")
+            env_payload.setdefault("POSTGRES_DB", "ems")
+        # Normalize EMS DB password placeholder so missing env still has a deterministic default.
+        db_url_value = env_payload.get("DATABASE_URL")
+        if isinstance(db_url_value, str):
+            env_payload["DATABASE_URL"] = db_url_value.replace("${EMS_DB_PASSWORD}", "${EMS_DB_PASSWORD:-ems}")
         if name in {"web", "frontend", "ui", selected_service}:
             env_payload.setdefault("XYN_APP_KEY", name)
             env_payload.setdefault("XYN_THEME_URL", f"https://xyence.io/xyn/api/branding/theme.css?app={name}")
