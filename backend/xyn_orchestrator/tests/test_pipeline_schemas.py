@@ -1944,7 +1944,7 @@ class PipelineSchemaTests(TestCase):
                 release_target=release_target,
             )
 
-    def test_planner_requires_component_repo_target_mapping(self):
+    def test_planner_infers_component_repo_target_mapping_from_name_and_context(self):
         blueprint = Blueprint.objects.create(
             name="home-ems",
             namespace="core",
@@ -1977,13 +1977,19 @@ class PipelineSchemaTests(TestCase):
             "fqdn": "home-ems.xyence.io",
             "target_instance_id": str(uuid.uuid4()),
         }
-        with self.assertRaisesRegex(RuntimeError, "no repoTarget mapping"):
-            _generate_implementation_plan(
-                blueprint,
-                module_catalog=_build_module_catalog(),
-                run_history_summary=_build_run_history_summary(blueprint, release_target),
-                release_target=release_target,
-            )
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=_build_module_catalog(),
+            run_history_summary=_build_run_history_summary(blueprint, release_target),
+            release_target=release_target,
+        )
+        build_item = next(
+            item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.components"
+        )
+        build_images = build_item.get("config", {}).get("images", [])
+        repo_by_service = {entry.get("service"): entry.get("repo") for entry in build_images}
+        self.assertEqual(repo_by_service.get("app-api"), "app-api")
+        self.assertEqual(repo_by_service.get("app-web"), "app-web")
 
     def test_planner_fails_when_runtime_mode_compose_images_without_components(self):
         blueprint = Blueprint.objects.create(
@@ -2012,6 +2018,49 @@ class PipelineSchemaTests(TestCase):
                 run_history_summary=_build_run_history_summary(blueprint, release_target),
                 release_target=release_target,
             )
+
+    def test_planner_defaults_repo_targets_when_omitted_and_build_config_present(self):
+        blueprint = Blueprint.objects.create(
+            name="auto-repo-target",
+            namespace="core",
+            spec_text=json.dumps(
+                {
+                    "releaseSpec": {
+                        "metadata": {"namespace": "core"},
+                        "components": [
+                            {
+                                "name": "web",
+                                "build": {"context": "services/web", "dockerfile": "Dockerfile"},
+                            },
+                            {
+                                "name": "api",
+                                "build": {"context": "services/api", "dockerfile": "Dockerfile"},
+                            },
+                        ],
+                    }
+                }
+            ),
+        )
+        release_target = {
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "dns": {"provider": "route53"},
+            "tls": {"mode": "host-ingress"},
+            "fqdn": "auto-repo-target.xyence.io",
+            "target_instance_id": str(uuid.uuid4()),
+        }
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=_build_module_catalog(),
+            run_history_summary=_build_run_history_summary(blueprint, release_target),
+            release_target=release_target,
+        )
+        build_item = next(
+            item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.components"
+        )
+        build_images = build_item.get("config", {}).get("images", [])
+        repo_by_service = {entry.get("service"): entry.get("repo") for entry in build_images}
+        self.assertEqual(repo_by_service.get("web"), "xyn-ui")
+        self.assertEqual(repo_by_service.get("api"), "xyn-api")
 
     def test_planner_does_not_require_blueprint_metadata_deploy(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})

@@ -1429,6 +1429,12 @@ def _generate_implementation_plan(
         target_name = str(normalized.get("name") or "").strip()
         if target_name:
             repo_target_map[target_name] = normalized
+    if not repo_target_map:
+        # Backward-compatible fallback for early drafts/specs that omit releaseSpec.repoTargets.
+        for target in _generic_repo_targets():
+            target_name = str(target.get("name") or "").strip()
+            if target_name:
+                repo_target_map[target_name] = _normalize_repo_target_entry(target)
     release_image_inputs: List[Dict[str, Any]] = []
     release_build_inputs: List[Dict[str, Any]] = []
     selected_repo_targets: Dict[str, Dict[str, Any]] = {}
@@ -1448,6 +1454,9 @@ def _generate_implementation_plan(
                 or ""
             ).strip()
             selected_repo_target: Optional[Dict[str, Any]] = None
+            if not repo_target_name:
+                context_hint = str(build_cfg.get("context") or "") or str(build_cfg.get("dockerfile") or "")
+                repo_target_name = _guess_repo_target_name_for_component(comp_name, context_hint, repo_target_map)
             if not repo_target_name:
                 raise RuntimeError(
                     f"component {comp_name} has build config but no repoTarget mapping. Add releaseSpec.repoTargets and component.build.repoTarget."
