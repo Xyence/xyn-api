@@ -582,10 +582,10 @@ class PipelineSchemaTests(TestCase):
         errors = list(Draft202012Validator(schema).iter_errors(plan))
         self.assertEqual(errors, [], f"Schema errors: {errors}")
         self.assertGreaterEqual(len(plan.get("work_items", [])), 1)
-        chassis = next((w for w in plan.get("work_items", []) if w.get("id") == "ems-stack-prod-web"), None)
+        chassis = next((w for w in plan.get("work_items", []) if w.get("id") == "ems.platform-scaffold"), None)
         self.assertIsNotNone(chassis)
         verify_cmds = [entry.get("command", "") for entry in chassis.get("verify", [])]
-        self.assertTrue(any("scripts/verify.sh" in cmd for cmd in verify_cmds))
+        self.assertTrue(any("services/app/README.md" in cmd for cmd in verify_cmds))
         self.assertIn("plan_rationale", plan)
         self.assertIn("module_catalog.v1.json", chassis.get("inputs", {}).get("artifacts", []))
         self.assertIn("run_history_summary.v1.json", chassis.get("inputs", {}).get("artifacts", []))
@@ -860,52 +860,17 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("EMS_JWT_SECRET", payload)
         self.assertNotIn("supersecret", payload)
 
-    def test_planner_selects_persistence_slice(self):
-        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
-        for work_item_id in [
-            "ems-stack-prod-web",
-            "ems-api-jwt-protect-me",
-            "ems-stack-pass-jwt-secret-and-verify-me",
-            "ems-api-devices-rbac",
-            "ems-stack-verify-rbac",
-        ]:
-            run = Run.objects.create(
-                entity_type="dev_task",
-                entity_id=uuid.uuid4(),
-                status="succeeded",
-            )
-            _write_run_artifact(
-                run,
-                "codegen_result.json",
-                {"success": True, "repo_results": []},
-                "codegen_result",
-            )
-            DevTask.objects.create(
-                title=work_item_id,
-                task_type="codegen",
-                status="succeeded",
-                source_entity_type="blueprint",
-                source_entity_id=blueprint.id,
-                work_item_id=work_item_id,
-                result_run=run,
-            )
-        module_catalog = _build_module_catalog()
-        run_history = _build_run_history_summary(blueprint)
+    def test_planner_generates_generic_scaffold_slice(self):
+        blueprint = Blueprint.objects.create(name="subscriber-notes", namespace="core")
         plan = _generate_implementation_plan(
             blueprint,
-            module_catalog=module_catalog,
-            run_history_summary=run_history,
+            module_catalog=_build_module_catalog(),
+            run_history_summary=_build_run_history_summary(blueprint),
         )
         ids = {item.get("id") for item in plan.get("work_items", [])}
-        self.assertIn("ems-api-devices-postgres", ids)
-        self.assertIn("ems-stack-verify-persistence", ids)
-        self.assertNotIn("ems-api-jwt-protect-me", ids)
-        self.assertNotIn("ems-api-devices-rbac", ids)
+        self.assertIn("subscriber-notes-scaffold", ids)
         rationale = plan.get("plan_rationale", {})
-        self.assertIn("persistence_devices", rationale.get("gaps_detected", []))
-        sample = next(iter(plan.get("work_items", [])))
-        self.assertIn("capabilities_required", sample)
-        self.assertIn("module_refs", sample)
+        self.assertIn("why_next", rationale)
 
     def test_planner_selects_route53_module_scaffold(self):
         blueprint = Blueprint.objects.create(
@@ -964,7 +929,28 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("blueprint.intent.requirements", context)
 
     def test_planner_selects_image_deploy_when_enabled(self):
-        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        blueprint = Blueprint.objects.create(
+            name="ems.platform",
+            namespace="core",
+            spec_text=json.dumps(
+                {
+                    "releaseSpec": {
+                        "metadata": {"namespace": "core"},
+                        "repoTargets": [
+                            {
+                                "name": "xyn-api",
+                                "url": "https://github.com/Xyence/xyn-api",
+                                "ref": "main",
+                                "path_root": ".",
+                                "auth": "https_token",
+                                "allow_write": False,
+                            }
+                        ],
+                        "components": [{"name": "api", "image": "ghcr.io/example/api:latest"}],
+                    }
+                }
+            ),
+        )
         release_target = {
             "schema_version": "release_target.v1",
             "id": str(uuid.uuid4()),
@@ -989,7 +975,28 @@ class PipelineSchemaTests(TestCase):
         self.assertTrue(str(config.get("release_version", "")).startswith("v"))
 
     def test_select_next_slice_includes_manifest_validation_when_image_deploy_present(self):
-        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        blueprint = Blueprint.objects.create(
+            name="ems.platform",
+            namespace="core",
+            spec_text=json.dumps(
+                {
+                    "releaseSpec": {
+                        "metadata": {"namespace": "core"},
+                        "repoTargets": [
+                            {
+                                "name": "xyn-api",
+                                "url": "https://github.com/Xyence/xyn-api",
+                                "ref": "main",
+                                "path_root": ".",
+                                "auth": "https_token",
+                                "allow_write": False,
+                            }
+                        ],
+                        "components": [{"name": "api", "image": "ghcr.io/example/api:latest"}],
+                    }
+                }
+            ),
+        )
         release_target = {
             "schema_version": "release_target.v1",
             "id": str(uuid.uuid4()),
@@ -1013,7 +1020,28 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("release.validate_manifest.pinned", selected_ids)
 
     def test_select_next_slice_omits_nginx_tls_for_host_ingress(self):
-        blueprint = Blueprint.objects.create(name="ems.platform", namespace="core")
+        blueprint = Blueprint.objects.create(
+            name="ems.platform",
+            namespace="core",
+            spec_text=json.dumps(
+                {
+                    "releaseSpec": {
+                        "metadata": {"namespace": "core"},
+                        "repoTargets": [
+                            {
+                                "name": "xyn-api",
+                                "url": "https://github.com/Xyence/xyn-api",
+                                "ref": "main",
+                                "path_root": ".",
+                                "auth": "https_token",
+                                "allow_write": False,
+                            }
+                        ],
+                        "components": [{"name": "web", "image": "ghcr.io/example/web:latest"}],
+                    }
+                }
+            ),
+        )
         release_target = {
             "schema_version": "release_target.v1",
             "id": str(uuid.uuid4()),
@@ -1279,20 +1307,27 @@ class PipelineSchemaTests(TestCase):
     def test_core_planner_and_renderer_do_not_hardcode_ems_services(self):
         planner_path = Path(__file__).resolve().parents[1] / "blueprints.py"
         worker_path = Path(__file__).resolve().parents[1] / "worker_tasks.py"
+        deployments_path = Path(__file__).resolve().parents[1] / "deployments.py"
         planner_content = planner_path.read_text(encoding="utf-8")
         worker_content = worker_path.read_text(encoding="utf-8")
+        deployments_content = deployments_path.read_text(encoding="utf-8")
 
         planner_start = planner_content.index("def _generate_implementation_plan(")
-        planner_end = planner_content.index("def _validate_solution_blueprint")
+        planner_end = planner_content.index("def _prune_run_artifacts")
         planner_slice = planner_content[planner_start:planner_end]
 
         render_start = worker_content.index("def _render_compose_for_images(")
-        render_end = worker_content.index("def _extract_compose_health_paths(")
+        render_end = worker_content.index("def _render_traefik_ingress_compose(")
         render_slice = worker_content[render_start:render_end]
+        deploy_start = deployments_content.index("def _adapt_compose_for_host_ingress(")
+        deploy_end = deployments_content.index("def _resolve_release_target(")
+        deploy_slice = deployments_content[deploy_start:deploy_end]
 
         self.assertNotIn("apps/ems-", planner_slice)
         self.assertNotIn("ems-api", render_slice)
         self.assertNotIn("ems-web", render_slice)
+        self.assertNotIn("ems-api", deploy_slice)
+        self.assertNotIn("ems-web", deploy_slice)
 
     def test_ssm_service_digest_commands_include_label_filter(self):
         commands = _build_ssm_service_digest_commands(["api", "web"])
@@ -1871,7 +1906,7 @@ class PipelineSchemaTests(TestCase):
         self.assertEqual(build_item.get("config", {}).get("blueprint_namespace"), "xyence.demo")
         self.assertEqual(build_item.get("config", {}).get("blueprint_repo_slug"), blueprint.repo_slug)
 
-    def test_planner_normalizes_partial_repo_targets_for_build_components(self):
+    def test_planner_requires_full_repo_targets_for_build_components(self):
         blueprint = Blueprint.objects.create(
             name="home-ems",
             namespace="core",
@@ -1879,10 +1914,7 @@ class PipelineSchemaTests(TestCase):
                 {
                     "releaseSpec": {
                         "metadata": {"namespace": "core"},
-                        "repoTargets": [
-                            {"name": "xyn-ui"},
-                            {"name": "xyn-api"},
-                        ],
+                        "repoTargets": [{"name": "xyn-ui"}, {"name": "xyn-api"}],
                         "components": [
                             {
                                 "name": "web",
@@ -1904,22 +1936,13 @@ class PipelineSchemaTests(TestCase):
             "fqdn": "home-ems.xyence.io",
             "target_instance_id": str(uuid.uuid4()),
         }
-        plan = _generate_implementation_plan(
-            blueprint,
-            module_catalog=_build_module_catalog(),
-            run_history_summary=_build_run_history_summary(blueprint, release_target),
-            release_target=release_target,
-        )
-        build_item = next(
-            item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.components"
-        )
-        for repo in build_item.get("repo_targets", []):
-            self.assertTrue(repo.get("name"))
-            self.assertTrue(repo.get("url"))
-            self.assertTrue(repo.get("ref"))
-            self.assertTrue(repo.get("path_root"))
-            self.assertTrue(repo.get("auth"))
-            self.assertIn("allow_write", repo)
+        with self.assertRaisesRegex(RuntimeError, "missing required fields"):
+            _generate_implementation_plan(
+                blueprint,
+                module_catalog=_build_module_catalog(),
+                run_history_summary=_build_run_history_summary(blueprint, release_target),
+                release_target=release_target,
+            )
 
     def test_planner_requires_component_repo_target_mapping(self):
         blueprint = Blueprint.objects.create(

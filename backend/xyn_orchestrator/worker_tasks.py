@@ -3945,17 +3945,9 @@ CMD ["sh", "-c", "echo migrate noop && exit 0"]
 
 
 def _resolve_context_alias(repo_key: str, service: str, context_rel: str) -> str:
-    repo = str(repo_key or "").strip().lower()
-    svc = str(service or "").strip().lower()
     ctx = str(context_rel or "").strip()
     if not ctx:
         return ctx
-    normalized = ctx.replace("\\", "/").lstrip("./")
-    if normalized.startswith("services/"):
-        if repo == "xyn-api" and svc in {"ems-api", "ems-worker"}:
-            return "apps/ems-api"
-        if repo == "xyn-ui" and svc == "ems-web":
-            return "apps/ems-ui"
     return ctx
 
 

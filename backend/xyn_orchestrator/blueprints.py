@@ -1088,61 +1088,20 @@ def _acceptance_checks_for_blueprint(
     remote_enabled = bool(deploy_target and deploy_fqdn)
     tls_mode = str(tls_meta.get("mode") or "").lower()
     tls_enabled = tls_mode in {"nginx+acme", "acme", "letsencrypt", "host-ingress", "embedded"}
-    blueprint_fqn = f"{blueprint.namespace}.{blueprint.name}"
-    if blueprint_fqn == "core.ems.platform":
-        checks = {
-            "local_chassis": ["ems-stack-prod-web"],
-            "jwt_required": ["ems-api-jwt-protect-me", "ems-stack-pass-jwt-secret-and-verify-me"],
-            "rbac_devices": ["ems-api-devices-rbac", "ems-stack-verify-rbac"],
-            "persistence_devices": ["ems-api-devices-postgres", "ems-stack-verify-persistence"],
-        }
-        if remote_enabled:
-            if image_deploy_enabled:
-                checks["remote_http_health"] = [
-                    "build.publish_images.container",
-                    "dns.ensure_record.route53",
-                    "deploy.apply_remote_compose.pull",
-                    "verify.public_http",
-                ]
-            else:
-                checks["remote_http_health"] = [
-                    "dns.ensure_record.route53",
-                    "deploy.apply_remote_compose.ssm",
-                    "verify.public_http",
-                ]
-        if remote_enabled and tls_enabled:
-            if image_deploy_enabled:
-                checks["remote_https_health"] = (
-                    [
-                        "build.publish_images.container",
-                        "dns.ensure_record.route53",
-                        "deploy.apply_remote_compose.pull",
-                        "verify.public_http",
-                        "verify.public_https",
-                    ]
-                    if tls_mode == "host-ingress"
-                    else [
-                        "build.publish_images.container",
-                        "dns.ensure_record.route53",
-                        "deploy.apply_remote_compose.pull",
-                        "verify.public_http",
-                        "tls.acme_http01",
-                        "ingress.nginx_tls_configure",
-                        "verify.public_https",
-                    ]
-                )
-            else:
-                checks["remote_https_health"] = (
-                    ["verify.public_https"]
-                    if tls_mode == "host-ingress"
-                    else [
-                        "tls.acme_http01",
-                        "ingress.nginx_tls_configure",
-                        "verify.public_https",
-                    ]
-                )
-        return checks
-    return {}
+    checks: Dict[str, List[str]] = {}
+    if remote_enabled:
+        checks["remote_http_health"] = (
+            ["build.publish_images.components", "release.validate_manifest.pinned", "dns.ensure_record.route53", "deploy.apply_remote_compose.pull", "verify.public_http"]
+            if image_deploy_enabled
+            else ["dns.ensure_record.route53", "deploy.apply_remote_compose.ssm", "verify.public_http"]
+        )
+    if remote_enabled and tls_enabled:
+        checks["remote_https_health"] = (
+            ["verify.public_https"]
+            if tls_mode == "host-ingress"
+            else ["tls.acme_http01", "ingress.nginx_tls_configure", "verify.public_https"]
+        )
+    return checks
 
 
 def _build_run_history_summary(
@@ -1204,11 +1163,10 @@ def _build_run_history_summary(
             https_health_ok = False
             https_api_ok = False
             for check in checks:
-                if check.get("name") in {"public_health", "http://ems.xyence.io/health", "health"} and check.get("ok"):
+                if check.get("name") in {"public_health", "health"} and check.get("ok"):
                     health_ok = True
                 if check.get("name") in {
                     "public_api_health",
-                    "http://ems.xyence.io/api/health",
                     "api_health",
                 } and check.get("ok"):
                     api_ok = True
@@ -1269,133 +1227,16 @@ def _select_next_slice(
     run_history_summary: Dict[str, Any],
     release_target: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    priority = [
-        "remote_https_health",
-        "remote_http_health",
-        "local_chassis",
-        "jwt_required",
-        "rbac_devices",
-        "persistence_devices",
-        "oidc",
-        "route53_acme_ssm",
-    ]
     status_map = {entry["id"]: entry["status"] for entry in run_history_summary.get("acceptance_checks_status", [])}
-    next_gap = None
-    for gap in priority:
-        if gap not in status_map:
-            continue
-        if status_map.get(gap) != "pass":
-            next_gap = gap
-            break
+    next_gap = next((gap for gap in ("remote_https_health", "remote_http_health") if status_map.get(gap) != "pass"), None)
     completed_ids = {
         entry.get("work_item_id")
         for entry in run_history_summary.get("completed_work_items", [])
         if entry.get("outcome") == "succeeded"
     }
-    image_deploy_present = any(item.get("id") == "deploy.apply_remote_compose.pull" for item in work_items)
-    build_present = any(
-        item.get("id") in {"build.publish_images.container", "build.publish_images.components"}
-        for item in work_items
-    )
-    metadata = blueprint.metadata_json or {}
-    tls_meta = metadata.get("tls") or {}
-    if release_target:
-        tls_meta = release_target.get("tls") or tls_meta
-    tls_mode = str(tls_meta.get("mode") or "").lower()
-    host_ingress = tls_mode == "host-ingress"
-    build_item_id = (
-        "build.publish_images.components"
-        if any(item.get("id") == "build.publish_images.components" for item in work_items)
-        else "build.publish_images.container"
-    )
-    remote_http_items = (
-        [
-            build_item_id,
-            "release.validate_manifest.pinned",
-            "dns.ensure_record.route53",
-            "deploy.apply_remote_compose.pull",
-            "verify.public_http",
-        ]
-        if image_deploy_present and build_present
-        else (
-            [
-                "release.validate_manifest.pinned",
-                "dns.ensure_record.route53",
-                "deploy.apply_remote_compose.pull",
-                "verify.public_http",
-            ]
-            if image_deploy_present
-            else ["dns.ensure_record.route53", "deploy.apply_remote_compose.ssm", "verify.public_http"]
-        )
-    )
-    remote_https_items = (
-        remote_http_items + ["verify.public_https"]
-        if host_ingress
-        else (
-            [
-                build_item_id,
-                "release.validate_manifest.pinned",
-                "dns.ensure_record.route53",
-                "deploy.apply_remote_compose.pull",
-                "verify.public_http",
-                "tls.acme_http01",
-                "ingress.nginx_tls_configure",
-                "verify.public_https",
-            ]
-            if image_deploy_present and build_present
-            else (
-                [
-                    "release.validate_manifest.pinned",
-                    "dns.ensure_record.route53",
-                    "deploy.apply_remote_compose.pull",
-                    "verify.public_http",
-                    "tls.acme_http01",
-                    "ingress.nginx_tls_configure",
-                    "verify.public_https",
-                ]
-                if image_deploy_present
-                else [
-                    "dns.ensure_record.route53",
-                    "deploy.apply_remote_compose.ssm",
-                    "verify.public_http",
-                    "tls.acme_http01",
-                    "ingress.nginx_tls_configure",
-                    "verify.public_https",
-                ]
-            )
-        )
-    )
-    gap_to_items = {
-        "local_chassis": ["ems-stack-prod-web"],
-        "jwt_required": ["ems-authn-jwt-module", "ems-api-jwt-protect-me", "ems-ui-token-input-me-call", "ems-stack-pass-jwt-secret-and-verify-me"],
-        "rbac_devices": ["ems-authz-rbac-module", "ems-api-devices-rbac", "ems-ui-devices-role-aware", "ems-stack-verify-rbac"],
-        "persistence_devices": [
-            "ems-api-db-foundation",
-            "ems-api-alembic-migrations",
-            "ems-api-container-startup-migrate",
-            "ems-api-devices-postgres",
-            "ems-stack-verify-persistence",
-        ],
-        "oidc": ["ems-api-authn-oidc", "ems-ui-auth"],
-        "route53_acme_ssm": ["ems-api-route53", "ems-api-acme", "ems-ssm-deploy"],
-        "remote_http_health": remote_http_items,
-        "remote_https_health": remote_https_items,
-    }
     if not next_gap:
         return work_items, {"gaps_detected": [], "modules_selected": [], "why_next": ["All known gaps satisfied."]}
-    selected_ids = gap_to_items.get(next_gap, [])
-    selected = [item for item in work_items if item["id"] in selected_ids and item["id"] not in completed_ids]
-    module_scaffolds = [
-        item
-        for item in work_items
-        if item.get("type") == "scaffold"
-        and isinstance(item.get("id"), str)
-        and item["id"].endswith("-module")
-        and item["id"] not in completed_ids
-    ]
-    for item in module_scaffolds:
-        if item not in selected:
-            selected.append(item)
+    selected = [item for item in work_items if item.get("id") not in completed_ids]
     rationale = {
         "gaps_detected": [next_gap],
         "modules_selected": [],
@@ -1410,103 +1251,19 @@ def _annotate_work_items(
     preferred_ingress_module: str = "ingress-nginx-acme",
 ) -> None:
     module_versions = {m["id"]: m.get("version", "0.1.0") for m in module_catalog.get("modules", [])}
-    work_item_caps = {
-        "ems-api-scaffold": ["app.api.fastapi"],
-        "ems-ui-scaffold": ["app.ui.react"],
-        "ems-compose-local-chassis": ["deploy.compose.local"],
-        "ems-stack-prod-web": ["deploy.compose.local", "runtime.web.static", "runtime.reverse_proxy.http"],
-        "ems-authn-jwt-module": ["authn.jwt.validate"],
-        "ems-authz-rbac-module": ["authz.rbac.enforce"],
-        "ems-api-jwt-protect-me": ["authn.jwt.validate"],
-        "ems-api-devices-rbac": ["authz.rbac.enforce", "ems.devices.api"],
-        "ems-api-devices-postgres": ["storage.postgres", "ems.devices.persistence"],
-        "ems-api-db-foundation": ["storage.postgres"],
-        "ems-api-alembic-migrations": ["storage.migrations.alembic"],
-        "ems-api-container-startup-migrate": ["storage.migrations.alembic"],
-        "ems-stack-verify-persistence": ["deploy.compose.local.verify"],
-        "ems-stack-verify-rbac": ["deploy.compose.local.verify"],
-        "ems-stack-pass-jwt-secret-and-verify-me": ["deploy.compose.local.verify"],
-        "ems-ui-token-input-me-call": ["app.ui.react", "authn.jwt.validate"],
-        "ems-ui-devices-role-aware": ["app.ui.react", "authz.rbac.enforce"],
-        "dns-route53-module": ["dns.route53.records"],
-        "deploy-ssm-compose-module": ["runtime.compose.apply_remote"],
-        "ingress-nginx-acme-module": ["ingress.tls.acme_http01"],
-        "ingress-traefik-acme-module": ["ingress.tls.acme_http01"],
-        "build-container-publish-module": ["build.container.image", "publish.container.registry"],
-        "runtime-compose-pull-apply-module": ["runtime.compose.pull_apply_remote"],
-        "dns-route53-ensure-record": ["dns.route53.records"],
-        "dns.ensure_record.route53": ["dns.route53.records"],
-        "remote-deploy-compose-ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
-        "deploy.apply_remote_compose.ssm": ["runtime.compose.apply_remote", "deploy.ssm.run_shell"],
-        "build.publish_images.container": ["build.container.image", "publish.container.registry"],
-        "build.publish_images.components": ["build.container.image", "publish.container.registry"],
-        "release.validate_manifest.pinned": ["release.manifest.pinned"],
-        "deploy.apply_remote_compose.pull": ["runtime.compose.pull_apply_remote"],
-        "remote-deploy-verify-public": ["deploy.verify.public_http"],
-        "verify.public_http": ["deploy.verify.public_http"],
-        "tls-acme-bootstrap": ["ingress.tls.acme_http01"],
-        "tls.acme_http01": ["ingress.tls.acme_http01"],
-        "tls-nginx-configure": ["ingress.nginx.tls_configure", "ingress.nginx.reverse_proxy"],
-        "ingress.nginx_tls_configure": ["ingress.nginx.tls_configure", "ingress.nginx.reverse_proxy"],
-        "remote-deploy-verify-https": ["deploy.verify.public_https", "ingress.tls.acme_http01"],
-        "verify.public_https": ["deploy.verify.public_https", "ingress.tls.acme_http01"],
-    }
-    work_item_modules = {
-        "ems-api-scaffold": ["ems-api"],
-        "ems-ui-scaffold": ["ems-ui"],
-        "ems-compose-local-chassis": ["ems-stack"],
-        "ems-stack-prod-web": ["ems-stack", "runtime-web-static-nginx"],
-        "ems-authn-jwt-module": ["authn-jwt"],
-        "ems-authz-rbac-module": ["authz-rbac"],
-        "ems-api-jwt-protect-me": ["authn-jwt", "ems-api"],
-        "ems-api-devices-rbac": ["authz-rbac", "ems-api"],
-        "ems-api-devices-postgres": ["storage-postgres", "ems-api"],
-        "ems-api-db-foundation": ["storage-postgres"],
-        "ems-api-alembic-migrations": ["migrations-alembic"],
-        "ems-api-container-startup-migrate": ["migrations-alembic"],
-        "ems-stack-verify-persistence": ["ems-stack"],
-        "ems-stack-verify-rbac": ["ems-stack"],
-        "ems-stack-pass-jwt-secret-and-verify-me": ["ems-stack"],
-        "ems-ui-token-input-me-call": ["ems-ui"],
-        "ems-ui-devices-role-aware": ["ems-ui"],
-        "dns-route53-module": ["dns-route53"],
-        "deploy-ssm-compose-module": ["deploy-ssm-compose"],
-        "ingress-nginx-acme-module": ["ingress-nginx-acme"],
-        "ingress-traefik-acme-module": ["ingress-traefik-acme"],
-        "build-container-publish-module": ["build-container-publish"],
-        "runtime-compose-pull-apply-module": ["runtime-compose-pull-apply"],
-        "dns-route53-ensure-record": ["dns-route53"],
-        "dns.ensure_record.route53": ["dns-route53"],
-        "remote-deploy-compose-ssm": ["deploy-ssm-compose"],
-        "deploy.apply_remote_compose.ssm": ["deploy-ssm-compose"],
-        "build.publish_images.container": ["build-container-publish"],
-        "build.publish_images.components": ["build-container-publish"],
-        "release.validate_manifest.pinned": ["build-container-publish"],
-        "deploy.apply_remote_compose.pull": ["runtime-compose-pull-apply"],
-        "remote-deploy-verify-public": ["deploy-ssm-compose"],
-        "verify.public_http": ["deploy-ssm-compose"],
-        "tls-acme-bootstrap": [preferred_ingress_module],
-        "tls.acme_http01": [preferred_ingress_module],
-        "tls-nginx-configure": [preferred_ingress_module],
-        "ingress.nginx_tls_configure": [preferred_ingress_module],
-        "remote-deploy-verify-https": [preferred_ingress_module],
-        "verify.public_https": [preferred_ingress_module],
-    }
+    known_modules = set(module_versions.keys())
     for item in work_items:
-        item_id = item.get("id")
-        caps = work_item_caps.get(item_id, [])
-        modules = work_item_modules.get(item_id, [])
-        if caps:
-            item["capabilities_required"] = caps
-        if modules:
-            item["module_refs"] = [{"id": module_id, "version": module_versions.get(module_id, "0.1.0")} for module_id in modules]
-            item.setdefault("labels", [])
-            for module_id in modules:
-                if f"module:{module_id}" not in item["labels"]:
-                    item["labels"].append(f"module:{module_id}")
-            for cap in caps:
-                if f"capability:{cap}" not in item["labels"]:
-                    item["labels"].append(f"capability:{cap}")
+        labels = [str(label) for label in (item.get("labels") or []) if isinstance(label, str)]
+        module_refs: List[Dict[str, str]] = []
+        for label in labels:
+            if not label.startswith("module:"):
+                continue
+            module_id = label.split(":", 1)[1].strip()
+            if not module_id or module_id not in known_modules:
+                continue
+            module_refs.append({"id": module_id, "version": module_versions.get(module_id, "0.1.0")})
+        if module_refs:
+            item["module_refs"] = module_refs
 
 
 def _generate_implementation_plan(
@@ -1527,908 +1284,96 @@ def _generate_implementation_plan(
         else ""
     )
     work_items: List[Dict[str, Any]] = []
-    legacy_ems_planner = bool((blueprint.metadata_json or {}).get("legacy_ems_planner"))
-    if legacy_ems_planner and blueprint_fqn == "core.ems.platform":
+    functional = [str(item).strip() for item in (intent_requirements.get("functional") or []) if str(item).strip()]
+    ui = [str(item).strip() for item in (intent_requirements.get("ui") or []) if str(item).strip()]
+    data_model = [str(item).strip() for item in (intent_requirements.get("dataModel") or []) if str(item).strip()]
+    operational = [str(item).strip() for item in (intent_requirements.get("operational") or []) if str(item).strip()]
+    dod = [str(item).strip() for item in (intent_requirements.get("definitionOfDone") or []) if str(item).strip()]
+    summary = str(intent_requirements.get("summary") or "").strip()
+    if not summary:
+        summary = (intent_prompt or "Create initial scaffold for blueprint.")[:240]
+
+    work_items = []
+    if functional:
+        work_items.append(
+            {
+                "id": f"{blueprint.name}-api-features",
+                "title": f"Implement API features for {blueprint_fqn}",
+                "description": summary,
+                "type": "feature",
+                "repo_targets": repo_targets[:1],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
+                "outputs": {"paths": ["services/api/README.md"]},
+                "acceptance_criteria": functional,
+                "verify": [{"name": "api-sanity", "command": "echo 'api checks defined in task output'"}],
+                "depends_on": [],
+                "labels": ["api", "feature", "intent-driven"],
+            }
+        )
+    if ui:
+        work_items.append(
+            {
+                "id": f"{blueprint.name}-ui-features",
+                "title": f"Implement UI requirements for {blueprint_fqn}",
+                "description": "Implement UI behavior captured in blueprint intent.",
+                "type": "feature",
+                "repo_targets": repo_targets[1:2] or repo_targets[:1],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
+                "outputs": {"paths": ["services/web/README.md"]},
+                "acceptance_criteria": ui,
+                "verify": [{"name": "ui-sanity", "command": "echo 'ui checks defined in task output'"}],
+                "depends_on": [work_items[0]["id"]] if work_items else [],
+                "labels": ["ui", "feature", "intent-driven"],
+            }
+        )
+    if data_model:
+        work_items.append(
+            {
+                "id": f"{blueprint.name}-data-model",
+                "title": f"Implement data model for {blueprint_fqn}",
+                "description": "Establish entities and persistence required by blueprint intent.",
+                "type": "integration",
+                "repo_targets": repo_targets[:1],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
+                "outputs": {"paths": ["services/api/migrations/README.md"]},
+                "acceptance_criteria": data_model,
+                "verify": [{"name": "data-sanity", "command": "echo 'data model checks defined in task output'"}],
+                "depends_on": [item["id"] for item in work_items[:1]],
+                "labels": ["data", "schema", "intent-driven"],
+            }
+        )
+    if operational or dod:
+        work_items.append(
+            {
+                "id": f"{blueprint.name}-operational-hardening",
+                "title": f"Operationalize {blueprint_fqn}",
+                "description": "Apply deployment and operational requirements from blueprint intent.",
+                "type": "deploy",
+                "repo_targets": repo_targets[:1],
+                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
+                "outputs": {"paths": ["services/api/ops/README.md"]},
+                "acceptance_criteria": operational + dod,
+                "verify": [{"name": "ops-sanity", "command": "echo 'ops checks defined in task output'"}],
+                "depends_on": [item["id"] for item in work_items],
+                "labels": ["deploy", "ops", "intent-driven"],
+            }
+        )
+    if not work_items:
         work_items = [
             {
-                "id": "ems-api-scaffold",
-                "title": "Scaffold EMS API service",
-                "description": "Create FastAPI scaffolding, router wiring, and health checks.",
+                "id": f"{blueprint.name}-scaffold",
+                "title": f"Scaffold {blueprint_fqn}",
+                "description": summary or "Create initial scaffold for blueprint.",
                 "type": "scaffold",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"], "context": ["ems-platform-blueprint"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/README.md",
-                        "apps/ems-api/requirements.txt",
-                        "apps/ems-api/Dockerfile",
-                        "apps/ems-api/pyproject.toml",
-                        "apps/ems-api/ems_api/__init__.py",
-                        "apps/ems-api/ems_api/main.py",
-                        "apps/ems-api/ems_api/routes/__init__.py",
-                        "apps/ems-api/ems_api/routes/health.py",
-                        "apps/ems-api/ems_api/routes/devices.py",
-                        "apps/ems-api/ems_api/routes/reports.py",
-                        "apps/ems-api/ems_api/tests/test_health.py",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "FastAPI app boots with /health endpoint.",
-                    "Project README describes local run steps.",
-                ],
-                "verify": [
-                    {
-                        "name": "compile",
-                        "command": "python -m compileall ems_api",
-                        "cwd": "apps/ems-api",
-                    },
-                    {
-                        "name": "import app",
-                        "command": "python -c \"import ems_api.main\"",
-                        "cwd": "apps/ems-api",
-                    },
-                ],
+                "repo_targets": repo_targets[:1],
+                "inputs": {"artifacts": ["implementation_plan.json"]},
+                "outputs": {"paths": ["services/app/README.md"]},
+                "acceptance_criteria": ["Scaffold created from blueprint intent."],
+                "verify": [{"name": "scaffold-file", "command": "test -f services/app/README.md"}],
                 "depends_on": [],
-                "labels": ["scaffold", "api"],
-            },
-            {
-                "id": "ems-api-authn-oidc",
-                "title": "Add OIDC authn scaffolding",
-                "description": "Add OIDC config placeholders and login flow stubs.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"], "context": ["xyn-planner-canon"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/ems_api/auth/__init__.py",
-                        "apps/ems-api/ems_api/auth/oidc.py",
-                        "apps/ems-api/ems_api/deps.py",
-                        "apps/ems-api/ems_api/tests/test_auth.py",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "OIDC settings present with placeholders.",
-                    "Login endpoint returns placeholder JWT.",
-                ],
-                "verify": [
-                    {"name": "auth-file", "command": "test -f ems_api/auth/oidc.py", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-scaffold"],
-                "labels": ["auth", "api"],
-            },
-            {
-                "id": "ems-api-rbac",
-                "title": "Add RBAC primitives",
-                "description": "Define roles, policies, and middleware checks.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/ems_api/auth/rbac.py",
-                        "apps/ems-api/ems_api/tests/test_rbac.py",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Roles Admin/Operator/Viewer defined.",
-                    "RBAC check utility available.",
-                ],
-                "verify": [
-                    {"name": "rbac-file", "command": "test -f ems_api/auth/rbac.py", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-authn-oidc"],
-                "labels": ["rbac", "api"],
-            },
-            {
-                "id": "ems-api-devices",
-                "title": "Device CRUD endpoints",
-                "description": "Stub device CRUD endpoints with RBAC guards.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/ems_api/routes/devices.py",
-                        "apps/ems-api/ems_api/tests/test_devices.py",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "CRUD endpoints exist for devices.",
-                    "Viewer role can only read.",
-                ],
-                "verify": [
-                    {"name": "devices-file", "command": "test -f ems_api/routes/devices.py", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-rbac"],
-                "labels": ["api", "devices"],
-            },
-            {
-                "id": "ems-api-reports",
-                "title": "Reports endpoint",
-                "description": "Stub reports endpoint with viewer access.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/ems_api/routes/reports.py",
-                        "apps/ems-api/ems_api/tests/test_reports.py",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Reports endpoint returns placeholder report data.",
-                ],
-                "verify": [
-                    {"name": "reports-file", "command": "test -f ems_api/routes/reports.py", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-rbac"],
-                "labels": ["api", "reports"],
-            },
-            {
-                "id": "ems-ui-scaffold",
-                "title": "Scaffold EMS UI",
-                "description": "Create React app shell with routing and entrypoints.",
-                "type": "scaffold",
-                "repo_targets": [repo_targets[1]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-ui/README.md",
-                        "apps/ems-ui/Dockerfile",
-                        "apps/ems-ui/nginx.conf",
-                        "apps/ems-ui/package.json",
-                        "apps/ems-ui/tsconfig.json",
-                        "apps/ems-ui/vite.config.ts",
-                        "apps/ems-ui/index.html",
-                        "apps/ems-ui/src/main.tsx",
-                        "apps/ems-ui/src/App.tsx",
-                        "apps/ems-ui/src/routes.tsx",
-                        "apps/ems-ui/src/styles.css",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "UI app renders basic layout and navigation.",
-                ],
-                "verify": [
-                    {
-                        "name": "ui-structure",
-                        "command": "test -f Dockerfile && test -f nginx.conf && test -f src/App.tsx && test -f src/main.tsx && test -f src/routes.tsx && test -f src/auth/Login.tsx && test -f src/devices/DeviceList.tsx && test -f src/reports/Reports.tsx && grep -q \"/api/health\" src/auth/Login.tsx && grep -q \"/api/me\" src/auth/Login.tsx",
-                        "cwd": "apps/ems-ui",
-                    },
-                ],
-                "depends_on": [],
-                "labels": ["scaffold", "ui"],
-            },
-            {
-                "id": "ems-authn-jwt-module",
-                "title": "JWT auth module scaffold",
-                "description": "Define reusable JWT auth module spec and docs.",
-                "type": "scaffold",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": "backend/registry/modules",
-                        "auth": "https_token",
-                        "allow_write": True,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "backend/registry/modules/authn-jwt.json",
-                        "backend/registry/modules/README.md",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Module spec describes JWT validation capability and configuration.",
-                ],
-                "verify": [
-                    {
-                        "name": "module-spec",
-                        "command": "test -f backend/registry/modules/authn-jwt.json",
-                        "cwd": ".",
-                    }
-                ],
-                "depends_on": [],
-                "labels": ["module", "auth"],
-            },
-            {
-                "id": "ems-authz-rbac-module",
-                "title": "RBAC module scaffold",
-                "description": "Define reusable RBAC module spec and docs.",
-                "type": "scaffold",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": "backend/registry/modules",
-                        "auth": "https_token",
-                        "allow_write": True,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["backend/registry/modules/authz-rbac.json"]},
-                "acceptance_criteria": [
-                    "Module spec describes RBAC enforcement capability and roles.",
-                ],
-                "verify": [
-                    {
-                        "name": "rbac-module-spec",
-                        "command": "test -f backend/registry/modules/authz-rbac.json",
-                        "cwd": ".",
-                    }
-                ],
-                "depends_on": [],
-                "labels": ["module", "authz"],
-            },
-            {
-                "id": "ems-api-jwt-protect-me",
-                "title": "Protect /me with JWT",
-                "description": "Add JWT validation, /me endpoint, and dev token helper.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/ems_api/auth.py",
-                        "apps/ems-api/ems_api/routes/me.py",
-                        "apps/ems-api/scripts/issue_dev_token.py",
-                        "apps/ems-api/requirements.txt",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "/me returns claims with valid JWT.",
-                    "/me returns 401 when unauthenticated.",
-                ],
-                "verify": [
-                    {
-                        "name": "jwt-files",
-                        "command": "test -f ems_api/auth.py && test -f ems_api/routes/me.py && test -f scripts/issue_dev_token.py",
-                        "cwd": "apps/ems-api",
-                    },
-                ],
-                "depends_on": ["ems-authn-jwt-module", "ems-api-scaffold"],
-                "labels": ["api", "auth"],
-            },
-            {
-                "id": "ems-api-db-foundation",
-                "title": "Database foundation",
-                "description": "SQLAlchemy base, session utilities, and device model.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/ems_api/db.py",
-                        "apps/ems-api/ems_api/models.py",
-                    ]
-                },
-                "acceptance_criteria": ["Database utilities and models exist."],
-                "verify": [
-                    {"name": "db-files", "command": "test -f ems_api/db.py && test -f ems_api/models.py", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-jwt-protect-me"],
-                "labels": ["api", "db"],
-            },
-            {
-                "id": "ems-api-alembic-migrations",
-                "title": "Alembic migrations",
-                "description": "Add Alembic config and initial devices migration.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/alembic.ini",
-                        "apps/ems-api/alembic/env.py",
-                        "apps/ems-api/alembic/versions/20260206_ems_devices.py",
-                    ]
-                },
-                "acceptance_criteria": ["Alembic migration for devices exists."],
-                "verify": [
-                    {"name": "alembic-files", "command": "test -f alembic.ini && test -f alembic/env.py", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-db-foundation"],
-                "labels": ["api", "db"],
-            },
-            {
-                "id": "ems-api-container-startup-migrate",
-                "title": "Run migrations on startup",
-                "description": "Add entrypoint to run alembic before uvicorn.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/scripts/entrypoint.sh",
-                        "apps/ems-api/Dockerfile",
-                    ]
-                },
-                "acceptance_criteria": ["Container runs alembic upgrade head on boot."],
-                "verify": [
-                    {"name": "entrypoint", "command": "test -f scripts/entrypoint.sh", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-alembic-migrations"],
-                "labels": ["api", "db", "deploy"],
-            },
-            {
-                "id": "ems-api-devices-rbac",
-                "title": "RBAC enforcement for devices",
-                "description": "Require admin for device writes and allow viewer/admin reads.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/ems_api/rbac.py",
-                        "apps/ems-api/ems_api/routes/devices.py",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Viewer can list devices but cannot create/delete.",
-                    "Admin can create/delete devices.",
-                ],
-                "verify": [
-                    {
-                        "name": "devices-rbac",
-                        "command": "test -f ems_api/rbac.py && grep -q require_roles ems_api/routes/devices.py",
-                        "cwd": "apps/ems-api",
-                    }
-                ],
-                "depends_on": ["ems-api-jwt-protect-me", "ems-authz-rbac-module"],
-                "labels": ["api", "authz"],
-            },
-            {
-                "id": "ems-api-devices-postgres",
-                "title": "Persist devices in Postgres",
-                "description": "Refactor devices CRUD to use SQLAlchemy/Postgres.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-api/ems_api/routes/devices.py"]},
-                "acceptance_criteria": ["Devices CRUD uses database storage."],
-                "verify": [
-                    {"name": "devices-db", "command": "grep -q 'Session' ems_api/routes/devices.py", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-db-foundation", "ems-api-devices-rbac"],
-                "labels": ["api", "db"],
-            },
-            {
-                "id": "ems-token-script-roles",
-                "title": "Dev token roles",
-                "description": "Allow dev token script to issue admin/viewer tokens.",
-                "type": "feature",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-api/scripts/issue_dev_token.py"]},
-                "acceptance_criteria": [
-                    "issue_dev_token.py supports --role admin|viewer.",
-                ],
-                "verify": [
-                    {
-                        "name": "token-roles",
-                        "command": "grep -q -- '--role' scripts/issue_dev_token.py",
-                        "cwd": "apps/ems-api",
-                    }
-                ],
-                "depends_on": ["ems-api-jwt-protect-me"],
-                "labels": ["api", "auth"],
-            },
-            {
-                "id": "ems-ui-token-input-me-call",
-                "title": "UI token input and /me call",
-                "description": "Add token input and /api/me call to UI login.",
-                "type": "feature",
-                "repo_targets": [repo_targets[1]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-ui/src/auth/Login.tsx",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "UI shows API health and /api/me identity response.",
-                ],
-                "verify": [
-                    {
-                        "name": "login-me-call",
-                        "command": "test -f src/auth/Login.tsx && grep -q \"/api/me\" src/auth/Login.tsx",
-                        "cwd": "apps/ems-ui",
-                    },
-                ],
-                "depends_on": ["ems-ui-scaffold", "ems-api-jwt-protect-me"],
-                "labels": ["ui", "auth"],
-            },
-            {
-                "id": "ems-ui-devices-role-aware",
-                "title": "Role-aware devices UI",
-                "description": "Render device list and show admin controls only for admin role.",
-                "type": "feature",
-                "repo_targets": [repo_targets[1]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-ui/src/devices/DeviceList.tsx"]},
-                "acceptance_criteria": [
-                    "Viewer sees list only; admin sees create/delete controls.",
-                ],
-                "verify": [
-                    {
-                        "name": "devices-ui",
-                        "command": "grep -q /api/devices src/devices/DeviceList.tsx",
-                        "cwd": "apps/ems-ui",
-                    }
-                ],
-                "depends_on": ["ems-ui-scaffold", "ems-api-devices-rbac"],
-                "labels": ["ui", "authz"],
-            },
-            {
-                "id": "ems-stack-pass-jwt-secret-and-verify-me",
-                "title": "Chassis JWT config and /me verification",
-                "description": "Pass EMS_JWT_SECRET and verify /api/me through the stack.",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": "apps/ems-stack",
-                        "auth": "https_token",
-                        "allow_write": True,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-stack/.env.example",
-                        "apps/ems-stack/docker-compose.yml",
-                        "apps/ems-stack/scripts/verify.sh",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Stack passes EMS_JWT_SECRET and /api/me checks in verify script.",
-                ],
-                "verify": [
-                    {
-                        "name": "stack-jwt-files",
-                        "command": "grep -q EMS_JWT_SECRET apps/ems-stack/docker-compose.yml && grep -q /api/me apps/ems-stack/scripts/verify.sh",
-                        "cwd": ".",
-                    }
-                ],
-                "depends_on": ["ems-stack-prod-web", "ems-api-jwt-protect-me"],
-                "labels": ["deploy", "auth"],
-            },
-            {
-                "id": "ems-stack-verify-rbac",
-                "title": "Chassis RBAC verification",
-                "description": "Verify viewer/admin behavior for /api/devices.",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": "apps/ems-stack",
-                        "auth": "https_token",
-                        "allow_write": True,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-stack/scripts/verify.sh"]},
-                "acceptance_criteria": [
-                    "verify.sh asserts viewer 403 and admin 200/201 on /api/devices.",
-                ],
-                "verify": [
-                    {
-                        "name": "rbac-verify-script",
-                        "command": "grep -q /api/devices apps/ems-stack/scripts/verify.sh && grep -q viewer apps/ems-stack/scripts/verify.sh",
-                        "cwd": ".",
-                    }
-                ],
-                "depends_on": ["ems-stack-pass-jwt-secret-and-verify-me", "ems-api-devices-rbac"],
-                "labels": ["deploy", "authz"],
-            },
-            {
-                "id": "ems-stack-verify-persistence",
-                "title": "Verify device persistence",
-                "description": "Ensure devices persist across ems-api restart.",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": "apps/ems-stack",
-                        "auth": "https_token",
-                        "allow_write": True,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-stack/scripts/verify.sh"]},
-                "acceptance_criteria": ["verify.sh checks persistence across restart."],
-                "verify": [
-                    {"name": "persistence-check", "command": "grep -q persist1 apps/ems-stack/scripts/verify.sh", "cwd": "."},
-                ],
-                "depends_on": ["ems-stack-verify-rbac", "ems-api-devices-postgres"],
-                "labels": ["deploy", "db"],
-            },
-            {
-                "id": "ems-ui-auth",
-                "title": "UI OIDC login view",
-                "description": "Add login page and token handling stubs.",
-                "type": "feature",
-                "repo_targets": [repo_targets[1]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-ui/src/auth/Login.tsx",
-                        "apps/ems-ui/src/auth/AuthProvider.tsx",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Login page exists with placeholder flow.",
-                ],
-                "verify": [
-                    {"name": "login-view", "command": "test -f src/auth/Login.tsx", "cwd": "apps/ems-ui"},
-                ],
-                "depends_on": ["ems-ui-scaffold"],
-                "labels": ["ui", "auth"],
-            },
-            {
-                "id": "ems-ui-devices",
-                "title": "UI device CRUD skeleton",
-                "description": "Add device list and detail pages.",
-                "type": "feature",
-                "repo_targets": [repo_targets[1]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-ui/src/devices/DeviceList.tsx",
-                        "apps/ems-ui/src/devices/DeviceDetail.tsx",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Device list page renders mock data.",
-                ],
-                "verify": [
-                    {"name": "device-ui", "command": "test -f src/devices/DeviceList.tsx", "cwd": "apps/ems-ui"},
-                ],
-                "depends_on": ["ems-ui-scaffold"],
-                "labels": ["ui", "devices"],
-            },
-            {
-                "id": "ems-ui-reports",
-                "title": "UI reports skeleton",
-                "description": "Add reports page with placeholder charts.",
-                "type": "feature",
-                "repo_targets": [repo_targets[1]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {"paths": ["apps/ems-ui/src/reports/Reports.tsx"]},
-                "acceptance_criteria": [
-                    "Reports page exists and renders placeholder content.",
-                ],
-                "verify": [
-                    {"name": "reports-ui", "command": "test -f src/reports/Reports.tsx", "cwd": "apps/ems-ui"},
-                ],
-                "depends_on": ["ems-ui-scaffold"],
-                "labels": ["ui", "reports"],
-            },
-            {
-                "id": "ems-deploy-compose",
-                "title": "Docker compose + nginx/acme scaffold",
-                "description": "Add docker-compose and nginx/acme placeholders for EMS.",
-                "type": "deploy",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/deploy/README.md",
-                        "apps/ems-api/deploy/docker-compose.yml",
-                        "apps/ems-api/deploy/nginx.conf",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Compose file defines api + ui services.",
-                ],
-                "verify": [
-                    {"name": "compose-file", "command": "test -f deploy/docker-compose.yml", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-scaffold", "ems-ui-scaffold"],
-                "labels": ["deploy", "infra"],
-            },
-            {
-                "id": "ems-stack-prod-web",
-                "title": "Local docker-compose chassis (prod web)",
-                "description": "Local EMS stack with ems-api, ems-web (static nginx), postgres.",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": "apps/ems-stack",
-                        "auth": "https_token",
-                        "allow_write": True,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-stack/README.md",
-                        "apps/ems-stack/docker-compose.yml",
-                        "apps/ems-stack/nginx/nginx.conf",
-                        "apps/ems-stack/.env.example",
-                        "apps/ems-stack/scripts/verify.sh",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Local stack can be brought up via docker-compose.",
-                    "/health returns 200 via nginx.",
-                    "UI root serves static HTML.",
-                ],
-                "verify": [
-                    {
-                        "name": "stack-files",
-                        "command": "test -f apps/ems-stack/docker-compose.yml && test -f apps/ems-stack/nginx/nginx.conf",
-                        "cwd": ".",
-                    },
-                    {
-                        "name": "stack-verify",
-                        "command": "bash apps/ems-stack/scripts/verify.sh",
-                        "cwd": ".",
-                    },
-                ],
-                "depends_on": ["ems-api-scaffold", "ems-ui-scaffold"],
-                "labels": ["deploy", "local", "compose"],
-            },
-            {
-                "id": "ems-dns-route53",
-                "title": "Route53 DNS stub",
-                "description": "Add Route53 integration placeholder for subdomain creation.",
-                "type": "integration",
-                "repo_targets": [repo_targets[0]],
-                "inputs": {"artifacts": ["implementation_plan.json"]},
-                "outputs": {
-                    "paths": [
-                        "apps/ems-api/ems_api/integrations/__init__.py",
-                        "apps/ems-api/ems_api/integrations/route53.py",
-                        "apps/ems-api/ems_api/tests/test_route53.py",
-                    ]
-                },
-                "acceptance_criteria": [
-                    "Route53 module stub exists with create/update function signatures.",
-                ],
-                "verify": [
-                    {"name": "route53-file", "command": "test -f ems_api/integrations/route53.py", "cwd": "apps/ems-api"},
-                ],
-                "depends_on": ["ems-api-scaffold"],
-                "labels": ["dns", "integration"],
-            },
-            {
-                "id": "dns.ensure_record.route53",
-                "title": "Ensure Route53 DNS record",
-                "description": "Create/ensure Route53 DNS A record for EMS public FQDN.",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": ".",
-                        "auth": "https_token",
-                        "allow_write": False,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
-                "outputs": {"paths": [], "artifacts": ["dns_change_result.json"]},
-                "acceptance_criteria": ["Route53 record exists for EMS FQDN."],
-                "verify": [{"name": "dns-ensure", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": [],
-                "labels": ["module", "dns", "module:dns-route53", "capability:dns.route53.records"],
-            },
-            {
-                "id": "deploy.apply_remote_compose.ssm",
-                "title": "Remote deploy via SSM",
-                "description": "Deploy EMS stack to target instance using SSM and docker-compose.",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": ".",
-                        "auth": "https_token",
-                        "allow_write": False,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
-                "outputs": {"paths": [], "artifacts": ["deploy_result.json", "deploy_manifest.json"]},
-                "acceptance_criteria": ["EMS stack deployed and healthy on target instance."],
-                "verify": [{"name": "remote-deploy", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["dns.ensure_record.route53"],
-                "labels": ["deploy", "ssm", "remote"],
-            },
-            {
-                "id": "verify.public_http",
-                "title": "Verify public EMS health",
-                "description": "Verify public HTTP health endpoints on EMS FQDN.",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": ".",
-                        "auth": "https_token",
-                        "allow_write": False,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
-                "outputs": {"paths": [], "artifacts": ["deploy_verify.json"]},
-                "acceptance_criteria": ["Public /health and /api/health return 200."],
-                "verify": [{"name": "public-verify", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["deploy.apply_remote_compose.ssm"],
-                "labels": ["deploy", "verify", "remote"],
-            },
-            {
-                "id": "tls.acme_http01",
-                "title": "ACME TLS bootstrap",
-                "description": "Issue or renew TLS certificates via ACME (Let's Encrypt).",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": ".",
-                        "auth": "https_token",
-                        "allow_write": False,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
-                "outputs": {"paths": [], "artifacts": ["acme_result.json", "deploy_execution_tls.log"]},
-                "acceptance_criteria": ["TLS certificate exists and is valid."],
-                "verify": [{"name": "acme-verify", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["dns.ensure_record.route53", "deploy.apply_remote_compose.ssm"],
-                "labels": ["deploy", "tls", "acme"],
-            },
-            {
-                "id": "ingress.nginx_tls_configure",
-                "title": "Configure nginx for TLS",
-                "description": "Enable TLS in nginx and reload stack.",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": ".",
-                        "auth": "https_token",
-                        "allow_write": False,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
-                "outputs": {"paths": [], "artifacts": ["deploy_execution_tls.log"]},
-                "acceptance_criteria": ["nginx serves HTTPS using ACME cert."],
-                "verify": [{"name": "tls-nginx", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["tls.acme_http01"],
-                "labels": ["deploy", "tls", "nginx"],
-            },
-            {
-                "id": "verify.public_https",
-                "title": "Verify public HTTPS health",
-                "description": "Verify public HTTPS endpoints on EMS FQDN.",
-                "type": "deploy",
-                "repo_targets": [
-                    {
-                        "name": "xyn-api",
-                        "url": "https://github.com/Xyence/xyn-api",
-                        "ref": "main",
-                        "path_root": ".",
-                        "auth": "https_token",
-                        "allow_write": False,
-                    }
-                ],
-                "inputs": {"artifacts": ["implementation_plan.json", "blueprint_metadata.json"]},
-                "outputs": {"paths": [], "artifacts": ["deploy_verify.json"]},
-                "acceptance_criteria": ["Public HTTPS /health and /api/health return 200."],
-                "verify": [{"name": "public-verify-https", "command": "echo 'handled by runner'", "cwd": "."}],
-                "depends_on": ["ingress.nginx_tls_configure"],
-                "labels": ["deploy", "verify", "https"],
-            },
+                "labels": ["scaffold", "intent-driven"],
+            }
         ]
-    else:
-        functional = [str(item).strip() for item in (intent_requirements.get("functional") or []) if str(item).strip()]
-        ui = [str(item).strip() for item in (intent_requirements.get("ui") or []) if str(item).strip()]
-        data_model = [str(item).strip() for item in (intent_requirements.get("dataModel") or []) if str(item).strip()]
-        operational = [str(item).strip() for item in (intent_requirements.get("operational") or []) if str(item).strip()]
-        dod = [str(item).strip() for item in (intent_requirements.get("definitionOfDone") or []) if str(item).strip()]
-        summary = str(intent_requirements.get("summary") or "").strip()
-        if not summary:
-            summary = (intent_prompt or "Create initial scaffold for blueprint.")[:240]
-
-        work_items = []
-        if functional:
-            work_items.append(
-                {
-                    "id": f"{blueprint.name}-api-features",
-                    "title": f"Implement API features for {blueprint_fqn}",
-                    "description": summary,
-                    "type": "feature",
-                    "repo_targets": repo_targets[:1],
-                    "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
-                    "outputs": {"paths": ["services/api/README.md"]},
-                    "acceptance_criteria": functional,
-                    "verify": [{"name": "api-sanity", "command": "echo 'api checks defined in task output'"}],
-                    "depends_on": [],
-                    "labels": ["api", "feature", "intent-driven"],
-                }
-            )
-        if ui:
-            work_items.append(
-                {
-                    "id": f"{blueprint.name}-ui-features",
-                    "title": f"Implement UI requirements for {blueprint_fqn}",
-                    "description": "Implement UI behavior captured in blueprint intent.",
-                    "type": "feature",
-                    "repo_targets": repo_targets[1:2] or repo_targets[:1],
-                    "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
-                    "outputs": {"paths": ["services/web/README.md"]},
-                    "acceptance_criteria": ui,
-                    "verify": [{"name": "ui-sanity", "command": "echo 'ui checks defined in task output'"}],
-                    "depends_on": [work_items[0]["id"]] if work_items else [],
-                    "labels": ["ui", "feature", "intent-driven"],
-                }
-            )
-        if data_model:
-            work_items.append(
-                {
-                    "id": f"{blueprint.name}-data-model",
-                    "title": f"Implement data model for {blueprint_fqn}",
-                    "description": "Establish entities and persistence required by blueprint intent.",
-                    "type": "integration",
-                    "repo_targets": repo_targets[:1],
-                    "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
-                    "outputs": {"paths": ["services/api/migrations/README.md"]},
-                    "acceptance_criteria": data_model,
-                    "verify": [{"name": "data-sanity", "command": "echo 'data model checks defined in task output'"}],
-                    "depends_on": [item["id"] for item in work_items[:1]],
-                    "labels": ["data", "schema", "intent-driven"],
-                }
-            )
-        if operational or dod:
-            work_items.append(
-                {
-                    "id": f"{blueprint.name}-operational-hardening",
-                    "title": f"Operationalize {blueprint_fqn}",
-                    "description": "Apply deployment and operational requirements from blueprint intent.",
-                    "type": "deploy",
-                    "repo_targets": repo_targets[:1],
-                    "inputs": {"artifacts": ["implementation_plan.json", "blueprint_intent.json"]},
-                    "outputs": {"paths": ["services/api/ops/README.md"]},
-                    "acceptance_criteria": operational + dod,
-                    "verify": [{"name": "ops-sanity", "command": "echo 'ops checks defined in task output'"}],
-                    "depends_on": [item["id"] for item in work_items],
-                    "labels": ["deploy", "ops", "intent-driven"],
-                }
-            )
-        if not work_items:
-            work_items = [
-                {
-                    "id": f"{blueprint.name}-scaffold",
-                    "title": f"Scaffold {blueprint_fqn}",
-                    "description": summary or "Create initial scaffold for blueprint.",
-                    "type": "scaffold",
-                    "repo_targets": repo_targets[:1],
-                    "inputs": {"artifacts": ["implementation_plan.json"]},
-                    "outputs": {"paths": ["services/app/README.md"]},
-                    "acceptance_criteria": ["Scaffold created from blueprint intent."],
-                    "verify": [{"name": "scaffold-file", "command": "test -f services/app/README.md"}],
-                    "depends_on": [],
-                    "labels": ["scaffold", "intent-driven"],
-                }
-            ]
 
     if intent_requirements or intent_prompt:
         _apply_intent_context_to_work_items(work_items, intent_requirements, intent_prompt)
@@ -2728,6 +1673,141 @@ def _generate_implementation_plan(
                     "labels": ["deploy", "ssm", "remote", "module:runtime-compose-pull-apply"],
                 }
             )
+    elif deploy_ssm_requested and not any(item.get("id") == "deploy.apply_remote_compose.ssm" for item in work_items):
+        work_items.append(
+            {
+                "id": "deploy.apply_remote_compose.ssm",
+                "title": "Remote deploy via SSM",
+                "description": "Deploy application stack to target instance using SSM and docker-compose.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "release_target.json"]},
+                "outputs": {"paths": [], "artifacts": ["deploy_result.json", "deploy_manifest.json"]},
+                "acceptance_criteria": ["Stack deployed and healthy on target instance."],
+                "verify": [{"name": "remote-deploy", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": ["dns.ensure_record.route53"],
+                "labels": ["deploy", "ssm", "remote", "module:deploy-ssm-compose"],
+            }
+        )
+
+    deploy_item_id = (
+        "deploy.apply_remote_compose.pull"
+        if any(item.get("id") == "deploy.apply_remote_compose.pull" for item in work_items)
+        else "deploy.apply_remote_compose.ssm"
+    )
+    if deploy_ssm_requested and not any(item.get("id") == "verify.public_http" for item in work_items):
+        work_items.append(
+            {
+                "id": "verify.public_http",
+                "title": "Verify public HTTP health",
+                "description": "Verify public HTTP health endpoint(s) on target FQDN.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "release_target.json"]},
+                "outputs": {"paths": [], "artifacts": ["deploy_verify.json"]},
+                "acceptance_criteria": ["Public /health endpoint returns 200."],
+                "verify": [{"name": "public-verify", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": [deploy_item_id] if deploy_item_id else [],
+                "labels": ["deploy", "verify", "remote", "module:deploy-ssm-compose"],
+            }
+        )
+
+    if deploy_ssm_requested and tls_acme_requested and tls_mode != "host-ingress":
+        if not any(item.get("id") == "tls.acme_http01" for item in work_items):
+            work_items.append(
+                {
+                    "id": "tls.acme_http01",
+                    "title": "ACME TLS bootstrap",
+                    "description": "Issue or renew TLS certificates via ACME HTTP-01.",
+                    "type": "deploy",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": ".",
+                            "auth": "https_token",
+                            "allow_write": False,
+                        }
+                    ],
+                    "inputs": {"artifacts": ["implementation_plan.json", "release_target.json"]},
+                    "outputs": {"paths": [], "artifacts": ["acme_result.json", "deploy_execution_tls.log"]},
+                    "acceptance_criteria": ["TLS certificate exists and is valid."],
+                    "verify": [{"name": "acme-verify", "command": "echo 'handled by runner'", "cwd": "."}],
+                    "depends_on": ["dns.ensure_record.route53", deploy_item_id] if deploy_item_id else ["dns.ensure_record.route53"],
+                    "labels": ["deploy", "tls", "acme", f"module:{preferred_ingress_module}"],
+                }
+            )
+        if not any(item.get("id") == "ingress.nginx_tls_configure" for item in work_items):
+            work_items.append(
+                {
+                    "id": "ingress.nginx_tls_configure",
+                    "title": "Configure ingress TLS",
+                    "description": "Enable TLS in ingress and reload stack.",
+                    "type": "deploy",
+                    "repo_targets": [
+                        {
+                            "name": "xyn-api",
+                            "url": "https://github.com/Xyence/xyn-api",
+                            "ref": "main",
+                            "path_root": ".",
+                            "auth": "https_token",
+                            "allow_write": False,
+                        }
+                    ],
+                    "inputs": {"artifacts": ["implementation_plan.json", "release_target.json"]},
+                    "outputs": {"paths": [], "artifacts": ["deploy_execution_tls.log"]},
+                    "acceptance_criteria": ["Ingress serves HTTPS using ACME cert."],
+                    "verify": [{"name": "tls-ingress", "command": "echo 'handled by runner'", "cwd": "."}],
+                    "depends_on": ["tls.acme_http01"],
+                    "labels": ["deploy", "tls", f"module:{preferred_ingress_module}"],
+                }
+            )
+
+    if deploy_ssm_requested and tls_acme_requested and not any(item.get("id") == "verify.public_https" for item in work_items):
+        https_dep = "verify.public_http" if tls_mode == "host-ingress" else "ingress.nginx_tls_configure"
+        work_items.append(
+            {
+                "id": "verify.public_https",
+                "title": "Verify public HTTPS health",
+                "description": "Verify public HTTPS health endpoint(s) on target FQDN.",
+                "type": "deploy",
+                "repo_targets": [
+                    {
+                        "name": "xyn-api",
+                        "url": "https://github.com/Xyence/xyn-api",
+                        "ref": "main",
+                        "path_root": ".",
+                        "auth": "https_token",
+                        "allow_write": False,
+                    }
+                ],
+                "inputs": {"artifacts": ["implementation_plan.json", "release_target.json"]},
+                "outputs": {"paths": [], "artifacts": ["deploy_verify.json"]},
+                "acceptance_criteria": ["Public HTTPS /health endpoint returns 200."],
+                "verify": [{"name": "public-verify-https", "command": "echo 'handled by runner'", "cwd": "."}],
+                "depends_on": [https_dep],
+                "labels": ["deploy", "verify", "https", f"module:{preferred_ingress_module}"],
+            }
+        )
     if route53_requested and "dns-route53" not in module_ids:
         if not any(item.get("id") == "dns-route53-module" for item in work_items):
             work_items.insert(

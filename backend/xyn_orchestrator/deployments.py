@@ -414,6 +414,7 @@ def _build_tls_steps(
     cert_dir: str,
     acme_webroot: str,
     expected_ip: str = "",
+    routed_service: str = "web",
 ) -> List[Dict[str, Any]]:
     lego_dir = os.path.join(os.path.dirname(cert_dir), "lego-data")
     dns_mismatch_check = (
@@ -436,8 +437,7 @@ def _build_tls_steps(
         "command -v curl >/dev/null 2>&1 || { echo \"tls_error_code=curl_missing\"; exit 42; }; "
         "command -v openssl >/dev/null 2>&1 || { echo \"tls_error_code=openssl_missing\"; exit 43; }; "
         f"cd \"{workdir}\"; "
-        "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
-        f"docker compose -f \"{compose_file}\" stop ems-web || true; "
+        f"docker compose -f \"{compose_file}\" stop {routed_service} || true; "
         "docker run --rm -p 80:80 "
         f"-v \"{lego_dir}\":/data "
         "goacme/lego:v4.12.3 "
@@ -454,12 +454,10 @@ def _build_tls_steps(
         f"cd \"{workdir}\"; "
         f"[ -f \"{cert_dir}/fullchain.pem\" ] || {{ echo \"tls_error_code=cert_missing\"; exit 46; }}; "
         f"[ -f \"{cert_dir}/privkey.pem\" ] || {{ echo \"tls_error_code=key_missing\"; exit 47; }}; "
-        f"EMS_CERTS_PATH=\"{cert_dir}\" EMS_ACME_WEBROOT_PATH=\"{acme_webroot}\" "
-        "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
+        f"XYN_CERTS_PATH=\"{cert_dir}\" XYN_ACME_WEBROOT_PATH=\"{acme_webroot}\" "
         f"docker compose -f \"{compose_file}\" up -d --remove-orphans; "
-        f"EMS_CERTS_PATH=\"{cert_dir}\" EMS_ACME_WEBROOT_PATH=\"{acme_webroot}\" "
-        "EMS_PUBLIC_PORT=80 EMS_PUBLIC_TLS_PORT=443 "
-        f"docker compose -f \"{compose_file}\" restart ems-web"
+        f"XYN_CERTS_PATH=\"{cert_dir}\" XYN_ACME_WEBROOT_PATH=\"{acme_webroot}\" "
+        f"docker compose -f \"{compose_file}\" restart {routed_service}"
     )
     verify_cmd = (
         "set -euo pipefail; "
@@ -650,20 +648,20 @@ def execute_release_plan_deploy(
                 instance.aws_region,
                 [
                     "mkdir -p /var/lib/xyn",
-                    "rm -rf /var/lib/xyn/ems",
+                    "rm -rf /var/lib/xyn/seed-app",
                     "git clone --depth 1 --branch "
                     + seed_ref
                     + " "
                     + seed_repo
-                    + " /var/lib/xyn/ems",
-                    "cp /var/lib/xyn/ems/compose.yml /var/lib/xyn/ems/docker-compose.yml",
+                    + " /var/lib/xyn/seed-app",
+                    "cp /var/lib/xyn/seed-app/compose.yml /var/lib/xyn/seed-app/docker-compose.yml",
                     "docker rm -f xyn-postgres xyn-redis xyn-core 2>/dev/null || true",
                 ],
             )
         if _is_host_ingress_target(release_target):
             ingress = (release_target.config_json or {}).get("ingress") or {}
             network = str(ingress.get("network") or "xyn-edge")
-            fqdn = (release_target.fqdn if release_target else "") or os.environ.get("EMS_PUBLIC_FQDN", "")
+            fqdn = (release_target.fqdn if release_target else "") or os.environ.get("XYN_PUBLIC_FQDN", "")
             _run_ssm_commands(
                 instance.instance_id,
                 instance.aws_region,
@@ -672,7 +670,7 @@ def execute_release_plan_deploy(
                     # Host-ingress mode must use the shared Traefik instance.
                     "docker ps --format '{{.Names}}' | grep -q '^xyn-ingress-traefik$' "
                     "|| { echo 'tls_error_code=shared_ingress_missing'; exit 62; }",
-                    # Keep ems-web alive when its nginx config still references cert files.
+                    # Keep routed web service alive when its config still references cert files.
                     f"mkdir -p \"{cert_dir}\"",
                     f"[ -f \"{cert_dir}/fullchain.pem\" ] && [ -f \"{cert_dir}/privkey.pem\" ] "
                     "|| openssl req -x509 -nodes -newkey rsa:2048 -days 365 "
@@ -720,7 +718,7 @@ def execute_release_plan_deploy(
     if deployment.status == "succeeded" and expects_tls:
         tls_mode = str(((release_target.tls_json if release_target else {}) or {}).get("mode", "nginx+acme")).lower()
         if tls_mode == "host-ingress":
-            fqdn = (release_target.fqdn if release_target else "") or os.environ.get("EMS_PUBLIC_FQDN", "")
+            fqdn = (release_target.fqdn if release_target else "") or os.environ.get("XYN_PUBLIC_FQDN", "")
             if not fqdn:
                 deployment.status = "failed"
                 deployment.error_message = "tls_config_missing: fqdn required"
@@ -753,7 +751,19 @@ def execute_release_plan_deploy(
             execution["status"] = "failed"
             execution["error"] = {"code": "tls_not_supported", "message": deployment.error_message}
         else:
-            fqdn = (release_target.fqdn if release_target else "") or os.environ.get("EMS_PUBLIC_FQDN", "")
+            fqdn = (release_target.fqdn if release_target else "") or os.environ.get("XYN_PUBLIC_FQDN", "")
+            ingress_cfg = ((release_target.config_json if release_target else {}) or {}).get("ingress") or {}
+            route_items = ingress_cfg.get("routes") if isinstance(ingress_cfg.get("routes"), list) else []
+            routed_service = "web"
+            for route in route_items:
+                if not isinstance(route, dict):
+                    continue
+                host = str(route.get("host") or "").strip().lower()
+                if host and fqdn and host == fqdn.lower():
+                    candidate = str(route.get("service") or "").strip()
+                    if candidate:
+                        routed_service = candidate
+                    break
             acme_email = (
                 str(((release_target.tls_json if release_target else {}) or {}).get("acme_email", "")).strip()
                 or os.environ.get("XYENCE_ACME_EMAIL", "")
@@ -772,6 +782,7 @@ def execute_release_plan_deploy(
                     cert_dir=cert_dir,
                     acme_webroot=acme_webroot,
                     expected_ip=instance.public_ip or "",
+                    routed_service=routed_service,
                 )
                 for step in tls_steps:
                     step_record: Dict[str, Any] = {"name": step.get("name") or "tls_step", "commands": []}
