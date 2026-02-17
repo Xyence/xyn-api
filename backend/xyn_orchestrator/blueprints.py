@@ -3226,6 +3226,11 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
     if staff_error := _require_staff(request):
         return staff_error
     blueprint = get_object_or_404(Blueprint, id=blueprint_id)
+    if blueprint.status in {"archived", "deprovisioning", "deprovisioned"}:
+        return JsonResponse(
+            {"error": f"Blueprint is {blueprint.status}; deploy is disabled until status is set back to active."},
+            status=409,
+        )
     latest_revision = blueprint.revisions.order_by("-revision").first()
     if not latest_revision:
         return JsonResponse({"error": "No revisions available"}, status=400)
@@ -3312,8 +3317,11 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
                 instance.operation_id = op.get("operationId", "")
                 op_status = str(op.get("status") or "").strip().lower()
                 if op_status in {"failed", "error", "cancelled", "canceled"}:
-                    raise RuntimeError(f"Release apply failed with status '{op_status}'")
-                instance.status = "applied"
+                    instance.status = "failed"
+                    instance.error = f"Release apply failed with status '{op_status}'"
+                    run.log_text += f"Release apply reported '{op_status}'; continuing with implementation planning\n"
+                else:
+                    instance.status = "applied"
             else:
                 instance.status = "planned"
             run.metadata_json = {"plan": plan, "operation": op}
@@ -6284,4 +6292,26 @@ def internal_dev_task_complete(request: HttpRequest, task_id: str) -> JsonRespon
     task.locked_by = ""
     task.locked_at = None
     task.save(update_fields=["status", "last_error", "locked_by", "locked_at", "updated_at"])
+    if task.source_run_id:
+        source_run = task.source_run
+        metadata = source_run.metadata_json if source_run and isinstance(source_run.metadata_json, dict) else {}
+        if source_run and metadata.get("operation") == "blueprint_deprovision":
+            terminal = {"succeeded", "failed", "canceled"}
+            pending_exists = DevTask.objects.filter(source_run_id=task.source_run_id).exclude(status__in=terminal).exists()
+            if not pending_exists:
+                any_failed = DevTask.objects.filter(source_run_id=task.source_run_id).filter(
+                    status__in=["failed", "canceled"]
+                ).exists()
+                source_run.status = "failed" if any_failed else "succeeded"
+                source_run.finished_at = timezone.now()
+                source_run.save(update_fields=["status", "finished_at", "updated_at"])
+                if source_run.entity_type == "blueprint":
+                    blueprint = Blueprint.objects.filter(id=source_run.entity_id).first()
+                    if blueprint:
+                        if any_failed:
+                            blueprint.status = "active"
+                        else:
+                            blueprint.status = "deprovisioned"
+                            blueprint.deprovisioned_at = timezone.now()
+                        blueprint.save(update_fields=["status", "deprovisioned_at", "updated_at"])
     return JsonResponse({"status": task.status})

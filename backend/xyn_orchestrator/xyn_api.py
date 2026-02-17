@@ -42,6 +42,7 @@ from .blueprints import (
     internal_release_target_rollback_last_success,
     _require_staff,
     _resolve_context_pack_list,
+    _write_run_artifact,
     _write_run_summary,
     instantiate_blueprint,
 )
@@ -253,6 +254,243 @@ def _serialize_release_target(target: ReleaseTarget) -> Dict[str, Any]:
     payload.setdefault("auto_generated", bool(target.auto_generated))
     payload.setdefault("editable", bool((target.config_json or {}).get("editable", True)))
     return payload
+
+
+def _blueprint_identifier(blueprint: Blueprint) -> str:
+    return f"{blueprint.namespace}.{blueprint.name}"
+
+
+def _default_release_target_remote_root(blueprint: Blueprint) -> str:
+    project_key = _blueprint_identifier(blueprint)
+    remote_root_slug = re.sub(r"[^a-z0-9]+", "-", project_key.lower()).strip("-") or "default"
+    return f"/opt/xyn/apps/{remote_root_slug}"
+
+
+def _release_target_remote_root(target: ReleaseTarget, blueprint: Blueprint) -> str:
+    runtime = target.runtime_json or {}
+    if isinstance(runtime, dict):
+        remote_root = str(runtime.get("remote_root") or "").strip()
+        if remote_root:
+            return remote_root
+    cfg_runtime = (target.config_json or {}).get("runtime") if isinstance(target.config_json, dict) else {}
+    if isinstance(cfg_runtime, dict):
+        remote_root = str(cfg_runtime.get("remote_root") or "").strip()
+        if remote_root:
+            return remote_root
+    return _default_release_target_remote_root(blueprint)
+
+
+def _build_blueprint_deprovision_plan(
+    blueprint: Blueprint,
+    release_targets: List[ReleaseTarget],
+    *,
+    stop_services: bool,
+    delete_dns: bool,
+    remove_runtime_markers: bool,
+    force_mode: bool = False,
+) -> Dict[str, Any]:
+    warnings: List[str] = []
+    can_execute = True
+    steps: List[Dict[str, Any]] = []
+    affected_targets: List[Dict[str, Any]] = []
+    dns_records: List[Dict[str, Any]] = []
+    runtime_roots: List[str] = []
+
+    for target in release_targets:
+        target_id = str(target.id)
+        target_payload = _serialize_release_target(target)
+        runtime = target_payload.get("runtime") if isinstance(target_payload.get("runtime"), dict) else {}
+        dns_cfg = target_payload.get("dns") if isinstance(target_payload.get("dns"), dict) else {}
+        remote_root = _release_target_remote_root(target, blueprint)
+        compose_file = str((runtime or {}).get("compose_file_path") or "compose.release.yml")
+        runtime_roots.append(remote_root)
+        if (stop_services or remove_runtime_markers) and not target.target_instance_id:
+            can_execute = False
+            warnings.append(
+                f"{target.name}: target instance is missing; runtime stop/cleanup cannot be executed."
+            )
+
+        zone_id = str((dns_cfg or {}).get("zone_id") or "").strip()
+        zone_name = str((dns_cfg or {}).get("zone_name") or "").strip()
+        dns_provider = str((dns_cfg or {}).get("provider") or "").strip().lower()
+        fqdn = str(target.fqdn or "").strip()
+        ownership_proven = bool((target.config_json or {}).get("dns_record_snapshot")) or bool(
+            (target.config_json or {}).get("xyn_dns_managed")
+        )
+        if delete_dns and fqdn:
+            dns_records.append(
+                {
+                    "release_target_id": target_id,
+                    "fqdn": fqdn,
+                    "provider": dns_provider or "route53",
+                    "zone_id": zone_id,
+                    "zone_name": zone_name,
+                    "ownership_proven": ownership_proven,
+                }
+            )
+            if dns_provider and dns_provider != "route53":
+                can_execute = False
+                warnings.append(f"{fqdn}: DNS provider '{dns_provider}' is not supported for deprovision delete.")
+            if not ownership_proven and not force_mode:
+                can_execute = False
+                warnings.append(
+                    f"{fqdn}: ownership cannot be proven for safe DNS delete. Use force mode or add managed snapshot."
+                )
+
+        affected_targets.append(
+            {
+                "id": target_id,
+                "name": target.name,
+                "environment": target.environment or "",
+                "fqdn": fqdn,
+                "target_instance_id": str(target.target_instance_id) if target.target_instance_id else "",
+                "remote_root": remote_root,
+                "compose_file_path": compose_file,
+            }
+        )
+
+        steps.append(
+            {
+                "id": f"deploy.lock_check.{target_id}",
+                "title": f"Check deploy lock for {target.name}",
+                "capability": "deploy.lock.check",
+                "work_item": {
+                    "id": f"deploy.lock_check.{target_id}",
+                    "title": f"Check deploy lock for {target.name}",
+                    "type": "deploy",
+                    "context_purpose_override": "operator",
+                    "capabilities_required": ["deploy.lock.check"],
+                    "config": {"release_target_id": target_id},
+                    "repo_targets": [],
+                },
+            }
+        )
+        if stop_services:
+            steps.append(
+                {
+                    "id": f"runtime.compose_down_remote.{target_id}",
+                    "title": f"Stop runtime stack for {target.name}",
+                    "capability": "runtime.compose.down_remote",
+                    "work_item": {
+                        "id": f"runtime.compose_down_remote.{target_id}",
+                        "title": f"Stop runtime stack for {target.name}",
+                        "type": "deploy",
+                        "context_purpose_override": "operator",
+                        "capabilities_required": ["runtime.compose.down_remote"],
+                        "config": {
+                            "release_target_id": target_id,
+                            "target_instance_id": str(target.target_instance_id) if target.target_instance_id else "",
+                            "remote_root": remote_root,
+                            "compose_file_path": compose_file,
+                        },
+                        "repo_targets": [],
+                    },
+                }
+            )
+        if remove_runtime_markers:
+            steps.append(
+                {
+                    "id": f"runtime.remove_runtime_markers.{target_id}",
+                    "title": f"Remove runtime markers for {target.name}",
+                    "capability": "runtime.runtime_markers.remove",
+                    "work_item": {
+                        "id": f"runtime.remove_runtime_markers.{target_id}",
+                        "title": f"Remove runtime markers for {target.name}",
+                        "type": "deploy",
+                        "context_purpose_override": "operator",
+                        "capabilities_required": ["runtime.runtime_markers.remove"],
+                        "config": {
+                            "release_target_id": target_id,
+                            "target_instance_id": str(target.target_instance_id) if target.target_instance_id else "",
+                            "remote_root": remote_root,
+                        },
+                        "repo_targets": [],
+                    },
+                }
+            )
+        if delete_dns and fqdn:
+            steps.append(
+                {
+                    "id": f"dns.delete_record.route53.{target_id}",
+                    "title": f"Delete Route53 record for {fqdn}",
+                    "capability": "dns.route53.delete_record",
+                    "work_item": {
+                        "id": f"dns.delete_record.route53.{target_id}",
+                        "title": f"Delete Route53 record for {fqdn}",
+                        "type": "deploy",
+                        "context_purpose_override": "operator",
+                        "capabilities_required": ["dns.route53.delete_record"],
+                        "config": {
+                            "release_target_id": target_id,
+                            "target_instance_id": str(target.target_instance_id) if target.target_instance_id else "",
+                            "fqdn": fqdn,
+                            "force": bool(force_mode),
+                            "dns": {
+                                "provider": dns_provider or "route53",
+                                "zone_id": zone_id,
+                                "zone_name": zone_name,
+                                "ownership_proven": ownership_proven,
+                            },
+                        },
+                        "repo_targets": [],
+                    },
+                }
+            )
+        steps.append(
+            {
+                "id": f"verify.deprovision.{target_id}",
+                "title": f"Verify deprovision for {target.name}",
+                "capability": "runtime.deprovision.verify",
+                "work_item": {
+                    "id": f"verify.deprovision.{target_id}",
+                    "title": f"Verify deprovision for {target.name}",
+                    "type": "deploy",
+                    "context_purpose_override": "operator",
+                    "capabilities_required": ["runtime.deprovision.verify"],
+                    "config": {
+                        "release_target_id": target_id,
+                        "target_instance_id": str(target.target_instance_id) if target.target_instance_id else "",
+                        "fqdn": fqdn,
+                        "remote_root": remote_root,
+                        "delete_dns": bool(delete_dns and fqdn),
+                        "force": bool(force_mode),
+                        "dns": {
+                            "provider": dns_provider or "route53",
+                            "zone_id": zone_id,
+                            "zone_name": zone_name,
+                        },
+                    },
+                    "repo_targets": [],
+                },
+            }
+        )
+
+    unique_runtime_roots = sorted({root for root in runtime_roots if root})
+    return {
+        "blueprint_id": str(blueprint.id),
+        "blueprint_name": blueprint.name,
+        "blueprint_namespace": blueprint.namespace,
+        "identifier": _blueprint_identifier(blueprint),
+        "generated_at": timezone.now().isoformat(),
+        "mode": "force" if force_mode else ("stop_services" if stop_services else "safe"),
+        "flags": {
+            "stop_services": bool(stop_services),
+            "delete_dns": bool(delete_dns),
+            "remove_runtime_markers": bool(remove_runtime_markers),
+            "can_execute": bool(can_execute),
+        },
+        "summary": {
+            "release_target_count": len(affected_targets),
+            "dns_record_count": len(dns_records),
+            "runtime_root_count": len(unique_runtime_roots),
+            "step_count": len(steps),
+        },
+        "affected_release_targets": affected_targets,
+        "dns_records": dns_records,
+        "runtime_roots": unique_runtime_roots,
+        "warnings": warnings,
+        "steps": steps,
+    }
 
 
 @login_required
@@ -3374,6 +3612,9 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"id": str(blueprint.id)})
 
     qs = Blueprint.objects.all().order_by("namespace", "name")
+    include_archived = (request.GET.get("include_archived") or "").strip() in {"1", "true", "yes"}
+    if not include_archived:
+        qs = qs.exclude(status="archived")
     if query := request.GET.get("q"):
         qs = qs.filter(models.Q(name__icontains=query) | models.Q(namespace__icontains=query))
     blueprints = list(qs)
@@ -3394,6 +3635,10 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
             "name": b.name,
             "namespace": b.namespace,
             "description": b.description,
+            "status": b.status,
+            "archived_at": b.archived_at,
+            "deprovisioned_at": b.deprovisioned_at,
+            "deprovision_last_run_id": str(b.deprovision_last_run_id) if b.deprovision_last_run_id else None,
             "spec_text": b.spec_text,
             "metadata_json": b.metadata_json,
             "created_at": b.created_at,
@@ -3414,12 +3659,29 @@ def blueprint_detail(request: HttpRequest, blueprint_id: str) -> JsonResponse:
     blueprint = get_object_or_404(Blueprint, id=blueprint_id)
     if request.method == "PATCH":
         payload = _parse_json(request)
-        for field in ["name", "namespace", "description", "spec_text", "metadata_json"]:
+        for field in ["name", "namespace", "description", "spec_text", "metadata_json", "status"]:
             if field in payload:
                 setattr(blueprint, field, payload[field])
+        if payload.get("status") == "archived":
+            blueprint.archived_at = timezone.now()
+        elif payload.get("status") == "deprovisioned":
+            blueprint.deprovisioned_at = timezone.now()
+        elif payload.get("status") == "active":
+            blueprint.archived_at = None
         blueprint.updated_by = request.user
         blueprint.save(
-            update_fields=["name", "namespace", "description", "spec_text", "metadata_json", "updated_by", "updated_at"]
+            update_fields=[
+                "name",
+                "namespace",
+                "description",
+                "spec_text",
+                "metadata_json",
+                "status",
+                "archived_at",
+                "deprovisioned_at",
+                "updated_by",
+                "updated_at",
+            ]
         )
         if payload.get("spec_json"):
             revision = blueprint.revisions.order_by("-revision").first()
@@ -3433,8 +3695,11 @@ def blueprint_detail(request: HttpRequest, blueprint_id: str) -> JsonResponse:
             )
         return JsonResponse({"id": str(blueprint.id)})
     if request.method == "DELETE":
-        blueprint.delete()
-        return JsonResponse({"status": "deleted"})
+        blueprint.status = "archived"
+        blueprint.archived_at = timezone.now()
+        blueprint.updated_by = request.user
+        blueprint.save(update_fields=["status", "archived_at", "updated_by", "updated_at"])
+        return JsonResponse({"status": "archived"})
 
     latest = blueprint.revisions.order_by("-revision").first()
     return JsonResponse(
@@ -3443,12 +3708,202 @@ def blueprint_detail(request: HttpRequest, blueprint_id: str) -> JsonResponse:
             "name": blueprint.name,
             "namespace": blueprint.namespace,
             "description": blueprint.description,
+            "status": blueprint.status,
+            "archived_at": blueprint.archived_at,
+            "deprovisioned_at": blueprint.deprovisioned_at,
+            "deprovision_last_run_id": str(blueprint.deprovision_last_run_id) if blueprint.deprovision_last_run_id else None,
             "spec_text": blueprint.spec_text,
             "metadata_json": blueprint.metadata_json,
             "created_at": blueprint.created_at,
             "updated_at": blueprint.updated_at,
             "latest_revision": latest.revision if latest else None,
             "spec_json": latest.spec_json if latest else None,
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def blueprint_archive(request: HttpRequest, blueprint_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    blueprint = get_object_or_404(Blueprint, id=blueprint_id)
+    blueprint.status = "archived"
+    blueprint.archived_at = timezone.now()
+    blueprint.updated_by = request.user
+    blueprint.save(update_fields=["status", "archived_at", "updated_by", "updated_at"])
+    return JsonResponse(
+        {
+            "status": blueprint.status,
+            "id": str(blueprint.id),
+            "archived_at": blueprint.archived_at.isoformat() if blueprint.archived_at else None,
+        }
+    )
+
+
+@login_required
+def blueprint_deprovision_plan(request: HttpRequest, blueprint_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    blueprint = get_object_or_404(Blueprint, id=blueprint_id)
+    release_targets = list(ReleaseTarget.objects.filter(blueprint=blueprint).order_by("name"))
+    target_ids = [value for value in request.GET.getlist("release_target_id") if value]
+    if target_ids:
+        release_targets = [target for target in release_targets if str(target.id) in set(target_ids)]
+    stop_services = (request.GET.get("mode") or "").strip().lower() in {"stop_services", "force"}
+    delete_dns = _parse_bool_param(request.GET.get("delete_dns"), default=True)
+    remove_runtime_markers = _parse_bool_param(request.GET.get("remove_runtime_markers"), default=True)
+    force_mode = (request.GET.get("mode") or "").strip().lower() == "force"
+    plan = _build_blueprint_deprovision_plan(
+        blueprint,
+        release_targets,
+        stop_services=stop_services,
+        delete_dns=delete_dns,
+        remove_runtime_markers=remove_runtime_markers,
+        force_mode=force_mode,
+    )
+    return JsonResponse(plan)
+
+
+@csrf_exempt
+@login_required
+def blueprint_deprovision(request: HttpRequest, blueprint_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    blueprint = get_object_or_404(Blueprint, id=blueprint_id)
+    payload = _parse_json(request)
+    confirm_text = str(payload.get("confirm_text") or "").strip()
+    expected = _blueprint_identifier(blueprint)
+    if confirm_text not in {expected, blueprint.name, str(blueprint.id)}:
+        return JsonResponse(
+            {
+                "error": "confirm_text mismatch",
+                "expected": expected,
+                "guidance": "Type blueprint identifier exactly to continue.",
+            },
+            status=400,
+        )
+    mode = str(payload.get("mode") or "safe").strip().lower()
+    if mode not in {"safe", "stop_services", "force"}:
+        return JsonResponse({"error": "mode must be safe, stop_services, or force"}, status=400)
+    target_ids = payload.get("release_target_ids") if isinstance(payload.get("release_target_ids"), list) else []
+    release_targets = list(ReleaseTarget.objects.filter(blueprint=blueprint).order_by("name"))
+    if target_ids:
+        target_id_set = {str(value) for value in target_ids}
+        release_targets = [target for target in release_targets if str(target.id) in target_id_set]
+    stop_services = bool(payload.get("stop_services")) or mode in {"stop_services", "force"}
+    delete_dns = bool(payload.get("delete_dns", True))
+    remove_runtime_markers = bool(payload.get("remove_runtime_markers", True))
+    plan = _build_blueprint_deprovision_plan(
+        blueprint,
+        release_targets,
+        stop_services=stop_services,
+        delete_dns=delete_dns,
+        remove_runtime_markers=remove_runtime_markers,
+        force_mode=(mode == "force"),
+    )
+    if not plan["flags"].get("can_execute") and mode != "force":
+        return JsonResponse(
+            {
+                "error": "deprovision_plan_not_executable",
+                "warnings": plan.get("warnings", []),
+                "plan": plan,
+            },
+            status=400,
+        )
+    dry_run = bool(payload.get("dry_run", False))
+    run = Run.objects.create(
+        entity_type="blueprint",
+        entity_id=blueprint.id,
+        status="running",
+        summary=f"Deprovision {expected}",
+        log_text="Starting blueprint deprovision\n",
+        metadata_json={
+            "operation": "blueprint_deprovision",
+            "mode": mode,
+            "dry_run": dry_run,
+            "release_target_ids": [str(target.id) for target in release_targets],
+        },
+        created_by=request.user,
+        started_at=timezone.now(),
+    )
+    _write_run_artifact(run, "deprovision_plan.json", plan, "deprovision")
+    implementation_plan = {
+        "schema_version": "implementation_plan.v1",
+        "blueprint_id": str(blueprint.id),
+        "blueprint_name": expected,
+        "generated_at": timezone.now().isoformat(),
+        "work_items": [entry.get("work_item", {}) for entry in plan.get("steps", []) if isinstance(entry, dict)],
+        "tasks": [
+            {
+                "task_type": "codegen",
+                "title": f"Deprovision: {entry.get('title')}",
+                "context_purpose": "operator",
+                "work_item_id": str((entry.get("work_item") or {}).get("id") or ""),
+            }
+            for entry in plan.get("steps", [])
+            if isinstance(entry, dict)
+        ],
+    }
+    _write_run_artifact(run, "implementation_plan.json", implementation_plan, "implementation_plan")
+    _write_run_artifact(run, "implementation_plan.md", "# Deprovision Plan\n\nGenerated by lifecycle action.", "implementation_plan")
+    created_tasks: List[DevTask] = []
+    if not dry_run:
+        for item in implementation_plan.get("work_items", []):
+            if not isinstance(item, dict):
+                continue
+            config = item.get("config") if isinstance(item.get("config"), dict) else {}
+            target_instance = None
+            target_instance_id = str(config.get("target_instance_id") or "").strip()
+            if target_instance_id:
+                target_instance = ProvisionedInstance.objects.filter(id=target_instance_id).first()
+            task = DevTask.objects.create(
+                title=f"Deprovision: {item.get('title') or item.get('id') or 'step'}",
+                task_type="codegen",
+                status="queued",
+                priority=0,
+                source_entity_type="blueprint",
+                source_entity_id=blueprint.id,
+                source_run=run,
+                input_artifact_key="implementation_plan.json",
+                work_item_id=str(item.get("id") or ""),
+                context_purpose="operator",
+                target_instance=target_instance,
+                created_by=request.user,
+                updated_by=request.user,
+            )
+            created_tasks.append(task)
+            _enqueue_job("xyn_orchestrator.worker_tasks.run_dev_task", str(task.id), "worker")
+        if created_tasks:
+            blueprint.status = "deprovisioning"
+        else:
+            blueprint.status = "deprovisioned"
+            blueprint.deprovisioned_at = timezone.now()
+        blueprint.deprovision_last_run = run
+        blueprint.updated_by = request.user
+        blueprint.save(
+            update_fields=["status", "deprovisioned_at", "deprovision_last_run", "updated_by", "updated_at"]
+        )
+        run.log_text += f"Queued {len(created_tasks)} deprovision task(s)\n"
+    else:
+        run.log_text += "Dry-run only; no deprovision tasks queued\n"
+    run.status = "succeeded"
+    run.finished_at = timezone.now()
+    run.save(update_fields=["status", "finished_at", "log_text", "updated_at"])
+    _write_run_summary(run)
+    return JsonResponse(
+        {
+            "run_id": str(run.id),
+            "status": run.status,
+            "blueprint_status": blueprint.status,
+            "task_count": len(created_tasks),
+            "dry_run": dry_run,
         }
     )
 

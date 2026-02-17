@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from django.test import TestCase, RequestFactory
+from django.contrib.auth import get_user_model
 from django.contrib.sessions.middleware import SessionMiddleware
 from django.http import JsonResponse
 from jsonschema import Draft202012Validator
@@ -2571,3 +2572,79 @@ class PipelineSchemaTests(TestCase):
         caps = _work_item_capabilities(work_item, "remote-deploy-compose-ssm")
         self.assertIn("runtime.compose.apply_remote", caps)
         self.assertIn("deploy.ssm.run_shell", caps)
+
+
+class BlueprintLifecycleApiTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(
+            username=f"staff-{uuid.uuid4().hex[:8]}",
+            email=f"staff-{uuid.uuid4().hex[:8]}@example.com",
+            password="pass",
+            is_staff=True,
+        )
+        self.client.force_login(self.user)
+        self.blueprint = Blueprint.objects.create(name="notes", namespace="core", created_by=self.user, updated_by=self.user)
+        self.instance = ProvisionedInstance.objects.create(name="seed-dev", aws_region="us-east-1", instance_id="i-123")
+        self.target = ReleaseTarget.objects.create(
+            blueprint=self.blueprint,
+            name="notes-dev-default",
+            environment="Dev",
+            target_instance=self.instance,
+            target_instance_ref=str(self.instance.id),
+            fqdn="notes.xyence.io",
+            dns_json={"provider": "route53", "zone_name": "xyence.io"},
+            runtime_json={"remote_root": "/opt/xyn/apps/core-notes", "compose_file_path": "compose.release.yml"},
+            config_json={"xyn_dns_managed": True},
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def test_archive_blueprint_endpoint_sets_status(self):
+        response = self.client.post(f"/xyn/api/blueprints/{self.blueprint.id}/archive")
+        self.assertEqual(response.status_code, 200)
+        self.blueprint.refresh_from_db()
+        self.assertEqual(self.blueprint.status, "archived")
+        self.assertIsNotNone(self.blueprint.archived_at)
+
+    def test_deprovision_requires_type_to_confirm(self):
+        response = self.client.post(
+            f"/xyn/api/blueprints/{self.blueprint.id}/deprovision",
+            data=json.dumps({"confirm_text": "wrong", "mode": "safe"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("confirm_text mismatch", response.content.decode("utf-8"))
+
+    def test_deprovision_creates_run_and_tasks(self):
+        identifier = f"{self.blueprint.namespace}.{self.blueprint.name}"
+        response = self.client.post(
+            f"/xyn/api/blueprints/{self.blueprint.id}/deprovision",
+            data=json.dumps(
+                {
+                    "confirm_text": identifier,
+                    "mode": "stop_services",
+                    "delete_dns": False,
+                    "remove_runtime_markers": True,
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        run_id = payload.get("run_id")
+        self.assertTrue(run_id)
+        run = Run.objects.get(id=run_id)
+        self.assertEqual(run.metadata_json.get("operation"), "blueprint_deprovision")
+        self.assertTrue(DevTask.objects.filter(source_run=run).exists())
+        self.blueprint.refresh_from_db()
+        self.assertEqual(self.blueprint.status, "deprovisioning")
+
+    def test_deprovision_plan_warns_when_dns_ownership_unproven(self):
+        self.target.config_json = {}
+        self.target.save(update_fields=["config_json", "updated_at"])
+        response = self.client.get(f"/xyn/api/blueprints/{self.blueprint.id}/deprovision_plan")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["flags"]["can_execute"])
+        self.assertTrue(payload["warnings"])

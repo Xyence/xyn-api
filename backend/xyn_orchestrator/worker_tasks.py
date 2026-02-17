@@ -898,6 +898,92 @@ def _verify_route53_record(fqdn: str, zone_id: str, target_ip: str) -> bool:
     return target_ip in values
 
 
+def _delete_route53_record_if_matches(fqdn: str, zone_id: str, target_ip: str, force: bool = False) -> Dict[str, Any]:
+    client = boto3.client("route53")
+    resp = client.list_resource_record_sets(
+        HostedZoneId=zone_id,
+        StartRecordName=fqdn,
+        StartRecordType="A",
+        MaxItems="1",
+    )
+    records = resp.get("ResourceRecordSets", [])
+    if not records:
+        return {"deleted": False, "reason": "record_not_found"}
+    record = records[0]
+    if record.get("Name", "").rstrip(".") != fqdn.rstrip("."):
+        return {"deleted": False, "reason": "record_name_mismatch"}
+    values = [str(item.get("Value") or "") for item in record.get("ResourceRecords", [])]
+    if target_ip and target_ip not in values and not force:
+        raise RuntimeError(
+            f"Refusing DNS delete for {fqdn}: record value mismatch (expected instance public IP {target_ip})."
+        )
+    change = client.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Comment": "Xyn deprovision DNS delete",
+            "Changes": [{"Action": "DELETE", "ResourceRecordSet": record}],
+        },
+    )
+    return {
+        "deleted": True,
+        "change_id": change.get("ChangeInfo", {}).get("Id", ""),
+        "status": change.get("ChangeInfo", {}).get("Status", ""),
+        "record_name": fqdn,
+    }
+
+
+def _build_compose_down_commands(remote_root: str, compose_file: str, release_target_id: str) -> List[str]:
+    return [
+        "set -euo pipefail",
+        f"ROOT=\"{remote_root}\"",
+        f"COMPOSE_FILE=\"{compose_file}\"",
+        "if [ -f \"$ROOT/$COMPOSE_FILE\" ]; then (cd \"$ROOT\" && docker compose -f \"$COMPOSE_FILE\" down || true); fi",
+        (
+            f"docker ps -aq --filter label=xyn.release_target_id={release_target_id} | "
+            "xargs -r docker rm -f >/dev/null 2>&1 || true"
+        ),
+        "echo compose_down_done",
+    ]
+
+
+def _build_remove_runtime_markers_commands(remote_root: str) -> List[str]:
+    marker_files = [
+        "release_manifest.json",
+        "release_manifest.sha256",
+        "compose.release.yml",
+        "compose.release.sha256",
+        "release_id",
+        "release_uuid",
+    ]
+    quoted = " ".join(f"\"{name}\"" for name in marker_files)
+    return [
+        "set -euo pipefail",
+        f"ROOT=\"{remote_root}\"",
+        "mkdir -p \"$ROOT\"",
+        f"for marker in {quoted}; do rm -f \"$ROOT/$marker\"; done",
+        "echo markers_removed",
+    ]
+
+
+def _build_verify_deprovision_commands(remote_root: str, release_target_id: str) -> List[str]:
+    marker_files = [
+        "release_manifest.json",
+        "release_manifest.sha256",
+        "compose.release.yml",
+        "compose.release.sha256",
+        "release_id",
+        "release_uuid",
+    ]
+    checks = " && ".join([f"[ ! -f \"$ROOT/{name}\" ]" for name in marker_files]) or "true"
+    return [
+        "set -euo pipefail",
+        f"ROOT=\"{remote_root}\"",
+        f"if docker ps --filter label=xyn.release_target_id={release_target_id} -q | grep -q .; then echo running_containers; exit 20; fi",
+        f"{checks} || {{ echo marker_present; exit 21; }}",
+        "echo deprovision_verified",
+    ]
+
+
 def _build_remote_deploy_commands(root_dir: str, compose_file: str, extra_env: Dict[str, str]) -> List[str]:
     env_exports = []
     for key, value in extra_env.items():
@@ -3481,6 +3567,282 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 work_item,
                 work_item_id,
                 caps,
+                {"deploy.lock_check"},
+                "deploy.lock.check",
+            ):
+                lock_result = {"release_target_id": (work_item.get("config") or {}).get("release_target_id"), "ok": True}
+                lock_url = _write_artifact(run_id, "deprovision_lock_check.json", json.dumps(lock_result, indent=2))
+                _post_json(
+                    f"/xyn/internal/runs/{run_id}/artifacts",
+                    {"name": "deprovision_lock_check.json", "kind": "deprovision", "url": lock_url},
+                )
+                artifacts.append(
+                    {
+                        "key": "deprovision_lock_check.json",
+                        "content_type": "application/json",
+                        "description": "Deprovision deploy lock check",
+                    }
+                )
+
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"runtime.compose_down_remote", "runtime.compose_down_remote.ssm"},
+                "runtime.compose.down_remote",
+            ):
+                try:
+                    config = work_item.get("config") if isinstance(work_item.get("config"), dict) else {}
+                    remote_root = str(config.get("remote_root") or "")
+                    compose_file = str(config.get("compose_file_path") or "compose.release.yml")
+                    release_target_id = str(config.get("release_target_id") or "")
+                    if not target_instance or not target_instance.get("instance_id"):
+                        raise RuntimeError("Target instance missing for compose down")
+                    if not remote_root:
+                        raise RuntimeError("remote_root required for compose down")
+                    exec_result = _run_ssm_commands(
+                        target_instance.get("instance_id"),
+                        target_instance.get("aws_region"),
+                        _build_compose_down_commands(remote_root, compose_file, release_target_id),
+                    )
+                    outcome = "succeeded" if exec_result.get("invocation_status") == "Success" else "failed"
+                    payload = {"outcome": outcome, "exec_result": exec_result}
+                    down_url = _write_artifact(run_id, "deprovision_runtime_result.json", json.dumps(payload, indent=2))
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "deprovision_runtime_result.json", "kind": "deprovision", "url": down_url},
+                    )
+                    artifacts.append(
+                        {
+                            "key": "deprovision_runtime_result.json",
+                            "content_type": "application/json",
+                            "description": "Runtime compose down result",
+                        }
+                    )
+                    if outcome != "succeeded":
+                        success = False
+                        errors.append(
+                            {
+                                "code": "compose_down_failed",
+                                "message": "Remote compose down failed.",
+                                "detail": {"stderr": exec_result.get("stderr", "")},
+                            }
+                        )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "compose_down_failed",
+                            "message": "Remote compose down failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                    )
+
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"runtime.remove_runtime_markers"},
+                "runtime.runtime_markers.remove",
+            ):
+                try:
+                    config = work_item.get("config") if isinstance(work_item.get("config"), dict) else {}
+                    remote_root = str(config.get("remote_root") or "")
+                    if not target_instance or not target_instance.get("instance_id"):
+                        raise RuntimeError("Target instance missing for runtime marker cleanup")
+                    if not remote_root:
+                        raise RuntimeError("remote_root required for runtime marker cleanup")
+                    exec_result = _run_ssm_commands(
+                        target_instance.get("instance_id"),
+                        target_instance.get("aws_region"),
+                        _build_remove_runtime_markers_commands(remote_root),
+                    )
+                    outcome = "succeeded" if exec_result.get("invocation_status") == "Success" else "failed"
+                    payload = {"outcome": outcome, "exec_result": exec_result}
+                    rm_url = _write_artifact(run_id, "deprovision_marker_cleanup.json", json.dumps(payload, indent=2))
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "deprovision_marker_cleanup.json", "kind": "deprovision", "url": rm_url},
+                    )
+                    artifacts.append(
+                        {
+                            "key": "deprovision_marker_cleanup.json",
+                            "content_type": "application/json",
+                            "description": "Runtime marker cleanup result",
+                        }
+                    )
+                    if outcome != "succeeded":
+                        success = False
+                        errors.append(
+                            {
+                                "code": "marker_cleanup_failed",
+                                "message": "Runtime marker cleanup failed.",
+                                "detail": {"stderr": exec_result.get("stderr", "")},
+                            }
+                        )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "marker_cleanup_failed",
+                            "message": "Runtime marker cleanup failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                    )
+
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"dns.delete_record.route53"},
+                "dns.route53.delete_record",
+            ):
+                try:
+                    config = work_item.get("config") if isinstance(work_item.get("config"), dict) else {}
+                    dns_cfg = config.get("dns") if isinstance(config.get("dns"), dict) else {}
+                    fqdn_value = str(config.get("fqdn") or fqdn or "")
+                    force_delete = bool(config.get("force"))
+                    if not fqdn_value:
+                        raise RuntimeError("FQDN missing for Route53 delete")
+                    if not bool(dns_cfg.get("ownership_proven")) and not force_delete:
+                        raise RuntimeError("DNS ownership not proven; refusing delete in safe mode.")
+                    zone_id = _resolve_route53_zone_id(
+                        fqdn_value,
+                        str(dns_cfg.get("zone_id") or dns_zone_id or ""),
+                        str(dns_cfg.get("zone_name") or dns_zone_name or ""),
+                    )
+                    target_ip = ""
+                    if target_instance and target_instance.get("instance_id") and target_instance.get("aws_region"):
+                        target_ip = _resolve_instance_public_ip(
+                            target_instance.get("instance_id"), target_instance.get("aws_region")
+                        )
+                    dns_result = _delete_route53_record_if_matches(
+                        fqdn_value, zone_id, target_ip, force=force_delete
+                    )
+                    verify_absent = True
+                    if target_ip:
+                        verify_absent = not _verify_route53_record(fqdn_value, zone_id, target_ip)
+                    payload = {"result": dns_result, "verified_absent": verify_absent}
+                    delete_url = _write_artifact(run_id, "dns_delete_result.json", json.dumps(payload, indent=2))
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "dns_delete_result.json", "kind": "deprovision", "url": delete_url},
+                    )
+                    artifacts.append(
+                        {
+                            "key": "dns_delete_result.json",
+                            "content_type": "application/json",
+                            "description": "Route53 delete result",
+                        }
+                    )
+                    if not verify_absent:
+                        success = False
+                        errors.append(
+                            {
+                                "code": "route53_delete_verify_failed",
+                                "message": "Route53 record still present after delete.",
+                                "detail": {"fqdn": fqdn_value, "zone_id": zone_id},
+                            }
+                        )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "route53_delete_failed",
+                            "message": "Route53 delete failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                    )
+
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
+                {"verify.deprovision"},
+                "runtime.deprovision.verify",
+            ):
+                try:
+                    config = work_item.get("config") if isinstance(work_item.get("config"), dict) else {}
+                    release_target_id = str(config.get("release_target_id") or "")
+                    remote_root = str(config.get("remote_root") or "")
+                    fqdn_value = str(config.get("fqdn") or fqdn or "")
+                    force_mode = bool(config.get("force"))
+                    dns_cfg = config.get("dns") if isinstance(config.get("dns"), dict) else {}
+                    verify_payload: Dict[str, Any] = {
+                        "release_target_id": release_target_id,
+                        "fqdn": fqdn_value,
+                        "runtime_markers_absent": False,
+                        "containers_absent": False,
+                        "dns_absent": None,
+                    }
+                    if target_instance and target_instance.get("instance_id") and remote_root:
+                        exec_result = _run_ssm_commands(
+                            target_instance.get("instance_id"),
+                            target_instance.get("aws_region"),
+                            _build_verify_deprovision_commands(remote_root, release_target_id),
+                        )
+                        verify_payload["ssm"] = exec_result
+                        verify_payload["runtime_markers_absent"] = exec_result.get("invocation_status") == "Success"
+                        verify_payload["containers_absent"] = exec_result.get("invocation_status") == "Success"
+                    else:
+                        verify_payload["ssm"] = {"skipped": True, "reason": "target_instance_or_remote_root_missing"}
+                        verify_payload["runtime_markers_absent"] = True
+                        verify_payload["containers_absent"] = True
+                    if config.get("delete_dns") and fqdn_value:
+                        zone_id = _resolve_route53_zone_id(
+                            fqdn_value,
+                            str(dns_cfg.get("zone_id") or dns_zone_id or ""),
+                            str(dns_cfg.get("zone_name") or dns_zone_name or ""),
+                        )
+                        try:
+                            if target_instance and target_instance.get("instance_id") and target_instance.get("aws_region"):
+                                target_ip = _resolve_instance_public_ip(
+                                    target_instance.get("instance_id"), target_instance.get("aws_region")
+                                )
+                                verify_payload["dns_absent"] = not _verify_route53_record(fqdn_value, zone_id, target_ip)
+                            else:
+                                verify_payload["dns_absent"] = None
+                        except Exception as exc:
+                            verify_payload["dns_absent"] = None
+                            verify_payload["dns_error"] = str(exc)
+                    ok = bool(verify_payload["runtime_markers_absent"] and verify_payload["containers_absent"])
+                    if verify_payload.get("dns_absent") is False and not force_mode:
+                        ok = False
+                    verify_url = _write_artifact(run_id, "deprovision_verify.json", json.dumps(verify_payload, indent=2))
+                    _post_json(
+                        f"/xyn/internal/runs/{run_id}/artifacts",
+                        {"name": "deprovision_verify.json", "kind": "deprovision", "url": verify_url},
+                    )
+                    artifacts.append(
+                        {
+                            "key": "deprovision_verify.json",
+                            "content_type": "application/json",
+                            "description": "Deprovision verification checks",
+                        }
+                    )
+                    if not ok:
+                        success = False
+                        errors.append(
+                            {
+                                "code": "deprovision_verify_failed",
+                                "message": "Deprovision verification failed.",
+                                "detail": verify_payload,
+                            }
+                        )
+                except Exception as exc:
+                    success = False
+                    errors.append(
+                        {
+                            "code": "deprovision_verify_failed",
+                            "message": "Deprovision verification failed.",
+                            "detail": {"error": str(exc)},
+                        }
+                    )
+
+            if _work_item_matches(
+                work_item,
+                work_item_id,
+                caps,
                 {"release.validate_manifest.pinned"},
                 "release.manifest.pinned",
             ):
@@ -4423,6 +4785,19 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
                 success,
                 treat_noop_as_error=treat_noop_as_error,
             )
+            if not repo_results:
+                repo_results.append(
+                    {
+                        "repo": {
+                            "name": "runtime-ops",
+                            "url": "internal://runtime-ops",
+                            "ref": "n/a",
+                            "path_root": ".",
+                        },
+                        "files_changed": [],
+                        "commands_executed": [],
+                    }
+                )
             result = {
                 "schema_version": "codegen_result.v1",
                 "task_id": task_id,

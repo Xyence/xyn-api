@@ -165,13 +165,26 @@ class VoiceTranscript(models.Model):
 
 
 class Blueprint(models.Model):
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("archived", "Archived"),
+        ("deprovisioning", "Deprovisioning"),
+        ("deprovisioned", "Deprovisioned"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=120)
     namespace = models.CharField(max_length=120, default="core")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
+    archived_at = models.DateTimeField(null=True, blank=True)
+    deprovisioned_at = models.DateTimeField(null=True, blank=True)
     description = models.TextField(blank=True)
     spec_text = models.TextField(blank=True)
     repo_slug = models.CharField(max_length=120, blank=True, default="")
     metadata_json = models.JSONField(null=True, blank=True)
+    deprovision_last_run = models.ForeignKey(
+        "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="blueprints_deprovisioned"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(
