@@ -449,6 +449,63 @@ class OidcContractTests(TestCase):
         self.assertTrue(location.startswith("https://ems.xyence.io") or location.startswith("/"))
         self.assertIn("id_token=token-1", location)
 
+    @mock.patch("xyn_orchestrator.xyn_api._decode_oidc_id_token")
+    @mock.patch("xyn_orchestrator.xyn_api.requests.post")
+    @mock.patch("xyn_orchestrator.xyn_api.get_discovery_doc")
+    def test_auth_callback_recovers_flow_from_state_when_session_keys_missing(
+        self, mock_discovery, mock_post, mock_decode
+    ):
+        provider = IdentityProvider.objects.create(
+            id="google",
+            display_name="Google",
+            issuer="https://accounts.google.com",
+            client_id="abc",
+            enabled=True,
+        )
+        AppOIDCClient.objects.create(
+            app_id="ems.platform",
+            login_mode="redirect",
+            default_provider=provider,
+            allowed_providers_json=["google"],
+            redirect_uris_json=["https://xyence.io/auth/callback"],
+            post_logout_redirect_uris_json=["https://bedrock.xyence.io/"],
+        )
+        mock_discovery.side_effect = [
+            {"authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth"},
+            {"token_endpoint": "https://accounts.google.com/token"},
+        ]
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"id_token": "token-1"}
+        mock_decode.return_value = {
+            "sub": "user-1",
+            "email": "user@xyence.io",
+            "iss": provider.issuer,
+            "aud": provider.client_id,
+            "name": "User One",
+        }
+        authorize_response = self.client.get(
+            "/xyn/api/auth/oidc/google/authorize",
+            {
+                "appId": "ems.platform",
+                "returnTo": "https://bedrock.xyence.io/devices",
+            },
+        )
+        self.assertEqual(authorize_response.status_code, 302)
+        session = self.client.session
+        state = session.get("oidc_state:ems.platform:google")
+        session.pop("oidc_provider_id", None)
+        session.pop("oidc_app_id", None)
+        session.pop("post_login_redirect", None)
+        session.save()
+        callback_response = self.client.get(
+            "/auth/callback",
+            {"code": "code-1", "state": state},
+        )
+        self.assertEqual(callback_response.status_code, 302)
+        location = callback_response["Location"]
+        self.assertTrue(location.startswith("https://bedrock.xyence.io/devices"))
+        self.assertIn("id_token=token-1", location)
+
     def test_auth_login_renders_shared_page(self):
         provider = IdentityProvider.objects.create(
             id="google",

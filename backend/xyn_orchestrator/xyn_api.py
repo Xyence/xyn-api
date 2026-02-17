@@ -1856,6 +1856,15 @@ def _extract_claim(claims: Dict[str, Any], key: str, fallback: str) -> str:
     return str(value) if value is not None else ""
 
 
+def _load_oidc_flow(request: HttpRequest, state: str) -> Dict[str, Any]:
+    if not state:
+        return {}
+    flow = request.session.get(f"oidc_flow:{state}") or {}
+    if isinstance(flow, dict):
+        return flow
+    return {}
+
+
 @csrf_exempt
 def oidc_authorize(request: HttpRequest, provider_id: str) -> HttpResponse:
     app_id = request.GET.get("appId") or request.GET.get("app_id") or ""
@@ -1892,7 +1901,13 @@ def oidc_authorize(request: HttpRequest, provider_id: str) -> HttpResponse:
     request.session["oidc_app_id"] = app_id
     request.session["oidc_provider_id"] = provider_id
     requested_return_to = request.GET.get("returnTo") or request.GET.get("next") or ""
-    request.session["post_login_redirect"] = _sanitize_return_to(requested_return_to, request, client, app_id)
+    post_login_redirect = _sanitize_return_to(requested_return_to, request, client, app_id)
+    request.session["post_login_redirect"] = post_login_redirect
+    request.session[f"oidc_flow:{state}"] = {
+        "app_id": app_id,
+        "provider_id": provider_id,
+        "return_to": post_login_redirect,
+    }
     scopes = provider.scopes_json or ["openid", "profile", "email"]
     params = {
         "response_type": "code",
@@ -1933,12 +1948,22 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
     code = request.POST.get("code") if request.method == "POST" else request.GET.get("code")
     state = request.POST.get("state") if request.method == "POST" else request.GET.get("state")
     app_id = request.POST.get("appId") if request.method == "POST" else request.GET.get("appId")
-    app_id = app_id or request.session.get("oidc_app_id") or ""
+    flow = _load_oidc_flow(request, state or "")
+    flow_app_id = str(flow.get("app_id") or "")
+    flow_provider_id = str(flow.get("provider_id") or "")
+    app_id = app_id or flow_app_id or request.session.get("oidc_app_id") or ""
     if not code or not state:
         return JsonResponse({"error": "missing code/state"}, status=400)
     if not app_id:
         return JsonResponse({"error": "appId required"}, status=400)
+    if flow_provider_id and flow_provider_id != provider_id:
+        return JsonResponse({"error": "invalid state"}, status=400)
     expected_state = request.session.get(f"oidc_state:{app_id}:{provider_id}")
+    if state != expected_state:
+        if not expected_state and flow_app_id == app_id and flow_provider_id in {"", provider_id}:
+            expected_state = state
+        else:
+            return JsonResponse({"error": "invalid state"}, status=400)
     if state != expected_state:
         return JsonResponse({"error": "invalid state"}, status=400)
     client = _resolve_app_config(app_id)
@@ -2070,11 +2095,20 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
     login(request, user, backend="django.contrib.auth.backends.ModelBackend")
     request.session["user_identity_id"] = str(identity.id)
     redirect_to = _sanitize_return_to(
-        request.session.get("post_login_redirect") or "",
+        request.session.get("post_login_redirect") or str(flow.get("return_to") or ""),
         request,
         client,
         app_id,
     )
+    request.session.pop(f"oidc_state:{app_id}:{provider_id}", None)
+    request.session.pop(f"oidc_nonce:{app_id}:{provider_id}", None)
+    request.session.pop(f"oidc_verifier:{app_id}:{provider_id}", None)
+    request.session.pop(f"oidc_flow:{state}", None)
+    if request.session.get("oidc_app_id") == app_id:
+        request.session.pop("oidc_app_id", None)
+    if request.session.get("oidc_provider_id") == provider_id:
+        request.session.pop("oidc_provider_id", None)
+    request.session.pop("post_login_redirect", None)
     if app_id != "xyn-ui":
         split = urlsplit(redirect_to)
         fragment_params = dict(parse_qsl(split.fragment, keep_blank_values=True))
@@ -2160,13 +2194,25 @@ def auth_login(request: HttpRequest) -> HttpResponse:
 @csrf_exempt
 def auth_callback(request: HttpRequest) -> HttpResponse:
     provider_id = request.session.get("oidc_provider_id")
+    state = request.POST.get("state") if request.method == "POST" else request.GET.get("state")
+    if not provider_id:
+        flow = _load_oidc_flow(request, state or "")
+        flow_provider_id = str(flow.get("provider_id") or "")
+        flow_app_id = str(flow.get("app_id") or "")
+        if flow_provider_id:
+            provider_id = flow_provider_id
+            request.session["oidc_provider_id"] = flow_provider_id
+        if flow_app_id:
+            request.session["oidc_app_id"] = flow_app_id
+        flow_return_to = str(flow.get("return_to") or "")
+        if flow_return_to and not request.session.get("post_login_redirect"):
+            request.session["post_login_redirect"] = flow_return_to
     if provider_id:
         return oidc_callback(request, provider_id)
     error = request.GET.get("error")
     if error:
         return JsonResponse({"error": error}, status=400)
     code = request.GET.get("code")
-    state = request.GET.get("state")
     if not code or not state:
         return JsonResponse({"error": "missing code/state"}, status=400)
     if state != request.session.get("oidc_state"):
