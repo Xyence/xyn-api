@@ -4310,6 +4310,7 @@ def _default_remote_root(release_target: Optional[Dict[str, Any]]) -> str:
 
 
 def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target: Optional[Dict[str, Any]] = None) -> str:
+    auth_app_id = "ems.platform"
     api_image = images.get("ems-api", {}).get("image_uri")
     web_image = images.get("ems-web", {}).get("image_uri")
     api_digest = images.get("ems-api", {}).get("digest")
@@ -4343,7 +4344,7 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target
             "    labels:\n"
             "      - \"traefik.enable=true\"\n"
             f"      - \"traefik.docker.network={route_network}\"\n"
-            "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId=ems.platform\"\n"
+            f"      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId={auth_app_id}\"\n"
             "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.trustForwardHeader=true\"\n"
             f"      - \"traefik.http.routers.{rid}.rule=Host(`{host}`)\"\n"
             f"      - \"traefik.http.routers.{rid}.entrypoints=websecure\"\n"
@@ -4382,7 +4383,7 @@ def _render_compose_for_images(images: Dict[str, Dict[str, str]], release_target
                 "    labels:\n"
                 "      - \"traefik.enable=true\"\n"
                 f"      - \"traefik.docker.network={route_network}\"\n"
-                "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId=ems.platform\"\n"
+                f"      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId={auth_app_id}\"\n"
                 "      - \"traefik.http.middlewares.xyn-auth-ems.forwardauth.trustForwardHeader=true\"\n"
                 "      - \"traefik.http.routers.ems.rule=Host(`${EMS_FQDN:-ems.xyence.io}`)\"\n"
                 "      - \"traefik.http.routers.ems.entrypoints=websecure\"\n"
@@ -4437,6 +4438,41 @@ def _render_compose_for_release_components(
     images: Dict[str, Dict[str, str]],
     release_target: Optional[Dict[str, Any]] = None,
 ) -> str:
+    def _infer_forward_auth_app_id() -> str:
+        # Prefer explicit app id from release target config when present.
+        if isinstance(release_target, dict):
+            config = release_target.get("config")
+            if isinstance(config, dict):
+                auth = config.get("auth")
+                if isinstance(auth, dict):
+                    explicit = str(auth.get("app_id") or auth.get("appId") or "").strip()
+                    if explicit:
+                        return explicit
+                oidc = config.get("oidc")
+                if isinstance(oidc, dict):
+                    explicit = str(oidc.get("app_id") or oidc.get("appId") or "").strip()
+                    if explicit:
+                        return explicit
+            runtime = release_target.get("runtime")
+            if isinstance(runtime, dict):
+                auth = runtime.get("auth")
+                if isinstance(auth, dict):
+                    explicit = str(auth.get("app_id") or auth.get("appId") or "").strip()
+                    if explicit:
+                        return explicit
+        component_names = {
+            str(component.get("name") or "").strip().lower()
+            for component in components
+            if isinstance(component, dict)
+        }
+        if "ems-web" in component_names or "ems-api" in component_names or any(
+            name.startswith("ems-") for name in component_names
+        ):
+            return "ems.platform"
+        return "xyn-ui"
+
+    auth_app_id = _infer_forward_auth_app_id()
+
     def _normalize_component_env(key: str, raw_value: Any) -> str:
         value = str(raw_value)
         if str(key).strip().upper() != "DATABASE_URL":
@@ -4634,18 +4670,21 @@ def _render_compose_for_release_components(
                 if not host:
                     continue
                 rid = _sanitize_route_id(host)
+                middleware_name = f"xyn-auth-{rid}"
                 compose_lines.append("    labels:\n")
                 compose_lines.append("      - \"traefik.enable=true\"\n")
                 compose_lines.append(f"      - \"traefik.docker.network={route_network}\"\n")
                 compose_lines.append(
-                    "      - \"traefik.http.middlewares.xyn-auth-app.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId=xyn-ui\"\n"
+                    f"      - \"traefik.http.middlewares.{middleware_name}.forwardauth.address=https://xyence.io/xyn/api/auth/session-check?appId={auth_app_id}\"\n"
                 )
-                compose_lines.append("      - \"traefik.http.middlewares.xyn-auth-app.forwardauth.trustForwardHeader=true\"\n")
+                compose_lines.append(
+                    f"      - \"traefik.http.middlewares.{middleware_name}.forwardauth.trustForwardHeader=true\"\n"
+                )
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.rule=Host(`{host}`)\"\n")
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.entrypoints=websecure\"\n")
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.tls=true\"\n")
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.tls.certresolver=le\"\n")
-                compose_lines.append(f"      - \"traefik.http.routers.{rid}.middlewares=xyn-auth-app@docker\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}.middlewares={middleware_name}@docker\"\n")
                 compose_lines.append(f"      - \"traefik.http.services.{rid}.loadbalancer.server.port={selected_port}\"\n")
                 break
         compose_lines.append("\n")
