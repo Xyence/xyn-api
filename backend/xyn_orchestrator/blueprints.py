@@ -3310,11 +3310,14 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
             instance.release_id = plan.get("releaseId", "")
             if op:
                 instance.operation_id = op.get("operationId", "")
-                instance.status = "applied" if op.get("status") == "succeeded" else "failed"
+                op_status = str(op.get("status") or "").strip().lower()
+                if op_status in {"failed", "error", "cancelled", "canceled"}:
+                    raise RuntimeError(f"Release apply failed with status '{op_status}'")
+                instance.status = "applied"
             else:
                 instance.status = "planned"
             run.metadata_json = {"plan": plan, "operation": op}
-            run.status = "succeeded" if instance.status in {"planned", "applied"} else "failed"
+            run.status = "running"
         else:
             instance.status = "planned"
             run.status = "succeeded"
@@ -3363,6 +3366,7 @@ def instantiate_blueprint(request: HttpRequest, blueprint_id: str) -> JsonRespon
                 enqueue_jobs=True,
             )
             run.log_text += f"Queued {len(dev_tasks)} dev tasks\n"
+        run.status = "succeeded"
     except Exception as exc:
         instance.status = "failed"
         instance.error = str(exc)
