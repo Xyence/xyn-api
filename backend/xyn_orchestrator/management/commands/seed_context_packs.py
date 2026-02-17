@@ -39,15 +39,6 @@ class Command(BaseCommand):
                 "filename": "xyn-coder-canon.md",
                 "is_default": True,
             },
-            {
-                "name": "ems-platform-blueprint",
-                "purpose": "planner",
-                "scope": "project",
-                "project_key": "core.ems.platform",
-                "version": "1.0.0",
-                "filename": "ems-platform-blueprint.md",
-                "is_default": False,
-            },
         ]
 
         for pack in packs:

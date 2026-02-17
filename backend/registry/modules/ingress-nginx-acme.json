@@ -24,7 +24,7 @@
         "acme_email": "Email for Let's Encrypt registration.",
         "webroot_path": "ACME webroot path on instance (default: /opt/xyn/acme-webroot).",
         "cert_root": "Certificate root path on instance (default: /opt/xyn/certs).",
-        "nginx_service": "Nginx container/service name in compose (default: ems-web).",
+        "nginx_service": "Nginx container/service name in compose (default: web).",
         "listen_ports": "HTTP/HTTPS port mapping (default 80/443).",
         "redirect_http_to_https": "Whether to redirect HTTP to HTTPS."
       },

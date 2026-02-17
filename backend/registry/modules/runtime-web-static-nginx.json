@@ -19,7 +19,7 @@
     ],
     "interfaces": {
       "config": {
-        "upstream_api_url": "Base URL for API upstream (e.g., http://ems-api:8000).",
+        "upstream_api_url": "Base URL for API upstream (e.g., http://api:8000).",
         "base_path": "API base path to proxy (default: /api).",
         "spa_fallback": "Whether to serve index.html for missing paths.",
         "listen_port": "Port nginx listens on (default: 8080)."

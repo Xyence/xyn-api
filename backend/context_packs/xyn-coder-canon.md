@@ -11,10 +11,10 @@ Scope: global
 ## Repo Targets (Defaults)
 - `xyn-api`:
   - url: `https://github.com/Xyence/xyn-api`
-  - path_root: `apps/ems-api`
+  - path_root: `services/<blueprint_slug>/api`
 - `xyn-ui`:
   - url: `https://github.com/Xyence/xyn-ui`
-  - path_root: `apps/ems-ui`
+  - path_root: `services/<blueprint_slug>/web`
 
 ## Coding Standards
 - Python: Black-friendly formatting, type hints where practical, keep modules small.

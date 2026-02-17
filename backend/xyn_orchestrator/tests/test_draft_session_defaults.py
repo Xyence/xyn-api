@@ -65,10 +65,10 @@ class DraftSessionDefaultsTests(TestCase):
             is_active=True,
         )
         self.project_pack = ContextPack.objects.create(
-            name="ems-platform-blueprint",
+            name="project-blueprint-pack",
             purpose="planner",
             scope="project",
-            project_key="core.ems.platform",
+            project_key="core.demo.app",
             version="1",
             content_markdown="proj",
             is_active=True,
@@ -81,7 +81,7 @@ class DraftSessionDefaultsTests(TestCase):
             {
                 "draft_kind": "blueprint",
                 "namespace": "core",
-                "project_key": "core.ems.platform",
+                "project_key": "core.demo.app",
             },
         )
         self.assertEqual(response.status_code, 200)
@@ -104,7 +104,7 @@ class DraftSessionDefaultsTests(TestCase):
             {
                 "draft_kind": "blueprint",
                 "namespace": "core",
-                "project_key": "core.ems.platform",
+                "project_key": "core.demo.app",
             },
         )
         self.assertEqual(response.status_code, 200)
@@ -115,7 +115,7 @@ class DraftSessionDefaultsTests(TestCase):
     def test_context_pack_defaults_solution_includes_coder(self):
         response = self.client.get(
             "/xyn/api/context-pack-defaults",
-            {"draft_kind": "solution", "namespace": "core", "project_key": "core.ems.platform"},
+            {"draft_kind": "solution", "namespace": "core", "project_key": "core.demo.app"},
         )
         self.assertEqual(response.status_code, 200)
         ids = set(response.json()["recommended_context_pack_ids"])
@@ -291,7 +291,7 @@ class DraftSessionDefaultsTests(TestCase):
             draft_kind="blueprint",
             status="drafting",
             namespace="core",
-            project_key="core.ems.platform",
+            project_key="core.demo.app",
         )
         BlueprintDraftSession.objects.create(
             name="Draft two",
@@ -301,7 +301,7 @@ class DraftSessionDefaultsTests(TestCase):
             namespace="lab",
             project_key="lab.other",
         )
-        response = self.client.get("/xyn/api/draft-sessions", {"status": "drafting", "project_key": "core.ems.platform"})
+        response = self.client.get("/xyn/api/draft-sessions", {"status": "drafting", "project_key": "core.demo.app"})
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(len(payload["sessions"]), 1)
@@ -862,7 +862,37 @@ class DraftSessionDefaultsTests(TestCase):
 
     def test_implementation_plan_carries_release_target_environment_id(self):
         instance = self._create_dev_instance()
-        blueprint = Blueprint.objects.create(name="env-carry", namespace="core")
+        blueprint = Blueprint.objects.create(
+            name="env-carry",
+            namespace="core",
+            spec_text=json.dumps(
+                {
+                    "releaseSpec": {
+                        "metadata": {"name": "env-carry", "namespace": "core"},
+                        "repoTargets": [
+                            {
+                                "name": "xyn-api",
+                                "url": "https://github.com/Xyence/xyn-api",
+                                "ref": "main",
+                                "path_root": ".",
+                                "auth": "github_app",
+                                "allow_write": True,
+                            }
+                        ],
+                        "components": [
+                            {
+                                "name": "api",
+                                "build": {
+                                    "repoTarget": "xyn-api",
+                                    "context": ".",
+                                    "dockerfile": "Dockerfile",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
         target = ReleaseTarget.objects.create(
             blueprint=blueprint,
             name="env-carry-dev-default",
@@ -918,7 +948,38 @@ class DraftSessionDefaultsTests(TestCase):
         self.assertEqual(sanitized["metadata"]["namespace"], "xyence-demo")
 
     def test_non_ems_blueprint_with_image_deploy_includes_remote_deploy_tasks(self):
-        blueprint = Blueprint.objects.create(name="test-b", namespace="core", metadata_json={})
+        blueprint = Blueprint.objects.create(
+            name="test-b",
+            namespace="core",
+            metadata_json={},
+            spec_text=json.dumps(
+                {
+                    "releaseSpec": {
+                        "metadata": {"name": "test-b", "namespace": "core"},
+                        "repoTargets": [
+                            {
+                                "name": "xyn-api",
+                                "url": "https://github.com/Xyence/xyn-api",
+                                "ref": "main",
+                                "path_root": ".",
+                                "auth": "github_app",
+                                "allow_write": True,
+                            }
+                        ],
+                        "components": [
+                            {
+                                "name": "api",
+                                "build": {
+                                    "repoTarget": "xyn-api",
+                                    "context": ".",
+                                    "dockerfile": "Dockerfile",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
         release_target = {
             "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "name": "test-b-dev-default",
@@ -939,7 +1000,7 @@ class DraftSessionDefaultsTests(TestCase):
         )
         ids = {item.get("id") for item in plan.get("work_items", [])}
         self.assertIn("dns.ensure_record.route53", ids)
-        self.assertIn("build.publish_images.container", ids)
+        self.assertIn("build.publish_images.components", ids)
         self.assertIn("deploy.apply_remote_compose.pull", ids)
 
     def test_normalize_generated_blueprint_prefers_build_over_image_when_both_present(self):

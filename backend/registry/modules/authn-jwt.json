@@ -18,9 +18,9 @@
     ],
     "interfaces": {
       "config": {
-        "EMS_JWT_SECRET": "Shared secret for HS256 verification.",
-        "EMS_JWT_ISSUER": "Token issuer (default: xyn-ems).",
-        "EMS_JWT_AUDIENCE": "Token audience (default: ems)."
+        "JWT_SECRET": "Shared secret for HS256 verification.",
+        "JWT_ISSUER": "Token issuer (default: xyn).",
+        "JWT_AUDIENCE": "Token audience (default: app)."
       },
       "claims": {
         "required": ["sub", "email"],
