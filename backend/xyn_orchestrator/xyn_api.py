@@ -2344,7 +2344,11 @@ def auth_session_check(request: HttpRequest) -> HttpResponse:
     )
     if not forwarded_uri.startswith("/"):
         forwarded_uri = f"/{forwarded_uri}"
-    return_to_candidate = f"{forwarded_proto}://{forwarded_host}{forwarded_uri}" if forwarded_host else forwarded_uri
+    if app_id == "ems.platform":
+        callback_uri = "/auth/callback"
+        return_to_candidate = f"{forwarded_proto}://{forwarded_host}{callback_uri}" if forwarded_host else callback_uri
+    else:
+        return_to_candidate = f"{forwarded_proto}://{forwarded_host}{forwarded_uri}" if forwarded_host else forwarded_uri
     return_to = _sanitize_return_to(return_to_candidate, request, client, app_id)
 
     if request.user.is_authenticated and request.session.get("user_identity_id"):

@@ -552,3 +552,32 @@ class OidcContractTests(TestCase):
             self.client.session.get("post_login_redirect"),
             "https://josh-test-b.xyence.io/auth/callback",
         )
+
+    def test_session_check_uses_callback_return_for_ems_platform(self):
+        provider = IdentityProvider.objects.create(
+            id="google",
+            display_name="Google",
+            issuer="https://accounts.google.com",
+            client_id="abc",
+            enabled=True,
+        )
+        AppOIDCClient.objects.create(
+            app_id="ems.platform",
+            login_mode="redirect",
+            default_provider=provider,
+            allowed_providers_json=["google"],
+            redirect_uris_json=["https://xyence.io/auth/callback"],
+            post_logout_redirect_uris_json=["https://bedrock.xyence.io/"],
+        )
+        response = self.client.get(
+            "/xyn/api/auth/session-check?appId=ems.platform",
+            **{
+                "HTTP_X_FORWARDED_PROTO": "https",
+                "HTTP_X_FORWARDED_HOST": "bedrock.xyence.io",
+                "HTTP_X_FORWARDED_URI": "/devices",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        location = response["Location"]
+        self.assertIn("/auth/login?appId=ems.platform", location)
+        self.assertIn("returnTo=https%3A%2F%2Fbedrock.xyence.io%2Fauth%2Fcallback", location)
