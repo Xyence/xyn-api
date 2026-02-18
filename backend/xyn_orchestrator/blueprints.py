@@ -2979,8 +2979,23 @@ def _publish_draft_session(session: BlueprintDraftSession, user) -> Dict[str, An
             blueprint.description = draft.get("description", blueprint.description)
             blueprint.spec_text = spec_text
             blueprint.metadata_json = metadata_json
+            # Publishing is an explicit commit action; resurrect archived/deprovisioned blueprints.
+            blueprint.status = "active"
+            blueprint.archived_at = None
+            blueprint.deprovisioned_at = None
             blueprint.updated_by = user
-            blueprint.save(update_fields=["description", "spec_text", "metadata_json", "updated_by", "updated_at"])
+            blueprint.save(
+                update_fields=[
+                    "description",
+                    "spec_text",
+                    "metadata_json",
+                    "status",
+                    "archived_at",
+                    "deprovisioned_at",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
         next_rev = (blueprint.revisions.aggregate(max_rev=models.Max("revision")).get("max_rev") or 0) + 1
         BlueprintRevision.objects.create(
             blueprint=blueprint,
