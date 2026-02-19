@@ -69,6 +69,21 @@
         "acceptAzp": {"type": "boolean"}
       },
       "additionalProperties": false
+    },
+    "fallbackDefaultRoleId": {"type": ["string", "null"]},
+    "requireGroupMatch": {"type": "boolean", "default": false},
+    "groupClaimPath": {"type": "string", "default": "groups"},
+    "groupRoleMappings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["remoteGroupName", "xynRoleId"],
+        "properties": {
+          "remoteGroupName": {"type": "string"},
+          "xynRoleId": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
     }
   },
   "additionalProperties": false

@@ -14,7 +14,11 @@ from xyn_orchestrator.models import (
     UserIdentity,
 )
 from xyn_orchestrator.oidc import get_jwks
-from xyn_orchestrator.xyn_api import _decode_oidc_id_token
+from xyn_orchestrator.xyn_api import (
+    _apply_first_login_role_mappings,
+    _decode_oidc_id_token,
+    _extract_remote_groups_from_claims,
+)
 
 
 class OidcContractTests(TestCase):
@@ -77,6 +81,20 @@ class OidcContractTests(TestCase):
         self.assertEqual(response.status_code, 200)
         provider = IdentityProvider.objects.get(id=provider_id)
         self.assertEqual(provider.display_name, "Google")
+
+    def test_provider_mapping_validation_rejects_duplicate_remote_groups(self):
+        payload = self._provider_payload()
+        payload["group_role_mappings"] = [
+            {"remote_group_name": "ops", "xyn_role_id": "platform_operator"},
+            {"remote_group_name": "ops", "xyn_role_id": "platform_admin"},
+        ]
+        response = self.client.post(
+            "/xyn/api/platform/identity-providers",
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("must be unique", " ".join(response.json().get("details") or []))
 
     def test_oidc_config_resolver(self):
         provider = IdentityProvider.objects.create(
@@ -264,6 +282,110 @@ class OidcContractTests(TestCase):
             {"code": "code-1", "state": "state-1", "appId": "xyn-ui"},
         )
         self.assertEqual(response.status_code, 403)
+
+    def test_extract_remote_groups_from_claims_supports_path_and_types(self):
+        claims = {
+            "groups": ["eng", "ops"],
+            "realm_access": {"roles": ["platform_admin"]},
+            "nested": {"objects": [{"name": "a"}, {"name": "b"}]},
+            "single": "solo",
+        }
+        self.assertEqual(_extract_remote_groups_from_claims(claims, "groups"), {"eng", "ops"})
+        self.assertEqual(_extract_remote_groups_from_claims(claims, "realm_access.roles"), {"platform_admin"})
+        self.assertEqual(_extract_remote_groups_from_claims(claims, "nested.objects"), {"a", "b"})
+        self.assertEqual(_extract_remote_groups_from_claims(claims, "single"), {"solo"})
+
+    def test_first_login_mapping_single_match_assigns_role(self):
+        provider = IdentityProvider.objects.create(
+            id="oidc-1",
+            display_name="OIDC 1",
+            issuer="https://issuer.single",
+            client_id="abc",
+            group_claim_path="groups",
+            group_role_mappings_json=[
+                {"remote_group_name": "ops", "xyn_role_id": "platform_operator"},
+            ],
+        )
+        identity = UserIdentity.objects.create(provider="oidc", issuer=provider.issuer, subject="single")
+        result = _apply_first_login_role_mappings(identity, provider, {"groups": ["ops"]})
+        self.assertEqual(result["reason"], "matched_mapping")
+        self.assertTrue(RoleBinding.objects.filter(user_identity=identity, role="platform_operator").exists())
+
+    def test_first_login_mapping_multiple_matches_assigns_multiple_roles(self):
+        provider = IdentityProvider.objects.create(
+            id="oidc-2",
+            display_name="OIDC 2",
+            issuer="https://issuer.multi",
+            client_id="abc",
+            group_claim_path="realm_access.roles",
+            group_role_mappings_json=[
+                {"remote_group_name": "platform-admins", "xyn_role_id": "platform_admin"},
+                {"remote_group_name": "platform-architects", "xyn_role_id": "platform_architect"},
+            ],
+        )
+        identity = UserIdentity.objects.create(provider="oidc", issuer=provider.issuer, subject="multi")
+        result = _apply_first_login_role_mappings(
+            identity,
+            provider,
+            {"realm_access": {"roles": ["platform-admins", "platform-architects"]}},
+        )
+        self.assertEqual(result["reason"], "matched_mapping")
+        self.assertEqual(
+            set(RoleBinding.objects.filter(user_identity=identity).values_list("role", flat=True)),
+            {"platform_admin", "platform_architect"},
+        )
+
+    def test_first_login_mapping_no_match_uses_fallback(self):
+        provider = IdentityProvider.objects.create(
+            id="oidc-3",
+            display_name="OIDC 3",
+            issuer="https://issuer.fallback",
+            client_id="abc",
+            group_claim_path="groups",
+            fallback_default_role_id="app_user",
+            group_role_mappings_json=[
+                {"remote_group_name": "ops", "xyn_role_id": "platform_operator"},
+            ],
+        )
+        identity = UserIdentity.objects.create(provider="oidc", issuer=provider.issuer, subject="fallback")
+        result = _apply_first_login_role_mappings(identity, provider, {"groups": ["none"]})
+        self.assertEqual(result["reason"], "fallback_default_role")
+        self.assertTrue(RoleBinding.objects.filter(user_identity=identity, role="app_user").exists())
+
+    def test_first_login_mapping_no_match_and_require_group_match_denies(self):
+        provider = IdentityProvider.objects.create(
+            id="oidc-4",
+            display_name="OIDC 4",
+            issuer="https://issuer.require",
+            client_id="abc",
+            require_group_match=True,
+            group_claim_path="groups",
+            group_role_mappings_json=[
+                {"remote_group_name": "ops", "xyn_role_id": "platform_operator"},
+            ],
+        )
+        identity = UserIdentity.objects.create(provider="oidc", issuer=provider.issuer, subject="require")
+        result = _apply_first_login_role_mappings(identity, provider, {"groups": ["none"]})
+        self.assertTrue(result["denied"])
+        self.assertEqual(result["reason"], "require_group_match_no_mapping")
+        self.assertFalse(RoleBinding.objects.filter(user_identity=identity).exists())
+
+    def test_first_login_mapping_skips_users_with_existing_roles(self):
+        provider = IdentityProvider.objects.create(
+            id="oidc-5",
+            display_name="OIDC 5",
+            issuer="https://issuer.existing",
+            client_id="abc",
+            group_claim_path="groups",
+            group_role_mappings_json=[
+                {"remote_group_name": "ops", "xyn_role_id": "platform_operator"},
+            ],
+        )
+        identity = UserIdentity.objects.create(provider="oidc", issuer=provider.issuer, subject="existing")
+        RoleBinding.objects.create(user_identity=identity, scope_kind="platform", role="platform_admin")
+        result = _apply_first_login_role_mappings(identity, provider, {"groups": ["ops"]})
+        self.assertEqual(result["reason"], "roles_already_present")
+        self.assertEqual(RoleBinding.objects.filter(user_identity=identity).count(), 1)
 
     @mock.patch("xyn_orchestrator.oidc.requests.get")
     def test_jwks_refresh_on_unknown_kid(self, mock_get):

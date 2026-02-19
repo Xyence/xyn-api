@@ -145,6 +145,10 @@ def provider_to_payload(provider: IdentityProvider) -> Dict[str, Any]:
         "domain_rules": provider.domain_rules_json or {},
         "claims": provider.claims_json or {},
         "audience_rules": provider.audience_rules_json or {},
+        "fallback_default_role_id": provider.fallback_default_role_id,
+        "require_group_match": provider.require_group_match,
+        "group_claim_path": provider.group_claim_path or "groups",
+        "group_role_mappings": provider.group_role_mappings_json or [],
         "last_discovery_refresh_at": provider.last_discovery_refresh_at,
     }
 

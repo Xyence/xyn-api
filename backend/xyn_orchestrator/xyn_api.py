@@ -107,6 +107,8 @@ from .secret_stores import SecretStoreError, normalize_secret_logical_name, writ
 from .storage.registry import StorageProviderRegistry
 from .notifications.registry import NotifierRegistry
 
+PLATFORM_ROLE_IDS = {"platform_admin", "platform_architect", "platform_operator", "app_user"}
+
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
     if request.body:
@@ -115,6 +117,57 @@ def _parse_json(request: HttpRequest) -> Dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _normalize_group_role_mapping_entries(raw_mappings: Any) -> list[Dict[str, str]]:
+    if raw_mappings is None:
+        return []
+    if not isinstance(raw_mappings, list):
+        return []
+    mappings: list[Dict[str, str]] = []
+    for item in raw_mappings:
+        if not isinstance(item, dict):
+            continue
+        remote = str(item.get("remote_group_name") or item.get("remoteGroupName") or "").strip()
+        role_id = str(item.get("xyn_role_id") or item.get("xynRoleId") or "").strip()
+        mappings.append(
+            {
+                "remote_group_name": remote,
+                "xyn_role_id": role_id,
+            }
+        )
+    return mappings
+
+
+def _validate_group_role_mappings(fallback_role: str, mappings: Any) -> list[str]:
+    errors: list[str] = []
+    if fallback_role and fallback_role not in PLATFORM_ROLE_IDS:
+        errors.append(f"fallback_default_role_id must be one of: {', '.join(sorted(PLATFORM_ROLE_IDS))}")
+    if mappings is None:
+        return errors
+    if not isinstance(mappings, list):
+        errors.append("group_role_mappings must be a list")
+        return errors
+    seen_remote_groups: set[str] = set()
+    for idx, entry in enumerate(mappings):
+        if not isinstance(entry, dict):
+            errors.append(f"group_role_mappings[{idx}] must be an object")
+            continue
+        remote_group_name = str(entry.get("remote_group_name") or entry.get("remoteGroupName") or "").strip()
+        role_id = str(entry.get("xyn_role_id") or entry.get("xynRoleId") or "").strip()
+        if not remote_group_name:
+            errors.append(f"group_role_mappings[{idx}].remote_group_name is required")
+        elif remote_group_name in seen_remote_groups:
+            errors.append(f"group_role_mappings[{idx}].remote_group_name must be unique per provider")
+        else:
+            seen_remote_groups.add(remote_group_name)
+        if not role_id:
+            errors.append(f"group_role_mappings[{idx}].xyn_role_id is required")
+        elif role_id not in PLATFORM_ROLE_IDS:
+            errors.append(
+                f"group_role_mappings[{idx}].xyn_role_id must be one of: {', '.join(sorted(PLATFORM_ROLE_IDS))}"
+            )
+    return errors
 
 
 def _load_schema_local(name: str) -> Dict[str, Any]:
@@ -636,6 +689,15 @@ def _normalize_provider_payload(payload: Dict[str, Any]) -> tuple[Dict[str, Any]
         "domainRules": payload.get("domain_rules") or payload.get("domainRules") or {},
         "claims": payload.get("claims") or {},
         "audienceRules": payload.get("audience_rules") or payload.get("audienceRules") or {},
+        "fallbackDefaultRoleId": payload.get("fallback_default_role_id")
+        or payload.get("fallbackDefaultRoleId")
+        or None,
+        "requireGroupMatch": bool(payload.get("require_group_match") or payload.get("requireGroupMatch") or False),
+        "groupClaimPath": str(payload.get("group_claim_path") or payload.get("groupClaimPath") or "groups").strip()
+        or "groups",
+        "groupRoleMappings": _normalize_group_role_mapping_entries(
+            payload.get("group_role_mappings") or payload.get("groupRoleMappings") or []
+        ),
     }
     model_fields = {
         "id": schema_payload["id"],
@@ -651,6 +713,10 @@ def _normalize_provider_payload(payload: Dict[str, Any]) -> tuple[Dict[str, Any]
         "domain_rules_json": schema_payload.get("domainRules") or {},
         "claims_json": schema_payload.get("claims") or {},
         "audience_rules_json": schema_payload.get("audienceRules") or {},
+        "fallback_default_role_id": schema_payload.get("fallbackDefaultRoleId") or None,
+        "require_group_match": bool(schema_payload.get("requireGroupMatch", False)),
+        "group_claim_path": schema_payload.get("groupClaimPath") or "groups",
+        "group_role_mappings_json": schema_payload.get("groupRoleMappings") or [],
     }
     return model_fields, schema_payload
 
@@ -684,8 +750,14 @@ def _normalize_app_client_payload(payload: Dict[str, Any]) -> tuple[Dict[str, An
 
 
 def _validate_provider_payload(payload: Dict[str, Any]) -> list[str]:
-    _fields, schema_payload = _normalize_provider_payload(payload)
+    fields, schema_payload = _normalize_provider_payload(payload)
     errors = _validate_schema_payload(schema_payload, "oidc_identity_provider.v1.schema.json")
+    errors.extend(
+        _validate_group_role_mappings(
+            str(fields.get("fallback_default_role_id") or ""),
+            fields.get("group_role_mappings_json"),
+        )
+    )
     return errors
 
 
@@ -2095,6 +2167,119 @@ def _extract_claim(claims: Dict[str, Any], key: str, fallback: str) -> str:
     return str(value) if value is not None else ""
 
 
+def _extract_claim_at_path(claims: Dict[str, Any], claim_path: str) -> Any:
+    current: Any = claims
+    for segment in [part.strip() for part in (claim_path or "groups").split(".") if part.strip()]:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(segment)
+    return current
+
+
+def _extract_remote_groups_from_claims(claims: Dict[str, Any], claim_path: str) -> Set[str]:
+    raw = _extract_claim_at_path(claims, claim_path or "groups")
+    groups: set[str] = set()
+    if isinstance(raw, str):
+        value = raw.strip()
+        if value:
+            groups.add(value)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                value = item.strip()
+                if value:
+                    groups.add(value)
+            elif isinstance(item, dict):
+                value = str(item.get("name") or "").strip()
+                if value:
+                    groups.add(value)
+    return groups
+
+
+def _apply_first_login_role_mappings(
+    identity: UserIdentity,
+    provider: IdentityProvider,
+    claims: Dict[str, Any],
+) -> Dict[str, Any]:
+    existing_roles = list(
+        RoleBinding.objects.filter(user_identity=identity, scope_kind="platform").values_list("role", flat=True)
+    )
+    if existing_roles:
+        return {
+            "denied": False,
+            "reason": "roles_already_present",
+            "assigned_roles": [],
+            "remote_groups": [],
+            "error": "",
+        }
+
+    claim_path = (provider.group_claim_path or "groups").strip() or "groups"
+    mappings = _normalize_group_role_mapping_entries(provider.group_role_mappings_json or [])
+    remote_groups = _extract_remote_groups_from_claims(claims, claim_path)
+    assigned_roles: list[str] = []
+    for mapping in mappings:
+        remote_group_name = mapping["remote_group_name"]
+        role_id = mapping["xyn_role_id"]
+        if (
+            remote_group_name
+            and role_id
+            and remote_group_name in remote_groups
+            and role_id in PLATFORM_ROLE_IDS
+            and role_id not in assigned_roles
+        ):
+            RoleBinding.objects.get_or_create(
+                user_identity=identity,
+                scope_kind="platform",
+                scope_id=None,
+                role=role_id,
+            )
+            assigned_roles.append(role_id)
+    if assigned_roles:
+        return {
+            "denied": False,
+            "reason": "matched_mapping",
+            "assigned_roles": assigned_roles,
+            "remote_groups": sorted(remote_groups),
+            "error": "",
+        }
+
+    fallback_role_id = str(provider.fallback_default_role_id or "").strip()
+    if fallback_role_id and fallback_role_id in PLATFORM_ROLE_IDS:
+        RoleBinding.objects.get_or_create(
+            user_identity=identity,
+            scope_kind="platform",
+            scope_id=None,
+            role=fallback_role_id,
+        )
+        return {
+            "denied": False,
+            "reason": "fallback_default_role",
+            "assigned_roles": [fallback_role_id],
+            "remote_groups": sorted(remote_groups),
+            "error": "",
+        }
+
+    if provider.require_group_match:
+        return {
+            "denied": True,
+            "reason": "require_group_match_no_mapping",
+            "assigned_roles": [],
+            "remote_groups": sorted(remote_groups),
+            "error": (
+                "No mapped groups were found in your identity claims. "
+                "Contact your administrator to update Identity Provider group-role mappings."
+            ),
+        }
+
+    return {
+        "denied": False,
+        "reason": "no_mapping_no_fallback",
+        "assigned_roles": [],
+        "remote_groups": sorted(remote_groups),
+        "error": "",
+    }
+
+
 def _load_oidc_flow(request: HttpRequest, state: str) -> Dict[str, Any]:
     if not state:
         return {}
@@ -2334,6 +2519,30 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
         )
     if not RoleBinding.objects.exists() and os.environ.get("ALLOW_FIRST_ADMIN_BOOTSTRAP", "").lower() == "true":
         RoleBinding.objects.create(user_identity=identity, scope_kind="platform", role="platform_admin")
+    assignment = _apply_first_login_role_mappings(identity, provider, claims)
+    extracted_groups = assignment.get("remote_groups") or []
+    if len(extracted_groups) > 25:
+        extracted_groups = extracted_groups[:25] + ["__truncated__"]
+    logger.info(
+        "oidc first-login role evaluation",
+        extra={
+            "provider_id": provider.id,
+            "user_identity_id": str(identity.id),
+            "reason": assignment.get("reason"),
+            "assigned_roles": assignment.get("assigned_roles") or [],
+            "extracted_groups": extracted_groups,
+        },
+    )
+    if assignment.get("denied"):
+        return JsonResponse(
+            {
+                "error": "group match required",
+                "details": assignment.get("error"),
+                "provider_id": provider.id,
+                "hint": "Ask a platform admin to add a group mapping or configure a fallback default role.",
+            },
+            status=403,
+        )
     roles = _get_roles(identity)
     User = get_user_model()
     issuer_hash = hashlib.sha256(provider.issuer.encode("utf-8")).hexdigest()[:12]
@@ -2353,7 +2562,14 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
     user.is_active = True
     user.save()
     if not roles and app_id == "xyn-ui":
-        return JsonResponse({"error": "no roles assigned"}, status=403)
+        return JsonResponse(
+            {
+                "error": "no roles assigned",
+                "details": "No mapped group roles were found and no fallback default role is configured.",
+                "hint": "Ask a platform admin to configure group-role mappings on your identity provider.",
+            },
+            status=403,
+        )
     login(request, user, backend="django.contrib.auth.backends.ModelBackend")
     request.session["user_identity_id"] = str(identity.id)
     redirect_to = _sanitize_return_to(
