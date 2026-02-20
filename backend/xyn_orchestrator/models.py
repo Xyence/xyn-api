@@ -858,6 +858,7 @@ class Artifact(models.Model):
     workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name="artifacts")
     type = models.ForeignKey(ArtifactType, on_delete=models.PROTECT, related_name="artifacts")
     title = models.CharField(max_length=300)
+    slug = models.SlugField(max_length=240, blank=True, default="")
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="draft")
     version = models.PositiveIntegerField(default=1)
     lineage_json = models.JSONField(null=True, blank=True)
@@ -876,6 +877,13 @@ class Artifact(models.Model):
 
     class Meta:
         ordering = ["-published_at", "-updated_at", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workspace", "slug"],
+                condition=~Q(slug=""),
+                name="uniq_artifact_workspace_slug",
+            )
+        ]
 
     def __str__(self) -> str:
         return self.title

@@ -97,3 +97,20 @@ class WorkspaceArtifactRegistryTests(TestCase):
         member.refresh_from_db()
         self.assertEqual(member.role, "publisher")
         self.assertTrue(member.termination_authority)
+
+    def test_duplicate_slug_in_workspace_is_rejected(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        first = self.client.post(
+            f"/xyn/api/workspaces/{self.workspace.id}/artifacts",
+            data=json.dumps({"type": "article", "title": "First", "slug": "same-slug"}),
+            content_type="application/json",
+        )
+        self.assertEqual(first.status_code, 200)
+        second = self.client.post(
+            f"/xyn/api/workspaces/{self.workspace.id}/artifacts",
+            data=json.dumps({"type": "article", "title": "Second", "slug": "same-slug"}),
+            content_type="application/json",
+        )
+        self.assertEqual(second.status_code, 400)
+        self.assertEqual(second.json().get("error"), "slug already exists in this workspace")

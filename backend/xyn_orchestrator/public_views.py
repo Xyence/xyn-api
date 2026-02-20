@@ -33,13 +33,8 @@ def public_articles(request):
 
     items = []
     for artifact in page.object_list:
-        slug_ref = (
-            ArtifactExternalRef.objects.filter(artifact=artifact)
-            .exclude(slug_path="")
-            .order_by("created_at")
-            .first()
-        )
-        slug = (slug_ref.slug_path if slug_ref else "") or str((artifact.scope_json or {}).get("slug") or "")
+        slug_ref = ArtifactExternalRef.objects.filter(artifact=artifact).exclude(slug_path="").order_by("created_at").first()
+        slug = artifact.slug or (slug_ref.slug_path if slug_ref else "") or str((artifact.scope_json or {}).get("slug") or "")
         items.append(
             {
                 "title": artifact.title,
@@ -79,6 +74,27 @@ def public_articles(request):
 
 @require_GET
 def public_article_detail(_request, slug: str):
+    artifact = (
+        Artifact.objects.filter(type__slug="article", status="published", visibility="public", slug=slug)
+        .select_related("workspace", "type")
+        .first()
+    )
+    if artifact:
+        revision = _latest_revision(artifact)
+        content = (revision.content_json if revision else {}) or {}
+        summary = str(content.get("summary") or (artifact.scope_json or {}).get("summary") or "")
+        payload = {
+            "title": content.get("title") or artifact.title,
+            "slug": slug,
+            "summary": summary,
+            "published_at": artifact.published_at,
+            "updated_at": artifact.updated_at,
+            "body_markdown": str(content.get("body_markdown") or ""),
+            "body_html": str(content.get("body_html") or ""),
+            "excerpt": summary,
+        }
+        return JsonResponse(payload)
+
     ref = (
         ArtifactExternalRef.objects.select_related("artifact")
         .filter(slug_path=slug, artifact__status="published", artifact__type__slug="article")

@@ -192,9 +192,9 @@ class ArtifactTypeAdmin(admin.ModelAdmin):
 
 @admin.register(Artifact)
 class ArtifactAdmin(admin.ModelAdmin):
-    list_display = ("title", "workspace", "type", "status", "visibility", "published_at", "updated_at")
+    list_display = ("title", "slug", "workspace", "type", "status", "visibility", "published_at", "updated_at")
     list_filter = ("workspace", "type", "status", "visibility")
-    search_fields = ("title",)
+    search_fields = ("title", "slug")
 
 
 @admin.register(ArtifactRevision)

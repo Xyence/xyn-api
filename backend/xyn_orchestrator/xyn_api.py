@@ -3275,10 +3275,28 @@ def _serialize_device(device: Device) -> Dict[str, Any]:
 
 
 def _artifact_slug(artifact: Artifact) -> str:
+    if artifact.slug:
+        return artifact.slug
     ref = ArtifactExternalRef.objects.filter(artifact=artifact).exclude(slug_path="").order_by("created_at").first()
     if ref:
         return ref.slug_path
     return str((artifact.scope_json or {}).get("slug") or "")
+
+
+def _normalize_artifact_slug(raw_slug: str, *, fallback_title: str = "") -> str:
+    candidate = str(raw_slug or "").strip().lower()
+    if not candidate and fallback_title:
+        candidate = slugify(fallback_title)
+    return slugify(candidate).strip().lower()
+
+
+def _artifact_slug_exists(workspace_id: str, slug: str, *, exclude_artifact_id: Optional[str] = None) -> bool:
+    if not slug:
+        return False
+    qs = Artifact.objects.filter(workspace_id=workspace_id, slug=slug)
+    if exclude_artifact_id:
+        qs = qs.exclude(id=exclude_artifact_id)
+    return qs.exists()
 
 
 def _latest_artifact_revision(artifact: Artifact) -> Optional[ArtifactRevision]:
@@ -3361,7 +3379,11 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
         title = str(payload.get("title") or "").strip()
         if not title:
             return JsonResponse({"error": "title is required"}, status=400)
-        slug = str(payload.get("slug") or slugify(title)).strip().lower()
+        slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=title)
+        if not slug:
+            return JsonResponse({"error": "slug is required"}, status=400)
+        if _artifact_slug_exists(str(workspace.id), slug):
+            return JsonResponse({"error": "slug already exists in this workspace"}, status=400)
         body_markdown = str(payload.get("body_markdown") or "")
         body_html = str(payload.get("body_html") or "")
         summary = str(payload.get("summary") or "")
@@ -3374,6 +3396,7 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
                 workspace=workspace,
                 type=artifact_type,
                 title=title,
+                slug=slug,
                 status="draft",
                 version=1,
                 visibility=visibility,
@@ -3441,8 +3464,11 @@ def workspace_artifact_detail(request: HttpRequest, workspace_id: str, artifact_
         if "visibility" in payload and payload.get("visibility") in {"private", "team", "public"}:
             artifact.visibility = payload.get("visibility")
         if "slug" in payload:
-            slug = str(payload.get("slug") or "").strip().lower()
+            slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=artifact.title)
             if slug:
+                if _artifact_slug_exists(str(workspace_id), slug, exclude_artifact_id=str(artifact.id)):
+                    return JsonResponse({"error": "slug already exists in this workspace"}, status=400)
+                artifact.slug = slug
                 scope = dict(artifact.scope_json or {})
                 scope["slug"] = slug
                 artifact.scope_json = scope
@@ -3452,7 +3478,7 @@ def workspace_artifact_detail(request: HttpRequest, workspace_id: str, artifact_
                     defaults={"external_id": str(artifact.id), "slug_path": slug},
                 )
         artifact.version = _next_artifact_revision_number(artifact)
-        artifact.save(update_fields=["title", "visibility", "scope_json", "version", "updated_at"])
+        artifact.save(update_fields=["title", "slug", "visibility", "scope_json", "version", "updated_at"])
         ArtifactRevision.objects.create(
             artifact=artifact,
             revision_number=artifact.version,
