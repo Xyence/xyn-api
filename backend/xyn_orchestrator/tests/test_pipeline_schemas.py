@@ -16,6 +16,7 @@ from jsonschema import Draft202012Validator
 import yaml
 
 from xyn_orchestrator.blueprints import (
+    _failed_dependency_work_items,
     _build_module_catalog,
     _build_run_history_summary,
     _generate_implementation_plan,
@@ -2098,6 +2099,44 @@ class PipelineSchemaTests(TestCase):
             item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.container"
         )
         self.assertTrue(build_item.get("repo_targets"))
+
+    def test_failed_dependency_work_items_detects_failed_prerequisite(self):
+        source_run = Run.objects.create(
+            entity_type="blueprint",
+            entity_id=uuid.uuid4(),
+            status="running",
+            summary="source run",
+        )
+        _write_run_artifact(
+            source_run,
+            "implementation_plan.json",
+            {
+                "work_items": [
+                    {"id": "build.publish_images.container", "depends_on": []},
+                    {"id": "deploy.apply_remote_compose.pull", "depends_on": ["build.publish_images.container"]},
+                ]
+            },
+            "implementation_plan",
+        )
+        DevTask.objects.create(
+            title="build",
+            task_type="codegen",
+            status="failed",
+            source_entity_type="blueprint",
+            source_entity_id=uuid.uuid4(),
+            source_run=source_run,
+            work_item_id="build.publish_images.container",
+        )
+        blocked = DevTask.objects.create(
+            title="deploy",
+            task_type="codegen",
+            status="queued",
+            source_entity_type="blueprint",
+            source_entity_id=uuid.uuid4(),
+            source_run=source_run,
+            work_item_id="deploy.apply_remote_compose.pull",
+        )
+        self.assertEqual(_failed_dependency_work_items(blocked), ["build.publish_images.container"])
 
     def test_planner_does_not_require_blueprint_metadata_deploy(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})

@@ -157,6 +157,41 @@ def _read_run_artifact_json(artifact: RunArtifact) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _plan_work_item_dependencies(source_run_id: str, work_item_id: str) -> List[str]:
+    if not source_run_id or not work_item_id:
+        return []
+    artifact = (
+        RunArtifact.objects.filter(run_id=source_run_id, name="implementation_plan.json")
+        .order_by("-created_at")
+        .first()
+    )
+    if not artifact:
+        return []
+    plan = _read_run_artifact_json(artifact)
+    if not isinstance(plan, dict):
+        return []
+    for item in plan.get("work_items", []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id") or "") != work_item_id:
+            continue
+        deps = item.get("depends_on") if isinstance(item.get("depends_on"), list) else []
+        return [str(dep).strip() for dep in deps if str(dep).strip()]
+    return []
+
+
+def _failed_dependency_work_items(task: DevTask) -> List[str]:
+    deps = _plan_work_item_dependencies(str(task.source_run_id or ""), task.work_item_id or "")
+    if not deps:
+        return []
+    failed = (
+        DevTask.objects.filter(source_run_id=task.source_run_id, work_item_id__in=deps, status__in=["failed", "canceled"])
+        .values_list("work_item_id", flat=True)
+        .distinct()
+    )
+    return [str(dep) for dep in failed if str(dep)]
+
+
 def _async_mode() -> str:
     mode = os.environ.get("XYENCE_ASYNC_JOBS_MODE", "").strip().lower()
     if mode:
@@ -6249,6 +6284,38 @@ def internal_dev_task_claim(request: HttpRequest, task_id: str) -> JsonResponse:
         return JsonResponse({"error": "Task not runnable"}, status=409)
     if task.task_type == "deploy_release_plan" and not task.target_instance_id:
         return JsonResponse({"error": "target_instance_id required for deploy_release_plan"}, status=400)
+    failed_deps = _failed_dependency_work_items(task)
+    if failed_deps:
+        blocked_reason = f"Blocked by failed dependencies: {', '.join(sorted(failed_deps))}"
+        task.status = "failed"
+        task.last_error = blocked_reason
+        task.locked_by = ""
+        task.locked_at = None
+        task.save(update_fields=["status", "last_error", "locked_by", "locked_at", "updated_at"])
+        if not task.result_run_id:
+            run = Run.objects.create(
+                entity_type="dev_task",
+                entity_id=task.id,
+                status="failed",
+                summary=f"Run dev task {task.title}",
+                error=blocked_reason,
+                created_by=task.created_by,
+                started_at=timezone.now(),
+                finished_at=timezone.now(),
+            )
+            task.result_run = run
+            task.save(update_fields=["result_run", "updated_at"])
+        return JsonResponse(
+            {
+                "id": str(task.id),
+                "task_type": task.task_type,
+                "status": task.status,
+                "work_item_id": task.work_item_id,
+                "result_run": str(task.result_run_id) if task.result_run_id else None,
+                "skip": True,
+                "blocked_by": sorted(failed_deps),
+            }
+        )
     payload = json.loads(request.body.decode("utf-8")) if request.body else {}
     worker_id = payload.get("worker_id", "worker")
     task.status = "running"

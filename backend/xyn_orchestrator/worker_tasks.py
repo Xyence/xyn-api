@@ -3160,6 +3160,8 @@ def run_dev_task(task_id: str, worker_id: str) -> None:
     run_id: Optional[str] = None
     try:
         task = _post_json(f"/xyn/internal/dev-tasks/{task_id}/claim", {"worker_id": worker_id})
+        if task.get("skip"):
+            return
         run_id = task.get("result_run")
         if not run_id:
             return
