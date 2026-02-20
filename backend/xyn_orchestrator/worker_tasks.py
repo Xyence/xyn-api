@@ -550,14 +550,58 @@ def _normalize_generated_blueprint(spec: Optional[Dict[str, Any]]) -> Dict[str, 
                     continue
                 ports = component.get("ports")
                 if isinstance(ports, list):
+                    normalized_ports: List[Dict[str, Any]] = []
                     for port in ports:
+                        normalized_port: Optional[Dict[str, Any]] = None
                         if isinstance(port, dict):
-                            port.pop("public", None)
-                            port.pop("expose", None)
-                            port.pop("hostname", None)
-                            port.pop("http", None)
-                            port.pop("https", None)
-                            port.pop("tls", None)
+                            normalized_port = dict(port)
+                            if "containerPort" not in normalized_port and "port" in normalized_port:
+                                normalized_port["containerPort"] = normalized_port.get("port")
+                            container_port = normalized_port.get("containerPort")
+                            host_port = normalized_port.get("hostPort")
+                            try:
+                                if container_port is not None:
+                                    normalized_port["containerPort"] = int(container_port)
+                            except (TypeError, ValueError):
+                                normalized_port.pop("containerPort", None)
+                            try:
+                                if host_port is not None:
+                                    normalized_port["hostPort"] = int(host_port)
+                            except (TypeError, ValueError):
+                                normalized_port.pop("hostPort", None)
+                            protocol = str(normalized_port.get("protocol") or "").strip().lower()
+                            if protocol in {"tcp", "udp"}:
+                                normalized_port["protocol"] = protocol
+                            else:
+                                normalized_port.pop("protocol", None)
+                        elif isinstance(port, str):
+                            value = port.strip().lower()
+                            if value:
+                                protocol = None
+                                if "/" in value:
+                                    value, proto = value.rsplit("/", 1)
+                                    proto = proto.strip().lower()
+                                    if proto in {"tcp", "udp"}:
+                                        protocol = proto
+                                parts = [part.strip() for part in value.split(":")]
+                                if len(parts) == 1 and parts[0].isdigit():
+                                    normalized_port = {"containerPort": int(parts[0])}
+                                elif len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                                    normalized_port = {"hostPort": int(parts[0]), "containerPort": int(parts[1])}
+                                elif len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+                                    normalized_port = {"hostPort": int(parts[1]), "containerPort": int(parts[2])}
+                                if normalized_port is not None and protocol:
+                                    normalized_port["protocol"] = protocol
+                        if isinstance(normalized_port, dict) and isinstance(normalized_port.get("containerPort"), int):
+                            normalized_port.pop("public", None)
+                            normalized_port.pop("expose", None)
+                            normalized_port.pop("hostname", None)
+                            normalized_port.pop("http", None)
+                            normalized_port.pop("https", None)
+                            normalized_port.pop("tls", None)
+                            normalized_port.pop("port", None)
+                            normalized_ports.append(normalized_port)
+                    component["ports"] = normalized_ports
                 volume_mounts = component.get("volumeMounts")
                 if isinstance(volume_mounts, list):
                     for mount in volume_mounts:

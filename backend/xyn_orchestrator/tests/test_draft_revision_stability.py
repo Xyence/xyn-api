@@ -112,3 +112,33 @@ class DraftRevisionStabilityTests(TestCase):
             normalized["releaseSpec"]["components"][0]["secretRefs"],
             [{"name": "db-secret", "key": "password", "targetEnv": "DB_PASS"}],
         )
+
+    def test_normalize_generated_blueprint_converts_string_ports(self):
+        draft = _baseline_draft()
+        draft["releaseSpec"]["components"][0]["ports"] = ["80:80", "443:443/tcp", "8080"]
+
+        normalized = services._normalize_generated_blueprint(draft)
+        ports = normalized["releaseSpec"]["components"][0]["ports"]
+        self.assertEqual(
+            ports,
+            [
+                {"hostPort": 80, "containerPort": 80},
+                {"hostPort": 443, "containerPort": 443, "protocol": "tcp"},
+                {"containerPort": 8080},
+            ],
+        )
+
+    def test_worker_normalize_generated_blueprint_converts_string_ports(self):
+        draft = _baseline_draft()
+        draft["releaseSpec"]["components"][0]["ports"] = ["80:80", "443:443/tcp", "8080"]
+
+        normalized = worker_tasks._normalize_generated_blueprint(draft)
+        ports = normalized["releaseSpec"]["components"][0]["ports"]
+        self.assertEqual(
+            ports,
+            [
+                {"hostPort": 80, "containerPort": 80},
+                {"hostPort": 443, "containerPort": 443, "protocol": "tcp"},
+                {"containerPort": 8080},
+            ],
+        )
