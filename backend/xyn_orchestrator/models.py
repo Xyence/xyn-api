@@ -789,6 +789,194 @@ class TenantMembership(models.Model):
         return f"{self.tenant.name} - {self.user_identity.email or self.user_identity.subject}"
 
 
+class Workspace(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    slug = models.SlugField(max_length=120, unique=True)
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class WorkspaceMembership(models.Model):
+    ROLE_CHOICES = [
+        ("reader", "Reader"),
+        ("contributor", "Contributor"),
+        ("publisher", "Publisher"),
+        ("moderator", "Moderator"),
+        ("admin", "Admin"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name="memberships")
+    user_identity = models.ForeignKey(UserIdentity, on_delete=models.CASCADE, related_name="workspace_memberships")
+    role = models.CharField(max_length=40, choices=ROLE_CHOICES, default="reader")
+    termination_authority = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["workspace__name", "user_identity__email"]
+        unique_together = ("workspace", "user_identity")
+
+    def __str__(self) -> str:
+        return f"{self.workspace.slug}:{self.user_identity_id}:{self.role}"
+
+
+class ArtifactType(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    slug = models.SlugField(max_length=120, unique=True)
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    icon = models.CharField(max_length=120, blank=True)
+    schema_json = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Artifact(models.Model):
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("reviewed", "Reviewed"),
+        ("ratified", "Ratified"),
+        ("published", "Published"),
+        ("deprecated", "Deprecated"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name="artifacts")
+    type = models.ForeignKey(ArtifactType, on_delete=models.PROTECT, related_name="artifacts")
+    title = models.CharField(max_length=300)
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="draft")
+    version = models.PositiveIntegerField(default=1)
+    lineage_json = models.JSONField(null=True, blank=True)
+    author = models.ForeignKey(UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifacts_authored")
+    custodian = models.ForeignKey(UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifacts_custodied")
+    ratified_by = models.ForeignKey(UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifacts_ratified")
+    ratified_at = models.DateTimeField(null=True, blank=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+    visibility = models.CharField(max_length=30, default="private")
+    verifiers_required_json = models.JSONField(default=list, blank=True)
+    verifiers_satisfied_json = models.JSONField(default=list, blank=True)
+    provenance_json = models.JSONField(default=dict, blank=True)
+    scope_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-published_at", "-updated_at", "-created_at"]
+
+    def __str__(self) -> str:
+        return self.title
+
+
+class ArtifactRevision(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="revisions")
+    revision_number = models.PositiveIntegerField()
+    content_json = models.JSONField(default=dict, blank=True)
+    created_by = models.ForeignKey(UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifact_revisions_created")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-revision_number"]
+        unique_together = ("artifact", "revision_number")
+
+    def __str__(self) -> str:
+        return f"{self.artifact_id}:r{self.revision_number}"
+
+
+class ArtifactEvent(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="events")
+    event_type = models.CharField(max_length=120)
+    actor = models.ForeignKey(UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifact_events")
+    payload_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.artifact_id}:{self.event_type}"
+
+
+class ArtifactLink(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    from_artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="links_from")
+    to_artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="links_to")
+    link_type = models.CharField(max_length=120)
+
+    class Meta:
+        unique_together = ("from_artifact", "to_artifact", "link_type")
+
+    def __str__(self) -> str:
+        return f"{self.from_artifact_id}->{self.to_artifact_id}:{self.link_type}"
+
+
+class ArtifactExternalRef(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="external_refs")
+    system = models.CharField(max_length=60, default="django")
+    external_id = models.CharField(max_length=120)
+    slug_path = models.CharField(max_length=240, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("system", "external_id")
+        constraints = [
+            models.UniqueConstraint(fields=["system", "slug_path"], condition=~Q(slug_path=""), name="uniq_artifact_extref_slug")
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.system}:{self.external_id}"
+
+
+class ArtifactReaction(models.Model):
+    VALUE_CHOICES = [
+        ("endorse", "Endorse"),
+        ("oppose", "Oppose"),
+        ("neutral", "Neutral"),
+    ]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="reactions")
+    user = models.ForeignKey(UserIdentity, on_delete=models.CASCADE, related_name="artifact_reactions")
+    value = models.CharField(max_length=20, choices=VALUE_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("artifact", "user")
+
+
+class ArtifactComment(models.Model):
+    STATUS_CHOICES = [
+        ("visible", "Visible"),
+        ("hidden", "Hidden"),
+        ("deleted", "Deleted"),
+    ]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="comments")
+    user = models.ForeignKey(UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifact_comments")
+    parent_comment = models.ForeignKey("self", null=True, blank=True, on_delete=models.CASCADE, related_name="replies")
+    body = models.TextField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="visible")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+
 class BrandProfile(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tenant = models.OneToOneField(Tenant, on_delete=models.CASCADE, related_name="brand_profile")

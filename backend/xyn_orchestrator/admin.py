@@ -58,6 +58,16 @@ from .models import (
     ReportAttachment,
     VoiceNote,
     VoiceTranscript,
+    Workspace,
+    WorkspaceMembership,
+    ArtifactType,
+    Artifact,
+    ArtifactRevision,
+    ArtifactEvent,
+    ArtifactLink,
+    ArtifactExternalRef,
+    ArtifactReaction,
+    ArtifactComment,
 )
 
 
@@ -76,22 +86,16 @@ class ArticleAdmin(admin.ModelAdmin):
     prepopulated_fields = {"slug": ("title",)}
     ordering = ("-published_at", "-created_at")
     inlines = [ArticleVersionInline]
-    actions = ["create_version_snapshot"]
+    actions = []
 
-    def save_model(self, request, obj, form, change):
-        super().save_model(request, obj, form, change)
-        if obj.status == "published":
-            obj.create_version_if_changed(source="manual")
+    def has_add_permission(self, request):
+        return False
 
-    def create_version_snapshot(self, request, queryset):
-        created = 0
-        for article in queryset:
-            if article.create_version_if_changed(source="manual"):
-                created += 1
-        self.message_user(request, f"Created {created} version snapshot(s).", messages.SUCCESS)
+    def has_delete_permission(self, request, obj=None):
+        return False
 
-    create_version_snapshot.short_description = "Create version snapshot(s)"
-
+    def has_change_permission(self, request, obj=None):
+        return False
 
 @admin.register(ArticleVersion)
 class ArticleVersionAdmin(admin.ModelAdmin):
@@ -166,6 +170,66 @@ class VoiceNoteAdmin(admin.ModelAdmin):
 @admin.register(VoiceTranscript)
 class VoiceTranscriptAdmin(admin.ModelAdmin):
     list_display = ("voice_note", "provider", "created_at")
+
+
+@admin.register(Workspace)
+class WorkspaceAdmin(admin.ModelAdmin):
+    list_display = ("slug", "name", "updated_at")
+    search_fields = ("slug", "name")
+
+
+@admin.register(WorkspaceMembership)
+class WorkspaceMembershipAdmin(admin.ModelAdmin):
+    list_display = ("workspace", "user_identity", "role", "termination_authority", "updated_at")
+    list_filter = ("workspace", "role", "termination_authority")
+
+
+@admin.register(ArtifactType)
+class ArtifactTypeAdmin(admin.ModelAdmin):
+    list_display = ("slug", "name", "created_at")
+    search_fields = ("slug", "name")
+
+
+@admin.register(Artifact)
+class ArtifactAdmin(admin.ModelAdmin):
+    list_display = ("title", "workspace", "type", "status", "visibility", "published_at", "updated_at")
+    list_filter = ("workspace", "type", "status", "visibility")
+    search_fields = ("title",)
+
+
+@admin.register(ArtifactRevision)
+class ArtifactRevisionAdmin(admin.ModelAdmin):
+    list_display = ("artifact", "revision_number", "created_at")
+    search_fields = ("artifact__title",)
+
+
+@admin.register(ArtifactEvent)
+class ArtifactEventAdmin(admin.ModelAdmin):
+    list_display = ("artifact", "event_type", "actor", "created_at")
+    list_filter = ("event_type",)
+
+
+@admin.register(ArtifactLink)
+class ArtifactLinkAdmin(admin.ModelAdmin):
+    list_display = ("from_artifact", "to_artifact", "link_type")
+
+
+@admin.register(ArtifactExternalRef)
+class ArtifactExternalRefAdmin(admin.ModelAdmin):
+    list_display = ("artifact", "system", "external_id", "slug_path", "created_at")
+    list_filter = ("system",)
+
+
+@admin.register(ArtifactReaction)
+class ArtifactReactionAdmin(admin.ModelAdmin):
+    list_display = ("artifact", "user", "value", "created_at")
+    list_filter = ("value",)
+
+
+@admin.register(ArtifactComment)
+class ArtifactCommentAdmin(admin.ModelAdmin):
+    list_display = ("artifact", "user", "status", "created_at")
+    list_filter = ("status",)
 
 
 @admin.register(BlueprintInstance)

@@ -73,6 +73,16 @@ from .models import (
     SecretRef,
     RoleBinding,
     UserIdentity,
+    Workspace,
+    WorkspaceMembership,
+    ArtifactType,
+    Artifact,
+    ArtifactRevision,
+    ArtifactEvent,
+    ArtifactLink,
+    ArtifactExternalRef,
+    ArtifactReaction,
+    ArtifactComment,
     Tenant,
     Contact,
     TenantMembership,
@@ -855,6 +865,52 @@ def _has_platform_role(identity: UserIdentity, roles: List[str]) -> bool:
 
 def _is_platform_architect(identity: UserIdentity) -> bool:
     return _has_platform_role(identity, ["platform_architect", "platform_admin"])
+
+
+WORKSPACE_ROLE_RANK = {
+    "reader": 1,
+    "contributor": 2,
+    "publisher": 3,
+    "moderator": 4,
+    "admin": 5,
+}
+
+
+def _workspace_membership(identity: UserIdentity, workspace_id: str) -> Optional[WorkspaceMembership]:
+    return WorkspaceMembership.objects.filter(workspace_id=workspace_id, user_identity=identity).first()
+
+
+def _workspace_has_role(identity: UserIdentity, workspace_id: str, minimum_role: str) -> bool:
+    membership = _workspace_membership(identity, workspace_id)
+    if not membership:
+        return False
+    return WORKSPACE_ROLE_RANK.get(membership.role, 0) >= WORKSPACE_ROLE_RANK.get(minimum_role, 99)
+
+
+def _workspace_has_termination_authority(identity: UserIdentity, workspace_id: str) -> bool:
+    membership = _workspace_membership(identity, workspace_id)
+    if not membership:
+        return False
+    return bool(membership.termination_authority or membership.role == "admin")
+
+
+def _next_artifact_revision_number(artifact: Artifact) -> int:
+    latest = ArtifactRevision.objects.filter(artifact=artifact).aggregate(max_no=models.Max("revision_number")).get("max_no")
+    return int(latest or 0) + 1
+
+
+def _record_artifact_event(
+    artifact: Artifact,
+    event_type: str,
+    actor: Optional[UserIdentity],
+    payload: Optional[Dict[str, Any]] = None,
+) -> ArtifactEvent:
+    return ArtifactEvent.objects.create(
+        artifact=artifact,
+        event_type=event_type,
+        actor=actor,
+        payload_json=payload or {},
+    )
 
 
 def _control_plane_app_ids() -> set[str]:
@@ -2842,6 +2898,7 @@ def api_me(request: HttpRequest) -> JsonResponse:
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
     roles = _get_roles(identity)
+    memberships = WorkspaceMembership.objects.filter(user_identity=identity).select_related("workspace").order_by("workspace__name")
     return JsonResponse(
         {
             "user": {
@@ -2851,6 +2908,16 @@ def api_me(request: HttpRequest) -> JsonResponse:
                 "display_name": identity.display_name,
             },
             "roles": roles,
+            "workspaces": [
+                {
+                    "id": str(m.workspace_id),
+                    "slug": m.workspace.slug,
+                    "name": m.workspace.name,
+                    "role": m.role,
+                    "termination_authority": m.termination_authority,
+                }
+                for m in memberships
+            ],
         }
     )
 
@@ -3205,6 +3272,408 @@ def _serialize_device(device: Device) -> Dict[str, Any]:
         "created_at": device.created_at,
         "updated_at": device.updated_at,
     }
+
+
+def _artifact_slug(artifact: Artifact) -> str:
+    ref = ArtifactExternalRef.objects.filter(artifact=artifact).exclude(slug_path="").order_by("created_at").first()
+    if ref:
+        return ref.slug_path
+    return str((artifact.scope_json or {}).get("slug") or "")
+
+
+def _latest_artifact_revision(artifact: Artifact) -> Optional[ArtifactRevision]:
+    return ArtifactRevision.objects.filter(artifact=artifact).order_by("-revision_number").first()
+
+
+def _serialize_artifact_summary(artifact: Artifact) -> Dict[str, Any]:
+    latest = _latest_artifact_revision(artifact)
+    content = latest.content_json if latest else {}
+    return {
+        "id": str(artifact.id),
+        "workspace_id": str(artifact.workspace_id),
+        "type": artifact.type.slug,
+        "title": artifact.title,
+        "slug": _artifact_slug(artifact),
+        "status": artifact.status,
+        "version": artifact.version,
+        "visibility": artifact.visibility,
+        "published_at": artifact.published_at,
+        "updated_at": artifact.updated_at,
+        "content": {
+            "summary": content.get("summary") or "",
+            "tags": content.get("tags") or [],
+        },
+    }
+
+
+def _serialize_comment(comment: ArtifactComment) -> Dict[str, Any]:
+    return {
+        "id": str(comment.id),
+        "artifact_id": str(comment.artifact_id),
+        "user_id": str(comment.user_id) if comment.user_id else None,
+        "parent_comment_id": str(comment.parent_comment_id) if comment.parent_comment_id else None,
+        "body": comment.body,
+        "status": comment.status,
+        "created_at": comment.created_at,
+    }
+
+
+@csrf_exempt
+def workspaces_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    memberships = WorkspaceMembership.objects.filter(user_identity=identity).select_related("workspace").order_by("workspace__name")
+    return JsonResponse(
+        {
+            "workspaces": [
+                {
+                    "id": str(m.workspace_id),
+                    "slug": m.workspace.slug,
+                    "name": m.workspace.name,
+                    "description": m.workspace.description,
+                    "role": m.role,
+                    "termination_authority": m.termination_authority,
+                }
+                for m in memberships
+            ]
+        }
+    )
+
+
+@csrf_exempt
+def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> JsonResponse:
+    workspace = get_object_or_404(Workspace, id=workspace_id)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    membership = _workspace_membership(identity, workspace_id)
+    if not membership:
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method == "POST":
+        if not _workspace_has_role(identity, workspace_id, "contributor"):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        type_slug = str(payload.get("type") or "article").strip().lower()
+        artifact_type = ArtifactType.objects.filter(slug=type_slug).first()
+        if not artifact_type:
+            return JsonResponse({"error": "artifact type not found"}, status=404)
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return JsonResponse({"error": "title is required"}, status=400)
+        slug = str(payload.get("slug") or slugify(title)).strip().lower()
+        body_markdown = str(payload.get("body_markdown") or "")
+        body_html = str(payload.get("body_html") or "")
+        summary = str(payload.get("summary") or "")
+        tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
+        visibility = str(payload.get("visibility") or "private")
+        if visibility not in {"private", "team", "public"}:
+            visibility = "private"
+        with transaction.atomic():
+            artifact = Artifact.objects.create(
+                workspace=workspace,
+                type=artifact_type,
+                title=title,
+                status="draft",
+                version=1,
+                visibility=visibility,
+                author=identity,
+                custodian=identity,
+                scope_json={"slug": slug, "summary": summary},
+                provenance_json={"source_system": "shine", "source_id": None},
+            )
+            ArtifactRevision.objects.create(
+                artifact=artifact,
+                revision_number=1,
+                content_json={
+                    "title": title,
+                    "summary": summary,
+                    "body_markdown": body_markdown,
+                    "body_html": body_html,
+                    "tags": tags,
+                },
+                created_by=identity,
+            )
+            ArtifactExternalRef.objects.create(
+                artifact=artifact,
+                system="shine",
+                external_id=str(artifact.id),
+                slug_path=slug,
+            )
+            _record_artifact_event(artifact, "artifact_created", identity, {"workspace_id": str(workspace.id)})
+        return JsonResponse({"id": str(artifact.id)})
+
+    artifact_type = request.GET.get("type") or ""
+    status = request.GET.get("status") or ""
+    qs = Artifact.objects.filter(workspace=workspace).select_related("type")
+    if artifact_type:
+        qs = qs.filter(type__slug=artifact_type)
+    if status:
+        qs = qs.filter(status=status)
+    if membership.role == "reader":
+        qs = qs.filter(status="published").filter(visibility__in=["team", "public"])
+    data = [_serialize_artifact_summary(item) for item in qs.order_by("-published_at", "-updated_at")]
+    return JsonResponse({"artifacts": data})
+
+
+@csrf_exempt
+def workspace_artifact_detail(request: HttpRequest, workspace_id: str, artifact_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    membership = _workspace_membership(identity, workspace_id)
+    if not membership:
+        return JsonResponse({"error": "forbidden"}, status=403)
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id, workspace_id=workspace_id)
+    latest = _latest_artifact_revision(artifact)
+    if request.method in ("PATCH", "PUT"):
+        if not _workspace_has_role(identity, workspace_id, "contributor"):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        if artifact.author_id and str(artifact.author_id) != str(identity.id) and not _workspace_has_role(identity, workspace_id, "admin"):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        content = dict((latest.content_json if latest else {}) or {})
+        for key in ["title", "summary", "body_markdown", "body_html", "tags"]:
+            if key in payload:
+                content[key] = payload.get(key)
+        if "title" in payload:
+            artifact.title = str(payload.get("title") or artifact.title)
+        if "visibility" in payload and payload.get("visibility") in {"private", "team", "public"}:
+            artifact.visibility = payload.get("visibility")
+        if "slug" in payload:
+            slug = str(payload.get("slug") or "").strip().lower()
+            if slug:
+                scope = dict(artifact.scope_json or {})
+                scope["slug"] = slug
+                artifact.scope_json = scope
+                ArtifactExternalRef.objects.update_or_create(
+                    artifact=artifact,
+                    system="shine",
+                    defaults={"external_id": str(artifact.id), "slug_path": slug},
+                )
+        artifact.version = _next_artifact_revision_number(artifact)
+        artifact.save(update_fields=["title", "visibility", "scope_json", "version", "updated_at"])
+        ArtifactRevision.objects.create(
+            artifact=artifact,
+            revision_number=artifact.version,
+            content_json=content,
+            created_by=identity,
+        )
+        _record_artifact_event(artifact, "artifact_revised", identity, {"version": artifact.version})
+        latest = _latest_artifact_revision(artifact)
+
+    reaction_counts = {"endorse": 0, "oppose": 0, "neutral": 0}
+    for row in ArtifactReaction.objects.filter(artifact=artifact).values("value").annotate(count=models.Count("id")):
+        reaction_counts[str(row["value"])] = int(row["count"])
+    comments = ArtifactComment.objects.filter(artifact=artifact).order_by("created_at")
+    payload = {
+        **_serialize_artifact_summary(artifact),
+        "content": (latest.content_json if latest else {}) or {},
+        "provenance_json": artifact.provenance_json or {},
+        "scope_json": artifact.scope_json or {},
+        "reactions": reaction_counts,
+        "comments": [_serialize_comment(comment) for comment in comments],
+    }
+    return JsonResponse(payload)
+
+
+@csrf_exempt
+def workspace_artifact_publish(request: HttpRequest, workspace_id: str, artifact_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _workspace_has_role(identity, workspace_id, "publisher"):
+        return JsonResponse({"error": "publisher role required"}, status=403)
+    if not _workspace_has_termination_authority(identity, workspace_id):
+        return JsonResponse({"error": "termination authority required"}, status=403)
+    artifact = get_object_or_404(Artifact, id=artifact_id, workspace_id=workspace_id)
+    artifact.status = "published"
+    artifact.visibility = "public"
+    artifact.published_at = timezone.now()
+    artifact.ratified_by = identity
+    artifact.ratified_at = timezone.now()
+    artifact.save(update_fields=["status", "visibility", "published_at", "ratified_by", "ratified_at", "updated_at"])
+    _record_artifact_event(artifact, "article_published", identity, {"status": "published"})
+    return JsonResponse({"id": str(artifact.id), "status": artifact.status})
+
+
+@csrf_exempt
+def workspace_artifact_deprecate(request: HttpRequest, workspace_id: str, artifact_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _workspace_has_role(identity, workspace_id, "publisher"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    artifact = get_object_or_404(Artifact, id=artifact_id, workspace_id=workspace_id)
+    artifact.status = "deprecated"
+    artifact.save(update_fields=["status", "updated_at"])
+    _record_artifact_event(artifact, "artifact_deprecated", identity, {})
+    return JsonResponse({"id": str(artifact.id), "status": artifact.status})
+
+
+@csrf_exempt
+def workspace_artifact_reactions_collection(request: HttpRequest, workspace_id: str, artifact_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _workspace_has_role(identity, workspace_id, "contributor"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    artifact = get_object_or_404(Artifact, id=artifact_id, workspace_id=workspace_id)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    value = str(payload.get("value") or "").strip().lower()
+    if value not in {"endorse", "oppose", "neutral"}:
+        return JsonResponse({"error": "value must be endorse|oppose|neutral"}, status=400)
+    ArtifactReaction.objects.update_or_create(
+        artifact=artifact,
+        user=identity,
+        defaults={"value": value},
+    )
+    _record_artifact_event(artifact, "reaction_set", identity, {"value": value})
+    return JsonResponse({"status": "ok"})
+
+
+@csrf_exempt
+def workspace_artifact_comments_collection(request: HttpRequest, workspace_id: str, artifact_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = get_object_or_404(Artifact, id=artifact_id, workspace_id=workspace_id)
+    if request.method == "POST":
+        if not _workspace_has_role(identity, workspace_id, "contributor"):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        body = str(payload.get("body") or "").strip()
+        if not body:
+            return JsonResponse({"error": "body is required"}, status=400)
+        parent_id = payload.get("parent_comment_id")
+        parent = ArtifactComment.objects.filter(id=parent_id, artifact=artifact).first() if parent_id else None
+        comment = ArtifactComment.objects.create(
+            artifact=artifact,
+            user=identity,
+            parent_comment=parent,
+            body=body,
+        )
+        _record_artifact_event(artifact, "comment_created", identity, {"comment_id": str(comment.id)})
+        return JsonResponse({"id": str(comment.id)})
+    comments = ArtifactComment.objects.filter(artifact=artifact).order_by("created_at")
+    return JsonResponse({"comments": [_serialize_comment(comment) for comment in comments]})
+
+
+@csrf_exempt
+def workspace_artifact_comment_detail(request: HttpRequest, workspace_id: str, artifact_id: str, comment_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = get_object_or_404(Artifact, id=artifact_id, workspace_id=workspace_id)
+    comment = get_object_or_404(ArtifactComment, id=comment_id, artifact=artifact)
+    if request.method != "PATCH":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _workspace_has_role(identity, workspace_id, "moderator"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"hidden", "deleted"}:
+        return JsonResponse({"error": "status must be hidden or deleted"}, status=400)
+    comment.status = status
+    comment.save(update_fields=["status"])
+    event_type = "comment_hidden" if status == "hidden" else "comment_deleted"
+    _record_artifact_event(artifact, event_type, identity, {"comment_id": str(comment.id)})
+    return JsonResponse({"id": str(comment.id), "status": comment.status})
+
+
+@csrf_exempt
+def workspace_activity(request: HttpRequest, workspace_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _workspace_membership(identity, workspace_id):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    events = (
+        ArtifactEvent.objects.filter(artifact__workspace_id=workspace_id)
+        .select_related("artifact", "actor")
+        .order_by("-created_at")[:300]
+    )
+    data = [
+        {
+            "id": str(event.id),
+            "artifact_id": str(event.artifact_id),
+            "artifact_title": event.artifact.title,
+            "event_type": event.event_type,
+            "actor_id": str(event.actor_id) if event.actor_id else None,
+            "payload_json": event.payload_json or {},
+            "created_at": event.created_at,
+        }
+        for event in events
+    ]
+    return JsonResponse({"events": data})
+
+
+@csrf_exempt
+def workspace_memberships_collection(request: HttpRequest, workspace_id: str) -> JsonResponse:
+    workspace = get_object_or_404(Workspace, id=workspace_id)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method == "POST":
+        if not _workspace_has_role(identity, workspace_id, "admin"):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        user_identity_id = str(payload.get("user_identity_id") or "")
+        role = str(payload.get("role") or "").strip().lower()
+        termination_authority = bool(payload.get("termination_authority", False))
+        if role not in WORKSPACE_ROLE_RANK:
+            return JsonResponse({"error": "invalid role"}, status=400)
+        user_identity = get_object_or_404(UserIdentity, id=user_identity_id)
+        membership, _ = WorkspaceMembership.objects.update_or_create(
+            workspace=workspace,
+            user_identity=user_identity,
+            defaults={"role": role, "termination_authority": termination_authority},
+        )
+        return JsonResponse({"id": str(membership.id)})
+    members = WorkspaceMembership.objects.filter(workspace=workspace).select_related("user_identity").order_by("user_identity__email")
+    return JsonResponse(
+        {
+            "memberships": [
+                {
+                    "id": str(member.id),
+                    "workspace_id": str(member.workspace_id),
+                    "user_identity_id": str(member.user_identity_id),
+                    "email": member.user_identity.email,
+                    "display_name": member.user_identity.display_name,
+                    "role": member.role,
+                    "termination_authority": member.termination_authority,
+                }
+                for member in members
+            ]
+        }
+    )
+
+
+@csrf_exempt
+def workspace_membership_detail(request: HttpRequest, workspace_id: str, membership_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _workspace_has_role(identity, workspace_id, "admin"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    membership = get_object_or_404(WorkspaceMembership, id=membership_id, workspace_id=workspace_id)
+    if request.method != "PATCH":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    role = str(payload.get("role") or membership.role).strip().lower()
+    if role not in WORKSPACE_ROLE_RANK:
+        return JsonResponse({"error": "invalid role"}, status=400)
+    membership.role = role
+    if "termination_authority" in payload:
+        membership.termination_authority = bool(payload.get("termination_authority"))
+    membership.save(update_fields=["role", "termination_authority", "updated_at"])
+    return JsonResponse({"id": str(membership.id)})
 
 
 @csrf_exempt
