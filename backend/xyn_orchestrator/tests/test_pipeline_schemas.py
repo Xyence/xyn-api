@@ -2296,6 +2296,67 @@ class PipelineSchemaTests(TestCase):
         self.assertEqual(image_entry.get("repository"), expected_repo)
         self.assertIn(expected_repo, image_entry.get("image_uri", ""))
 
+    @mock.patch("xyn_orchestrator.worker_tasks.subprocess.run")
+    @mock.patch("xyn_orchestrator.worker_tasks._docker_login_source_registry_if_needed")
+    @mock.patch("xyn_orchestrator.worker_tasks._docker_login_ecr")
+    @mock.patch("xyn_orchestrator.worker_tasks.boto3.client")
+    def test_build_publish_ghcr_source_pull_failure_falls_back_to_placeholder(
+        self,
+        boto_client,
+        docker_login_ecr,
+        source_registry_login,
+        subprocess_run,
+    ):
+        class _RepoMissing(Exception):
+            pass
+
+        class _FakeEcr:
+            def __init__(self):
+                self.exceptions = type("Exceptions", (), {"RepositoryNotFoundException": _RepoMissing})
+                self.created = []
+                self.described_images = []
+
+            def describe_repositories(self, repositoryNames):
+                repo_name = repositoryNames[0]
+                if repo_name not in self.created:
+                    raise _RepoMissing()
+                return {"repositories": [{"repositoryName": repo_name}]}
+
+            def create_repository(self, **kwargs):
+                self.created.append(kwargs["repositoryName"])
+                return {"repository": {"repositoryName": kwargs["repositoryName"]}}
+
+            def describe_images(self, repositoryName, imageIds):
+                self.described_images.append((repositoryName, imageIds))
+                return {"imageDetails": [{"imageDigest": "sha256:def456"}]}
+
+        fake_sts = mock.Mock()
+        fake_sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        fake_ecr = _FakeEcr()
+        boto_client.side_effect = lambda service, region_name=None: fake_sts if service == "sts" else fake_ecr
+        docker_login_ecr.return_value = "123456789012.dkr.ecr.us-east-1.amazonaws.com"
+        source_registry_login.return_value = None
+
+        pull_fail = mock.Mock(returncode=1, stdout="", stderr="pull denied")
+        build_ok = mock.Mock(returncode=0, stdout="", stderr="")
+        push_ok = mock.Mock(returncode=0, stdout="", stderr="")
+        subprocess_run.side_effect = [pull_fail, build_ok, push_ok]
+
+        build_result, _manifest, _images_map = _build_publish_images(
+            release_id="v102",
+            images=[{"name": "api", "service": "api", "image_uri": "ghcr.io/xyence/ems-api:0.1.0"}],
+            registry_cfg={"provider": "ecr", "region": "us-east-1", "repository_prefix": "xyn"},
+            repo_sources={},
+            blueprint_id="bp-123",
+            blueprint_namespace="xyence.demo",
+            blueprint_repo_slug="subscriber-notes",
+        )
+
+        self.assertEqual(build_result.get("outcome"), "succeeded")
+        image_entry = build_result.get("images", [])[0]
+        self.assertTrue(image_entry.get("pushed"))
+        self.assertEqual(image_entry.get("source"), "placeholder")
+
     def test_repo_slug_stable_on_blueprint_rename(self):
         blueprint = Blueprint.objects.create(name="Subscriber Notes", namespace="xyence.demo")
         original_slug = blueprint.repo_slug

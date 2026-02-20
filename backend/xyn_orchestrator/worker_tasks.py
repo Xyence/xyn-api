@@ -1678,6 +1678,11 @@ def _build_publish_images(
                 _ecr_ensure_repo(ecr, repo_name, tags=repo_tags, scan_on_push=scan_on_push)
             explicit_image_uri = str(image.get("image_uri") or "").strip()
             if explicit_image_uri:
+                image_uri_lc = explicit_image_uri.strip().lower()
+                allow_placeholder_fallback = (
+                    (explicit_image_uri.startswith("xyence/") and explicit_image_uri.endswith(":dev"))
+                    or image_uri_lc.startswith("ghcr.io/xyence/")
+                )
                 _docker_login_source_registry_if_needed(explicit_image_uri)
                 pull_proc = subprocess.run(
                     ["docker", "pull", explicit_image_uri],
@@ -1686,7 +1691,7 @@ def _build_publish_images(
                 )
                 if pull_proc.returncode != 0:
                     pull_error = pull_proc.stderr or pull_proc.stdout or "pull failed"
-                    if explicit_image_uri.startswith("xyence/") and explicit_image_uri.endswith(":dev"):
+                    if allow_placeholder_fallback:
                         ok, build_error = _build_placeholder_image(
                             image_uri=f"{_ecr_repo_uri(account_id, registry_region, repo_name)}:{release_id}",
                             service_name=str(service or name or "component"),
