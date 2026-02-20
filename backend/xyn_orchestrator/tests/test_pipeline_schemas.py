@@ -62,6 +62,7 @@ from xyn_orchestrator.worker_tasks import (
     _validate_release_manifest_pinned,
     _route53_ensure_with_noop,
     _slugify,
+    _public_verify,
     _run_remote_deploy,
     _work_item_capabilities,
 )
@@ -1305,6 +1306,44 @@ class PipelineSchemaTests(TestCase):
         self.assertIn("traefik.docker.network=xyn-edge", content)
         self.assertIn("traefik.http.routers.home-xyence-io.rule=Host(`home.xyence.io`)", content)
         self.assertIn("external: true", content)
+
+    def test_render_compose_for_images_host_ingress_skips_traefik_as_backend(self):
+        content = _render_compose_for_images(
+            {
+                "traefik": {"image_uri": "traefik:v3.1"},
+                "ems-ui": {"image_uri": "repo/ems-ui:v1"},
+                "ems-api": {"image_uri": "repo/ems-api:v1"},
+            },
+            {
+                "tls": {"mode": "host-ingress"},
+                "ingress": {
+                    "network": "xyn-edge",
+                    "routes": [{"host": "home.xyence.io", "service": "web", "port": 3000}],
+                },
+            },
+        )
+        parsed = yaml.safe_load(content) or {}
+        services = parsed.get("services") if isinstance(parsed, dict) else {}
+        self.assertIsInstance(services, dict)
+        traefik_labels = ((services.get("traefik") or {}).get("labels") or [])
+        ui_labels = ((services.get("ems-ui") or {}).get("labels") or [])
+        self.assertFalse(any("traefik.http.routers.home-xyence-io.rule" in str(label) for label in traefik_labels))
+        self.assertTrue(any("traefik.http.routers.home-xyence-io.rule" in str(label) for label in ui_labels))
+        self.assertTrue(any("traefik.http.services.home-xyence-io.loadbalancer.server.port=3000" in str(label) for label in ui_labels))
+
+    def test_public_verify_rejects_cross_host_redirects(self):
+        class _Resp:
+            def __init__(self):
+                self.status_code = 200
+                self.url = "https://xyence.io/auth/login?appId=xyn-ui"
+                self.headers = {"content-type": "text/html"}
+                self.text = "<html>login</html>"
+
+        with mock.patch("xyn_orchestrator.worker_tasks.requests.get", return_value=_Resp()):
+            ok, checks = _public_verify("ems-central.xyence.io")
+        self.assertFalse(ok)
+        self.assertTrue(checks)
+        self.assertTrue(all(check.get("ok") is False for check in checks))
 
     def test_core_planner_and_renderer_do_not_hardcode_ems_services(self):
         planner_path = Path(__file__).resolve().parents[1] / "blueprints.py"

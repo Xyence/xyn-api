@@ -2032,14 +2032,66 @@ def _render_compose_for_release_components(
         for component in components
         if isinstance(component, dict) and str(component.get("name") or "").strip()
     }
+    route_port_hint: Optional[int] = None
+    for route in route_defs:
+        if not isinstance(route, dict):
+            continue
+        try:
+            route_port_hint = int(route.get("port"))
+            break
+        except Exception:
+            continue
+
+    def _is_ingress_infra(component_name: str, component_payload: Optional[Dict[str, Any]] = None) -> bool:
+        name = str(component_name or "").strip().lower()
+        if name in {"traefik", "nginx", "ingress", "gateway", "proxy", "reverse-proxy"}:
+            return True
+        image_uri = ""
+        if isinstance(component_payload, dict):
+            image_uri = str(component_payload.get("image") or "").lower()
+        if "traefik" in image_uri:
+            return True
+        if "nginx" in image_uri:
+            return True
+        return False
+
+    def _resolve_component_alias(alias: str) -> str:
+        candidate = str(alias or "").strip().lower()
+        if not candidate:
+            return ""
+        exact = [name for name in component_by_name.keys() if name.lower() == candidate]
+        if exact:
+            return exact[0]
+        token_matches: List[str] = []
+        suffix_matches: List[str] = []
+        for name in component_by_name.keys():
+            lowered = name.lower()
+            parts = [part for part in re.split(r"[-_]", lowered) if part]
+            if candidate in parts:
+                token_matches.append(name)
+            if lowered.endswith(f"-{candidate}") or lowered.endswith(f"_{candidate}"):
+                suffix_matches.append(name)
+        pool = token_matches or suffix_matches
+        if not pool:
+            return ""
+        ranked = sorted(
+            pool,
+            key=lambda item: (
+                _is_ingress_infra(item, component_by_name.get(item)),
+                len(item),
+                item,
+            ),
+        )
+        return ranked[0]
     selected_service = ""
     selected_port = 8080
     for route in route_defs:
         if not isinstance(route, dict):
             continue
         candidate = str(route.get("service") or "").strip()
-        if candidate and candidate in component_by_name:
-            selected_service = candidate
+        matched = _resolve_component_alias(candidate) if candidate else ""
+        if matched:
+            selected_service = matched
             try:
                 selected_port = int(route.get("port") or selected_port)
             except Exception:
@@ -2047,11 +2099,19 @@ def _render_compose_for_release_components(
             break
     if not selected_service:
         for candidate in ("web", "frontend", "ui", "api"):
-            if candidate in component_by_name:
-                selected_service = candidate
+            matched = _resolve_component_alias(candidate)
+            if matched:
+                selected_service = matched
                 break
     if not selected_service and component_by_name:
-        selected_service = next(iter(component_by_name.keys()))
+        candidates = [
+            name for name in component_by_name.keys() if not _is_ingress_infra(name, component_by_name.get(name))
+        ]
+        if not candidates:
+            candidates = list(component_by_name.keys())
+        selected_service = sorted(candidates, key=lambda item: (len(item), item))[0]
+    if route_port_hint and selected_port == 8080:
+        selected_port = route_port_hint
     if selected_service:
         ports = component_by_name.get(selected_service, {}).get("ports")
         if isinstance(ports, list):
@@ -2637,9 +2697,20 @@ def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
                 "content_type": response.headers.get("content-type", ""),
                 "body_preview": (response.text or "").strip().replace("\n", " ")[:200],
             }
+            parsed = urlparse(str(response.url or ""))
+            final_host = (parsed.hostname or "").strip().lower()
+            expected_host = str(fqdn or "").strip().lower()
+            host_ok = bool(final_host) and final_host == expected_host
+            path_ok = True
+            if path != "/":
+                final_path = (parsed.path or "/").strip() or "/"
+                path_ok = final_path == path
             status_ok = response.status_code in expected
-            checks.append({"name": name, "ok": status_ok, "detail": detail})
-            ok = ok and status_ok
+            check_ok = status_ok and host_ok and path_ok
+            detail["host_ok"] = host_ok
+            detail["path_ok"] = path_ok
+            checks.append({"name": name, "ok": check_ok, "detail": detail})
+            ok = ok and check_ok
         except Exception as exc:
             checks.append({"name": name, "ok": False, "detail": str(exc)})
             ok = False
