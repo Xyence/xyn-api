@@ -1078,6 +1078,139 @@ class Device(models.Model):
         return f"{self.name} ({self.tenant.name})"
 
 
+class DraftAction(models.Model):
+    ACTION_CLASS_CHOICES = [
+        ("read_only", "Read Only"),
+        ("write_proposed", "Write Proposed"),
+        ("write_execute", "Write Execute"),
+        ("account_security_write", "Account Security Write"),
+    ]
+    ACTION_TYPE_CHOICES = [
+        ("device.reboot", "Device Reboot"),
+        ("device.factory_reset", "Device Factory Reset"),
+        ("device.push_config", "Device Push Config"),
+        ("credential_ref.attach", "Credential Ref Attach"),
+        ("adapter.enable", "Adapter Enable"),
+        ("adapter.configure", "Adapter Configure"),
+    ]
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("pending_verification", "Pending Verification"),
+        ("pending_ratification", "Pending Ratification"),
+        ("executing", "Executing"),
+        ("succeeded", "Succeeded"),
+        ("failed", "Failed"),
+        ("canceled", "Canceled"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="draft_actions")
+    device = models.ForeignKey(Device, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_actions")
+    instance_ref = models.CharField(max_length=120, blank=True, default="")
+    action_type = models.CharField(max_length=120, choices=ACTION_TYPE_CHOICES)
+    action_class = models.CharField(max_length=40, choices=ACTION_CLASS_CHOICES)
+    params_json = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=40, choices=STATUS_CHOICES, default="draft")
+    requested_by = models.ForeignKey(
+        UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_actions_requested"
+    )
+    custodian = models.ForeignKey(
+        UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_actions_custodied"
+    )
+    last_error_code = models.CharField(max_length=120, blank=True, default="")
+    last_error_message = models.TextField(blank=True, default="")
+    provenance_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["tenant", "status"]), models.Index(fields=["device", "created_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.action_type}:{self.id}"
+
+
+class ActionVerifierEvidence(models.Model):
+    STATUS_CHOICES = [
+        ("required", "Required"),
+        ("satisfied", "Satisfied"),
+        ("failed", "Failed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    draft_action = models.ForeignKey(DraftAction, on_delete=models.CASCADE, related_name="verifier_evidence")
+    verifier_type = models.CharField(max_length=80)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="required")
+    evidence_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        indexes = [models.Index(fields=["draft_action", "verifier_type"])]
+
+
+class RatificationEvent(models.Model):
+    METHOD_CHOICES = [
+        ("ui_confirm", "UI Confirm"),
+        ("admin_override", "Admin Override"),
+        ("policy_auto", "Policy Auto"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    draft_action = models.ForeignKey(DraftAction, on_delete=models.CASCADE, related_name="ratification_events")
+    ratified_by = models.ForeignKey(
+        UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="ratifications"
+    )
+    ratified_at = models.DateTimeField(default=timezone.now)
+    method = models.CharField(max_length=40, choices=METHOD_CHOICES, default="ui_confirm")
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-ratified_at"]
+
+
+class ExecutionReceipt(models.Model):
+    OUTCOME_CHOICES = [
+        ("success", "Success"),
+        ("failure", "Failure"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    draft_action = models.ForeignKey(DraftAction, on_delete=models.CASCADE, related_name="receipts")
+    executed_at = models.DateTimeField(default=timezone.now)
+    executed_by = models.ForeignKey(
+        UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="execution_receipts"
+    )
+    adapter_key = models.CharField(max_length=120, blank=True, default="")
+    request_payload_redacted_json = models.JSONField(default=dict, blank=True)
+    response_redacted_json = models.JSONField(default=dict, blank=True)
+    outcome = models.CharField(max_length=20, choices=OUTCOME_CHOICES)
+    error_code = models.CharField(max_length=120, blank=True, default="")
+    error_message = models.TextField(blank=True, default="")
+    logs_ref = models.CharField(max_length=300, blank=True, default="")
+
+    class Meta:
+        ordering = ["-executed_at"]
+
+
+class DraftActionEvent(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    draft_action = models.ForeignKey(DraftAction, on_delete=models.CASCADE, related_name="events")
+    event_type = models.CharField(max_length=120)
+    from_status = models.CharField(max_length=40, blank=True, default="")
+    to_status = models.CharField(max_length=40, blank=True, default="")
+    actor = models.ForeignKey(
+        UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_action_events"
+    )
+    payload_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        indexes = [models.Index(fields=["draft_action", "created_at"])]
+
+
 class ReleasePlan(models.Model):
     TARGET_CHOICES = [
         ("module", "Module"),

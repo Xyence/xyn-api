@@ -10,7 +10,7 @@ import uuid
 import hashlib
 import fnmatch
 from functools import wraps
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, quote
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit, quote
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Set, Tuple
 
@@ -90,6 +90,11 @@ from .models import (
     PlatformBranding,
     AppBrandingOverride,
     Device,
+    DraftAction,
+    ActionVerifierEvidence,
+    RatificationEvent,
+    ExecutionReceipt,
+    DraftActionEvent,
     Deployment,
     AuditLog,
     PlatformConfigDocument,
@@ -953,12 +958,274 @@ def _tenant_role_rank(role: str) -> int:
     return order.get(role, 0)
 
 
-def _require_tenant_access(identity: UserIdentity, tenant_id: str, minimum_role: str) -> bool:
-    membership = TenantMembership.objects.filter(
+EMS_ACTION_TYPES: Dict[str, str] = {
+    "device.reboot": "write_execute",
+    "device.factory_reset": "account_security_write",
+    "device.push_config": "write_execute",
+    "credential_ref.attach": "account_security_write",
+    "adapter.enable": "account_security_write",
+    "adapter.configure": "account_security_write",
+}
+
+
+def _tenant_membership(identity: UserIdentity, tenant_id: str) -> Optional[TenantMembership]:
+    return TenantMembership.objects.filter(
         tenant_id=tenant_id,
         user_identity=identity,
         status="active",
     ).first()
+
+
+def _tenant_role_to_ems_role(tenant_role: str) -> str:
+    role = str(tenant_role or "")
+    if role == "tenant_admin":
+        return "ems_admin"
+    if role == "tenant_operator":
+        return "ems_operator"
+    return "ems_viewer"
+
+
+def _ems_role_rank(ems_role: str) -> int:
+    return {"ems_viewer": 1, "ems_operator": 2, "ems_admin": 3}.get(ems_role, 0)
+
+
+def _ems_role_allowed(ems_role: str, allowed_roles: List[str]) -> bool:
+    return str(ems_role or "") in {str(item or "") for item in (allowed_roles or [])}
+
+
+def _resolve_action_policy(
+    tenant: Tenant,
+    action_type: str,
+    instance_ref: str = "",
+) -> Dict[str, Any]:
+    default_policy: Dict[str, Dict[str, Any]] = {
+        "device.reboot": {
+            "requires_confirmation": True,
+            "requires_ratification": False,
+            "allowed_roles_to_request": ["ems_operator", "ems_admin"],
+            "allowed_roles_to_ratify": ["ems_admin"],
+            "allowed_roles_to_execute": ["ems_admin", "system"],
+        },
+        "device.factory_reset": {
+            "requires_confirmation": True,
+            "requires_ratification": True,
+            "allowed_roles_to_request": ["ems_admin"],
+            "allowed_roles_to_ratify": ["ems_admin"],
+            "allowed_roles_to_execute": ["ems_admin", "system"],
+        },
+        "device.push_config": {
+            "requires_confirmation": True,
+            "requires_ratification": True,
+            "allowed_roles_to_request": ["ems_admin"],
+            "allowed_roles_to_ratify": ["ems_admin"],
+            "allowed_roles_to_execute": ["ems_admin", "system"],
+        },
+        "credential_ref.attach": {
+            "requires_confirmation": True,
+            "requires_ratification": True,
+            "allowed_roles_to_request": ["ems_admin"],
+            "allowed_roles_to_ratify": ["ems_admin"],
+            "allowed_roles_to_execute": ["ems_admin", "system"],
+        },
+        "adapter.enable": {
+            "requires_confirmation": True,
+            "requires_ratification": True,
+            "allowed_roles_to_request": ["ems_admin"],
+            "allowed_roles_to_ratify": ["ems_admin"],
+            "allowed_roles_to_execute": ["ems_admin", "system"],
+        },
+        "adapter.configure": {
+            "requires_confirmation": True,
+            "requires_ratification": True,
+            "allowed_roles_to_request": ["ems_admin"],
+            "allowed_roles_to_ratify": ["ems_admin"],
+            "allowed_roles_to_execute": ["ems_admin", "system"],
+        },
+    }
+    merged = dict(default_policy.get(action_type) or {})
+    metadata = tenant.metadata_json if isinstance(tenant.metadata_json, dict) else {}
+    action_policies = metadata.get("ems_action_policies") if isinstance(metadata.get("ems_action_policies"), dict) else {}
+    instance_policies = (
+        metadata.get("ems_action_policies_by_instance")
+        if isinstance(metadata.get("ems_action_policies_by_instance"), dict)
+        else {}
+    )
+    tenant_override = action_policies.get(action_type) if isinstance(action_policies.get(action_type), dict) else {}
+    instance_override = {}
+    if instance_ref:
+        item = instance_policies.get(instance_ref)
+        if isinstance(item, dict) and isinstance(item.get(action_type), dict):
+            instance_override = item.get(action_type) or {}
+    merged.update(tenant_override)
+    merged.update(instance_override)
+    merged["action_type"] = action_type
+    return merged
+
+
+def _redact_sensitive_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        for key, raw in value.items():
+            lowered = str(key).lower()
+            if any(token in lowered for token in ("password", "secret", "token", "credential", "apikey", "api_key")):
+                redacted[str(key)] = "***redacted***"
+            else:
+                redacted[str(key)] = _redact_sensitive_json(raw)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_json(item) for item in value]
+    return value
+
+
+def _record_draft_action_event(
+    action: DraftAction,
+    event_type: str,
+    actor: Optional[UserIdentity],
+    from_status: str = "",
+    to_status: str = "",
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    DraftActionEvent.objects.create(
+        draft_action=action,
+        event_type=event_type,
+        actor=actor,
+        from_status=from_status,
+        to_status=to_status,
+        payload_json=payload or {},
+    )
+
+
+def _transition_draft_action(
+    action: DraftAction,
+    new_status: str,
+    actor: Optional[UserIdentity],
+    event_type: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    previous = action.status
+    action.status = new_status
+    action.save(update_fields=["status", "updated_at"])
+    _record_draft_action_event(action, event_type, actor, previous, new_status, payload or {})
+
+
+def _serialize_receipt(receipt: ExecutionReceipt) -> Dict[str, Any]:
+    return {
+        "id": str(receipt.id),
+        "draft_action_id": str(receipt.draft_action_id),
+        "executed_at": receipt.executed_at,
+        "executed_by": str(receipt.executed_by_id) if receipt.executed_by_id else None,
+        "adapter_key": receipt.adapter_key,
+        "request_payload_redacted_json": receipt.request_payload_redacted_json,
+        "response_redacted_json": receipt.response_redacted_json,
+        "outcome": receipt.outcome,
+        "error_code": receipt.error_code,
+        "error_message": receipt.error_message,
+        "logs_ref": receipt.logs_ref,
+    }
+
+
+def _serialize_draft_action(action: DraftAction) -> Dict[str, Any]:
+    return {
+        "id": str(action.id),
+        "tenant_id": str(action.tenant_id),
+        "device_id": str(action.device_id) if action.device_id else None,
+        "instance_ref": action.instance_ref or None,
+        "action_type": action.action_type,
+        "action_class": action.action_class,
+        "params_json": action.params_json or {},
+        "status": action.status,
+        "requested_by": str(action.requested_by_id) if action.requested_by_id else None,
+        "custodian_id": str(action.custodian_id) if action.custodian_id else None,
+        "last_error_code": action.last_error_code or "",
+        "last_error_message": action.last_error_message or "",
+        "provenance_json": action.provenance_json or {},
+        "created_at": action.created_at,
+        "updated_at": action.updated_at,
+    }
+
+
+def _action_timeline(action: DraftAction) -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": str(item.id),
+            "event_type": item.event_type,
+            "from_status": item.from_status,
+            "to_status": item.to_status,
+            "actor_id": str(item.actor_id) if item.actor_id else None,
+            "payload_json": item.payload_json or {},
+            "created_at": item.created_at,
+        }
+        for item in action.events.all().order_by("created_at")
+    ]
+
+
+def _execute_draft_action(
+    action: DraftAction,
+    actor: Optional[UserIdentity] = None,
+) -> Tuple[bool, ExecutionReceipt]:
+    _transition_draft_action(action, "executing", actor, "action_executing")
+    adapter_key = str((action.params_json or {}).get("adapter_key") or "ems-gov-device-adapter")
+    requested_payload = {
+        "device_id": str(action.device_id) if action.device_id else None,
+        "action_type": action.action_type,
+        "params": action.params_json or {},
+    }
+    redacted_request = _redact_sensitive_json(requested_payload)
+    try:
+        if action.action_type != "device.reboot":
+            raise RuntimeError("action_type_not_supported")
+        simulate_failure = bool((action.params_json or {}).get("simulate_failure"))
+        if simulate_failure:
+            raise RuntimeError("simulated_reboot_failure")
+        adapter_response = {
+            "accepted": True,
+            "action": action.action_type,
+            "device_id": str(action.device_id) if action.device_id else None,
+            "provider": adapter_key,
+            "execution_mode": "inline",
+        }
+        receipt = ExecutionReceipt.objects.create(
+            draft_action=action,
+            executed_by=actor,
+            adapter_key=adapter_key,
+            request_payload_redacted_json=redacted_request,
+            response_redacted_json=_redact_sensitive_json(adapter_response),
+            outcome="success",
+        )
+        action.last_error_code = ""
+        action.last_error_message = ""
+        action.save(update_fields=["last_error_code", "last_error_message", "updated_at"])
+        _transition_draft_action(action, "succeeded", actor, "action_succeeded", {"receipt_id": str(receipt.id)})
+        return True, receipt
+    except Exception as exc:
+        error_code = "execution_failed"
+        error_message = str(exc)
+        failure_response = {"error": error_message}
+        receipt = ExecutionReceipt.objects.create(
+            draft_action=action,
+            executed_by=actor,
+            adapter_key=adapter_key,
+            request_payload_redacted_json=redacted_request,
+            response_redacted_json=_redact_sensitive_json(failure_response),
+            outcome="failure",
+            error_code=error_code,
+            error_message=error_message,
+        )
+        action.last_error_code = error_code
+        action.last_error_message = error_message
+        action.save(update_fields=["last_error_code", "last_error_message", "updated_at"])
+        _transition_draft_action(
+            action,
+            "failed",
+            actor,
+            "action_failed",
+            {"receipt_id": str(receipt.id), "error_code": error_code, "error_message": error_message},
+        )
+        return False, receipt
+
+
+def _require_tenant_access(identity: UserIdentity, tenant_id: str, minimum_role: str) -> bool:
+    membership = _tenant_membership(identity, tenant_id)
     if not membership:
         return False
     return _tenant_role_rank(membership.role) >= _tenant_role_rank(minimum_role)
@@ -4082,6 +4349,335 @@ def device_detail(request: HttpRequest, device_id: str) -> JsonResponse:
         device.delete()
         return JsonResponse({"status": "deleted"})
     return JsonResponse({"error": "method not allowed"}, status=405)
+
+
+def _resolve_action_scope(identity: UserIdentity, request: HttpRequest) -> Tuple[Optional[Tenant], Optional[str], Optional[str]]:
+    tenant = _get_active_tenant(identity, request)
+    if not tenant:
+        return None, None, "active tenant not set"
+    return tenant, str(tenant.id), None
+
+
+def _action_for_tenant(identity: UserIdentity, request: HttpRequest, action_id: str) -> Tuple[Optional[DraftAction], Optional[JsonResponse]]:
+    action = get_object_or_404(DraftAction, id=action_id)
+    if _is_platform_admin(identity):
+        return action, None
+    tenant = _get_active_tenant(identity, request)
+    if not tenant or str(action.tenant_id) != str(tenant.id):
+        return None, JsonResponse({"error": "forbidden"}, status=403)
+    if not _require_tenant_access(identity, str(action.tenant_id), "tenant_viewer"):
+        return None, JsonResponse({"error": "forbidden"}, status=403)
+    return action, None
+
+
+@csrf_exempt
+def device_actions_collection(request: HttpRequest, device_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    device = get_object_or_404(Device, id=device_id)
+    if not _is_platform_admin(identity):
+        tenant = _get_active_tenant(identity, request)
+        if not tenant or str(tenant.id) != str(device.tenant_id):
+            return JsonResponse({"error": "forbidden"}, status=403)
+
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    payload = _parse_json(request)
+    action_type = str(payload.get("action_type") or "").strip()
+    if not action_type:
+        return JsonResponse({"error": "action_type is required"}, status=400)
+    if action_type not in EMS_ACTION_TYPES:
+        return JsonResponse({"error": "unsupported action_type"}, status=400)
+
+    membership = _tenant_membership(identity, str(device.tenant_id))
+    ems_role = "ems_admin" if _is_platform_admin(identity) else _tenant_role_to_ems_role(membership.role if membership else "")
+    policy = _resolve_action_policy(
+        device.tenant,
+        action_type,
+        str(payload.get("instance_id") or payload.get("instance_ref") or ""),
+    )
+    allowed_request = [str(item) for item in (policy.get("allowed_roles_to_request") or [])]
+    if not _is_platform_admin(identity) and not _ems_role_allowed(ems_role, allowed_request):
+        return JsonResponse({"error": "forbidden: request role not allowed"}, status=403)
+
+    params_json = payload.get("params")
+    if params_json is None:
+        params_json = {}
+    if not isinstance(params_json, dict):
+        return JsonResponse({"error": "params must be an object"}, status=400)
+    params_json = _redact_sensitive_json(params_json)
+    action_class = EMS_ACTION_TYPES.get(action_type, "write_execute")
+    requires_confirmation = bool(policy.get("requires_confirmation", True))
+    requires_ratification = bool(policy.get("requires_ratification", False))
+    next_status = "pending_verification" if requires_confirmation else ("pending_ratification" if requires_ratification else "executing")
+
+    provenance = {
+        "request_id": str(uuid.uuid4()),
+        "correlation_id": request.headers.get("X-Request-ID") or str(uuid.uuid4()),
+        "source": "ems-ui",
+        "ip": request.META.get("REMOTE_ADDR"),
+        "user_agent": request.META.get("HTTP_USER_AGENT", ""),
+    }
+    action = DraftAction.objects.create(
+        tenant=device.tenant,
+        device=device,
+        instance_ref=str(payload.get("instance_id") or payload.get("instance_ref") or ""),
+        action_type=action_type,
+        action_class=action_class,
+        params_json=params_json,
+        status=next_status,
+        requested_by=identity,
+        custodian=identity if ems_role == "ems_admin" else None,
+        provenance_json=provenance,
+    )
+    _record_draft_action_event(
+        action,
+        "action_requested",
+        identity,
+        "",
+        next_status,
+        {
+            "action_type": action_type,
+            "action_class": action_class,
+            "requires_confirmation": requires_confirmation,
+            "requires_ratification": requires_ratification,
+        },
+    )
+    if requires_confirmation:
+        ActionVerifierEvidence.objects.create(
+            draft_action=action,
+            verifier_type="user_confirmation",
+            status="required",
+            evidence_json={"required": True},
+        )
+
+    # Fast path for policies that do not require confirmation/ratification.
+    if next_status == "executing":
+        _execute_draft_action(action, None)
+        action.refresh_from_db()
+
+    return JsonResponse(
+        {
+            "action": _serialize_draft_action(action),
+            "requires_confirmation": requires_confirmation,
+            "requires_ratification": requires_ratification,
+            "next_status": action.status,
+        },
+        status=201,
+    )
+
+
+@csrf_exempt
+def actions_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    tenant, tenant_id, error = _resolve_action_scope(identity, request)
+    if error:
+        return JsonResponse({"error": error}, status=400)
+    qs = DraftAction.objects.filter(tenant_id=tenant_id).select_related("device").order_by("-created_at")
+    device_id = (request.GET.get("device_id") or "").strip()
+    if device_id:
+        qs = qs.filter(device_id=device_id)
+    data = [_serialize_draft_action(item) for item in qs[:200]]
+    return JsonResponse({"actions": data})
+
+
+@csrf_exempt
+def action_detail(request: HttpRequest, action_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    action, error = _action_for_tenant(identity, request, action_id)
+    if error:
+        return error
+    assert action is not None
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    return JsonResponse(
+        {
+            "action": _serialize_draft_action(action),
+            "timeline": _action_timeline(action),
+            "evidence": [
+                {
+                    "id": str(item.id),
+                    "verifier_type": item.verifier_type,
+                    "status": item.status,
+                    "evidence_json": item.evidence_json or {},
+                    "created_at": item.created_at,
+                }
+                for item in action.verifier_evidence.all().order_by("created_at")
+            ],
+            "ratifications": [
+                {
+                    "id": str(item.id),
+                    "ratified_by": str(item.ratified_by_id) if item.ratified_by_id else None,
+                    "ratified_at": item.ratified_at,
+                    "method": item.method,
+                    "notes": item.notes,
+                }
+                for item in action.ratification_events.all().order_by("-ratified_at")
+            ],
+        }
+    )
+
+
+@csrf_exempt
+def action_receipts_collection(request: HttpRequest, action_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    action, error = _action_for_tenant(identity, request, action_id)
+    if error:
+        return error
+    assert action is not None
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    data = [_serialize_receipt(item) for item in action.receipts.all().order_by("-executed_at")]
+    return JsonResponse({"receipts": data})
+
+
+@csrf_exempt
+def action_confirm(request: HttpRequest, action_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    action, error = _action_for_tenant(identity, request, action_id)
+    if error:
+        return error
+    assert action is not None
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if action.status != "pending_verification":
+        return JsonResponse({"error": "action is not pending_verification"}, status=400)
+
+    membership = _tenant_membership(identity, str(action.tenant_id))
+    ems_role = "ems_admin" if _is_platform_admin(identity) else _tenant_role_to_ems_role(membership.role if membership else "")
+    if not _is_platform_admin(identity) and _ems_role_rank(ems_role) < _ems_role_rank("ems_operator"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    evidence = ActionVerifierEvidence.objects.filter(
+        draft_action=action,
+        verifier_type="user_confirmation",
+    ).order_by("-created_at").first()
+    if evidence:
+        evidence.status = "satisfied"
+        evidence.evidence_json = {
+            "confirmed_by": str(identity.id),
+            "confirmed_at": timezone.now().isoformat(),
+        }
+        evidence.save(update_fields=["status", "evidence_json"])
+    else:
+        ActionVerifierEvidence.objects.create(
+            draft_action=action,
+            verifier_type="user_confirmation",
+            status="satisfied",
+            evidence_json={"confirmed_by": str(identity.id), "confirmed_at": timezone.now().isoformat()},
+        )
+
+    policy = _resolve_action_policy(action.tenant, action.action_type, action.instance_ref)
+    if bool(policy.get("requires_ratification", False)):
+        _transition_draft_action(action, "pending_ratification", identity, "verification_satisfied")
+        action.refresh_from_db()
+        return JsonResponse({"action": _serialize_draft_action(action)})
+
+    allowed_execute = [str(item) for item in (policy.get("allowed_roles_to_execute") or [])]
+    if "system" in allowed_execute:
+        success, receipt = _execute_draft_action(action, None)
+    elif _is_platform_admin(identity) or _ems_role_allowed(ems_role, allowed_execute):
+        success, receipt = _execute_draft_action(action, identity)
+    else:
+        _transition_draft_action(action, "pending_ratification", identity, "verification_satisfied")
+        action.refresh_from_db()
+        return JsonResponse({"action": _serialize_draft_action(action)})
+
+    action.refresh_from_db()
+    return JsonResponse(
+        {
+            "action": _serialize_draft_action(action),
+            "receipt": _serialize_receipt(receipt),
+            "success": success,
+        }
+    )
+
+
+@csrf_exempt
+def action_ratify(request: HttpRequest, action_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    action, error = _action_for_tenant(identity, request, action_id)
+    if error:
+        return error
+    assert action is not None
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if action.status != "pending_ratification":
+        return JsonResponse({"error": "action is not pending_ratification"}, status=400)
+
+    membership = _tenant_membership(identity, str(action.tenant_id))
+    ems_role = "ems_admin" if _is_platform_admin(identity) else _tenant_role_to_ems_role(membership.role if membership else "")
+    policy = _resolve_action_policy(action.tenant, action.action_type, action.instance_ref)
+    allowed_ratify = [str(item) for item in (policy.get("allowed_roles_to_ratify") or [])]
+    if not (_is_platform_admin(identity) or _ems_role_allowed(ems_role, allowed_ratify)):
+        return JsonResponse({"error": "forbidden: ratify role not allowed"}, status=403)
+
+    payload = _parse_json(request)
+    RatificationEvent.objects.create(
+        draft_action=action,
+        ratified_by=identity,
+        method=str(payload.get("method") or "ui_confirm"),
+        notes=str(payload.get("notes") or ""),
+    )
+    _record_draft_action_event(action, "action_ratified", identity, action.status, action.status)
+    success, receipt = _execute_draft_action(action, identity)
+    action.refresh_from_db()
+    return JsonResponse({"action": _serialize_draft_action(action), "receipt": _serialize_receipt(receipt), "success": success})
+
+
+@csrf_exempt
+def action_execute(request: HttpRequest, action_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    action, error = _action_for_tenant(identity, request, action_id)
+    if error:
+        return error
+    assert action is not None
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if action.status not in {"pending_ratification", "pending_verification", "draft"}:
+        return JsonResponse({"error": f"action cannot be executed from status '{action.status}'"}, status=400)
+
+    membership = _tenant_membership(identity, str(action.tenant_id))
+    ems_role = "ems_admin" if _is_platform_admin(identity) else _tenant_role_to_ems_role(membership.role if membership else "")
+    policy = _resolve_action_policy(action.tenant, action.action_type, action.instance_ref)
+    allowed_execute = [str(item) for item in (policy.get("allowed_roles_to_execute") or [])]
+    if not (_is_platform_admin(identity) or _ems_role_allowed(ems_role, allowed_execute)):
+        return JsonResponse({"error": "forbidden: execute role not allowed"}, status=403)
+
+    # If confirmation is required, ensure it was satisfied.
+    if bool(policy.get("requires_confirmation", False)):
+        confirmed = ActionVerifierEvidence.objects.filter(
+            draft_action=action,
+            verifier_type="user_confirmation",
+            status="satisfied",
+        ).exists()
+        if not confirmed:
+            return JsonResponse({"error": "confirmation required"}, status=400)
+
+    if bool(policy.get("requires_ratification", False)):
+        ratified = RatificationEvent.objects.filter(draft_action=action).exists()
+        if not ratified and not _is_platform_admin(identity):
+            return JsonResponse({"error": "ratification required"}, status=400)
+
+    success, receipt = _execute_draft_action(action, identity)
+    action.refresh_from_db()
+    return JsonResponse({"action": _serialize_draft_action(action), "receipt": _serialize_receipt(receipt), "success": success})
 
 
 def tenant_branding_public(request: HttpRequest, tenant_id: str) -> JsonResponse:

@@ -81,6 +81,10 @@ from xyn_orchestrator.models import (
     TenantMembership,
     BrandProfile,
     Device,
+    DraftAction,
+    ActionVerifierEvidence,
+    RatificationEvent,
+    ExecutionReceipt,
 )
 
 
@@ -243,6 +247,19 @@ class PlatformAdminTests(TestCase):
         RoleBinding.objects.create(user_identity=identity, scope_kind="platform", role="platform_admin")
         session = self.client.session
         session["user_identity_id"] = str(identity.id)
+        session.save()
+        return identity
+
+    def _set_tenant_session(self, tenant: Tenant, role: str = "tenant_operator") -> UserIdentity:
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            issuer="https://issuer.example.com",
+            subject=f"sub-{uuid.uuid4()}",
+        )
+        TenantMembership.objects.create(tenant=tenant, user_identity=identity, role=role)
+        session = self.client.session
+        session["user_identity_id"] = str(identity.id)
+        session["active_tenant_id"] = str(tenant.id)
         session.save()
         return identity
 
@@ -442,6 +459,136 @@ class PlatformAdminTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_ems_operator_can_request_reboot_and_confirmation_is_recorded(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        device = Device.objects.create(tenant=tenant, name="dev1", device_type="router")
+        self._set_tenant_session(tenant, "tenant_operator")
+        create_resp = self.client.post(
+            f"/xyn/api/devices/{device.id}/actions",
+            data=json.dumps({"action_type": "device.reboot", "params": {"reason": "maintenance"}}),
+            content_type="application/json",
+        )
+        self.assertEqual(create_resp.status_code, 201)
+        action_id = create_resp.json()["action"]["id"]
+        action = DraftAction.objects.get(id=action_id)
+        self.assertEqual(action.status, "pending_verification")
+        evidence = ActionVerifierEvidence.objects.get(draft_action=action, verifier_type="user_confirmation")
+        self.assertEqual(evidence.status, "required")
+
+        confirm_resp = self.client.post(
+            f"/xyn/api/actions/{action_id}/confirm",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(confirm_resp.status_code, 200)
+        action.refresh_from_db()
+        self.assertEqual(action.status, "succeeded")
+        evidence.refresh_from_db()
+        self.assertEqual(evidence.status, "satisfied")
+        self.assertTrue(ExecutionReceipt.objects.filter(draft_action=action).exists())
+
+    def test_ems_operator_cannot_execute_directly(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        device = Device.objects.create(tenant=tenant, name="dev1", device_type="router")
+        self._set_tenant_session(tenant, "tenant_operator")
+        create_resp = self.client.post(
+            f"/xyn/api/devices/{device.id}/actions",
+            data=json.dumps({"action_type": "device.reboot", "params": {}}),
+            content_type="application/json",
+        )
+        action_id = create_resp.json()["action"]["id"]
+        execute_resp = self.client.post(
+            f"/xyn/api/actions/{action_id}/execute",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(execute_resp.status_code, 403)
+
+    def test_ems_admin_can_execute_when_confirmed(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        device = Device.objects.create(tenant=tenant, name="dev1", device_type="router")
+        self._set_tenant_session(tenant, "tenant_admin")
+        create_resp = self.client.post(
+            f"/xyn/api/devices/{device.id}/actions",
+            data=json.dumps({"action_type": "device.reboot", "params": {"reason": "admin test"}}),
+            content_type="application/json",
+        )
+        action_id = create_resp.json()["action"]["id"]
+        confirm_resp = self.client.post(
+            f"/xyn/api/actions/{action_id}/confirm",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(confirm_resp.status_code, 200)
+        execute_resp = self.client.post(
+            f"/xyn/api/actions/{action_id}/execute",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        # Action may already be terminal from auto execution in confirm fast-path.
+        self.assertIn(execute_resp.status_code, {200, 400})
+
+        detail_resp = self.client.get(f"/xyn/api/actions/{action_id}")
+        self.assertEqual(detail_resp.status_code, 200)
+        self.assertEqual(detail_resp.json()["action"]["status"], "succeeded")
+
+    def test_receipt_created_on_failure(self):
+        tenant = Tenant.objects.create(name="Acme", slug="acme")
+        device = Device.objects.create(tenant=tenant, name="dev1", device_type="router")
+        self._set_tenant_session(tenant, "tenant_operator")
+        create_resp = self.client.post(
+            f"/xyn/api/devices/{device.id}/actions",
+            data=json.dumps({"action_type": "device.reboot", "params": {"simulate_failure": True}}),
+            content_type="application/json",
+        )
+        action_id = create_resp.json()["action"]["id"]
+        confirm_resp = self.client.post(
+            f"/xyn/api/actions/{action_id}/confirm",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(confirm_resp.status_code, 200)
+        action = DraftAction.objects.get(id=action_id)
+        self.assertEqual(action.status, "failed")
+        receipt = ExecutionReceipt.objects.filter(draft_action=action).order_by("-executed_at").first()
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt.outcome, "failure")
+
+    def test_admin_can_ratify_when_policy_requires(self):
+        tenant = Tenant.objects.create(
+            name="Acme",
+            slug="acme",
+            metadata_json={
+                "ems_action_policies": {
+                    "device.reboot": {"requires_ratification": True}
+                }
+            },
+        )
+        device = Device.objects.create(tenant=tenant, name="dev1", device_type="router")
+        self._set_tenant_session(tenant, "tenant_admin")
+        create_resp = self.client.post(
+            f"/xyn/api/devices/{device.id}/actions",
+            data=json.dumps({"action_type": "device.reboot", "params": {"reason": "ratify"}}),
+            content_type="application/json",
+        )
+        action_id = create_resp.json()["action"]["id"]
+        confirm_resp = self.client.post(
+            f"/xyn/api/actions/{action_id}/confirm",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(confirm_resp.status_code, 200)
+        self.assertEqual(confirm_resp.json()["action"]["status"], "pending_ratification")
+        ratify_resp = self.client.post(
+            f"/xyn/api/actions/{action_id}/ratify",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(ratify_resp.status_code, 200)
+        action = DraftAction.objects.get(id=action_id)
+        self.assertEqual(action.status, "succeeded")
+        self.assertTrue(RatificationEvent.objects.filter(draft_action=action).exists())
 
 
 class AdminBridgeTests(TestCase):
