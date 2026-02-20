@@ -1588,6 +1588,9 @@ def _generate_implementation_plan(
                 build_id = "build.publish_images.container"
                 if isinstance(release_repo_targets, list) and release_repo_targets:
                     build_repo_targets = [target for target in release_repo_targets if isinstance(target, dict)]
+                else:
+                    # Backward-compatible fallback for image-only specs without explicit repoTargets.
+                    build_repo_targets = list(repo_target_map.values())
             if not build_images:
                 raise RuntimeError(
                     "runtime.mode=compose_images requires releaseSpec.components with either build or image entries"
@@ -1596,6 +1599,8 @@ def _generate_implementation_plan(
                 _ensure_repo_target_complete(target, context=f"build repo_target[{index}]")
                 for index, target in enumerate(build_repo_targets)
             ]
+            if not build_repo_targets:
+                raise RuntimeError(f"{build_id} requires non-empty repo_targets")
             work_items.append(
                 {
                     "id": build_id,

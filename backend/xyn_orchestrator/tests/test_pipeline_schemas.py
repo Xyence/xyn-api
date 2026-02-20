@@ -2063,6 +2063,42 @@ class PipelineSchemaTests(TestCase):
         self.assertEqual(repo_by_service.get("web"), "xyn-ui")
         self.assertEqual(repo_by_service.get("api"), "xyn-api")
 
+    def test_planner_defaults_repo_targets_when_omitted_and_image_config_present(self):
+        blueprint = Blueprint.objects.create(
+            name="auto-repo-target-image-only",
+            namespace="core",
+            spec_text=json.dumps(
+                {
+                    "releaseSpec": {
+                        "metadata": {"namespace": "core"},
+                        "components": [
+                            {
+                                "name": "api",
+                                "image": "ghcr.io/example/api:1.2.3",
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
+        release_target = {
+            "runtime": {"type": "docker-compose", "transport": "ssm", "mode": "compose_images"},
+            "dns": {"provider": "route53"},
+            "tls": {"mode": "host-ingress"},
+            "fqdn": "auto-repo-target-image-only.xyence.io",
+            "target_instance_id": str(uuid.uuid4()),
+        }
+        plan = _generate_implementation_plan(
+            blueprint,
+            module_catalog=_build_module_catalog(),
+            run_history_summary=_build_run_history_summary(blueprint, release_target),
+            release_target=release_target,
+        )
+        build_item = next(
+            item for item in plan.get("work_items", []) if item.get("id") == "build.publish_images.container"
+        )
+        self.assertTrue(build_item.get("repo_targets"))
+
     def test_planner_does_not_require_blueprint_metadata_deploy(self):
         blueprint = Blueprint.objects.create(name="ems.platform", namespace="core", metadata_json={})
         target = ReleaseTarget.objects.create(
