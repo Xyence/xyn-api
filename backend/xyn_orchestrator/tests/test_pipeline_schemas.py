@@ -1330,8 +1330,30 @@ class PipelineSchemaTests(TestCase):
         self.assertFalse(any("traefik.http.routers.home-xyence-io.rule" in str(label) for label in traefik_labels))
         self.assertTrue(any("traefik.http.routers.home-xyence-io.rule" in str(label) for label in ui_labels))
         self.assertTrue(any("traefik.http.services.home-xyence-io.loadbalancer.server.port=3000" in str(label) for label in ui_labels))
+        self.assertTrue(
+            any(
+                "traefik.http.routers.home-xyence-io-health.rule=Host(`home.xyence.io`) && (Path(`/health`) || Path(`/api/health`))"
+                in str(label)
+                for label in ui_labels
+            )
+        )
+        self.assertTrue(any("traefik.http.routers.home-xyence-io-health.service=home-xyence-io" in str(label) for label in ui_labels))
 
-    def test_public_verify_rejects_cross_host_redirects(self):
+    def test_public_verify_allows_root_auth_redirect_with_original_return_to(self):
+        class _Resp:
+            def __init__(self):
+                self.status_code = 200
+                self.url = "https://xyence.io/auth/login?appId=xyn-ui&returnTo=https%3A%2F%2Fems-central.xyence.io%2F"
+                self.headers = {"content-type": "text/html"}
+                self.text = "<html>login</html>"
+
+        with mock.patch("xyn_orchestrator.worker_tasks.requests.get", return_value=_Resp()):
+            ok, checks = _public_verify("ems-central.xyence.io")
+        self.assertFalse(ok)
+        root = next((check for check in checks if check.get("name") == "public_root"), {})
+        self.assertTrue(root.get("ok"))
+
+    def test_public_verify_rejects_cross_host_redirects_for_health_checks(self):
         class _Resp:
             def __init__(self):
                 self.status_code = 200
@@ -1343,7 +1365,9 @@ class PipelineSchemaTests(TestCase):
             ok, checks = _public_verify("ems-central.xyence.io")
         self.assertFalse(ok)
         self.assertTrue(checks)
-        self.assertTrue(all(check.get("ok") is False for check in checks))
+        health_checks = [check for check in checks if str(check.get("name", "")).startswith("public_") and check.get("name") != "public_root"]
+        self.assertTrue(health_checks)
+        self.assertTrue(all(check.get("ok") is False for check in health_checks))
 
     def test_core_planner_and_renderer_do_not_hardcode_ems_services(self):
         planner_path = Path(__file__).resolve().parents[1] / "blueprints.py"

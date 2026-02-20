@@ -9,7 +9,7 @@ import tempfile
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunsplit
 
 import boto3
 import requests
@@ -2276,6 +2276,16 @@ def _render_compose_for_release_components(
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.tls.certresolver=le\"\n")
                 compose_lines.append(f"      - \"traefik.http.routers.{rid}.middlewares={middleware_name}@docker\"\n")
                 compose_lines.append(f"      - \"traefik.http.services.{rid}.loadbalancer.server.port={selected_port}\"\n")
+                # Keep liveness endpoints unauthenticated so deploy verification can
+                # validate routing/health before user auth is configured.
+                compose_lines.append(
+                    f"      - \"traefik.http.routers.{rid}-health.rule=Host(`{host}`) && (Path(`/health`) || Path(`/api/health`))\"\n"
+                )
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}-health.entrypoints=websecure\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}-health.tls=true\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}-health.tls.certresolver=le\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}-health.service={rid}\"\n")
+                compose_lines.append(f"      - \"traefik.http.routers.{rid}-health.priority=200\"\n")
                 break
         compose_lines.append("\n")
 
@@ -2706,9 +2716,19 @@ def _public_verify(fqdn: str) -> tuple[bool, List[Dict[str, Any]]]:
                 final_path = (parsed.path or "/").strip() or "/"
                 path_ok = final_path == path
             status_ok = response.status_code in expected
-            check_ok = status_ok and host_ok and path_ok
+            auth_redirect_ok = False
+            if path == "/" and final_host and final_host != expected_host:
+                final_path = (parsed.path or "/").strip() or "/"
+                if final_path == "/auth/login":
+                    return_to = (parse_qs(parsed.query or "").get("returnTo") or [""])[0].strip()
+                    if return_to.startswith(f"https://{expected_host}/") or return_to.startswith(
+                        f"http://{expected_host}/"
+                    ):
+                        auth_redirect_ok = True
+            check_ok = status_ok and ((host_ok and path_ok) or auth_redirect_ok)
             detail["host_ok"] = host_ok
             detail["path_ok"] = path_ok
+            detail["auth_redirect_ok"] = auth_redirect_ok
             checks.append({"name": name, "ok": check_ok, "detail": detail})
             ok = ok and check_ok
         except Exception as exc:
