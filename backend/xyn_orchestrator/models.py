@@ -1711,6 +1711,65 @@ class PlatformConfigDocument(models.Model):
         return f"Platform config v{self.version}"
 
 
+class ModelProvider(models.Model):
+    PROVIDER_CHOICES = [
+        ("openai", "OpenAI"),
+        ("anthropic", "Anthropic"),
+        ("google", "Google"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    slug = models.CharField(max_length=40, choices=PROVIDER_CHOICES, unique=True)
+    name = models.CharField(max_length=120)
+    enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["slug"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class ModelConfig(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    provider = models.ForeignKey(ModelProvider, on_delete=models.PROTECT, related_name="model_configs")
+    model_name = models.CharField(max_length=160)
+    temperature = models.FloatField(default=0.2)
+    max_tokens = models.IntegerField(default=1200)
+    top_p = models.FloatField(default=1.0)
+    frequency_penalty = models.FloatField(default=0.0)
+    presence_penalty = models.FloatField(default=0.0)
+    extra_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["provider__slug", "model_name"]
+
+    def __str__(self) -> str:
+        return f"{self.provider.slug}:{self.model_name}"
+
+
+class AgentPurpose(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    slug = models.SlugField(max_length=80, unique=True)
+    model_config = models.ForeignKey(ModelConfig, null=True, blank=True, on_delete=models.SET_NULL, related_name="purposes")
+    system_prompt_markdown = models.TextField(blank=True)
+    enabled = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="agent_purposes_updated"
+    )
+
+    class Meta:
+        ordering = ["slug"]
+
+    def __str__(self) -> str:
+        return self.slug
+
+
 class Report(models.Model):
     TYPE_CHOICES = [
         ("bug", "Bug"),

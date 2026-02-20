@@ -97,6 +97,9 @@ from .models import (
     DraftActionEvent,
     Deployment,
     AuditLog,
+    ModelProvider,
+    ModelConfig,
+    AgentPurpose,
     PlatformConfigDocument,
     Report,
     ReportAttachment,
@@ -123,6 +126,7 @@ from .storage.registry import StorageProviderRegistry
 from .notifications.registry import NotifierRegistry
 
 PLATFORM_ROLE_IDS = {"platform_admin", "platform_architect", "platform_operator", "app_user"}
+DOC_ARTIFACT_TYPE_SLUG = "doc_page"
 
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
@@ -870,6 +874,101 @@ def _has_platform_role(identity: UserIdentity, roles: List[str]) -> bool:
 
 def _is_platform_architect(identity: UserIdentity) -> bool:
     return _has_platform_role(identity, ["platform_architect", "platform_admin"])
+
+
+def _can_manage_docs(identity: UserIdentity) -> bool:
+    return _has_platform_role(identity, ["platform_architect", "platform_admin"])
+
+
+def _docs_workspace() -> Workspace:
+    workspace = Workspace.objects.filter(slug="platform-builder").first()
+    if workspace:
+        return workspace
+    workspace, _ = Workspace.objects.get_or_create(
+        slug="platform-builder",
+        defaults={"name": "Platform Builder", "description": "Platform governance and operator documentation"},
+    )
+    return workspace
+
+
+def _ensure_doc_artifact_type() -> ArtifactType:
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug=DOC_ARTIFACT_TYPE_SLUG,
+        defaults={
+            "name": "Doc Page",
+            "description": "Route-bound platform documentation",
+            "icon": "FileText",
+            "schema_json": {"fields": ["body_markdown", "tags", "route_bindings"]},
+        },
+    )
+    return artifact_type
+
+
+def _normalize_doc_route_bindings(raw: Any) -> list[str]:
+    values: list[str] = []
+    if not isinstance(raw, list):
+        return values
+    seen: set[str] = set()
+    for entry in raw:
+        route_id = str(entry or "").strip()
+        if not route_id:
+            continue
+        if route_id in seen:
+            continue
+        seen.add(route_id)
+        values.append(route_id)
+    return values
+
+
+def _normalize_doc_tags(raw: Any) -> list[str]:
+    values: list[str] = []
+    if not isinstance(raw, list):
+        return values
+    seen: set[str] = set()
+    for entry in raw:
+        tag = str(entry or "").strip().lower()
+        if not tag:
+            continue
+        if tag in seen:
+            continue
+        seen.add(tag)
+        values.append(tag)
+    return values
+
+
+def _can_view_doc(identity: UserIdentity, artifact: Artifact) -> bool:
+    if _can_manage_docs(identity):
+        return True
+    if artifact.status != "published":
+        return False
+    return artifact.visibility in {"public", "team"}
+
+
+def _serialize_doc_page(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
+    latest = revision or _latest_artifact_revision(artifact)
+    content = dict((latest.content_json if latest else {}) or {})
+    scope = dict(artifact.scope_json or {})
+    return {
+        "id": str(artifact.id),
+        "artifact_id": str(artifact.id),
+        "workspace_id": str(artifact.workspace_id),
+        "type": artifact.type.slug,
+        "title": artifact.title,
+        "slug": _artifact_slug(artifact),
+        "status": artifact.status,
+        "visibility": artifact.visibility,
+        "route_bindings": _normalize_doc_route_bindings(scope.get("route_bindings")),
+        "tags": _normalize_doc_tags(content.get("tags")),
+        "body_markdown": str(content.get("body_markdown") or ""),
+        "summary": str(content.get("summary") or ""),
+        "version": artifact.version,
+        "created_at": artifact.created_at,
+        "updated_at": artifact.updated_at,
+        "published_at": artifact.published_at,
+        "created_by": str(artifact.author_id) if artifact.author_id else None,
+        "updated_by": str(latest.created_by_id) if latest and latest.created_by_id else None,
+        "updated_by_email": latest.created_by.email if latest and latest.created_by else None,
+    }
 
 
 WORKSPACE_ROLE_RANK = {
@@ -3967,6 +4066,352 @@ def workspace_membership_detail(request: HttpRequest, workspace_id: str, members
         membership.termination_authority = bool(payload.get("termination_authority"))
     membership.save(update_fields=["role", "termination_authority", "updated_at"])
     return JsonResponse({"id": str(membership.id)})
+
+
+@csrf_exempt
+def docs_by_route(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    route_id = str(request.GET.get("route_id") or "").strip()
+    if not route_id:
+        return JsonResponse({"error": "route_id is required"}, status=400)
+    _ensure_doc_artifact_type()
+    workspace_id = str(request.GET.get("workspace_id") or "").strip()
+    qs = Artifact.objects.filter(type__slug=DOC_ARTIFACT_TYPE_SLUG).select_related("type", "workspace", "author")
+    if workspace_id:
+        qs = qs.filter(workspace_id=workspace_id)
+    if not _can_manage_docs(identity):
+        qs = qs.filter(status="published", visibility__in=["public", "team"])
+    candidates: list[Artifact] = []
+    for artifact in qs.order_by("-published_at", "-updated_at", "-created_at"):
+        bindings = _normalize_doc_route_bindings((artifact.scope_json or {}).get("route_bindings"))
+        if route_id in bindings:
+            candidates.append(artifact)
+    doc = candidates[0] if candidates else None
+    if not doc:
+        return JsonResponse({"doc": None, "route_id": route_id})
+    return JsonResponse({"doc": _serialize_doc_page(doc), "route_id": route_id})
+
+
+@csrf_exempt
+def docs_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    docs_workspace = _docs_workspace()
+    doc_type = _ensure_doc_artifact_type()
+    if request.method == "POST":
+        if not _can_manage_docs(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return JsonResponse({"error": "title is required"}, status=400)
+        slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=title)
+        if not slug:
+            return JsonResponse({"error": "slug is required"}, status=400)
+        if _artifact_slug_exists(str(docs_workspace.id), slug):
+            return JsonResponse({"error": "slug already exists in docs workspace"}, status=400)
+        visibility = str(payload.get("visibility") or "team").strip().lower()
+        if visibility not in {"private", "team", "public"}:
+            visibility = "team"
+        route_bindings = _normalize_doc_route_bindings(payload.get("route_bindings"))
+        tags = _normalize_doc_tags(payload.get("tags"))
+        summary = str(payload.get("summary") or "")
+        body_markdown = str(payload.get("body_markdown") or "")
+        with transaction.atomic():
+            artifact = Artifact.objects.create(
+                workspace=docs_workspace,
+                type=doc_type,
+                title=title,
+                slug=slug,
+                status="draft",
+                version=1,
+                visibility=visibility,
+                author=identity,
+                custodian=identity,
+                scope_json={"route_bindings": route_bindings, "slug": slug},
+                provenance_json={"source_system": "shine", "source_id": None},
+            )
+            revision = ArtifactRevision.objects.create(
+                artifact=artifact,
+                revision_number=1,
+                content_json={
+                    "title": title,
+                    "summary": summary,
+                    "body_markdown": body_markdown,
+                    "tags": tags,
+                },
+                created_by=identity,
+            )
+            _record_artifact_event(
+                artifact,
+                "doc_created",
+                identity,
+                {"route_bindings": route_bindings, "visibility": visibility},
+            )
+        return JsonResponse({"doc": _serialize_doc_page(artifact, revision)})
+
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    tags_query = str(request.GET.get("tags") or "").strip()
+    tags_filter = {tag.strip().lower() for tag in tags_query.split(",") if tag.strip()} if tags_query else set()
+    include_drafts = request.GET.get("include_drafts") == "1"
+    qs = Artifact.objects.filter(type__slug=DOC_ARTIFACT_TYPE_SLUG).select_related("type", "workspace")
+    if not _can_manage_docs(identity) or not include_drafts:
+        qs = qs.filter(status="published", visibility__in=["public", "team"])
+    docs: list[Dict[str, Any]] = []
+    for artifact in qs.order_by("-published_at", "-updated_at", "-created_at"):
+        serialized = _serialize_doc_page(artifact)
+        doc_tags = set(serialized.get("tags") or [])
+        if tags_filter and not tags_filter.issubset(doc_tags):
+            continue
+        docs.append(serialized)
+    return JsonResponse({"docs": docs})
+
+
+@csrf_exempt
+def doc_detail_by_slug(request: HttpRequest, slug: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), type__slug=DOC_ARTIFACT_TYPE_SLUG, slug=slug)
+    if not _can_view_doc(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    return JsonResponse({"doc": _serialize_doc_page(artifact)})
+
+
+@csrf_exempt
+def doc_detail(request: HttpRequest, doc_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=doc_id, type__slug=DOC_ARTIFACT_TYPE_SLUG)
+    if request.method in {"PUT", "PATCH"}:
+        if not _can_manage_docs(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        latest = _latest_artifact_revision(artifact)
+        content = dict((latest.content_json if latest else {}) or {})
+        if "title" in payload:
+            artifact.title = str(payload.get("title") or artifact.title).strip() or artifact.title
+            content["title"] = artifact.title
+        if "slug" in payload:
+            normalized_slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=artifact.title)
+            if not normalized_slug:
+                return JsonResponse({"error": "slug is required"}, status=400)
+            if _artifact_slug_exists(str(artifact.workspace_id), normalized_slug, exclude_artifact_id=str(artifact.id)):
+                return JsonResponse({"error": "slug already exists in docs workspace"}, status=400)
+            artifact.slug = normalized_slug
+        if "visibility" in payload:
+            visibility = str(payload.get("visibility") or "").strip().lower()
+            if visibility not in {"private", "team", "public"}:
+                return JsonResponse({"error": "invalid visibility"}, status=400)
+            artifact.visibility = visibility
+        if "summary" in payload:
+            content["summary"] = str(payload.get("summary") or "")
+        if "body_markdown" in payload:
+            content["body_markdown"] = str(payload.get("body_markdown") or "")
+        if "tags" in payload:
+            content["tags"] = _normalize_doc_tags(payload.get("tags"))
+        scope = dict(artifact.scope_json or {})
+        if "route_bindings" in payload:
+            scope["route_bindings"] = _normalize_doc_route_bindings(payload.get("route_bindings"))
+        if artifact.slug:
+            scope["slug"] = artifact.slug
+        artifact.scope_json = scope
+        artifact.version = _next_artifact_revision_number(artifact)
+        artifact.save(update_fields=["title", "slug", "visibility", "scope_json", "version", "updated_at"])
+        revision = ArtifactRevision.objects.create(
+            artifact=artifact,
+            revision_number=artifact.version,
+            content_json=content,
+            created_by=identity,
+        )
+        _record_artifact_event(artifact, "doc_updated", identity, {"version": artifact.version})
+        return JsonResponse({"doc": _serialize_doc_page(artifact, revision)})
+
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _can_view_doc(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    return JsonResponse({"doc": _serialize_doc_page(artifact)})
+
+
+@csrf_exempt
+def doc_publish(request: HttpRequest, doc_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_docs(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    artifact = get_object_or_404(Artifact, id=doc_id, type__slug=DOC_ARTIFACT_TYPE_SLUG)
+    artifact.status = "published"
+    if artifact.visibility == "private":
+        artifact.visibility = "team"
+    artifact.published_at = timezone.now()
+    artifact.ratified_by = identity
+    artifact.ratified_at = timezone.now()
+    artifact.save(update_fields=["status", "visibility", "published_at", "ratified_by", "ratified_at", "updated_at"])
+    _record_artifact_event(artifact, "doc_published", identity, {"status": "published"})
+    return JsonResponse({"doc": _serialize_doc_page(artifact)})
+
+
+def _default_tour_payload(slug: str) -> Dict[str, Any]:
+    if slug != "deploy-subscriber-notes":
+        return {"error": "tour not found"}
+    return {
+        "slug": "deploy-subscriber-notes",
+        "title": "Deploy Subscriber Notes",
+        "description": "Golden path: blueprint to running deployment with logs.",
+        "steps": [
+            {"id": "blueprint-open", "route": "/app/blueprints", "selector": "[data-tour='blueprints-list']", "text": "Go to Blueprints and open the Subscriber Notes blueprint."},
+            {"id": "draft-generate", "route": "/app/drafts", "selector": "[data-tour='draft-generate']", "text": "Generate a draft from the blueprint."},
+            {"id": "release-plan", "route": "/app/release-plans", "selector": "[data-tour='release-plan-create']", "text": "Create a release plan for the generated draft."},
+            {"id": "instance-select", "route": "/app/instances", "selector": "[data-tour='instance-select']", "text": "Select the target instance xyn-seed-dev-1."},
+            {"id": "deploy-plan", "route": "/app/release-plans", "selector": "[data-tour='release-plan-deploy']", "text": "Deploy the release plan."},
+            {"id": "observe", "route": "/app/runs", "selector": "[data-tour='run-artifacts']", "text": "Open execution logs and artifacts to verify deployment."},
+        ],
+    }
+
+
+@csrf_exempt
+def tour_detail(request: HttpRequest, tour_slug: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _default_tour_payload(tour_slug)
+    if payload.get("error"):
+        return JsonResponse(payload, status=404)
+    return JsonResponse(payload)
+
+
+def _ensure_default_agent_purposes() -> None:
+    openai_provider, _ = ModelProvider.objects.get_or_create(slug="openai", defaults={"name": "OpenAI", "enabled": True})
+    anthropic_provider, _ = ModelProvider.objects.get_or_create(slug="anthropic", defaults={"name": "Anthropic", "enabled": True})
+    google_provider, _ = ModelProvider.objects.get_or_create(slug="google", defaults={"name": "Google", "enabled": False})
+    provider_slug = str(os.environ.get("XYN_DEFAULT_MODEL_PROVIDER") or "openai").strip().lower()
+    provider = {"openai": openai_provider, "anthropic": anthropic_provider, "google": google_provider}.get(provider_slug, openai_provider)
+    default_model = str(os.environ.get("XYN_DEFAULT_MODEL_NAME") or "gpt-4o-mini").strip()
+    config, _ = ModelConfig.objects.get_or_create(
+        provider=provider,
+        model_name=default_model,
+        defaults={
+            "temperature": float(os.environ.get("XYN_DEFAULT_MODEL_TEMPERATURE") or 0.2),
+            "max_tokens": int(os.environ.get("XYN_DEFAULT_MODEL_MAX_TOKENS") or 1200),
+        },
+    )
+    AgentPurpose.objects.get_or_create(
+        slug="coding",
+        defaults={
+            "model_config": config,
+            "system_prompt_markdown": "You are the coding assistant for Xyn.",
+            "enabled": True,
+        },
+    )
+    AgentPurpose.objects.get_or_create(
+        slug="documentation",
+        defaults={
+            "model_config": config,
+            "system_prompt_markdown": "You are the documentation assistant for Xyn.",
+            "enabled": True,
+        },
+    )
+
+
+def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:
+    model = purpose.model_config
+    provider = model.provider if model else None
+    return {
+        "slug": purpose.slug,
+        "enabled": purpose.enabled,
+        "system_prompt_markdown": purpose.system_prompt_markdown,
+        "updated_at": purpose.updated_at,
+        "model_config": (
+            {
+                "id": str(model.id),
+                "provider": provider.slug if provider else None,
+                "model_name": model.model_name,
+                "temperature": model.temperature,
+                "max_tokens": model.max_tokens,
+                "top_p": model.top_p,
+                "frequency_penalty": model.frequency_penalty,
+                "presence_penalty": model.presence_penalty,
+                "extra_json": model.extra_json or {},
+            }
+            if model
+            else None
+        ),
+    }
+
+
+@csrf_exempt
+def ai_purposes_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    _ensure_default_agent_purposes()
+    purposes = AgentPurpose.objects.select_related("model_config__provider").order_by("slug")
+    return JsonResponse({"purposes": [_serialize_agent_purpose(item) for item in purposes]})
+
+
+@csrf_exempt
+def ai_purpose_detail(request: HttpRequest, purpose_slug: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    _ensure_default_agent_purposes()
+    purpose = get_object_or_404(AgentPurpose.objects.select_related("model_config__provider"), slug=purpose_slug)
+    if request.method == "GET":
+        return JsonResponse({"purpose": _serialize_agent_purpose(purpose)})
+    if request.method not in {"PUT", "PATCH"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    if "enabled" in payload:
+        purpose.enabled = bool(payload.get("enabled"))
+    if "system_prompt_markdown" in payload:
+        purpose.system_prompt_markdown = str(payload.get("system_prompt_markdown") or "")
+    model_payload = payload.get("model_config")
+    if isinstance(model_payload, dict):
+        provider_slug = str(model_payload.get("provider") or "").strip().lower()
+        model_name = str(model_payload.get("model_name") or "").strip()
+        provider = None
+        if provider_slug:
+            provider = ModelProvider.objects.filter(slug=provider_slug).first()
+            if not provider:
+                return JsonResponse({"error": "invalid provider"}, status=400)
+        if model_name:
+            if not provider:
+                provider = purpose.model_config.provider if purpose.model_config else ModelProvider.objects.filter(slug="openai").first()
+            if not provider:
+                return JsonResponse({"error": "model provider unavailable"}, status=400)
+            model_config = purpose.model_config
+            if model_config and model_config.provider_id == provider.id and model_config.model_name == model_name:
+                pass
+            else:
+                model_config = ModelConfig.objects.create(
+                    provider=provider,
+                    model_name=model_name,
+                    temperature=float(model_payload.get("temperature") if model_payload.get("temperature") is not None else 0.2),
+                    max_tokens=int(model_payload.get("max_tokens") or 1200),
+                    top_p=float(model_payload.get("top_p") if model_payload.get("top_p") is not None else 1.0),
+                    frequency_penalty=float(model_payload.get("frequency_penalty") if model_payload.get("frequency_penalty") is not None else 0.0),
+                    presence_penalty=float(model_payload.get("presence_penalty") if model_payload.get("presence_penalty") is not None else 0.0),
+                    extra_json=model_payload.get("extra_json") if isinstance(model_payload.get("extra_json"), dict) else {},
+                )
+            purpose.model_config = model_config
+    purpose.updated_by = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
+    purpose.save(update_fields=["enabled", "system_prompt_markdown", "model_config", "updated_by", "updated_at"])
+    return JsonResponse({"purpose": _serialize_agent_purpose(purpose)})
 
 
 @csrf_exempt
