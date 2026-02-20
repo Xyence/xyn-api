@@ -160,6 +160,8 @@ def _normalize_generated_blueprint(spec: Optional[Dict[str, Any]]) -> Dict[str, 
                                     normalized_port["hostPort"] = int(host_port)
                             except (TypeError, ValueError):
                                 normalized_port.pop("hostPort", None)
+                            if isinstance(normalized_port.get("hostPort"), int) and normalized_port["hostPort"] <= 0:
+                                normalized_port.pop("hostPort", None)
                             protocol = str(normalized_port.get("protocol") or "").strip().lower()
                             if protocol in {"tcp", "udp"}:
                                 normalized_port["protocol"] = protocol

@@ -142,3 +142,19 @@ class DraftRevisionStabilityTests(TestCase):
                 {"containerPort": 8080},
             ],
         )
+
+    def test_normalize_generated_blueprint_drops_non_positive_host_port(self):
+        draft = _baseline_draft()
+        draft["releaseSpec"]["components"][0]["ports"] = [{"hostPort": 0, "containerPort": 8080}]
+
+        normalized = services._normalize_generated_blueprint(draft)
+        ports = normalized["releaseSpec"]["components"][0]["ports"]
+        self.assertEqual(ports, [{"containerPort": 8080}])
+
+    def test_worker_normalize_generated_blueprint_drops_non_positive_host_port(self):
+        draft = _baseline_draft()
+        draft["releaseSpec"]["components"][0]["ports"] = [{"hostPort": 0, "containerPort": 8080}]
+
+        normalized = worker_tasks._normalize_generated_blueprint(draft)
+        ports = normalized["releaseSpec"]["components"][0]["ports"]
+        self.assertEqual(ports, [{"containerPort": 8080}])
