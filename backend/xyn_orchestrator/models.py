@@ -1778,15 +1778,18 @@ class AgentPurpose(models.Model):
 
 class ProviderCredential(models.Model):
     AUTH_TYPE_CHOICES = [
-        ("api_key_encrypted", "Encrypted API key"),
+        ("api_key", "API key"),
         ("env_ref", "Environment variable"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     provider = models.ForeignKey(ModelProvider, on_delete=models.PROTECT, related_name="credentials")
     name = models.CharField(max_length=160)
-    auth_type = models.CharField(max_length=40, choices=AUTH_TYPE_CHOICES, default="env_ref")
+    auth_type = models.CharField(max_length=40, choices=AUTH_TYPE_CHOICES, default="api_key")
     api_key_encrypted = models.TextField(blank=True, null=True)
+    secret_ref = models.ForeignKey(
+        "SecretRef", null=True, blank=True, on_delete=models.SET_NULL, related_name="provider_credentials"
+    )
     env_var_name = models.CharField(max_length=160, blank=True)
     is_default = models.BooleanField(default=False)
     enabled = models.BooleanField(default=True)

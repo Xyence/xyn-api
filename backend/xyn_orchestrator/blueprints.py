@@ -5010,10 +5010,11 @@ def internal_ai_config(request: HttpRequest) -> JsonResponse:
         return token_error
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
-    from .ai_runtime import AiConfigError, resolve_ai_config
+    from .ai_runtime import AiConfigError, ensure_default_ai_seeds, resolve_ai_config
 
     purpose = str(request.GET.get("purpose") or "coding").strip().lower()
     try:
+        ensure_default_ai_seeds()
         config = resolve_ai_config(purpose_slug=purpose)
     except AiConfigError as exc:
         return JsonResponse({"error": str(exc)}, status=404)

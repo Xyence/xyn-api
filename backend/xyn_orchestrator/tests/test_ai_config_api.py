@@ -58,7 +58,7 @@ class AiConfigApiTests(TestCase):
                 {
                     "provider": "openai",
                     "name": "openai-primary",
-                    "auth_type": "api_key_encrypted",
+                    "auth_type": "api_key",
                     "api_key": "sk-live-abcdefghijklmn1234",
                     "is_default": True,
                 }

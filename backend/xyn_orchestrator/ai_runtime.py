@@ -11,8 +11,13 @@ from .models import (
     AgentDefinition,
     AgentPurpose,
     ModelProvider,
+    OpenAIConfig,
     ProviderCredential,
+    SecretRef,
+    SecretStore,
 )
+from .oidc import resolve_secret_ref
+from .secret_stores import normalize_secret_logical_name, write_secret_value
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +86,12 @@ def _credential_api_key(credential: Optional[ProviderCredential], provider_slug:
         return ""
     if not credential.enabled:
         return ""
-    if credential.auth_type == "api_key_encrypted":
+    if credential.auth_type == "api_key":
+        if credential.secret_ref_id:
+            ref = SecretRef.objects.select_related("store").filter(id=credential.secret_ref_id).first()
+            if ref and ref.external_ref:
+                resolved = resolve_secret_ref({"type": "aws.secrets_manager", "ref": ref.external_ref})
+                return str(resolved or "").strip()
         return decrypt_api_key(str(credential.api_key_encrypted or ""))
     env_var = str(credential.env_var_name or "").strip()
     if not env_var:
@@ -304,6 +314,87 @@ def ensure_default_ai_seeds() -> None:
     provider_slug = str(os.environ.get("XYN_DEFAULT_MODEL_PROVIDER") or "openai").strip().lower()
     model_name = str(os.environ.get("XYN_DEFAULT_MODEL_NAME") or "gpt-4o-mini").strip()
     provider = provider_map.get(provider_slug) or provider_map.get("openai")
+
+    def _seed_bootstrap_credential(slug: str, provider_obj: Optional[ModelProvider]) -> Optional[ProviderCredential]:
+        if not provider_obj:
+            return None
+        existing_default = (
+            ProviderCredential.objects.filter(provider=provider_obj, is_default=True, enabled=True).order_by("-created_at").first()
+        )
+        if existing_default:
+            return existing_default
+        env_value = _read_provider_env_key(slug)
+        if not env_value and slug == "openai":
+            legacy = OpenAIConfig.objects.first()
+            env_value = str(legacy.api_key if legacy else "").strip()
+        if not env_value:
+            return None
+        name = "codex-bootstrap"
+        existing_named = ProviderCredential.objects.filter(provider=provider_obj, name=name).first()
+        if existing_named:
+            if not existing_named.is_default:
+                existing_named.is_default = True
+                existing_named.enabled = True
+                existing_named.save(update_fields=["is_default", "enabled", "updated_at"])
+            return existing_named
+        store = SecretStore.objects.filter(is_default=True).first()
+        if not store:
+            return ProviderCredential.objects.create(
+                provider=provider_obj,
+                name=name,
+                auth_type="env_ref",
+                env_var_name=PROVIDER_ENV_API_KEY.get(slug, [""])[0] or "",
+                is_default=True,
+                enabled=True,
+            )
+        logical = normalize_secret_logical_name(f"ai/{slug}/{name}/api_key")
+        secret_ref = SecretRef.objects.filter(scope_kind="platform", scope_id__isnull=True, name=logical).first()
+        if not secret_ref:
+            secret_ref = SecretRef.objects.create(
+                name=logical,
+                scope_kind="platform",
+                scope_id=None,
+                store=store,
+                external_ref="pending",
+                type="secrets_manager",
+                description=f"{slug} bootstrap AI API key",
+            )
+        try:
+            external_ref, metadata = write_secret_value(
+                store,
+                logical_name=logical,
+                scope_kind="platform",
+                scope_id=None,
+                scope_path_id=None,
+                secret_ref_id=str(secret_ref.id),
+                value=env_value,
+                description=f"{slug} bootstrap AI API key",
+            )
+            secret_ref.external_ref = external_ref
+            secret_ref.metadata_json = {**(secret_ref.metadata_json or {}), **metadata}
+            secret_ref.save(update_fields=["external_ref", "metadata_json", "updated_at"])
+            return ProviderCredential.objects.create(
+                provider=provider_obj,
+                name=name,
+                auth_type="api_key",
+                secret_ref=secret_ref,
+                is_default=True,
+                enabled=True,
+            )
+        except Exception:
+            # Fall back to env_ref if store exists but isn't writable in this environment.
+            return ProviderCredential.objects.create(
+                provider=provider_obj,
+                name=name,
+                auth_type="env_ref",
+                env_var_name=PROVIDER_ENV_API_KEY.get(slug, [""])[0] or "",
+                is_default=True,
+                enabled=True,
+            )
+
+    _seed_bootstrap_credential("openai", provider_map.get("openai"))
+    _seed_bootstrap_credential("anthropic", provider_map.get("anthropic"))
+    _seed_bootstrap_credential("google", provider_map.get("google"))
 
     default_model = None
     if provider:

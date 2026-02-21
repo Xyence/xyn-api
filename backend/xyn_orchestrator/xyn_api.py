@@ -4508,11 +4508,16 @@ def _serialize_model_provider(provider: ModelProvider) -> Dict[str, Any]:
 
 def _serialize_credential(credential: ProviderCredential) -> Dict[str, Any]:
     resolved_secret = ""
-    if credential.auth_type == "api_key_encrypted":
-        try:
-            resolved_secret = decrypt_api_key(str(credential.api_key_encrypted or ""))
-        except Exception:
-            resolved_secret = ""
+    if credential.auth_type == "api_key":
+        if credential.secret_ref and credential.secret_ref.external_ref:
+            resolved_secret = str(
+                resolve_oidc_secret_ref({"type": "aws.secrets_manager", "ref": credential.secret_ref.external_ref}) or ""
+            )
+        elif credential.api_key_encrypted:
+            try:
+                resolved_secret = decrypt_api_key(str(credential.api_key_encrypted or ""))
+            except Exception:
+                resolved_secret = ""
     elif credential.auth_type == "env_ref":
         env_name = str(credential.env_var_name or "").strip()
         resolved_secret = str(os.environ.get(env_name) or "") if env_name else ""
@@ -4523,6 +4528,7 @@ def _serialize_credential(credential: ProviderCredential) -> Dict[str, Any]:
         "provider_id": str(credential.provider_id),
         "name": credential.name,
         "auth_type": credential.auth_type,
+        "secret_ref_id": str(credential.secret_ref_id) if credential.secret_ref_id else None,
         "env_var_name": credential.env_var_name or "",
         "is_default": credential.is_default,
         "enabled": credential.enabled,
@@ -4602,25 +4608,45 @@ def ai_credentials_collection(request: HttpRequest) -> JsonResponse:
     payload = _parse_json(request)
     provider_slug = str(payload.get("provider") or "").strip().lower()
     name = str(payload.get("name") or "").strip()
-    auth_type = str(payload.get("auth_type") or "env_ref").strip()
+    auth_type = str(payload.get("auth_type") or "api_key").strip()
+    if auth_type == "api_key_encrypted":
+        auth_type = "api_key"
     if not provider_slug or not name:
         return JsonResponse({"error": "provider and name are required"}, status=400)
     provider = ModelProvider.objects.filter(slug=provider_slug).first()
     if not provider:
         return JsonResponse({"error": "invalid provider"}, status=400)
-    if auth_type not in {"api_key_encrypted", "env_ref"}:
+    if auth_type not in {"api_key", "env_ref"}:
         return JsonResponse({"error": "invalid auth_type"}, status=400)
 
     api_key_encrypted = None
     env_var_name = ""
-    if auth_type == "api_key_encrypted":
+    secret_ref = None
+    if auth_type == "api_key":
         raw_key = str(payload.get("api_key") or "").strip()
         if not raw_key:
-            return JsonResponse({"error": "api_key is required for api_key_encrypted"}, status=400)
-        try:
-            api_key_encrypted = encrypt_api_key(raw_key)
-        except AiConfigError as exc:
-            return JsonResponse({"error": str(exc)}, status=400)
+            return JsonResponse({"error": "api_key is required for api_key"}, status=400)
+        store = _resolve_secret_store(str(payload.get("store_id") or "").strip() or None)
+        if store:
+            logical_name = normalize_secret_logical_name(f"ai/{provider_slug}/{name}/api_key")
+            try:
+                secret_ref = _create_or_update_secret_ref(
+                    identity=identity,
+                    user=getattr(request, "user", None),
+                    name=logical_name,
+                    scope_kind="platform",
+                    scope_id=None,
+                    store=store,
+                    value=raw_key,
+                    description=f"{provider_slug} AI credential: {name}",
+                )
+            except (SecretStoreError, PermissionError) as exc:
+                return JsonResponse({"error": str(exc)}, status=400)
+        else:
+            try:
+                api_key_encrypted = encrypt_api_key(raw_key)
+            except AiConfigError as exc:
+                return JsonResponse({"error": str(exc)}, status=400)
     else:
         env_var_name = str(payload.get("env_var_name") or "").strip()
         if not env_var_name:
@@ -4631,6 +4657,7 @@ def ai_credentials_collection(request: HttpRequest) -> JsonResponse:
         name=name,
         auth_type=auth_type,
         api_key_encrypted=api_key_encrypted,
+        secret_ref=secret_ref,
         env_var_name=env_var_name,
         enabled=bool(payload.get("enabled", True)),
         is_default=bool(payload.get("is_default", False)),
@@ -4664,23 +4691,52 @@ def ai_credential_detail(request: HttpRequest, credential_id: str) -> JsonRespon
         credential.is_default = bool(payload.get("is_default"))
     if "auth_type" in payload:
         auth_type = str(payload.get("auth_type") or "").strip()
-        if auth_type not in {"api_key_encrypted", "env_ref"}:
+        if auth_type == "api_key_encrypted":
+            auth_type = "api_key"
+        if auth_type not in {"api_key", "env_ref"}:
             return JsonResponse({"error": "invalid auth_type"}, status=400)
         credential.auth_type = auth_type
-    if credential.auth_type == "api_key_encrypted" and "api_key" in payload:
+    if credential.auth_type == "api_key" and "api_key" in payload:
         raw_key = str(payload.get("api_key") or "").strip()
         if raw_key:
-            try:
-                credential.api_key_encrypted = encrypt_api_key(raw_key)
-            except AiConfigError as exc:
-                return JsonResponse({"error": str(exc)}, status=400)
+            store = _resolve_secret_store(str(payload.get("store_id") or "").strip() or None)
+            if store:
+                logical_name = normalize_secret_logical_name(
+                    f"ai/{credential.provider.slug}/{credential.name or str(credential.id)}/api_key"
+                )
+                try:
+                    secret_ref = _create_or_update_secret_ref(
+                        identity=identity,
+                        user=getattr(request, "user", None),
+                        name=logical_name,
+                        scope_kind="platform",
+                        scope_id=None,
+                        store=store,
+                        value=raw_key,
+                        description=f"{credential.provider.slug} AI credential: {credential.name}",
+                        existing_ref=credential.secret_ref,
+                    )
+                except (SecretStoreError, PermissionError) as exc:
+                    return JsonResponse({"error": str(exc)}, status=400)
+                credential.secret_ref = secret_ref
+                credential.api_key_encrypted = None
+            else:
+                try:
+                    credential.api_key_encrypted = encrypt_api_key(raw_key)
+                except AiConfigError as exc:
+                    return JsonResponse({"error": str(exc)}, status=400)
     if credential.auth_type == "env_ref" and "env_var_name" in payload:
         credential.env_var_name = str(payload.get("env_var_name") or "").strip()
+    if credential.auth_type == "env_ref":
+        credential.secret_ref = None
+        if "env_var_name" not in payload and not credential.env_var_name:
+            credential.env_var_name = ""
     credential.save(
         update_fields=[
             "name",
             "auth_type",
             "api_key_encrypted",
+            "secret_ref",
             "env_var_name",
             "enabled",
             "is_default",
