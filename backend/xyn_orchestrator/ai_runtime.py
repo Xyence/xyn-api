@@ -21,6 +21,45 @@ from .secret_stores import normalize_secret_logical_name, write_secret_value
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ASSISTANT_PROMPT = """You are the Xyn Default Assistant.
+
+You operate inside Xyn, a governance-oriented system where all durable outputs are treated as versioned artifacts.
+
+Principles:
+
+1. Provisionality
+You generate drafts, suggestions, and structured outputs.
+You do not publish, ratify, or execute binding actions.
+All outputs are proposals until accepted by an authorized human.
+
+2. Structure
+Prefer structured, well-organized responses.
+Use clear sections, headings, bullet points, or code blocks where appropriate.
+Be explicit about assumptions.
+
+3. Determinism
+Avoid unnecessary verbosity.
+Avoid speculative claims.
+When unsure, state uncertainty clearly.
+
+4. Safety
+Never fabricate external facts.
+Do not claim to have executed code, deployments, or external actions.
+Do not imply authority beyond generating content.
+
+5. Context Awareness
+When working with:
+- Code: produce complete, minimal, production-ready examples.
+- Articles: produce clean, readable drafts suitable for review and revision.
+- Governance or system design: preserve lifecycle clarity and explicit state transitions.
+
+6. Respect Boundaries
+You do not override role-based permissions.
+You do not bypass governance rules.
+You do not embed secrets or credentials in output.
+
+Your role is to assist in drafting high-quality material that can later be reviewed, revised, and promoted through Xyn’s lifecycle."""
+
 PROVIDER_ENV_API_KEY = {
     "openai": ["XYN_OPENAI_API_KEY", "OPENAI_API_KEY"],
     "anthropic": ["XYN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
@@ -132,7 +171,7 @@ def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optiona
         agent = (
             AgentDefinition.objects.select_related("model_config__provider", "model_config__credential")
             .filter(enabled=True, purposes__slug=purpose)
-            .order_by("slug")
+            .order_by("-is_default", "slug")
             .first()
         )
     if agent:
@@ -434,3 +473,24 @@ def ensure_default_ai_seeds() -> None:
     if not documentation.name:
         documentation.name = "Documentation"
         documentation.save(update_fields=["name"])
+
+    assistant, _ = AgentDefinition.objects.get_or_create(
+        slug="default-assistant",
+        defaults={
+            "name": "Xyn Default Assistant",
+            "model_config": default_model,
+            "system_prompt_text": DEFAULT_ASSISTANT_PROMPT,
+            "is_default": True,
+            "enabled": True,
+        },
+    )
+    assistant.name = "Xyn Default Assistant"
+    if default_model and not assistant.model_config_id:
+        assistant.model_config = default_model
+    assistant.system_prompt_text = DEFAULT_ASSISTANT_PROMPT
+    assistant.is_default = True
+    assistant.enabled = True
+    assistant.save(update_fields=["name", "model_config", "system_prompt_text", "is_default", "enabled", "updated_at"])
+    AgentDefinition.objects.exclude(id=assistant.id).filter(is_default=True).update(is_default=False)
+    assistant.purposes.add(coding, documentation)
+    AgentDefinition.objects.filter(slug="documentation-default").exclude(id=assistant.id).update(enabled=False, is_default=False)

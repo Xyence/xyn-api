@@ -111,7 +111,8 @@ class AiConfigApiTests(TestCase):
 
         coding_agents = self.client.get("/xyn/api/ai/agents?purpose=coding")
         self.assertEqual(coding_agents.status_code, 200)
-        self.assertEqual(len(coding_agents.json()["agents"]), 0)
+        coding_slugs = [item["slug"] for item in coding_agents.json()["agents"]]
+        self.assertIn("default-assistant", coding_slugs)
 
     @patch("xyn_orchestrator.xyn_api.invoke_model")
     def test_ai_invoke_uses_agent_and_returns_content(self, invoke_mock):

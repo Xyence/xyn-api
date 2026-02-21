@@ -1810,6 +1810,7 @@ class AgentDefinition(models.Model):
     model_config = models.ForeignKey(ModelConfig, on_delete=models.PROTECT, related_name="agent_definitions")
     system_prompt_text = models.TextField(blank=True)
     context_pack_refs_json = models.JSONField(default=list, blank=True)
+    is_default = models.BooleanField(default=False)
     enabled = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

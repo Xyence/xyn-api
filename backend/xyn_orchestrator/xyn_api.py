@@ -4571,6 +4571,7 @@ def _serialize_agent_definition(agent: AgentDefinition) -> Dict[str, Any]:
         "model_config": _serialize_model_config(agent.model_config),
         "system_prompt_text": agent.system_prompt_text or "",
         "context_pack_refs_json": agent.context_pack_refs_json or [],
+        "is_default": bool(agent.is_default),
         "enabled": agent.enabled,
         "purposes": purpose_slugs,
         "created_at": agent.created_at,
@@ -4891,8 +4892,11 @@ def ai_agents_collection(request: HttpRequest) -> JsonResponse:
         model_config=model_config,
         system_prompt_text=str(payload.get("system_prompt_text") or ""),
         context_pack_refs_json=payload.get("context_pack_refs_json") if isinstance(payload.get("context_pack_refs_json"), list) else [],
+        is_default=bool(payload.get("is_default", False)),
         enabled=bool(payload.get("enabled", True)),
     )
+    if agent.is_default:
+        AgentDefinition.objects.exclude(id=agent.id).update(is_default=False)
     purpose_slugs = payload.get("purposes") if isinstance(payload.get("purposes"), list) else []
     purposes = list(AgentPurpose.objects.filter(slug__in=purpose_slugs))
     for purpose in purposes:
@@ -4938,6 +4942,8 @@ def ai_agent_detail(request: HttpRequest, agent_id: str) -> JsonResponse:
         agent.context_pack_refs_json = payload.get("context_pack_refs_json")
     if "enabled" in payload:
         agent.enabled = bool(payload.get("enabled"))
+    if "is_default" in payload:
+        agent.is_default = bool(payload.get("is_default"))
     agent.save(
         update_fields=[
             "slug",
@@ -4945,10 +4951,13 @@ def ai_agent_detail(request: HttpRequest, agent_id: str) -> JsonResponse:
             "model_config",
             "system_prompt_text",
             "context_pack_refs_json",
+            "is_default",
             "enabled",
             "updated_at",
         ]
     )
+    if agent.is_default:
+        AgentDefinition.objects.exclude(id=agent.id).update(is_default=False)
     if "purposes" in payload and isinstance(payload.get("purposes"), list):
         desired = list(AgentPurpose.objects.filter(slug__in=payload.get("purposes")))
         AgentDefinitionPurpose.objects.filter(agent_definition=agent).exclude(purpose__in=desired).delete()
