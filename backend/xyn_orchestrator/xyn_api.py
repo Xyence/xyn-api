@@ -4833,8 +4833,15 @@ def ai_model_config_detail(request: HttpRequest, model_config_id: str) -> JsonRe
     if request.method == "GET":
         return JsonResponse({"model_config": _serialize_model_config(config)})
     if request.method == "DELETE":
-        config.delete()
-        return JsonResponse({}, status=204)
+        config.enabled = False
+        config.save(update_fields=["enabled", "updated_at"])
+        return JsonResponse(
+            {
+                "model_config": _serialize_model_config(config),
+                "status": "deprecated",
+                "message": "Model config deprecated (disabled).",
+            }
+        )
     if request.method != "PATCH":
         return JsonResponse({"error": "method not allowed"}, status=405)
     payload = _parse_json(request)

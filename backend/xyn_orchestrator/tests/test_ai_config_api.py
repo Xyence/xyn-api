@@ -226,3 +226,20 @@ class AiConfigApiTests(TestCase):
         warned_params = {item["param"] for item in payload.get("warnings") or []}
         self.assertIn("temperature", warned_params)
         self.assertNotIn("temperature", payload.get("effective_params") or {})
+
+    def test_delete_model_config_deprecates_instead_of_hard_delete(self):
+        self._set_identity(self.admin_identity)
+        provider = self._ensure_provider()
+        config = ModelConfig.objects.create(
+            provider=provider,
+            model_name="gpt-5",
+            temperature=0.2,
+            max_tokens=500,
+            enabled=True,
+        )
+        response = self.client.delete(f"/xyn/api/ai/model-configs/{config.id}")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload.get("status"), "deprecated")
+        config.refresh_from_db()
+        self.assertFalse(config.enabled)
