@@ -100,6 +100,7 @@ class DocsApiTests(TestCase):
         purposes = list_response.json()["purposes"]
         self.assertTrue(any(item["slug"] == "documentation" for item in purposes))
         self.assertIn("preamble", purposes[0])
+        self.assertIn("status", purposes[0])
         self.assertNotIn("system_prompt_markdown", purposes[0])
 
         update_forbidden = self.client.put(
@@ -116,8 +117,8 @@ class DocsApiTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(update_ok.status_code, 200)
-        self.assertFalse(update_ok.json()["purpose"]["enabled"])
-        self.assertFalse(AgentPurpose.objects.get(slug="documentation").enabled)
+        self.assertEqual(update_ok.json()["purpose"]["status"], "deprecated")
+        self.assertEqual(AgentPurpose.objects.get(slug="documentation").status, "deprecated")
 
         update_preamble = self.client.patch(
             "/xyn/api/ai/purposes/documentation",
@@ -153,7 +154,7 @@ class DocsApiTests(TestCase):
                 {
                     "slug": "analysis",
                     "name": "Analysis",
-                    "enabled": True,
+                    "status": "active",
                     "preamble": "Analyze data and summarize outcomes.",
                 }
             ),
@@ -161,21 +162,23 @@ class DocsApiTests(TestCase):
         )
         self.assertEqual(create.status_code, 200)
         self.assertEqual(create.json()["purpose"]["slug"], "analysis")
+        self.assertEqual(create.json()["purpose"]["status"], "active")
         self.assertEqual(create.json()["purpose"]["referenced_by"]["agents"], 0)
 
         update = self.client.patch(
             "/xyn/api/ai/purposes/analysis",
-            data=json.dumps({"enabled": False, "slug": "analysis"}),
+            data=json.dumps({"status": "deprecated", "slug": "analysis"}),
             content_type="application/json",
         )
         self.assertEqual(update.status_code, 200)
-        self.assertFalse(update.json()["purpose"]["enabled"])
+        self.assertEqual(update.json()["purpose"]["status"], "deprecated")
 
         delete = self.client.delete("/xyn/api/ai/purposes/analysis")
-        self.assertEqual(delete.status_code, 204)
-        self.assertFalse(AgentPurpose.objects.filter(slug="analysis").exists())
+        self.assertEqual(delete.status_code, 200)
+        self.assertTrue(AgentPurpose.objects.filter(slug="analysis").exists())
+        self.assertEqual(AgentPurpose.objects.get(slug="analysis").status, "deprecated")
 
-    def test_delete_referenced_purpose_returns_conflict(self):
+    def test_delete_referenced_purpose_marks_deprecated(self):
         self._set_identity(self.admin_identity)
         provider, _ = ModelProvider.objects.get_or_create(slug="openai", defaults={"name": "OpenAI", "enabled": True})
         config = ModelConfig.objects.create(provider=provider, model_name="gpt-4o-mini")
@@ -190,10 +193,9 @@ class DocsApiTests(TestCase):
         AgentDefinitionPurpose.objects.create(agent_definition=agent, purpose=purpose)
 
         response = self.client.delete("/xyn/api/ai/purposes/documentation")
-        self.assertEqual(response.status_code, 409)
-        payload = response.json()
-        self.assertEqual(payload["error"], "purpose_in_use")
-        self.assertEqual(payload["referenced_by"]["agents"], 1)
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["purpose"]
+        self.assertEqual(payload["status"], "deprecated")
         self.assertTrue(AgentPurpose.objects.filter(slug="documentation").exists())
 
     def test_disabling_referenced_purpose_keeps_agent_association(self):
@@ -216,7 +218,7 @@ class DocsApiTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)
-        self.assertFalse(AgentPurpose.objects.get(slug="documentation").enabled)
+        self.assertEqual(AgentPurpose.objects.get(slug="documentation").status, "deprecated")
         self.assertTrue(
             AgentDefinitionPurpose.objects.filter(agent_definition=agent, purpose__slug="documentation").exists()
         )

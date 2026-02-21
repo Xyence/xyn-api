@@ -4474,7 +4474,8 @@ def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:
         "slug": purpose.slug,
         "name": purpose.name or purpose.slug.replace("-", " ").title(),
         "description": purpose.description or "",
-        "enabled": purpose.enabled,
+        "status": purpose.status or "active",
+        "enabled": (purpose.status or "active") == "active",
         "preamble": purpose.preamble or "",
         "referenced_by": references,
         "updated_at": purpose.updated_at,
@@ -5027,10 +5028,15 @@ def ai_purposes_collection(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "not authenticated"}, status=401)
     _ensure_default_agent_purposes()
     if request.method == "GET":
+        status_filter = str(request.GET.get("status") or "").strip().lower()
         enabled_filter = str(request.GET.get("enabled") or "").strip().lower()
         purposes = AgentPurpose.objects.select_related("model_config__provider").order_by("slug")
+        if status_filter in {"active", "deprecated"}:
+            purposes = purposes.filter(status=status_filter)
         if enabled_filter in {"1", "true", "yes"}:
-            purposes = purposes.filter(enabled=True)
+            purposes = purposes.exclude(status="deprecated")
+        elif enabled_filter in {"0", "false", "no"}:
+            purposes = purposes.filter(status="deprecated")
         return JsonResponse({"purposes": [_serialize_agent_purpose(item) for item in purposes]})
     if request.method != "POST":
         return JsonResponse({"error": "method not allowed"}, status=405)
@@ -5052,9 +5058,16 @@ def ai_purposes_collection(request: HttpRequest) -> JsonResponse:
         name=str(payload.get("name") or "").strip(),
         description=str(payload.get("description") or "").strip(),
         preamble=preamble,
+        status=(
+            str(payload.get("status") or "").strip().lower()
+            if str(payload.get("status") or "").strip().lower() in {"active", "deprecated"}
+            else ("active" if bool(payload.get("enabled", True)) else "deprecated")
+        ),
         enabled=bool(payload.get("enabled", True)),
         updated_by=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
     )
+    purpose.enabled = purpose.status == "active"
+    purpose.save(update_fields=["enabled", "updated_at"])
     return JsonResponse({"purpose": _serialize_agent_purpose(purpose)})
 
 
@@ -5070,18 +5083,11 @@ def ai_purpose_detail(request: HttpRequest, purpose_slug: str) -> JsonResponse:
     if request.method == "DELETE":
         if not _can_manage_ai(identity):
             return JsonResponse({"error": "forbidden"}, status=403)
-        summary = get_purpose_reference_summary(purpose.id)
-        if summary["agents"] > 0:
-            return JsonResponse(
-                {
-                    "error": "purpose_in_use",
-                    "message": f"Purpose is referenced by {summary['agents']} agents. Disable it instead.",
-                    "referenced_by": summary,
-                },
-                status=409,
-            )
-        purpose.delete()
-        return JsonResponse({}, status=204)
+        purpose.status = "deprecated"
+        purpose.enabled = False
+        purpose.updated_by = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
+        purpose.save(update_fields=["status", "enabled", "updated_by", "updated_at"])
+        return JsonResponse({"purpose": _serialize_agent_purpose(purpose)})
     if request.method not in {"PUT", "PATCH"}:
         return JsonResponse({"error": "method not allowed"}, status=405)
     if not _can_manage_ai(identity):
@@ -5090,7 +5096,12 @@ def ai_purpose_detail(request: HttpRequest, purpose_slug: str) -> JsonResponse:
     if "slug" in payload and str(payload.get("slug") or "").strip().lower() != purpose.slug:
         return JsonResponse({"error": "Purpose slug is immutable. Create a new purpose instead."}, status=400)
     if "enabled" in payload:
-        purpose.enabled = bool(payload.get("enabled"))
+        purpose.status = "active" if bool(payload.get("enabled")) else "deprecated"
+    if "status" in payload:
+        next_status = str(payload.get("status") or "").strip().lower()
+        if next_status not in {"active", "deprecated"}:
+            return JsonResponse({"error": "status must be one of: active, deprecated"}, status=400)
+        purpose.status = next_status
     if "name" in payload:
         purpose.name = str(payload.get("name") or purpose.name)
     if "description" in payload:
@@ -5138,8 +5149,9 @@ def ai_purpose_detail(request: HttpRequest, purpose_slug: str) -> JsonResponse:
                 )
             purpose.model_config = model_config
     purpose.updated_by = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
+    purpose.enabled = purpose.status != "deprecated"
     purpose.save(
-        update_fields=["name", "description", "enabled", "preamble", "model_config", "updated_by", "updated_at"]
+        update_fields=["name", "description", "status", "enabled", "preamble", "model_config", "updated_by", "updated_at"]
     )
     return JsonResponse({"purpose": _serialize_agent_purpose(purpose)})
 

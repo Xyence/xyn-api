@@ -1758,6 +1758,11 @@ class ModelConfig(models.Model):
 
 
 class AgentPurpose(models.Model):
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("deprecated", "Deprecated"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     slug = models.SlugField(max_length=80, unique=True)
     name = models.CharField(max_length=120, blank=True)
@@ -1765,6 +1770,8 @@ class AgentPurpose(models.Model):
     model_config = models.ForeignKey(ModelConfig, null=True, blank=True, on_delete=models.SET_NULL, related_name="purposes")
     # Short purpose-level guidance prepended to agent system prompts at runtime.
     preamble = models.TextField(blank=True, validators=[MaxLengthValidator(1000)])
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
+    # Backward-compatibility field; status is the source of truth.
     enabled = models.BooleanField(default=True)
     updated_at = models.DateTimeField(auto_now=True)
     updated_by = models.ForeignKey(

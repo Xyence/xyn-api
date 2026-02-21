@@ -467,6 +467,7 @@ def ensure_default_ai_seeds() -> None:
         defaults={
             "name": "Coding",
             "description": "Code generation and development tasks",
+            "status": "active",
             "enabled": True,
             "preamble": "Purpose: coding. Focus on production-ready implementation guidance.",
             "model_config": default_model,
@@ -477,6 +478,7 @@ def ensure_default_ai_seeds() -> None:
         defaults={
             "name": "Documentation",
             "description": "Documentation drafting and editing",
+            "status": "active",
             "enabled": True,
             "preamble": "Purpose: documentation. Produce concise, accurate, publishable drafts.",
             "model_config": default_model,
