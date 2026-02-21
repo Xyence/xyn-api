@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from cryptography.fernet import Fernet
 
+from .ai_compat import compute_effective_params
 from .models import (
     AgentDefinition,
     AgentPurpose,
@@ -243,6 +244,7 @@ def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optiona
             "model_name": model_config.model_name,
             "api_key": api_key,
             "temperature": model_config.temperature,
+            "top_p": model_config.top_p,
             "max_tokens": model_config.max_tokens,
             "system_prompt": assemble_system_prompt(agent.system_prompt_text, purpose_preamble),
             "agent_slug": agent.slug,
@@ -266,6 +268,7 @@ def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optiona
         "model_name": model_name,
         "api_key": api_key,
         "temperature": float(os.environ.get("XYN_DEFAULT_MODEL_TEMPERATURE") or 0.2),
+        "top_p": float(os.environ.get("XYN_DEFAULT_MODEL_TOP_P") or 1.0),
         "max_tokens": int(os.environ.get("XYN_DEFAULT_MODEL_MAX_TOKENS") or 1200),
         "system_prompt": "",
         "agent_slug": None,
@@ -285,8 +288,20 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
     if system_prompt:
         payload_messages = [{"role": "system", "content": system_prompt}] + payload_messages
 
-    temperature = resolved_config.get("temperature")
-    max_tokens = resolved_config.get("max_tokens")
+    base_params = {
+        "temperature": resolved_config.get("temperature"),
+        "top_p": resolved_config.get("top_p"),
+        "max_tokens": resolved_config.get("max_tokens"),
+    }
+    effective_params, warnings = compute_effective_params(
+        provider=provider,
+        model_name=model_name,
+        base_params=base_params,
+        invocation_mode="chat",
+    )
+    temperature = effective_params.get("temperature")
+    top_p = effective_params.get("top_p")
+    max_tokens = effective_params.get("max_tokens")
 
     if provider == "openai":
         body: Dict[str, Any] = {
@@ -295,6 +310,8 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
         }
         if temperature is not None:
             body["temperature"] = temperature
+        if top_p is not None:
+            body["top_p"] = top_p
         if max_tokens is not None:
             body["max_output_tokens"] = max_tokens
         response = requests.post(
@@ -312,6 +329,8 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
             "provider": provider,
             "model": model_name,
             "usage": data.get("usage") if isinstance(data.get("usage"), dict) else None,
+            "effective_params": effective_params,
+            "warnings": warnings,
             "raw": data,
         }
 
@@ -329,6 +348,8 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
             body["system"] = system_text
         if temperature is not None:
             body["temperature"] = float(temperature)
+        if top_p is not None:
+            body["top_p"] = float(top_p)
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -352,6 +373,8 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
             "provider": provider,
             "model": model_name,
             "usage": data.get("usage") if isinstance(data.get("usage"), dict) else None,
+            "effective_params": effective_params,
+            "warnings": warnings,
             "raw": data,
         }
 
@@ -367,6 +390,8 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
                 "maxOutputTokens": int(max_tokens or 1200),
             },
         }
+        if top_p is not None:
+            body["generationConfig"]["topP"] = float(top_p)
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}",
             headers={"Content-Type": "application/json"},
@@ -388,6 +413,8 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
             "provider": provider,
             "model": model_name,
             "usage": None,
+            "effective_params": effective_params,
+            "warnings": warnings,
             "raw": data,
         }
 

@@ -5011,6 +5011,7 @@ def internal_ai_config(request: HttpRequest) -> JsonResponse:
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
     from .ai_runtime import AiConfigError, ensure_default_ai_seeds, resolve_ai_config
+    from .ai_compat import compute_effective_params
 
     purpose = str(request.GET.get("purpose") or "coding").strip().lower()
     try:
@@ -5018,13 +5019,27 @@ def internal_ai_config(request: HttpRequest) -> JsonResponse:
         config = resolve_ai_config(purpose_slug=purpose)
     except AiConfigError as exc:
         return JsonResponse({"error": str(exc)}, status=404)
+    base_params = {
+        "temperature": config.get("temperature"),
+        "top_p": config.get("top_p"),
+        "max_tokens": config.get("max_tokens"),
+    }
+    effective_params, warnings = compute_effective_params(
+        provider=str(config.get("provider") or ""),
+        model_name=str(config.get("model_name") or ""),
+        base_params=base_params,
+        invocation_mode="worker",
+    )
     return JsonResponse(
         {
             "provider": config.get("provider"),
             "model_name": config.get("model_name"),
             "api_key": config.get("api_key"),
-            "temperature": config.get("temperature"),
-            "max_tokens": config.get("max_tokens"),
+            "temperature": effective_params.get("temperature"),
+            "top_p": effective_params.get("top_p"),
+            "max_tokens": effective_params.get("max_tokens"),
+            "effective_params": effective_params,
+            "warnings": warnings,
             "system_prompt": config.get("system_prompt") or "",
             "agent_slug": config.get("agent_slug"),
             "purpose": config.get("purpose") or purpose,

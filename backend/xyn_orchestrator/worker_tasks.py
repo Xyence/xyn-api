@@ -758,6 +758,8 @@ def _openai_revise_blueprint(
         model = config.get("model_name") or config.get("model")
         if not api_key or not model:
             return None, "OpenAI config missing api_key/model."
+        if isinstance(config.get("warnings"), list) and config.get("warnings"):
+            logger.warning("AI compat warnings (revise): %s", config.get("warnings"))
     except Exception as exc:
         return None, f"Failed to load OpenAI config: {exc}"
     from openai import OpenAI  # type: ignore
@@ -801,6 +803,8 @@ def _openai_generate_blueprint(
         model = config.get("model_name") or config.get("model")
         if not api_key or not model:
             return None, "OpenAI config missing api_key/model."
+        if isinstance(config.get("warnings"), list) and config.get("warnings"):
+            logger.warning("AI compat warnings (generate): %s", config.get("warnings"))
     except Exception as exc:
         return None, f"Failed to load OpenAI config: {exc}"
     from openai import OpenAI  # type: ignore

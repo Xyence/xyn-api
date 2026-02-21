@@ -137,6 +137,7 @@ from .ai_runtime import (
     mask_secret,
     resolve_ai_config,
 )
+from .ai_compat import compute_effective_params
 
 PLATFORM_ROLE_IDS = {"platform_admin", "platform_architect", "platform_operator", "app_user"}
 DOC_ARTIFACT_TYPE_SLUG = "doc_page"
@@ -4571,6 +4572,26 @@ def _serialize_model_config(config: ModelConfig) -> Dict[str, Any]:
     }
 
 
+def _model_config_compat_payload(config: ModelConfig) -> Dict[str, Any]:
+    base_params = {
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "max_tokens": config.max_tokens,
+    }
+    effective_params, warnings = compute_effective_params(
+        provider=str(config.provider.slug or ""),
+        model_name=str(config.model_name or ""),
+        base_params=base_params,
+        invocation_mode="chat",
+    )
+    return {
+        "provider": config.provider.slug,
+        "model_name": config.model_name,
+        "effective_params": effective_params,
+        "warnings": warnings,
+    }
+
+
 def _serialize_agent_definition(agent: AgentDefinition) -> Dict[str, Any]:
     purpose_slugs = [item.slug for item in agent.purposes.all().order_by("slug")]
     return {
@@ -4867,6 +4888,19 @@ def ai_model_config_detail(request: HttpRequest, model_config_id: str) -> JsonRe
 
 
 @csrf_exempt
+def ai_model_config_compat(request: HttpRequest, model_config_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    config = get_object_or_404(ModelConfig.objects.select_related("provider"), id=model_config_id)
+    return JsonResponse(_model_config_compat_payload(config))
+
+
+@csrf_exempt
 def ai_agents_collection(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
@@ -5016,6 +5050,8 @@ def ai_invoke(request: HttpRequest) -> JsonResponse:
             "provider": result.get("provider"),
             "model": result.get("model"),
             "usage": result.get("usage"),
+            "effective_params": result.get("effective_params") if isinstance(result.get("effective_params"), dict) else {},
+            "warnings": result.get("warnings") if isinstance(result.get("warnings"), list) else [],
             "agent_slug": resolved.get("agent_slug") or agent_slug,
         }
     )

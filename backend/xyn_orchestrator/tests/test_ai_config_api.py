@@ -141,6 +141,8 @@ class AiConfigApiTests(TestCase):
             "provider": "openai",
             "model": "gpt-4o-mini",
             "usage": {"input_tokens": 1},
+            "effective_params": {"temperature": 0.2, "max_tokens": 800},
+            "warnings": [],
         }
 
         response = self.client.post(
@@ -159,6 +161,8 @@ class AiConfigApiTests(TestCase):
         self.assertEqual(body["content"], "Generated markdown")
         self.assertEqual(body["provider"], "openai")
         self.assertEqual(body["agent_slug"], "docs-invoke")
+        self.assertEqual(body["effective_params"]["temperature"], 0.2)
+        self.assertEqual(body["warnings"], [])
         invoke_kwargs = invoke_mock.call_args.kwargs
         resolved = invoke_kwargs["resolved_config"]
         self.assertIn("assist docs", str(resolved.get("system_prompt") or ""))
@@ -205,3 +209,20 @@ class AiConfigApiTests(TestCase):
         invoke_kwargs = invoke_mock.call_args.kwargs
         self.assertEqual(len(invoke_kwargs["messages"]), 1)
         self.assertEqual(invoke_kwargs["messages"][0]["role"], "user")
+
+    def test_model_config_compat_endpoint_warns_for_gpt5_temperature(self):
+        self._set_identity(self.admin_identity)
+        provider = self._ensure_provider()
+        config = ModelConfig.objects.create(
+            provider=provider,
+            model_name="gpt-5",
+            temperature=0.2,
+            max_tokens=500,
+            enabled=True,
+        )
+        response = self.client.get(f"/xyn/api/ai/model-configs/{config.id}/compat")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        warned_params = {item["param"] for item in payload.get("warnings") or []}
+        self.assertIn("temperature", warned_params)
+        self.assertNotIn("temperature", payload.get("effective_params") or {})

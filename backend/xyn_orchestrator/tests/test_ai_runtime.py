@@ -1,4 +1,5 @@
 import os
+from unittest.mock import Mock, patch
 
 from django.test import TestCase
 
@@ -6,6 +7,7 @@ from xyn_orchestrator.ai_runtime import (
     _extract_openai_response_text,
     assemble_system_prompt,
     ensure_default_ai_seeds,
+    invoke_model,
     resolve_ai_config,
 )
 from xyn_orchestrator.models import AgentDefinition, AgentDefinitionPurpose, AgentPurpose, ModelConfig, ModelProvider, ProviderCredential
@@ -87,3 +89,26 @@ class AiRuntimeTests(TestCase):
             ],
         }
         self.assertEqual(_extract_openai_response_text(payload), "Health check passed.")
+
+    @patch("xyn_orchestrator.ai_runtime.requests.post")
+    def test_invoke_model_omits_unsupported_temperature_for_gpt5(self, post_mock):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"output_text": "ok"}
+        post_mock.return_value = response
+        invoke_model(
+            resolved_config={
+                "provider": "openai",
+                "model_name": "gpt-5",
+                "api_key": "sk-test",
+                "temperature": 0.2,
+                "top_p": 0.95,
+                "max_tokens": 120,
+            },
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        kwargs = post_mock.call_args.kwargs
+        body = kwargs["json"]
+        self.assertNotIn("temperature", body)
+        self.assertNotIn("top_p", body)
+        self.assertEqual(body.get("max_output_tokens"), 120)
