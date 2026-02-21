@@ -1735,6 +1735,9 @@ class ModelProvider(models.Model):
 class ModelConfig(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     provider = models.ForeignKey(ModelProvider, on_delete=models.PROTECT, related_name="model_configs")
+    credential = models.ForeignKey(
+        "ProviderCredential", null=True, blank=True, on_delete=models.SET_NULL, related_name="model_configs"
+    )
     model_name = models.CharField(max_length=160)
     temperature = models.FloatField(default=0.2)
     max_tokens = models.IntegerField(default=1200)
@@ -1742,6 +1745,7 @@ class ModelConfig(models.Model):
     frequency_penalty = models.FloatField(default=0.0)
     presence_penalty = models.FloatField(default=0.0)
     extra_json = models.JSONField(default=dict, blank=True)
+    enabled = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1755,6 +1759,8 @@ class ModelConfig(models.Model):
 class AgentPurpose(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     slug = models.SlugField(max_length=80, unique=True)
+    name = models.CharField(max_length=120, blank=True)
+    description = models.CharField(max_length=500, blank=True)
     model_config = models.ForeignKey(ModelConfig, null=True, blank=True, on_delete=models.SET_NULL, related_name="purposes")
     system_prompt_markdown = models.TextField(blank=True)
     enabled = models.BooleanField(default=True)
@@ -1768,6 +1774,62 @@ class AgentPurpose(models.Model):
 
     def __str__(self) -> str:
         return self.slug
+
+
+class ProviderCredential(models.Model):
+    AUTH_TYPE_CHOICES = [
+        ("api_key_encrypted", "Encrypted API key"),
+        ("env_ref", "Environment variable"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    provider = models.ForeignKey(ModelProvider, on_delete=models.PROTECT, related_name="credentials")
+    name = models.CharField(max_length=160)
+    auth_type = models.CharField(max_length=40, choices=AUTH_TYPE_CHOICES, default="env_ref")
+    api_key_encrypted = models.TextField(blank=True, null=True)
+    env_var_name = models.CharField(max_length=160, blank=True)
+    is_default = models.BooleanField(default=False)
+    enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["provider__slug", "-is_default", "name"]
+
+    def __str__(self) -> str:
+        return f"{self.provider.slug}:{self.name}"
+
+
+class AgentDefinition(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    slug = models.SlugField(max_length=120, unique=True)
+    name = models.CharField(max_length=160)
+    model_config = models.ForeignKey(ModelConfig, on_delete=models.PROTECT, related_name="agent_definitions")
+    system_prompt_text = models.TextField(blank=True)
+    context_pack_refs_json = models.JSONField(default=list, blank=True)
+    enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    purposes = models.ManyToManyField(AgentPurpose, through="AgentDefinitionPurpose", related_name="agent_definitions")
+
+    class Meta:
+        ordering = ["name", "slug"]
+
+    def __str__(self) -> str:
+        return self.slug
+
+
+class AgentDefinitionPurpose(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    agent_definition = models.ForeignKey(AgentDefinition, on_delete=models.CASCADE, related_name="purpose_links")
+    purpose = models.ForeignKey(AgentPurpose, on_delete=models.CASCADE, related_name="agent_links")
+
+    class Meta:
+        unique_together = ("agent_definition", "purpose")
+        ordering = ["agent_definition__slug", "purpose__slug"]
+
+    def __str__(self) -> str:
+        return f"{self.agent_definition.slug}:{self.purpose.slug}"
 
 
 class Report(models.Model):

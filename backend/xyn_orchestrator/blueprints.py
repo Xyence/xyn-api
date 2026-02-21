@@ -5005,18 +5005,49 @@ def internal_draft_session_status(request: HttpRequest, session_id: str) -> Json
 
 
 @csrf_exempt
+def internal_ai_config(request: HttpRequest) -> JsonResponse:
+    if token_error := _require_internal_token(request):
+        return token_error
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    from .ai_runtime import AiConfigError, resolve_ai_config
+
+    purpose = str(request.GET.get("purpose") or "coding").strip().lower()
+    try:
+        config = resolve_ai_config(purpose_slug=purpose)
+    except AiConfigError as exc:
+        return JsonResponse({"error": str(exc)}, status=404)
+    return JsonResponse(
+        {
+            "provider": config.get("provider"),
+            "model_name": config.get("model_name"),
+            "api_key": config.get("api_key"),
+            "temperature": config.get("temperature"),
+            "max_tokens": config.get("max_tokens"),
+            "system_prompt": config.get("system_prompt") or "",
+            "agent_slug": config.get("agent_slug"),
+            "purpose": config.get("purpose") or purpose,
+        }
+    )
+
+
+@csrf_exempt
 def internal_openai_config(request: HttpRequest) -> JsonResponse:
     if token_error := _require_internal_token(request):
         return token_error
-    from .models import OpenAIConfig
+    # Deprecated shim for older workers. Prefer /xyn/internal/ai/config?purpose=coding.
+    from .ai_runtime import AiConfigError, resolve_ai_config
 
-    config = OpenAIConfig.objects.first()
-    if not config:
-        return JsonResponse({"error": "Missing OpenAI config"}, status=404)
+    try:
+        config = resolve_ai_config(purpose_slug="coding")
+    except AiConfigError as exc:
+        return JsonResponse({"error": str(exc)}, status=404)
+    if config.get("provider") != "openai":
+        return JsonResponse({"error": "coding purpose resolved to non-openai provider"}, status=400)
     return JsonResponse(
         {
-            "api_key": config.api_key,
-            "model": config.default_model,
+            "api_key": config.get("api_key"),
+            "model": config.get("model_name"),
         }
     )
 

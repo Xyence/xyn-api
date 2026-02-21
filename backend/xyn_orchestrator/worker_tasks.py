@@ -750,9 +750,12 @@ def _openai_revise_blueprint(
     validation_errors: Optional[List[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
-        config = _get_json("/xyn/internal/openai-config")
+        config = _get_json("/xyn/internal/ai/config?purpose=coding")
+        provider = str(config.get("provider") or "openai").strip().lower()
+        if provider != "openai":
+            return None, f"worker provider not implemented yet: {provider}"
         api_key = config.get("api_key")
-        model = config.get("model")
+        model = config.get("model_name") or config.get("model")
         if not api_key or not model:
             return None, "OpenAI config missing api_key/model."
     except Exception as exc:
@@ -790,9 +793,12 @@ def _openai_generate_blueprint(
     transcript: str, kind: str, context_text: str
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
-        config = _get_json("/xyn/internal/openai-config")
+        config = _get_json("/xyn/internal/ai/config?purpose=coding")
+        provider = str(config.get("provider") or "openai").strip().lower()
+        if provider != "openai":
+            return None, f"worker provider not implemented yet: {provider}"
         api_key = config.get("api_key")
-        model = config.get("model")
+        model = config.get("model_name") or config.get("model")
         if not api_key or not model:
             return None, "OpenAI config missing api_key/model."
     except Exception as exc:

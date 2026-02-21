@@ -100,6 +100,9 @@ from .models import (
     ModelProvider,
     ModelConfig,
     AgentPurpose,
+    ProviderCredential,
+    AgentDefinition,
+    AgentDefinitionPurpose,
     PlatformConfigDocument,
     Report,
     ReportAttachment,
@@ -124,6 +127,16 @@ from .oidc import (
 from .secret_stores import SecretStoreError, normalize_secret_logical_name, write_secret_value
 from .storage.registry import StorageProviderRegistry
 from .notifications.registry import NotifierRegistry
+from .ai_runtime import (
+    AiConfigError,
+    AiInvokeError,
+    decrypt_api_key,
+    encrypt_api_key,
+    ensure_default_ai_seeds,
+    invoke_model,
+    mask_secret,
+    resolve_ai_config,
+)
 
 PLATFORM_ROLE_IDS = {"platform_admin", "platform_architect", "platform_operator", "app_user"}
 DOC_ARTIFACT_TYPE_SLUG = "doc_page"
@@ -3843,8 +3856,19 @@ def workspace_artifact_detail(request: HttpRequest, workspace_id: str, artifact_
                     system="shine",
                     defaults={"external_id": str(artifact.id), "slug_path": slug},
                 )
+        ai_metadata = payload.get("ai_metadata") if isinstance(payload.get("ai_metadata"), dict) else None
+        if ai_metadata:
+            provenance = dict(artifact.provenance_json or {})
+            provenance["last_ai_invocation"] = {
+                "agent_slug": ai_metadata.get("agent_slug"),
+                "provider": ai_metadata.get("provider"),
+                "model_name": ai_metadata.get("model_name"),
+                "invoked_at": ai_metadata.get("invoked_at") or timezone.now().isoformat(),
+                "mode": ai_metadata.get("mode"),
+            }
+            artifact.provenance_json = provenance
         artifact.version = _next_artifact_revision_number(artifact)
-        artifact.save(update_fields=["title", "slug", "visibility", "scope_json", "version", "updated_at"])
+        artifact.save(update_fields=["title", "slug", "visibility", "scope_json", "provenance_json", "version", "updated_at"])
         ArtifactRevision.objects.create(
             artifact=artifact,
             revision_number=artifact.version,
@@ -3852,6 +3876,19 @@ def workspace_artifact_detail(request: HttpRequest, workspace_id: str, artifact_
             created_by=identity,
         )
         _record_artifact_event(artifact, "artifact_revised", identity, {"version": artifact.version})
+        if ai_metadata:
+            _record_artifact_event(
+                artifact,
+                "ai_invocation",
+                identity,
+                {
+                    "version": artifact.version,
+                    "agent_slug": ai_metadata.get("agent_slug"),
+                    "provider": ai_metadata.get("provider"),
+                    "model_name": ai_metadata.get("model_name"),
+                    "mode": ai_metadata.get("mode"),
+                },
+            )
         latest = _latest_artifact_revision(artifact)
 
     reaction_counts = {"endorse": 0, "oppose": 0, "neutral": 0}
@@ -4425,36 +4462,7 @@ def tour_detail(request: HttpRequest, tour_slug: str) -> JsonResponse:
 
 
 def _ensure_default_agent_purposes() -> None:
-    openai_provider, _ = ModelProvider.objects.get_or_create(slug="openai", defaults={"name": "OpenAI", "enabled": True})
-    anthropic_provider, _ = ModelProvider.objects.get_or_create(slug="anthropic", defaults={"name": "Anthropic", "enabled": True})
-    google_provider, _ = ModelProvider.objects.get_or_create(slug="google", defaults={"name": "Google", "enabled": False})
-    provider_slug = str(os.environ.get("XYN_DEFAULT_MODEL_PROVIDER") or "openai").strip().lower()
-    provider = {"openai": openai_provider, "anthropic": anthropic_provider, "google": google_provider}.get(provider_slug, openai_provider)
-    default_model = str(os.environ.get("XYN_DEFAULT_MODEL_NAME") or "gpt-4o-mini").strip()
-    config, _ = ModelConfig.objects.get_or_create(
-        provider=provider,
-        model_name=default_model,
-        defaults={
-            "temperature": float(os.environ.get("XYN_DEFAULT_MODEL_TEMPERATURE") or 0.2),
-            "max_tokens": int(os.environ.get("XYN_DEFAULT_MODEL_MAX_TOKENS") or 1200),
-        },
-    )
-    AgentPurpose.objects.get_or_create(
-        slug="coding",
-        defaults={
-            "model_config": config,
-            "system_prompt_markdown": "You are the coding assistant for Xyn.",
-            "enabled": True,
-        },
-    )
-    AgentPurpose.objects.get_or_create(
-        slug="documentation",
-        defaults={
-            "model_config": config,
-            "system_prompt_markdown": "You are the documentation assistant for Xyn.",
-            "enabled": True,
-        },
-    )
+    ensure_default_ai_seeds()
 
 
 def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:
@@ -4462,6 +4470,8 @@ def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:
     provider = model.provider if model else None
     return {
         "slug": purpose.slug,
+        "name": purpose.name or purpose.slug.replace("-", " ").title(),
+        "description": purpose.description or "",
         "enabled": purpose.enabled,
         "system_prompt_markdown": purpose.system_prompt_markdown,
         "updated_at": purpose.updated_at,
@@ -4481,6 +4491,457 @@ def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:
             else None
         ),
     }
+
+
+def _can_manage_ai(identity: UserIdentity) -> bool:
+    return _has_platform_role(identity, ["platform_admin", "platform_architect"])
+
+
+def _serialize_model_provider(provider: ModelProvider) -> Dict[str, Any]:
+    return {
+        "id": str(provider.id),
+        "slug": provider.slug,
+        "name": provider.name,
+        "enabled": provider.enabled,
+    }
+
+
+def _serialize_credential(credential: ProviderCredential) -> Dict[str, Any]:
+    resolved_secret = ""
+    if credential.auth_type == "api_key_encrypted":
+        try:
+            resolved_secret = decrypt_api_key(str(credential.api_key_encrypted or ""))
+        except Exception:
+            resolved_secret = ""
+    elif credential.auth_type == "env_ref":
+        env_name = str(credential.env_var_name or "").strip()
+        resolved_secret = str(os.environ.get(env_name) or "") if env_name else ""
+    masked = mask_secret(resolved_secret)
+    return {
+        "id": str(credential.id),
+        "provider": credential.provider.slug,
+        "provider_id": str(credential.provider_id),
+        "name": credential.name,
+        "auth_type": credential.auth_type,
+        "env_var_name": credential.env_var_name or "",
+        "is_default": credential.is_default,
+        "enabled": credential.enabled,
+        "secret": {
+            "configured": bool(masked["has_value"]),
+            "masked": masked["masked"],
+            "last4": masked["last4"],
+        },
+        "created_at": credential.created_at,
+        "updated_at": credential.updated_at,
+    }
+
+
+def _serialize_model_config(config: ModelConfig) -> Dict[str, Any]:
+    return {
+        "id": str(config.id),
+        "provider": config.provider.slug,
+        "provider_id": str(config.provider_id),
+        "credential_id": str(config.credential_id) if config.credential_id else None,
+        "model_name": config.model_name,
+        "temperature": config.temperature,
+        "max_tokens": config.max_tokens,
+        "top_p": config.top_p,
+        "frequency_penalty": config.frequency_penalty,
+        "presence_penalty": config.presence_penalty,
+        "extra_json": config.extra_json or {},
+        "enabled": config.enabled,
+        "created_at": config.created_at,
+        "updated_at": config.updated_at,
+    }
+
+
+def _serialize_agent_definition(agent: AgentDefinition) -> Dict[str, Any]:
+    purpose_slugs = [item.slug for item in agent.purposes.all().order_by("slug")]
+    return {
+        "id": str(agent.id),
+        "slug": agent.slug,
+        "name": agent.name,
+        "model_config_id": str(agent.model_config_id),
+        "model_config": _serialize_model_config(agent.model_config),
+        "system_prompt_text": agent.system_prompt_text or "",
+        "context_pack_refs_json": agent.context_pack_refs_json or [],
+        "enabled": agent.enabled,
+        "purposes": purpose_slugs,
+        "created_at": agent.created_at,
+        "updated_at": agent.updated_at,
+    }
+
+
+@csrf_exempt
+def ai_providers_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    _ensure_default_agent_purposes()
+    providers = ModelProvider.objects.all().order_by("slug")
+    return JsonResponse({"providers": [_serialize_model_provider(item) for item in providers]})
+
+
+@csrf_exempt
+def ai_credentials_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    _ensure_default_agent_purposes()
+    if request.method == "GET":
+        credentials = ProviderCredential.objects.select_related("provider").order_by("provider__slug", "-is_default", "name")
+        return JsonResponse({"credentials": [_serialize_credential(item) for item in credentials]})
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    provider_slug = str(payload.get("provider") or "").strip().lower()
+    name = str(payload.get("name") or "").strip()
+    auth_type = str(payload.get("auth_type") or "env_ref").strip()
+    if not provider_slug or not name:
+        return JsonResponse({"error": "provider and name are required"}, status=400)
+    provider = ModelProvider.objects.filter(slug=provider_slug).first()
+    if not provider:
+        return JsonResponse({"error": "invalid provider"}, status=400)
+    if auth_type not in {"api_key_encrypted", "env_ref"}:
+        return JsonResponse({"error": "invalid auth_type"}, status=400)
+
+    api_key_encrypted = None
+    env_var_name = ""
+    if auth_type == "api_key_encrypted":
+        raw_key = str(payload.get("api_key") or "").strip()
+        if not raw_key:
+            return JsonResponse({"error": "api_key is required for api_key_encrypted"}, status=400)
+        try:
+            api_key_encrypted = encrypt_api_key(raw_key)
+        except AiConfigError as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
+    else:
+        env_var_name = str(payload.get("env_var_name") or "").strip()
+        if not env_var_name:
+            return JsonResponse({"error": "env_var_name is required for env_ref"}, status=400)
+
+    credential = ProviderCredential.objects.create(
+        provider=provider,
+        name=name,
+        auth_type=auth_type,
+        api_key_encrypted=api_key_encrypted,
+        env_var_name=env_var_name,
+        enabled=bool(payload.get("enabled", True)),
+        is_default=bool(payload.get("is_default", False)),
+    )
+    if credential.is_default:
+        ProviderCredential.objects.filter(provider=provider).exclude(id=credential.id).update(is_default=False)
+    return JsonResponse({"credential": _serialize_credential(credential)})
+
+
+@csrf_exempt
+def ai_credential_detail(request: HttpRequest, credential_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    credential = get_object_or_404(ProviderCredential.objects.select_related("provider"), id=credential_id)
+    if request.method == "GET":
+        return JsonResponse({"credential": _serialize_credential(credential)})
+    if request.method == "DELETE":
+        credential.delete()
+        return JsonResponse({}, status=204)
+    if request.method != "PATCH":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    if "name" in payload:
+        credential.name = str(payload.get("name") or credential.name).strip()
+    if "enabled" in payload:
+        credential.enabled = bool(payload.get("enabled"))
+    if "is_default" in payload:
+        credential.is_default = bool(payload.get("is_default"))
+    if "auth_type" in payload:
+        auth_type = str(payload.get("auth_type") or "").strip()
+        if auth_type not in {"api_key_encrypted", "env_ref"}:
+            return JsonResponse({"error": "invalid auth_type"}, status=400)
+        credential.auth_type = auth_type
+    if credential.auth_type == "api_key_encrypted" and "api_key" in payload:
+        raw_key = str(payload.get("api_key") or "").strip()
+        if raw_key:
+            try:
+                credential.api_key_encrypted = encrypt_api_key(raw_key)
+            except AiConfigError as exc:
+                return JsonResponse({"error": str(exc)}, status=400)
+    if credential.auth_type == "env_ref" and "env_var_name" in payload:
+        credential.env_var_name = str(payload.get("env_var_name") or "").strip()
+    credential.save(
+        update_fields=[
+            "name",
+            "auth_type",
+            "api_key_encrypted",
+            "env_var_name",
+            "enabled",
+            "is_default",
+            "updated_at",
+        ]
+    )
+    if credential.is_default:
+        ProviderCredential.objects.filter(provider_id=credential.provider_id).exclude(id=credential.id).update(is_default=False)
+    return JsonResponse({"credential": _serialize_credential(credential)})
+
+
+@csrf_exempt
+def ai_model_configs_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    _ensure_default_agent_purposes()
+    if request.method == "GET":
+        configs = ModelConfig.objects.select_related("provider", "credential").order_by("provider__slug", "model_name")
+        return JsonResponse({"model_configs": [_serialize_model_config(item) for item in configs]})
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    provider_slug = str(payload.get("provider") or "").strip().lower()
+    model_name = str(payload.get("model_name") or "").strip()
+    if not provider_slug or not model_name:
+        return JsonResponse({"error": "provider and model_name are required"}, status=400)
+    provider = ModelProvider.objects.filter(slug=provider_slug).first()
+    if not provider:
+        return JsonResponse({"error": "invalid provider"}, status=400)
+    credential = None
+    credential_id = payload.get("credential_id")
+    if credential_id:
+        credential = ProviderCredential.objects.filter(id=credential_id, provider=provider).first()
+        if not credential:
+            return JsonResponse({"error": "credential_id not found for provider"}, status=400)
+    config = ModelConfig.objects.create(
+        provider=provider,
+        credential=credential,
+        model_name=model_name,
+        temperature=float(payload.get("temperature") if payload.get("temperature") is not None else 0.2),
+        max_tokens=int(payload.get("max_tokens") or 1200),
+        top_p=float(payload.get("top_p") if payload.get("top_p") is not None else 1.0),
+        frequency_penalty=float(payload.get("frequency_penalty") if payload.get("frequency_penalty") is not None else 0.0),
+        presence_penalty=float(payload.get("presence_penalty") if payload.get("presence_penalty") is not None else 0.0),
+        extra_json=payload.get("extra_json") if isinstance(payload.get("extra_json"), dict) else {},
+        enabled=bool(payload.get("enabled", True)),
+    )
+    return JsonResponse({"model_config": _serialize_model_config(config)})
+
+
+@csrf_exempt
+def ai_model_config_detail(request: HttpRequest, model_config_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    config = get_object_or_404(ModelConfig.objects.select_related("provider", "credential"), id=model_config_id)
+    if request.method == "GET":
+        return JsonResponse({"model_config": _serialize_model_config(config)})
+    if request.method == "DELETE":
+        config.delete()
+        return JsonResponse({}, status=204)
+    if request.method != "PATCH":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    if "provider" in payload:
+        provider_slug = str(payload.get("provider") or "").strip().lower()
+        provider = ModelProvider.objects.filter(slug=provider_slug).first()
+        if not provider:
+            return JsonResponse({"error": "invalid provider"}, status=400)
+        config.provider = provider
+    if "credential_id" in payload:
+        credential_id = payload.get("credential_id")
+        if credential_id:
+            credential = ProviderCredential.objects.filter(id=credential_id, provider_id=config.provider_id).first()
+            if not credential:
+                return JsonResponse({"error": "credential_id not found for provider"}, status=400)
+            config.credential = credential
+        else:
+            config.credential = None
+    if "model_name" in payload:
+        config.model_name = str(payload.get("model_name") or config.model_name).strip()
+    if "temperature" in payload:
+        config.temperature = float(payload.get("temperature") if payload.get("temperature") is not None else 0.2)
+    if "max_tokens" in payload:
+        config.max_tokens = int(payload.get("max_tokens") or 1200)
+    if "top_p" in payload:
+        config.top_p = float(payload.get("top_p") if payload.get("top_p") is not None else 1.0)
+    if "frequency_penalty" in payload:
+        config.frequency_penalty = float(payload.get("frequency_penalty") if payload.get("frequency_penalty") is not None else 0.0)
+    if "presence_penalty" in payload:
+        config.presence_penalty = float(payload.get("presence_penalty") if payload.get("presence_penalty") is not None else 0.0)
+    if "extra_json" in payload and isinstance(payload.get("extra_json"), dict):
+        config.extra_json = payload.get("extra_json")
+    if "enabled" in payload:
+        config.enabled = bool(payload.get("enabled"))
+    config.save(
+        update_fields=[
+            "provider",
+            "credential",
+            "model_name",
+            "temperature",
+            "max_tokens",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "extra_json",
+            "enabled",
+            "updated_at",
+        ]
+    )
+    return JsonResponse({"model_config": _serialize_model_config(config)})
+
+
+@csrf_exempt
+def ai_agents_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    _ensure_default_agent_purposes()
+    if request.method == "GET":
+        purpose = str(request.GET.get("purpose") or "").strip().lower()
+        enabled_only = str(request.GET.get("enabled") or "").strip().lower() in {"1", "true", "yes"}
+        agents = AgentDefinition.objects.select_related("model_config__provider", "model_config__credential").prefetch_related("purposes")
+        if purpose:
+            agents = agents.filter(purposes__slug=purpose)
+        if enabled_only:
+            agents = agents.filter(enabled=True)
+        return JsonResponse({"agents": [_serialize_agent_definition(item) for item in agents.order_by("name", "slug")]})
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    slug = str(payload.get("slug") or "").strip().lower()
+    name = str(payload.get("name") or "").strip()
+    model_config_id = payload.get("model_config_id")
+    if not slug or not name or not model_config_id:
+        return JsonResponse({"error": "slug, name, and model_config_id are required"}, status=400)
+    if AgentDefinition.objects.filter(slug=slug).exists():
+        return JsonResponse({"error": "slug already exists"}, status=400)
+    model_config = ModelConfig.objects.filter(id=model_config_id).first()
+    if not model_config:
+        return JsonResponse({"error": "invalid model_config_id"}, status=400)
+    agent = AgentDefinition.objects.create(
+        slug=slug,
+        name=name,
+        model_config=model_config,
+        system_prompt_text=str(payload.get("system_prompt_text") or ""),
+        context_pack_refs_json=payload.get("context_pack_refs_json") if isinstance(payload.get("context_pack_refs_json"), list) else [],
+        enabled=bool(payload.get("enabled", True)),
+    )
+    purpose_slugs = payload.get("purposes") if isinstance(payload.get("purposes"), list) else []
+    purposes = list(AgentPurpose.objects.filter(slug__in=purpose_slugs))
+    for purpose in purposes:
+        AgentDefinitionPurpose.objects.get_or_create(agent_definition=agent, purpose=purpose)
+    agent.refresh_from_db()
+    return JsonResponse({"agent": _serialize_agent_definition(agent)})
+
+
+@csrf_exempt
+def ai_agent_detail(request: HttpRequest, agent_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    agent = get_object_or_404(
+        AgentDefinition.objects.select_related("model_config__provider", "model_config__credential").prefetch_related("purposes"),
+        id=agent_id,
+    )
+    if request.method == "GET":
+        return JsonResponse({"agent": _serialize_agent_definition(agent)})
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method == "DELETE":
+        agent.delete()
+        return JsonResponse({}, status=204)
+    if request.method != "PATCH":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    if "slug" in payload:
+        next_slug = str(payload.get("slug") or agent.slug).strip().lower()
+        if next_slug != agent.slug and AgentDefinition.objects.filter(slug=next_slug).exists():
+            return JsonResponse({"error": "slug already exists"}, status=400)
+        agent.slug = next_slug
+    if "name" in payload:
+        agent.name = str(payload.get("name") or agent.name).strip()
+    if "model_config_id" in payload:
+        model_config = ModelConfig.objects.filter(id=payload.get("model_config_id")).first()
+        if not model_config:
+            return JsonResponse({"error": "invalid model_config_id"}, status=400)
+        agent.model_config = model_config
+    if "system_prompt_text" in payload:
+        agent.system_prompt_text = str(payload.get("system_prompt_text") or "")
+    if "context_pack_refs_json" in payload and isinstance(payload.get("context_pack_refs_json"), list):
+        agent.context_pack_refs_json = payload.get("context_pack_refs_json")
+    if "enabled" in payload:
+        agent.enabled = bool(payload.get("enabled"))
+    agent.save(
+        update_fields=[
+            "slug",
+            "name",
+            "model_config",
+            "system_prompt_text",
+            "context_pack_refs_json",
+            "enabled",
+            "updated_at",
+        ]
+    )
+    if "purposes" in payload and isinstance(payload.get("purposes"), list):
+        desired = list(AgentPurpose.objects.filter(slug__in=payload.get("purposes")))
+        AgentDefinitionPurpose.objects.filter(agent_definition=agent).exclude(purpose__in=desired).delete()
+        for purpose in desired:
+            AgentDefinitionPurpose.objects.get_or_create(agent_definition=agent, purpose=purpose)
+    agent.refresh_from_db()
+    return JsonResponse({"agent": _serialize_agent_definition(agent)})
+
+
+@csrf_exempt
+def ai_invoke(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    agent_slug = str(payload.get("agent_slug") or "").strip()
+    if not agent_slug:
+        return JsonResponse({"error": "agent_slug is required"}, status=400)
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return JsonResponse({"error": "messages must be a list"}, status=400)
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    try:
+        resolved = resolve_ai_config(agent_slug=agent_slug)
+        result = invoke_model(resolved_config=resolved, messages=messages)
+    except (AiConfigError, AiInvokeError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    AuditLog.objects.create(
+        message="ai_invocation",
+        metadata_json={
+            "actor_identity_id": str(identity.id),
+            "agent_slug": resolved.get("agent_slug") or agent_slug,
+            "provider": resolved.get("provider"),
+            "model_name": resolved.get("model_name"),
+            "purpose": resolved.get("purpose"),
+            "metadata": metadata,
+        },
+    )
+    return JsonResponse(
+        {
+            "content": result.get("content") or "",
+            "provider": result.get("provider"),
+            "model": result.get("model"),
+            "usage": result.get("usage"),
+            "agent_slug": resolved.get("agent_slug") or agent_slug,
+        }
+    )
 
 
 @csrf_exempt
@@ -4511,6 +4972,10 @@ def ai_purpose_detail(request: HttpRequest, purpose_slug: str) -> JsonResponse:
     payload = _parse_json(request)
     if "enabled" in payload:
         purpose.enabled = bool(payload.get("enabled"))
+    if "name" in payload:
+        purpose.name = str(payload.get("name") or purpose.name)
+    if "description" in payload:
+        purpose.description = str(payload.get("description") or "")
     if "system_prompt_markdown" in payload:
         purpose.system_prompt_markdown = str(payload.get("system_prompt_markdown") or "")
     model_payload = payload.get("model_config")
@@ -4543,7 +5008,9 @@ def ai_purpose_detail(request: HttpRequest, purpose_slug: str) -> JsonResponse:
                 )
             purpose.model_config = model_config
     purpose.updated_by = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
-    purpose.save(update_fields=["enabled", "system_prompt_markdown", "model_config", "updated_by", "updated_at"])
+    purpose.save(
+        update_fields=["name", "description", "enabled", "system_prompt_markdown", "model_config", "updated_by", "updated_at"]
+    )
     return JsonResponse({"purpose": _serialize_agent_purpose(purpose)})
 
 
