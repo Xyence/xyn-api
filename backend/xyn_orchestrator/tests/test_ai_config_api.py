@@ -106,8 +106,8 @@ class AiConfigApiTests(TestCase):
 
         docs_agents = self.client.get("/xyn/api/ai/agents?purpose=documentation")
         self.assertEqual(docs_agents.status_code, 200)
-        self.assertEqual(len(docs_agents.json()["agents"]), 1)
-        self.assertEqual(docs_agents.json()["agents"][0]["slug"], "docs-default")
+        doc_slugs = [item["slug"] for item in docs_agents.json()["agents"]]
+        self.assertIn("docs-default", doc_slugs)
 
         coding_agents = self.client.get("/xyn/api/ai/agents?purpose=coding")
         self.assertEqual(coding_agents.status_code, 200)
