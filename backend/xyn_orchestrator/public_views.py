@@ -33,13 +33,15 @@ def public_articles(request):
 
     items = []
     for artifact in page.object_list:
+        revision = _latest_revision(artifact)
+        content = (revision.content_json if revision else {}) or {}
         slug_ref = ArtifactExternalRef.objects.filter(artifact=artifact).exclude(slug_path="").order_by("created_at").first()
         slug = artifact.slug or (slug_ref.slug_path if slug_ref else "") or str((artifact.scope_json or {}).get("slug") or "")
         items.append(
             {
                 "title": artifact.title,
                 "slug": slug,
-                "summary": str((artifact.scope_json or {}).get("summary") or ""),
+                "summary": str(content.get("summary") or (artifact.scope_json or {}).get("summary") or ""),
                 "published_at": artifact.published_at,
                 "updated_at": artifact.updated_at,
             }
