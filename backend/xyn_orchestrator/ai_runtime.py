@@ -517,4 +517,6 @@ def ensure_default_ai_seeds() -> None:
     assistant.save(update_fields=["name", "model_config", "system_prompt_text", "is_default", "enabled", "updated_at"])
     AgentDefinition.objects.exclude(id=assistant.id).filter(is_default=True).update(is_default=False)
     assistant.purposes.add(coding, documentation)
-    AgentDefinition.objects.filter(slug="documentation-default").exclude(id=assistant.id).update(enabled=False, is_default=False)
+    # Remove the legacy bootstrap agent to keep a single canonical default assistant.
+    AgentDefinition.objects.filter(slug="documentation-default").exclude(id=assistant.id).delete()
+    AgentDefinition.objects.filter(name__iexact="Documentation Default").exclude(id=assistant.id).delete()
