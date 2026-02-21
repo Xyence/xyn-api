@@ -147,7 +147,14 @@ def _credential_api_key(credential: Optional[ProviderCredential], provider_slug:
 
 
 def _resolve_model_api_key(provider_slug: str, credential: Optional[ProviderCredential]) -> str:
-    api_key = _credential_api_key(credential, provider_slug)
+    selected_credential = credential
+    if selected_credential is None:
+        selected_credential = (
+            ProviderCredential.objects.filter(provider__slug=provider_slug, is_default=True, enabled=True)
+            .order_by("-updated_at", "-created_at")
+            .first()
+        )
+    api_key = _credential_api_key(selected_credential, provider_slug)
     if api_key:
         return api_key
     return _read_provider_env_key(provider_slug)

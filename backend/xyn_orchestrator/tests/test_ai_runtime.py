@@ -1,7 +1,9 @@
+import os
+
 from django.test import TestCase
 
-from xyn_orchestrator.ai_runtime import assemble_system_prompt, ensure_default_ai_seeds
-from xyn_orchestrator.models import AgentDefinition, ModelProvider
+from xyn_orchestrator.ai_runtime import assemble_system_prompt, ensure_default_ai_seeds, resolve_ai_config
+from xyn_orchestrator.models import AgentDefinition, AgentDefinitionPurpose, AgentPurpose, ModelConfig, ModelProvider, ProviderCredential
 
 
 class AiRuntimeTests(TestCase):
@@ -39,3 +41,27 @@ class AiRuntimeTests(TestCase):
         self.assertEqual(default_assistant.name, "Xyn Default Assistant")
         self.assertTrue(default_assistant.purposes.filter(slug="coding").exists())
         self.assertTrue(default_assistant.purposes.filter(slug="documentation").exists())
+
+    def test_resolve_ai_config_uses_provider_default_credential_when_model_credential_missing(self):
+        provider, _ = ModelProvider.objects.get_or_create(slug="openai", defaults={"name": "OpenAI", "enabled": True})
+        os.environ["XYN_TEST_OPENAI_KEY"] = "sk-runtime-test-1234"
+        ProviderCredential.objects.create(
+            provider=provider,
+            name="default-openai",
+            auth_type="env_ref",
+            env_var_name="XYN_TEST_OPENAI_KEY",
+            is_default=True,
+            enabled=True,
+        )
+        model = ModelConfig.objects.create(provider=provider, model_name="gpt-4o-mini", credential=None, enabled=True)
+        purpose, _ = AgentPurpose.objects.get_or_create(slug="coding", defaults={"name": "Coding", "status": "active", "enabled": True})
+        agent = AgentDefinition.objects.create(
+            slug="test-default-credential-agent",
+            name="Test Default Credential Agent",
+            model_config=model,
+            enabled=True,
+        )
+        AgentDefinitionPurpose.objects.create(agent_definition=agent, purpose=purpose)
+        resolved = resolve_ai_config(agent_slug=agent.slug)
+        self.assertEqual(resolved.get("provider"), "openai")
+        self.assertEqual(resolved.get("api_key"), "sk-runtime-test-1234")
