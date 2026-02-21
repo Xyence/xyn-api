@@ -140,6 +140,7 @@ from .ai_runtime import (
 
 PLATFORM_ROLE_IDS = {"platform_admin", "platform_architect", "platform_operator", "app_user"}
 DOC_ARTIFACT_TYPE_SLUG = "doc_page"
+PURPOSE_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
@@ -4468,12 +4469,14 @@ def _ensure_default_agent_purposes() -> None:
 def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:
     model = purpose.model_config
     provider = model.provider if model else None
+    references = get_purpose_reference_summary(purpose.id)
     return {
         "slug": purpose.slug,
         "name": purpose.name or purpose.slug.replace("-", " ").title(),
         "description": purpose.description or "",
         "enabled": purpose.enabled,
         "preamble": purpose.preamble or "",
+        "referenced_by": references,
         "updated_at": purpose.updated_at,
         "model_config": (
             {
@@ -4495,6 +4498,12 @@ def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:
 
 def _can_manage_ai(identity: UserIdentity) -> bool:
     return _has_platform_role(identity, ["platform_admin", "platform_architect"])
+
+
+def get_purpose_reference_summary(purpose_id: Any) -> Dict[str, int]:
+    return {
+        "agents": AgentDefinitionPurpose.objects.filter(purpose_id=purpose_id).count(),
+    }
 
 
 def _serialize_model_provider(provider: ModelProvider) -> Dict[str, Any]:
@@ -5016,11 +5025,37 @@ def ai_purposes_collection(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
-    if request.method != "GET":
-        return JsonResponse({"error": "method not allowed"}, status=405)
     _ensure_default_agent_purposes()
-    purposes = AgentPurpose.objects.select_related("model_config__provider").order_by("slug")
-    return JsonResponse({"purposes": [_serialize_agent_purpose(item) for item in purposes]})
+    if request.method == "GET":
+        enabled_filter = str(request.GET.get("enabled") or "").strip().lower()
+        purposes = AgentPurpose.objects.select_related("model_config__provider").order_by("slug")
+        if enabled_filter in {"1", "true", "yes"}:
+            purposes = purposes.filter(enabled=True)
+        return JsonResponse({"purposes": [_serialize_agent_purpose(item) for item in purposes]})
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    slug = str(payload.get("slug") or "").strip().lower()
+    if not slug:
+        return JsonResponse({"error": "slug is required"}, status=400)
+    if not PURPOSE_SLUG_PATTERN.match(slug):
+        return JsonResponse({"error": "slug must match ^[a-z0-9][a-z0-9-]{1,62}$"}, status=400)
+    if AgentPurpose.objects.filter(slug=slug).exists():
+        return JsonResponse({"error": "slug already exists"}, status=400)
+    preamble = str(payload.get("preamble") or "")
+    if len(preamble) > 1000:
+        return JsonResponse({"error": "preamble must be 1000 characters or less"}, status=400)
+    purpose = AgentPurpose.objects.create(
+        slug=slug,
+        name=str(payload.get("name") or "").strip(),
+        description=str(payload.get("description") or "").strip(),
+        preamble=preamble,
+        enabled=bool(payload.get("enabled", True)),
+        updated_by=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
+    )
+    return JsonResponse({"purpose": _serialize_agent_purpose(purpose)})
 
 
 @csrf_exempt
@@ -5032,11 +5067,28 @@ def ai_purpose_detail(request: HttpRequest, purpose_slug: str) -> JsonResponse:
     purpose = get_object_or_404(AgentPurpose.objects.select_related("model_config__provider"), slug=purpose_slug)
     if request.method == "GET":
         return JsonResponse({"purpose": _serialize_agent_purpose(purpose)})
+    if request.method == "DELETE":
+        if not _can_manage_ai(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        summary = get_purpose_reference_summary(purpose.id)
+        if summary["agents"] > 0:
+            return JsonResponse(
+                {
+                    "error": "purpose_in_use",
+                    "message": f"Purpose is referenced by {summary['agents']} agents. Disable it instead.",
+                    "referenced_by": summary,
+                },
+                status=409,
+            )
+        purpose.delete()
+        return JsonResponse({}, status=204)
     if request.method not in {"PUT", "PATCH"}:
         return JsonResponse({"error": "method not allowed"}, status=405)
-    if not _is_platform_admin(identity):
+    if not _can_manage_ai(identity):
         return JsonResponse({"error": "forbidden"}, status=403)
     payload = _parse_json(request)
+    if "slug" in payload and str(payload.get("slug") or "").strip().lower() != purpose.slug:
+        return JsonResponse({"error": "Purpose slug is immutable. Create a new purpose instead."}, status=400)
     if "enabled" in payload:
         purpose.enabled = bool(payload.get("enabled"))
     if "name" in payload:
