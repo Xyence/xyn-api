@@ -31,10 +31,9 @@ class GovernedArticlesApiTests(TestCase):
                 {
                     "workspace_id": str(self.workspace.id),
                     "title": "Core Concepts",
-                    "slug": "core-concepts",
+                    "slug": f"core-concepts-{self.admin_identity.id}",
                     "category": "core-concepts",
-                    "visibility_type": "role_based",
-                    "allowed_roles": ["app_user"],
+                    "visibility_type": "authenticated",
                     "route_bindings": ["/app/guides"],
                     "tags": ["guide", "core-concepts"],
                     "body_markdown": "# Intro",
@@ -42,7 +41,7 @@ class GovernedArticlesApiTests(TestCase):
             ),
             content_type="application/json",
         )
-        self.assertEqual(create.status_code, 200)
+        self.assertEqual(create.status_code, 200, create.content.decode())
         article_id = create.json()["article"]["id"]
         article = Artifact.objects.get(id=article_id)
         self.assertEqual(article.type.slug, "article")
