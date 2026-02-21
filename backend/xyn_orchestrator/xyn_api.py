@@ -141,6 +141,19 @@ from .ai_compat import compute_effective_params
 
 PLATFORM_ROLE_IDS = {"platform_admin", "platform_architect", "platform_operator", "app_user"}
 DOC_ARTIFACT_TYPE_SLUG = "doc_page"
+ARTICLE_ARTIFACT_TYPE_SLUG = "article"
+ARTICLE_CATEGORIES = {"web", "guide", "core-concepts", "release-note", "internal", "tutorial"}
+GUIDE_ARTICLE_CATEGORIES = {"guide", "core-concepts", "tutorial"}
+ARTICLE_VISIBILITY_TYPES = {"public", "authenticated", "role_based", "private"}
+ARTICLE_STATUS_CHOICES = {"draft", "reviewed", "ratified", "published", "deprecated"}
+ARTICLE_TRANSITIONS = {
+    "draft": {"reviewed", "published", "deprecated"},
+    "reviewed": {"ratified", "published", "deprecated"},
+    "ratified": {"published", "deprecated"},
+    "published": {"deprecated"},
+    "deprecated": set(),
+}
+WORKSPACE_ROLE_SLUGS = {"reader", "contributor", "publisher", "moderator", "admin"}
 PURPOSE_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 
 
@@ -919,6 +932,23 @@ def _ensure_doc_artifact_type() -> ArtifactType:
     return artifact_type
 
 
+def _ensure_article_artifact_type() -> ArtifactType:
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug=ARTICLE_ARTIFACT_TYPE_SLUG,
+        defaults={
+            "name": "Article",
+            "description": "Governed knowledge artifact for web pages, guides, and documentation",
+            "icon": "BookOpen",
+            "schema_json": {
+                "category": sorted(ARTICLE_CATEGORIES),
+                "visibility_type": sorted(ARTICLE_VISIBILITY_TYPES),
+                "status": sorted(ARTICLE_STATUS_CHOICES),
+            },
+        },
+    )
+    return artifact_type
+
+
 def _normalize_doc_route_bindings(raw: Any) -> list[str]:
     values: list[str] = []
     if not isinstance(raw, list):
@@ -949,6 +979,225 @@ def _normalize_doc_tags(raw: Any) -> list[str]:
         seen.add(tag)
         values.append(tag)
     return values
+
+
+def _normalize_role_slugs(raw: Any) -> list[str]:
+    values: list[str] = []
+    if not isinstance(raw, list):
+        return values
+    seen: set[str] = set()
+    for entry in raw:
+        role = str(entry or "").strip().lower()
+        if not role:
+            continue
+        if role in seen:
+            continue
+        seen.add(role)
+        values.append(role)
+    return values
+
+
+def _normalize_article_category(raw: Any, *, fallback: str = "web") -> str:
+    value = str(raw or "").strip().lower()
+    if value in ARTICLE_CATEGORIES:
+        return value
+    return fallback
+
+
+def _normalize_article_visibility_type(raw: Any, *, fallback: str = "private") -> str:
+    value = str(raw or "").strip().lower()
+    if value in ARTICLE_VISIBILITY_TYPES:
+        return value
+    return fallback
+
+
+def _artifact_visibility_for_article_type(visibility_type: str) -> str:
+    if visibility_type == "public":
+        return "public"
+    if visibility_type in {"authenticated", "role_based"}:
+        return "team"
+    return "private"
+
+
+def _article_visibility_type_from_artifact(artifact: Artifact) -> str:
+    scope = dict(artifact.scope_json or {})
+    value = str(scope.get("visibility_type") or "").strip().lower()
+    if value in ARTICLE_VISIBILITY_TYPES:
+        return value
+    if artifact.visibility == "public":
+        return "public"
+    if artifact.visibility == "team":
+        return "authenticated"
+    return "private"
+
+
+def _article_allowed_roles(artifact: Artifact) -> list[str]:
+    scope = dict(artifact.scope_json or {})
+    return _normalize_role_slugs(scope.get("allowed_roles"))
+
+
+def _article_category(artifact: Artifact) -> str:
+    scope = dict(artifact.scope_json or {})
+    if artifact.type.slug == DOC_ARTIFACT_TYPE_SLUG:
+        tags = _normalize_doc_tags((scope or {}).get("tags"))
+        if "core-concepts" in tags:
+            return "core-concepts"
+        if "tutorial" in tags:
+            return "tutorial"
+        return "guide"
+    return _normalize_article_category(scope.get("category"), fallback="web")
+
+
+def _derive_guide_category(tags: list[str]) -> str:
+    normalized = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+    if "core-concepts" in normalized:
+        return "core-concepts"
+    if "tutorial" in normalized:
+        return "tutorial"
+    return "guide"
+
+
+def _article_route_bindings(artifact: Artifact) -> list[str]:
+    scope = dict(artifact.scope_json or {})
+    return _normalize_doc_route_bindings(scope.get("route_bindings"))
+
+
+def _article_content(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
+    latest = revision or _latest_artifact_revision(artifact)
+    content = dict((latest.content_json if latest else {}) or {})
+    scope = dict(artifact.scope_json or {})
+    tags = _normalize_doc_tags(content.get("tags") if "tags" in content else scope.get("tags"))
+    summary = str(content.get("summary") or scope.get("summary") or "")
+    body_markdown = str(content.get("body_markdown") or "")
+    body_html = str(content.get("body_html") or "")
+    return {
+        "title": str(content.get("title") or artifact.title),
+        "summary": summary,
+        "body_markdown": body_markdown,
+        "body_html": body_html,
+        "tags": tags,
+        "latest_revision": latest,
+    }
+
+
+def _can_manage_articles(identity: UserIdentity) -> bool:
+    return _has_platform_role(identity, ["platform_architect", "platform_admin"])
+
+
+def _can_edit_article(identity: UserIdentity, artifact: Artifact) -> bool:
+    if _can_manage_articles(identity):
+        return True
+    if artifact.status != "draft":
+        return False
+    return artifact.author_id and str(artifact.author_id) == str(identity.id)
+
+
+def _can_view_article(identity: UserIdentity, artifact: Artifact) -> bool:
+    if _can_manage_articles(identity):
+        return True
+    if artifact.status != "published":
+        return bool(artifact.author_id and str(artifact.author_id) == str(identity.id))
+    visibility_type = _article_visibility_type_from_artifact(artifact)
+    if visibility_type == "public":
+        return True
+    if visibility_type == "authenticated":
+        return identity is not None
+    if visibility_type == "private":
+        return bool(artifact.author_id and str(artifact.author_id) == str(identity.id))
+    allowed = set(_article_allowed_roles(artifact))
+    if not allowed:
+        return False
+    user_roles = set(_get_roles(identity))
+    return bool(user_roles.intersection(allowed))
+
+
+def _serialize_article_summary(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
+    content = _article_content(artifact, revision)
+    return {
+        "id": str(artifact.id),
+        "workspace_id": str(artifact.workspace_id),
+        "type": artifact.type.slug,
+        "title": artifact.title,
+        "slug": _artifact_slug(artifact),
+        "status": artifact.status,
+        "version": artifact.version,
+        "published_at": artifact.published_at,
+        "updated_at": artifact.updated_at,
+        "category": _article_category(artifact),
+        "visibility_type": _article_visibility_type_from_artifact(artifact),
+        "allowed_roles": _article_allowed_roles(artifact),
+        "route_bindings": _article_route_bindings(artifact),
+        "tags": content.get("tags") or [],
+        "summary": content.get("summary") or "",
+        "cover_image_url": str((artifact.scope_json or {}).get("cover_image_url") or ""),
+        "canonical_url": str((artifact.scope_json or {}).get("canonical_url") or ""),
+    }
+
+
+def _serialize_article_detail(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
+    latest = revision or _latest_artifact_revision(artifact)
+    content = _article_content(artifact, latest)
+    payload = _serialize_article_summary(artifact, latest)
+    reaction_counts = {"endorse": 0, "oppose": 0, "neutral": 0}
+    for row in ArtifactReaction.objects.filter(artifact=artifact).values("value").annotate(count=models.Count("id")):
+        reaction_counts[str(row["value"])] = int(row["count"])
+    comments = ArtifactComment.objects.filter(artifact=artifact).order_by("created_at")
+    payload.update(
+        {
+            "body_markdown": content.get("body_markdown") or "",
+            "body_html": content.get("body_html") or "",
+            "provenance_json": artifact.provenance_json or {},
+            "license_json": (artifact.scope_json or {}).get("license_json") or {},
+            "reactions": reaction_counts,
+            "comments": [_serialize_comment(comment) for comment in comments],
+            "created_at": artifact.created_at,
+            "created_by": str(artifact.author_id) if artifact.author_id else None,
+            "updated_by": str(latest.created_by_id) if latest and latest.created_by_id else None,
+            "updated_by_email": latest.created_by.email if latest and latest.created_by else None,
+        }
+    )
+    return payload
+
+
+def _serialize_article_revision(revision: ArtifactRevision) -> Dict[str, Any]:
+    content = dict(revision.content_json or {})
+    return {
+        "id": str(revision.id),
+        "article_id": str(revision.artifact_id),
+        "revision_number": revision.revision_number,
+        "body_markdown": str(content.get("body_markdown") or ""),
+        "body_html": str(content.get("body_html") or ""),
+        "summary": str(content.get("summary") or ""),
+        "created_by": str(revision.created_by_id) if revision.created_by_id else None,
+        "created_by_email": revision.created_by.email if revision.created_by else None,
+        "created_at": revision.created_at,
+        "provenance_json": dict(content.get("provenance_json") or {}),
+    }
+
+
+def _article_to_doc_page_payload(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
+    serialized = _serialize_article_detail(artifact, revision)
+    return {
+        "id": serialized["id"],
+        "artifact_id": serialized["id"],
+        "workspace_id": serialized["workspace_id"],
+        "type": "article",
+        "title": serialized["title"],
+        "slug": serialized["slug"],
+        "status": serialized["status"],
+        "visibility": artifact.visibility,
+        "route_bindings": serialized["route_bindings"],
+        "tags": serialized["tags"],
+        "body_markdown": serialized["body_markdown"],
+        "summary": serialized["summary"],
+        "version": serialized["version"],
+        "created_at": serialized["created_at"],
+        "updated_at": serialized["updated_at"],
+        "published_at": serialized["published_at"],
+        "created_by": serialized["created_by"],
+        "updated_by": serialized["updated_by"],
+        "updated_by_email": serialized["updated_by_email"],
+    }
 
 
 def _can_view_doc(identity: UserIdentity, artifact: Artifact) -> bool:
@@ -4107,6 +4356,363 @@ def workspace_membership_detail(request: HttpRequest, workspace_id: str, members
     return JsonResponse({"id": str(membership.id)})
 
 
+def _resolve_article_workspace(identity: UserIdentity, requested_workspace_id: str) -> Optional[Workspace]:
+    if requested_workspace_id:
+        workspace = Workspace.objects.filter(id=requested_workspace_id).first()
+        if not workspace:
+            return None
+        membership = _workspace_membership(identity, str(workspace.id))
+        if membership or _can_manage_articles(identity):
+            return workspace
+        return None
+    default_workspace = Workspace.objects.filter(slug="platform-builder").first() or Workspace.objects.first()
+    if default_workspace:
+        return default_workspace
+    return None
+
+
+@csrf_exempt
+def articles_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    article_type = _ensure_article_artifact_type()
+
+    if request.method == "POST":
+        if not _can_manage_articles(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return JsonResponse({"error": "title is required"}, status=400)
+        workspace_id = str(payload.get("workspace_id") or "").strip()
+        workspace = _resolve_article_workspace(identity, workspace_id)
+        if not workspace:
+            return JsonResponse({"error": "workspace not found or forbidden"}, status=404)
+        slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=title)
+        if not slug:
+            return JsonResponse({"error": "slug is required"}, status=400)
+        if _artifact_slug_exists(str(workspace.id), slug):
+            return JsonResponse({"error": "slug already exists in this workspace"}, status=400)
+        category = _normalize_article_category(payload.get("category"), fallback="web")
+        visibility_type = _normalize_article_visibility_type(payload.get("visibility_type"), fallback="private")
+        allowed_roles = _normalize_role_slugs(payload.get("allowed_roles"))
+        if visibility_type == "role_based" and not allowed_roles:
+            return JsonResponse({"error": "allowed_roles is required for role_based visibility"}, status=400)
+        invalid_roles = [role for role in allowed_roles if role not in PLATFORM_ROLE_IDS and role not in WORKSPACE_ROLE_SLUGS]
+        if invalid_roles:
+            return JsonResponse({"error": f"invalid allowed_roles: {', '.join(sorted(set(invalid_roles)))}"}, status=400)
+        route_bindings = _normalize_doc_route_bindings(payload.get("route_bindings"))
+        tags = _normalize_doc_tags(payload.get("tags"))
+        summary = str(payload.get("summary") or "")
+        body_markdown = str(payload.get("body_markdown") or "")
+        body_html = str(payload.get("body_html") or "")
+        status = str(payload.get("status") or "draft").strip().lower()
+        if status not in ARTICLE_STATUS_CHOICES:
+            return JsonResponse({"error": "invalid status"}, status=400)
+        published_at = timezone.now() if status == "published" else None
+        with transaction.atomic():
+            artifact = Artifact.objects.create(
+                workspace=workspace,
+                type=article_type,
+                title=title,
+                slug=slug,
+                status=status,
+                version=1,
+                visibility=_artifact_visibility_for_article_type(visibility_type),
+                author=identity,
+                custodian=identity,
+                published_at=published_at,
+                ratified_by=identity if status in {"ratified", "published"} else None,
+                ratified_at=timezone.now() if status in {"ratified", "published"} else None,
+                scope_json={
+                    "slug": slug,
+                    "category": category,
+                    "visibility_type": visibility_type,
+                    "allowed_roles": allowed_roles,
+                    "route_bindings": route_bindings,
+                    "tags": tags,
+                    "cover_image_url": str(payload.get("cover_image_url") or ""),
+                    "canonical_url": str(payload.get("canonical_url") or ""),
+                    "license_json": payload.get("license_json") if isinstance(payload.get("license_json"), dict) else {},
+                },
+                provenance_json=payload.get("provenance_json") if isinstance(payload.get("provenance_json"), dict) else {},
+            )
+            ArtifactRevision.objects.create(
+                artifact=artifact,
+                revision_number=1,
+                content_json={
+                    "title": title,
+                    "summary": summary,
+                    "body_markdown": body_markdown,
+                    "body_html": body_html,
+                    "tags": tags,
+                    "provenance_json": payload.get("revision_provenance_json")
+                    if isinstance(payload.get("revision_provenance_json"), dict)
+                    else {},
+                },
+                created_by=identity,
+            )
+            ArtifactExternalRef.objects.update_or_create(
+                artifact=artifact,
+                system="shine",
+                defaults={"external_id": str(artifact.id), "slug_path": slug},
+            )
+            _record_artifact_event(
+                artifact,
+                "article_created",
+                identity,
+                {"category": category, "visibility_type": visibility_type, "status": status},
+            )
+        return JsonResponse({"article": _serialize_article_detail(artifact)})
+
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    qs = Artifact.objects.filter(type=article_type).select_related("type", "workspace", "author")
+    workspace_id = str(request.GET.get("workspace_id") or "").strip()
+    if workspace_id:
+        qs = qs.filter(workspace_id=workspace_id)
+    status = str(request.GET.get("status") or "").strip().lower()
+    if status:
+        qs = qs.filter(status=status)
+    category_filter = str(request.GET.get("category") or "").strip().lower()
+    visibility_filter = str(request.GET.get("visibility") or "").strip().lower()
+    route_id = str(request.GET.get("route_id") or "").strip()
+    query = str(request.GET.get("q") or "").strip().lower()
+    include_unpublished = request.GET.get("include_unpublished") == "1"
+    results: list[dict[str, Any]] = []
+    for artifact in qs.order_by("-published_at", "-updated_at", "-created_at"):
+        if not include_unpublished and not _can_manage_articles(identity) and artifact.status != "published":
+            continue
+        if not _can_view_article(identity, artifact):
+            continue
+        category = _article_category(artifact)
+        if category_filter and category != category_filter:
+            continue
+        visibility_type = _article_visibility_type_from_artifact(artifact)
+        if visibility_filter and visibility_type != visibility_filter:
+            continue
+        bindings = _article_route_bindings(artifact)
+        if route_id and route_id not in bindings:
+            continue
+        serialized = _serialize_article_summary(artifact)
+        if query:
+            haystack = " ".join(
+                [
+                    serialized.get("title", ""),
+                    serialized.get("slug", ""),
+                    serialized.get("summary", ""),
+                    " ".join(serialized.get("tags") or []),
+                ]
+            ).lower()
+            if query not in haystack:
+                continue
+        results.append(serialized)
+    return JsonResponse({"articles": results})
+
+
+def _resolve_article_or_404(article_id_or_slug: str) -> Artifact:
+    by_id = Artifact.objects.filter(id=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG).select_related("type", "workspace").first()
+    if by_id:
+        return by_id
+    by_slug = Artifact.objects.filter(slug=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG).select_related("type", "workspace").first()
+    if by_slug:
+        return by_slug
+    return get_object_or_404(Artifact, id=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG)
+
+
+@csrf_exempt
+def article_detail(request: HttpRequest, article_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if request.method in {"PATCH", "PUT"}:
+        if not _can_edit_article(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        if "body_markdown" in payload or "body_html" in payload:
+            return JsonResponse({"error": "body updates must use /revisions endpoint"}, status=400)
+        scope = dict(artifact.scope_json or {})
+        dirty_fields: set[str] = set()
+        if "title" in payload:
+            title = str(payload.get("title") or "").strip()
+            if not title:
+                return JsonResponse({"error": "title is required"}, status=400)
+            artifact.title = title
+            dirty_fields.add("title")
+        if "slug" in payload:
+            slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=artifact.title)
+            if not slug:
+                return JsonResponse({"error": "slug is required"}, status=400)
+            if _artifact_slug_exists(str(artifact.workspace_id), slug, exclude_artifact_id=str(artifact.id)):
+                return JsonResponse({"error": "slug already exists in this workspace"}, status=400)
+            artifact.slug = slug
+            scope["slug"] = slug
+            ArtifactExternalRef.objects.update_or_create(
+                artifact=artifact,
+                system="shine",
+                defaults={"external_id": str(artifact.id), "slug_path": slug},
+            )
+            dirty_fields.update({"slug", "scope_json"})
+        if "category" in payload:
+            scope["category"] = _normalize_article_category(payload.get("category"), fallback=_article_category(artifact))
+            dirty_fields.add("scope_json")
+        if "visibility_type" in payload:
+            visibility_type = _normalize_article_visibility_type(
+                payload.get("visibility_type"),
+                fallback=_article_visibility_type_from_artifact(artifact),
+            )
+            allowed_roles = _normalize_role_slugs(payload.get("allowed_roles") if "allowed_roles" in payload else scope.get("allowed_roles"))
+            if visibility_type == "role_based" and not allowed_roles:
+                return JsonResponse({"error": "allowed_roles is required for role_based visibility"}, status=400)
+            invalid_roles = [role for role in allowed_roles if role not in PLATFORM_ROLE_IDS and role not in WORKSPACE_ROLE_SLUGS]
+            if invalid_roles:
+                return JsonResponse({"error": f"invalid allowed_roles: {', '.join(sorted(set(invalid_roles)))}"}, status=400)
+            scope["visibility_type"] = visibility_type
+            scope["allowed_roles"] = allowed_roles
+            artifact.visibility = _artifact_visibility_for_article_type(visibility_type)
+            dirty_fields.update({"scope_json", "visibility"})
+        elif "allowed_roles" in payload:
+            allowed_roles = _normalize_role_slugs(payload.get("allowed_roles"))
+            invalid_roles = [role for role in allowed_roles if role not in PLATFORM_ROLE_IDS and role not in WORKSPACE_ROLE_SLUGS]
+            if invalid_roles:
+                return JsonResponse({"error": f"invalid allowed_roles: {', '.join(sorted(set(invalid_roles)))}"}, status=400)
+            scope["allowed_roles"] = allowed_roles
+            dirty_fields.add("scope_json")
+        if "route_bindings" in payload:
+            scope["route_bindings"] = _normalize_doc_route_bindings(payload.get("route_bindings"))
+            dirty_fields.add("scope_json")
+        if "tags" in payload:
+            scope["tags"] = _normalize_doc_tags(payload.get("tags"))
+            dirty_fields.add("scope_json")
+        if "cover_image_url" in payload:
+            scope["cover_image_url"] = str(payload.get("cover_image_url") or "")
+            dirty_fields.add("scope_json")
+        if "canonical_url" in payload:
+            scope["canonical_url"] = str(payload.get("canonical_url") or "")
+            dirty_fields.add("scope_json")
+        if "license_json" in payload and isinstance(payload.get("license_json"), dict):
+            scope["license_json"] = payload.get("license_json")
+            dirty_fields.add("scope_json")
+        if dirty_fields:
+            artifact.scope_json = scope
+            dirty_fields.add("updated_at")
+            artifact.save(update_fields=sorted(dirty_fields))
+            _record_artifact_event(artifact, "article_metadata_updated", identity, {"fields": sorted(dirty_fields)})
+    if not _can_view_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    return JsonResponse({"article": _serialize_article_detail(artifact)})
+
+
+@csrf_exempt
+def article_revisions_collection(request: HttpRequest, article_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if request.method == "POST":
+        if not _can_edit_article(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        body_markdown = str(payload.get("body_markdown") or "")
+        body_html = str(payload.get("body_html") or "")
+        if not body_markdown and not body_html:
+            return JsonResponse({"error": "body_markdown or body_html is required"}, status=400)
+        latest = _latest_artifact_revision(artifact)
+        content = dict((latest.content_json if latest else {}) or {})
+        content["title"] = str(payload.get("title") or content.get("title") or artifact.title)
+        content["summary"] = str(payload.get("summary") or content.get("summary") or "")
+        if "tags" in payload:
+            content["tags"] = _normalize_doc_tags(payload.get("tags"))
+        if "body_markdown" in payload:
+            content["body_markdown"] = body_markdown
+        if "body_html" in payload:
+            content["body_html"] = body_html
+        provenance_json = payload.get("provenance_json") if isinstance(payload.get("provenance_json"), dict) else {}
+        content["provenance_json"] = provenance_json
+        revision_no = _next_artifact_revision_number(artifact)
+        with transaction.atomic():
+            revision = ArtifactRevision.objects.create(
+                artifact=artifact,
+                revision_number=revision_no,
+                content_json=content,
+                created_by=identity,
+            )
+            artifact.version = revision_no
+            if content.get("title"):
+                artifact.title = str(content.get("title"))
+            artifact.save(update_fields=["version", "title", "updated_at"])
+            _record_artifact_event(
+                artifact,
+                "article_revision_created",
+                identity,
+                {"revision_number": revision_no, "source": str(payload.get("source") or "manual")},
+            )
+            if provenance_json.get("agent_slug"):
+                _record_artifact_event(
+                    artifact,
+                    "ai_invoked",
+                    identity,
+                    {
+                        "revision_number": revision_no,
+                        "agent_slug": provenance_json.get("agent_slug"),
+                        "provider": provenance_json.get("provider"),
+                        "model_name": provenance_json.get("model_name"),
+                    },
+                )
+        return JsonResponse({"revision": _serialize_article_revision(revision), "article": _serialize_article_detail(artifact)})
+
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _can_view_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    revisions = ArtifactRevision.objects.filter(artifact=artifact).select_related("created_by").order_by("-revision_number")
+    return JsonResponse({"revisions": [_serialize_article_revision(item) for item in revisions]})
+
+
+@csrf_exempt
+def article_transition(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_articles(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    artifact = _resolve_article_or_404(article_id)
+    payload = _parse_json(request)
+    to_status = str(payload.get("to_status") or "").strip().lower()
+    if to_status not in ARTICLE_STATUS_CHOICES:
+        return JsonResponse({"error": "invalid to_status"}, status=400)
+    if to_status == artifact.status:
+        return JsonResponse({"article": _serialize_article_detail(artifact)})
+    allowed = ARTICLE_TRANSITIONS.get(artifact.status, set())
+    if to_status not in allowed:
+        return JsonResponse({"error": f"invalid transition {artifact.status} -> {to_status}"}, status=400)
+    from_status = artifact.status
+    artifact.status = to_status
+    update_fields = ["status", "updated_at"]
+    if to_status == "published":
+        artifact.published_at = timezone.now()
+        artifact.ratified_by = identity
+        artifact.ratified_at = timezone.now()
+        if _article_visibility_type_from_artifact(artifact) == "private":
+            scope = dict(artifact.scope_json or {})
+            scope["visibility_type"] = "public"
+            artifact.scope_json = scope
+            artifact.visibility = "public"
+            update_fields.extend(["scope_json", "visibility"])
+        update_fields.extend(["published_at", "ratified_by", "ratified_at"])
+    artifact.save(update_fields=list(dict.fromkeys(update_fields)))
+    _record_artifact_event(artifact, "article_status_changed", identity, {"from": from_status, "to": to_status})
+    if to_status == "published":
+        _record_artifact_event(artifact, "article_published", identity, {"status": "published"})
+    if to_status == "deprecated":
+        _record_artifact_event(artifact, "article_deprecated", identity, {"status": "deprecated"})
+    return JsonResponse({"article": _serialize_article_detail(artifact)})
+
+
 @csrf_exempt
 def docs_by_route(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
@@ -4116,7 +4722,23 @@ def docs_by_route(request: HttpRequest) -> JsonResponse:
     if not route_id:
         return JsonResponse({"error": "route_id is required"}, status=400)
     _ensure_doc_artifact_type()
+    _ensure_article_artifact_type()
     workspace_id = str(request.GET.get("workspace_id") or "").strip()
+    guide_article_qs = Artifact.objects.filter(type__slug=ARTICLE_ARTIFACT_TYPE_SLUG).select_related("type", "workspace", "author")
+    if workspace_id:
+        guide_article_qs = guide_article_qs.filter(workspace_id=workspace_id)
+    candidates: list[Artifact] = []
+    for artifact in guide_article_qs.order_by("-published_at", "-updated_at", "-created_at"):
+        if _article_category(artifact) not in GUIDE_ARTICLE_CATEGORIES:
+            continue
+        if not _can_view_article(identity, artifact):
+            continue
+        bindings = _article_route_bindings(artifact)
+        if route_id in bindings:
+            candidates.append(artifact)
+    if candidates:
+        return JsonResponse({"doc": _article_to_doc_page_payload(candidates[0]), "route_id": route_id})
+
     qs = Artifact.objects.filter(type__slug=DOC_ARTIFACT_TYPE_SLUG).select_related("type", "workspace", "author")
     if workspace_id:
         qs = qs.filter(workspace_id=workspace_id)
@@ -4139,7 +4761,8 @@ def docs_collection(request: HttpRequest) -> JsonResponse:
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
     docs_workspace = _docs_workspace()
-    doc_type = _ensure_doc_artifact_type()
+    _ensure_doc_artifact_type()
+    article_type = _ensure_article_artifact_type()
     if request.method == "POST":
         if not _can_manage_docs(identity):
             return JsonResponse({"error": "forbidden"}, status=403)
@@ -4155,14 +4778,16 @@ def docs_collection(request: HttpRequest) -> JsonResponse:
         visibility = str(payload.get("visibility") or "team").strip().lower()
         if visibility not in {"private", "team", "public"}:
             visibility = "team"
+        visibility_type = "public" if visibility == "public" else ("private" if visibility == "private" else "authenticated")
         route_bindings = _normalize_doc_route_bindings(payload.get("route_bindings"))
         tags = _normalize_doc_tags(payload.get("tags"))
         summary = str(payload.get("summary") or "")
         body_markdown = str(payload.get("body_markdown") or "")
+        category = _normalize_article_category(payload.get("category"), fallback=_derive_guide_category(tags))
         with transaction.atomic():
             artifact = Artifact.objects.create(
                 workspace=docs_workspace,
-                type=doc_type,
+                type=article_type,
                 title=title,
                 slug=slug,
                 status="draft",
@@ -4170,7 +4795,14 @@ def docs_collection(request: HttpRequest) -> JsonResponse:
                 visibility=visibility,
                 author=identity,
                 custodian=identity,
-                scope_json={"route_bindings": route_bindings, "slug": slug},
+                scope_json={
+                    "route_bindings": route_bindings,
+                    "slug": slug,
+                    "category": category,
+                    "visibility_type": visibility_type,
+                    "allowed_roles": [],
+                    "tags": tags,
+                },
                 provenance_json={"source_system": "shine", "source_id": None},
             )
             revision = ArtifactRevision.objects.create(
@@ -4184,29 +4816,41 @@ def docs_collection(request: HttpRequest) -> JsonResponse:
                 },
                 created_by=identity,
             )
-            _record_artifact_event(
-                artifact,
-                "doc_created",
-                identity,
-                {"route_bindings": route_bindings, "visibility": visibility},
-            )
-        return JsonResponse({"doc": _serialize_doc_page(artifact, revision)})
+            _record_artifact_event(artifact, "article_created", identity, {"category": category, "route_bindings": route_bindings})
+        return JsonResponse({"doc": _article_to_doc_page_payload(artifact, revision)})
 
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
     tags_query = str(request.GET.get("tags") or "").strip()
     tags_filter = {tag.strip().lower() for tag in tags_query.split(",") if tag.strip()} if tags_query else set()
     include_drafts = request.GET.get("include_drafts") == "1"
-    qs = Artifact.objects.filter(type__slug=DOC_ARTIFACT_TYPE_SLUG).select_related("type", "workspace")
-    if not _can_manage_docs(identity) or not include_drafts:
-        qs = qs.filter(status="published", visibility__in=["public", "team"])
     docs: list[Dict[str, Any]] = []
-    for artifact in qs.order_by("-published_at", "-updated_at", "-created_at"):
-        serialized = _serialize_doc_page(artifact)
+
+    article_qs = Artifact.objects.filter(type=article_type).select_related("type", "workspace")
+    for artifact in article_qs.order_by("-published_at", "-updated_at", "-created_at"):
+        if _article_category(artifact) not in GUIDE_ARTICLE_CATEGORIES:
+            continue
+        if (not _can_manage_docs(identity) or not include_drafts) and artifact.status != "published":
+            continue
+        if not _can_view_article(identity, artifact):
+            continue
+        serialized = _article_to_doc_page_payload(artifact)
         doc_tags = set(serialized.get("tags") or [])
         if tags_filter and not tags_filter.issubset(doc_tags):
             continue
         docs.append(serialized)
+
+    # Backward-compatible fallback for legacy doc_page artifacts.
+    if not docs:
+        qs = Artifact.objects.filter(type__slug=DOC_ARTIFACT_TYPE_SLUG).select_related("type", "workspace")
+        if not _can_manage_docs(identity) or not include_drafts:
+            qs = qs.filter(status="published", visibility__in=["public", "team"])
+        for artifact in qs.order_by("-published_at", "-updated_at", "-created_at"):
+            serialized = _serialize_doc_page(artifact)
+            doc_tags = set(serialized.get("tags") or [])
+            if tags_filter and not tags_filter.issubset(doc_tags):
+                continue
+            docs.append(serialized)
     return JsonResponse({"docs": docs})
 
 
@@ -4215,6 +4859,11 @@ def doc_detail_by_slug(request: HttpRequest, slug: str) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
+    article = Artifact.objects.select_related("type").filter(type__slug=ARTICLE_ARTIFACT_TYPE_SLUG, slug=slug).first()
+    if article and _article_category(article) in GUIDE_ARTICLE_CATEGORIES:
+        if not _can_view_article(identity, article):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        return JsonResponse({"doc": _article_to_doc_page_payload(article)})
     artifact = get_object_or_404(Artifact.objects.select_related("type"), type__slug=DOC_ARTIFACT_TYPE_SLUG, slug=slug)
     if not _can_view_doc(identity, artifact):
         return JsonResponse({"error": "forbidden"}, status=403)
@@ -4226,10 +4875,74 @@ def doc_detail(request: HttpRequest, doc_id: str) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
-    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=doc_id, type__slug=DOC_ARTIFACT_TYPE_SLUG)
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=doc_id)
     if request.method in {"PUT", "PATCH"}:
         if not _can_manage_docs(identity):
             return JsonResponse({"error": "forbidden"}, status=403)
+        if artifact.type.slug == ARTICLE_ARTIFACT_TYPE_SLUG:
+            payload = _parse_json(request)
+            scope_payload: Dict[str, Any] = {}
+            if "route_bindings" in payload:
+                scope_payload["route_bindings"] = _normalize_doc_route_bindings(payload.get("route_bindings"))
+            if "tags" in payload:
+                scope_payload["tags"] = _normalize_doc_tags(payload.get("tags"))
+            if "visibility" in payload:
+                raw_visibility = str(payload.get("visibility") or "").strip().lower()
+                if raw_visibility not in {"private", "team", "public"}:
+                    return JsonResponse({"error": "invalid visibility"}, status=400)
+                scope_payload["visibility_type"] = (
+                    "public" if raw_visibility == "public" else ("private" if raw_visibility == "private" else "authenticated")
+                )
+            article_update_payload = {
+                "title": payload.get("title"),
+                "slug": payload.get("slug"),
+                "route_bindings": scope_payload.get("route_bindings"),
+                "tags": scope_payload.get("tags"),
+                "visibility_type": scope_payload.get("visibility_type"),
+                "category": payload.get("category"),
+            }
+            article_update_payload = {key: value for key, value in article_update_payload.items() if value is not None}
+            if article_update_payload:
+                latest = _latest_artifact_revision(artifact)
+                content = dict((latest.content_json if latest else {}) or {})
+                scope = dict(artifact.scope_json or {})
+                if "title" in article_update_payload:
+                    artifact.title = str(article_update_payload["title"] or artifact.title).strip() or artifact.title
+                    content["title"] = artifact.title
+                if "slug" in article_update_payload:
+                    normalized_slug = _normalize_artifact_slug(str(article_update_payload.get("slug") or ""), fallback_title=artifact.title)
+                    if not normalized_slug:
+                        return JsonResponse({"error": "slug is required"}, status=400)
+                    if _artifact_slug_exists(str(artifact.workspace_id), normalized_slug, exclude_artifact_id=str(artifact.id)):
+                        return JsonResponse({"error": "slug already exists in docs workspace"}, status=400)
+                    artifact.slug = normalized_slug
+                    scope["slug"] = normalized_slug
+                if "route_bindings" in article_update_payload:
+                    scope["route_bindings"] = _normalize_doc_route_bindings(article_update_payload.get("route_bindings"))
+                if "tags" in article_update_payload:
+                    scope["tags"] = _normalize_doc_tags(article_update_payload.get("tags"))
+                    content["tags"] = _normalize_doc_tags(article_update_payload.get("tags"))
+                if "visibility_type" in article_update_payload:
+                    visibility_type = _normalize_article_visibility_type(article_update_payload.get("visibility_type"), fallback="authenticated")
+                    scope["visibility_type"] = visibility_type
+                    artifact.visibility = _artifact_visibility_for_article_type(visibility_type)
+                if "category" in article_update_payload:
+                    scope["category"] = _normalize_article_category(article_update_payload.get("category"), fallback="guide")
+                if "summary" in payload:
+                    content["summary"] = str(payload.get("summary") or "")
+                if "body_markdown" in payload:
+                    content["body_markdown"] = str(payload.get("body_markdown") or "")
+                artifact.scope_json = scope
+                artifact.version = _next_artifact_revision_number(artifact)
+                artifact.save(update_fields=["title", "slug", "visibility", "scope_json", "version", "updated_at"])
+                revision = ArtifactRevision.objects.create(
+                    artifact=artifact,
+                    revision_number=artifact.version,
+                    content_json=content,
+                    created_by=identity,
+                )
+                _record_artifact_event(artifact, "article_revision_created", identity, {"revision_number": artifact.version, "source": "manual"})
+                return JsonResponse({"doc": _article_to_doc_page_payload(artifact, revision)})
         payload = _parse_json(request)
         latest = _latest_artifact_revision(artifact)
         content = dict((latest.content_json if latest else {}) or {})
@@ -4273,6 +4986,10 @@ def doc_detail(request: HttpRequest, doc_id: str) -> JsonResponse:
 
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
+    if artifact.type.slug == ARTICLE_ARTIFACT_TYPE_SLUG:
+        if not _can_view_article(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        return JsonResponse({"doc": _article_to_doc_page_payload(artifact)})
     if not _can_view_doc(identity, artifact):
         return JsonResponse({"error": "forbidden"}, status=403)
     return JsonResponse({"doc": _serialize_doc_page(artifact)})
@@ -4287,7 +5004,27 @@ def doc_publish(request: HttpRequest, doc_id: str) -> JsonResponse:
         return JsonResponse({"error": "not authenticated"}, status=401)
     if not _can_manage_docs(identity):
         return JsonResponse({"error": "forbidden"}, status=403)
-    artifact = get_object_or_404(Artifact, id=doc_id, type__slug=DOC_ARTIFACT_TYPE_SLUG)
+    artifact = get_object_or_404(Artifact, id=doc_id)
+    if artifact.type.slug == ARTICLE_ARTIFACT_TYPE_SLUG:
+        if _article_category(artifact) not in GUIDE_ARTICLE_CATEGORIES:
+            return JsonResponse({"error": "not a guide article"}, status=400)
+        artifact.status = "published"
+        if artifact.visibility == "private":
+            artifact.visibility = "team"
+            scope = dict(artifact.scope_json or {})
+            scope["visibility_type"] = "authenticated"
+            artifact.scope_json = scope
+            update_fields = ["status", "visibility", "scope_json", "published_at", "ratified_by", "ratified_at", "updated_at"]
+        else:
+            update_fields = ["status", "published_at", "ratified_by", "ratified_at", "updated_at"]
+        artifact.published_at = timezone.now()
+        artifact.ratified_by = identity
+        artifact.ratified_at = timezone.now()
+        artifact.save(update_fields=update_fields)
+        _record_artifact_event(artifact, "article_published", identity, {"status": "published"})
+        return JsonResponse({"doc": _article_to_doc_page_payload(artifact)})
+    if artifact.type.slug != DOC_ARTIFACT_TYPE_SLUG:
+        return JsonResponse({"error": "unsupported artifact type"}, status=400)
     artifact.status = "published"
     if artifact.visibility == "private":
         artifact.visibility = "team"
