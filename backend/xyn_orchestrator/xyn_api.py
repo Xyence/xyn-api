@@ -4260,20 +4260,151 @@ def doc_publish(request: HttpRequest, doc_id: str) -> JsonResponse:
     return JsonResponse({"doc": _serialize_doc_page(artifact)})
 
 
+def _subscriber_notes_prompt_template() -> str:
+    return (
+        "Create a Subscriber Notes app for a telecom support team.\n\n"
+        "Requirements:\n"
+        "- Show a list of subscriber notes with created time and status.\n"
+        "- Allow add, edit, and archive note entries.\n"
+        "- Include search/filter by subscriber id and status.\n"
+        "- Keep UI minimal and readable for operator workflows.\n"
+        "- Expose API endpoints for list/create/update/archive."
+    )
+
+
 def _default_tour_payload(slug: str) -> Dict[str, Any]:
     if slug != "deploy-subscriber-notes":
         return {"error": "tour not found"}
     return {
+        "schema_version": 2,
         "slug": "deploy-subscriber-notes",
         "title": "Deploy Subscriber Notes",
-        "description": "Golden path: blueprint to running deployment with logs.",
+        "description": "Draft to deployment lifecycle with deterministic naming and resilient guidance.",
+        "variables": {
+            "short_id": {"type": "generated", "format": "base32", "length": 8},
+            "draft_name": {"type": "template", "value": "subscriber-notes-${short_id}"},
+            "subscriber_notes_prompt": {"type": "static", "value": _subscriber_notes_prompt_template()},
+        },
         "steps": [
-            {"id": "blueprint-open", "route": "/app/blueprints", "selector": "[data-tour='blueprints-list']", "text": "Go to Blueprints and open the Subscriber Notes blueprint."},
-            {"id": "draft-generate", "route": "/app/drafts", "selector": "[data-tour='draft-generate']", "text": "Generate a draft from the blueprint."},
-            {"id": "release-plan", "route": "/app/release-plans", "selector": "[data-tour='release-plan-create']", "text": "Create a release plan for the generated draft."},
-            {"id": "instance-select", "route": "/app/instances", "selector": "[data-tour='instance-select']", "text": "Select the target instance xyn-seed-dev-1."},
-            {"id": "deploy-plan", "route": "/app/release-plans", "selector": "[data-tour='release-plan-deploy']", "text": "Deploy the release plan."},
-            {"id": "observe", "route": "/app/runs", "selector": "[data-tour='run-artifacts']", "text": "Open execution logs and artifacts to verify deployment."},
+            {
+                "id": "intro",
+                "route": "/app/drafts",
+                "attach": {"selector": None, "fallback": "center"},
+                "title": "Drafts are where intent becomes structure",
+                "body": (
+                    "Draft Sessions capture the shape of what you want to build before turning it into a reusable blueprint. "
+                    "This keeps experimentation separate from published artifacts. "
+                    "In this tour you will create one fresh draft and move it through release and deployment."
+                ),
+                "actions": [],
+                "wait_for": None,
+            },
+            {
+                "id": "draft-create",
+                "route": "/app/drafts",
+                "attach": {"selector": "[data-tour='draft-create']", "fallback": "center", "wait_ms": 3000},
+                "title": "Create a new draft session",
+                "body": (
+                    "Use a unique draft name so this flow works from a clean install and avoids collisions. "
+                    "You can create the draft automatically, then continue editing in the UI."
+                ),
+                "actions": [
+                    {
+                        "type": "copy_to_clipboard",
+                        "label": "Copy Subscriber Notes prompt",
+                        "value_template": "${subscriber_notes_prompt}",
+                    },
+                    {
+                        "type": "ensure_resource",
+                        "label": "Create draft for me",
+                        "resource": "draft_session",
+                        "id_key": "draft_id",
+                        "create_via": {
+                            "method": "POST",
+                            "path": "/xyn/api/draft-sessions",
+                            "body_template": {
+                                "title": "${draft_name}",
+                                "kind": "blueprint",
+                                "namespace": "core",
+                                "project_key": "core.subscriber-notes-${short_id}",
+                                "generate_code": False,
+                                "initial_prompt": "${subscriber_notes_prompt}",
+                            },
+                        },
+                        "instructions": "If auto-create is blocked, click New draft session and paste the copied prompt.",
+                    },
+                ],
+                "wait_for": None,
+            },
+            {
+                "id": "draft-promote",
+                "route": "/app/drafts",
+                "attach": {"selector": "[data-tour='draft-promote']", "fallback": "center", "wait_ms": 3000},
+                "title": "Promote draft to blueprint",
+                "body": (
+                    "Promotion converts the working draft into a governed blueprint that can be versioned and released. "
+                    "This is the handoff from proposal to buildable definition."
+                ),
+                "actions": [
+                    {
+                        "type": "ui_hint",
+                        "text": "Use Submit as Blueprint, then confirm fields in the modal before continuing.",
+                    }
+                ],
+                "wait_for": None,
+            },
+            {
+                "id": "release-plan-create",
+                "route": "/app/release-plans",
+                "attach": {"selector": "[data-tour='release-plan-create']", "fallback": "center", "wait_ms": 3000},
+                "title": "Create a release plan",
+                "body": (
+                    "Release Plans bind a blueprint output to a target environment and deployment context. "
+                    "This is where you define what should change and where it should land."
+                ),
+                "actions": [
+                    {"type": "ui_hint", "text": "Select an environment and click Create."}
+                ],
+                "wait_for": None,
+            },
+            {
+                "id": "instance-select",
+                "route": "/app/instances",
+                "attach": {"selector": "[data-tour='instance-select']", "fallback": "center", "wait_ms": 3000},
+                "title": "Choose a development instance",
+                "body": (
+                    "Pick any available development instance, preferably Local when available. "
+                    "This tour does not require xyn-seed-dev-1 or any preseeded remote target."
+                ),
+                "actions": [
+                    {"type": "ui_hint", "text": "Select the instance you want for deployment, then return to Release Plans."}
+                ],
+                "wait_for": None,
+            },
+            {
+                "id": "deploy-plan",
+                "route": "/app/release-plans",
+                "attach": {"selector": "[data-tour='release-plan-deploy']", "fallback": "center", "wait_ms": 3000},
+                "title": "Deploy the plan",
+                "body": (
+                    "Deployment executes the release plan against your selected instance. "
+                    "If the button is disabled, complete required fields first and continue once ready."
+                ),
+                "actions": [],
+                "wait_for": None,
+            },
+            {
+                "id": "observe",
+                "route": "/app/runs",
+                "attach": {"selector": "[data-tour='run-artifacts']", "fallback": "center", "wait_ms": 3000},
+                "title": "Observe logs and artifacts",
+                "body": (
+                    "Runs, logs, and artifacts provide the auditable record of what executed and what was produced. "
+                    "Use this page to validate outcomes and troubleshoot failures."
+                ),
+                "actions": [],
+                "wait_for": None,
+            },
         ],
     }
 
@@ -4288,6 +4419,8 @@ def tour_detail(request: HttpRequest, tour_slug: str) -> JsonResponse:
     payload = _default_tour_payload(tour_slug)
     if payload.get("error"):
         return JsonResponse(payload, status=404)
+    if "schema_version" not in payload:
+        payload["schema_version"] = 1
     return JsonResponse(payload)
 
 
