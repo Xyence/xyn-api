@@ -75,6 +75,14 @@ class AiInvokeError(RuntimeError):
     pass
 
 
+def assemble_system_prompt(agent_prompt: Optional[str], purpose_preamble: Optional[str]) -> str:
+    preamble = str(purpose_preamble or "").strip()
+    prompt = str(agent_prompt or "").strip()
+    if preamble and prompt:
+        return f"{preamble}\n\n{prompt}"
+    return preamble or prompt
+
+
 def _fernet() -> Fernet:
     raw = str(os.environ.get("XYN_CREDENTIALS_ENCRYPTION_KEY") or os.environ.get("XYN_SECRET_KEY") or "").strip()
     if not raw:
@@ -159,7 +167,7 @@ def _serialize_messages_for_provider(messages: List[Dict[str, str]]) -> List[Dic
 
 
 def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optional[str] = None) -> Dict[str, Any]:
-    purpose = str(purpose_slug or "").strip() or "coding"
+    purpose = str(purpose_slug or "").strip().lower()
     agent = None
     if agent_slug:
         agent = (
@@ -174,6 +182,14 @@ def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optiona
             .order_by("-is_default", "slug")
             .first()
         )
+    if not purpose:
+        if agent:
+            first_purpose = agent.purposes.order_by("slug").first()
+            purpose = str(first_purpose.slug if first_purpose else "coding")
+        else:
+            purpose = "coding"
+    purpose_obj = AgentPurpose.objects.filter(slug=purpose).first()
+    purpose_preamble = str(getattr(purpose_obj, "preamble", "") or "")
     if agent:
         model_config = agent.model_config
         provider = model_config.provider
@@ -189,7 +205,7 @@ def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optiona
             "api_key": api_key,
             "temperature": model_config.temperature,
             "max_tokens": model_config.max_tokens,
-            "system_prompt": agent.system_prompt_text,
+            "system_prompt": assemble_system_prompt(agent.system_prompt_text, purpose_preamble),
             "agent_slug": agent.slug,
             "purpose": purpose,
         }
@@ -225,7 +241,7 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
     if not provider or not model_name or not api_key:
         raise AiInvokeError("provider/model/api_key are required")
 
-    payload_messages = _serialize_messages_for_provider(messages)
+    payload_messages = [msg for msg in _serialize_messages_for_provider(messages) if msg.get("role") != "system"]
     system_prompt = str(resolved_config.get("system_prompt") or "").strip()
     if system_prompt:
         payload_messages = [{"role": "system", "content": system_prompt}] + payload_messages
@@ -452,7 +468,7 @@ def ensure_default_ai_seeds() -> None:
             "name": "Coding",
             "description": "Code generation and development tasks",
             "enabled": True,
-            "system_prompt_markdown": "You are the coding assistant for Xyn.",
+            "preamble": "Purpose: coding. Focus on production-ready implementation guidance.",
             "model_config": default_model,
         },
     )
@@ -462,17 +478,25 @@ def ensure_default_ai_seeds() -> None:
             "name": "Documentation",
             "description": "Documentation drafting and editing",
             "enabled": True,
-            "system_prompt_markdown": "You are the documentation assistant for Xyn.",
+            "preamble": "Purpose: documentation. Produce concise, accurate, publishable drafts.",
             "model_config": default_model,
         },
     )
 
     if not coding.name:
         coding.name = "Coding"
-        coding.save(update_fields=["name"])
+    if not coding.preamble:
+        coding.preamble = "Purpose: coding. Focus on production-ready implementation guidance."
+    if not coding.model_config_id and default_model:
+        coding.model_config = default_model
+    coding.save(update_fields=["name", "preamble", "model_config", "updated_at"])
     if not documentation.name:
         documentation.name = "Documentation"
-        documentation.save(update_fields=["name"])
+    if not documentation.preamble:
+        documentation.preamble = "Purpose: documentation. Produce concise, accurate, publishable drafts."
+    if not documentation.model_config_id and default_model:
+        documentation.model_config = default_model
+    documentation.save(update_fields=["name", "preamble", "model_config", "updated_at"])
 
     assistant, _ = AgentDefinition.objects.get_or_create(
         slug="default-assistant",

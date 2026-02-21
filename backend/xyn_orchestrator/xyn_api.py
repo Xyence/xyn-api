@@ -4473,7 +4473,7 @@ def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:
         "name": purpose.name or purpose.slug.replace("-", " ").title(),
         "description": purpose.description or "",
         "enabled": purpose.enabled,
-        "system_prompt_markdown": purpose.system_prompt_markdown,
+        "preamble": purpose.preamble or "",
         "updated_at": purpose.updated_at,
         "model_config": (
             {
@@ -4982,9 +4982,11 @@ def ai_invoke(request: HttpRequest) -> JsonResponse:
     if not isinstance(messages, list):
         return JsonResponse({"error": "messages must be a list"}, status=400)
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    # Server owns the system prompt; client-provided system messages are ignored.
+    filtered_messages = [msg for msg in messages if isinstance(msg, dict) and str(msg.get("role") or "").strip().lower() != "system"]
     try:
         resolved = resolve_ai_config(agent_slug=agent_slug)
-        result = invoke_model(resolved_config=resolved, messages=messages)
+        result = invoke_model(resolved_config=resolved, messages=filtered_messages)
     except (AiConfigError, AiInvokeError) as exc:
         return JsonResponse({"error": str(exc)}, status=400)
     AuditLog.objects.create(
@@ -5041,8 +5043,19 @@ def ai_purpose_detail(request: HttpRequest, purpose_slug: str) -> JsonResponse:
         purpose.name = str(payload.get("name") or purpose.name)
     if "description" in payload:
         purpose.description = str(payload.get("description") or "")
-    if "system_prompt_markdown" in payload:
-        purpose.system_prompt_markdown = str(payload.get("system_prompt_markdown") or "")
+    preamble_value = None
+    if "preamble" in payload:
+        preamble_value = str(payload.get("preamble") or "")
+    elif "system_prompt" in payload:
+        # Backward compatibility for one release.
+        preamble_value = str(payload.get("system_prompt") or "")
+    elif "system_prompt_markdown" in payload:
+        # Backward compatibility for one release.
+        preamble_value = str(payload.get("system_prompt_markdown") or "")
+    if preamble_value is not None:
+        if len(preamble_value) > 1000:
+            return JsonResponse({"error": "preamble must be 1000 characters or less"}, status=400)
+        purpose.preamble = preamble_value
     model_payload = payload.get("model_config")
     if isinstance(model_payload, dict):
         provider_slug = str(model_payload.get("provider") or "").strip().lower()
@@ -5074,7 +5087,7 @@ def ai_purpose_detail(request: HttpRequest, purpose_slug: str) -> JsonResponse:
             purpose.model_config = model_config
     purpose.updated_by = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
     purpose.save(
-        update_fields=["name", "description", "enabled", "system_prompt_markdown", "model_config", "updated_by", "updated_at"]
+        update_fields=["name", "description", "enabled", "preamble", "model_config", "updated_by", "updated_at"]
     )
     return JsonResponse({"purpose": _serialize_agent_purpose(purpose)})
 

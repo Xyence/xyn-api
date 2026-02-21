@@ -84,6 +84,8 @@ class DocsApiTests(TestCase):
         self.assertEqual(list_response.status_code, 200)
         purposes = list_response.json()["purposes"]
         self.assertTrue(any(item["slug"] == "documentation" for item in purposes))
+        self.assertIn("preamble", purposes[0])
+        self.assertNotIn("system_prompt_markdown", purposes[0])
 
         update_forbidden = self.client.put(
             "/xyn/api/ai/purposes/documentation",
@@ -101,6 +103,23 @@ class DocsApiTests(TestCase):
         self.assertEqual(update_ok.status_code, 200)
         self.assertFalse(update_ok.json()["purpose"]["enabled"])
         self.assertFalse(AgentPurpose.objects.get(slug="documentation").enabled)
+
+        update_preamble = self.client.patch(
+            "/xyn/api/ai/purposes/documentation",
+            data=json.dumps({"preamble": "Docs purpose preamble"}),
+            content_type="application/json",
+        )
+        self.assertEqual(update_preamble.status_code, 200)
+        self.assertEqual(update_preamble.json()["purpose"]["preamble"], "Docs purpose preamble")
+        self.assertEqual(AgentPurpose.objects.get(slug="documentation").preamble, "Docs purpose preamble")
+
+        compat_update = self.client.patch(
+            "/xyn/api/ai/purposes/documentation",
+            data=json.dumps({"system_prompt": "Compat preamble"}),
+            content_type="application/json",
+        )
+        self.assertEqual(compat_update.status_code, 200)
+        self.assertEqual(compat_update.json()["purpose"]["preamble"], "Compat preamble")
 
     def test_docs_slug_lookup_requires_published_for_reader(self):
         self._set_identity(self.admin_identity)

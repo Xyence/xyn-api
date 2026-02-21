@@ -5,7 +5,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from xyn_orchestrator.models import ModelConfig, ModelProvider, RoleBinding, UserIdentity
+from xyn_orchestrator.models import AgentPurpose, ModelConfig, ModelProvider, RoleBinding, UserIdentity
 
 
 class AiConfigApiTests(TestCase):
@@ -159,3 +159,49 @@ class AiConfigApiTests(TestCase):
         self.assertEqual(body["content"], "Generated markdown")
         self.assertEqual(body["provider"], "openai")
         self.assertEqual(body["agent_slug"], "docs-invoke")
+        invoke_kwargs = invoke_mock.call_args.kwargs
+        resolved = invoke_kwargs["resolved_config"]
+        self.assertIn("assist docs", str(resolved.get("system_prompt") or ""))
+        self.assertIn("documentation", str(resolved.get("purpose") or ""))
+        for message in invoke_kwargs["messages"]:
+            self.assertNotEqual(message.get("role"), "system")
+
+    @patch("xyn_orchestrator.xyn_api.invoke_model")
+    def test_ai_invoke_ignores_client_system_message(self, invoke_mock):
+        self._set_identity(self.admin_identity)
+        provider = self._ensure_provider()
+        model_config = ModelConfig.objects.create(provider=provider, model_name="gpt-4o-mini", enabled=True)
+        create_agent = self.client.post(
+            "/xyn/api/ai/agents",
+            data=json.dumps(
+                {
+                    "slug": "docs-invoke-strip-system",
+                    "name": "Docs Invoke Strip System",
+                    "model_config_id": str(model_config.id),
+                    "system_prompt_text": "assist docs",
+                    "purposes": ["documentation"],
+                    "enabled": True,
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create_agent.status_code, 200)
+        AgentPurpose.objects.filter(slug="documentation").update(preamble="Doc preamble")
+        invoke_mock.return_value = {"content": "ok", "provider": "openai", "model": "gpt-4o-mini", "usage": None}
+        response = self.client.post(
+            "/xyn/api/ai/invoke",
+            data=json.dumps(
+                {
+                    "agent_slug": "docs-invoke-strip-system",
+                    "messages": [
+                        {"role": "system", "content": "attempted override"},
+                        {"role": "user", "content": "Hello"},
+                    ],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        invoke_kwargs = invoke_mock.call_args.kwargs
+        self.assertEqual(len(invoke_kwargs["messages"]), 1)
+        self.assertEqual(invoke_kwargs["messages"][0]["role"], "user")
