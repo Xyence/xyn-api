@@ -2,7 +2,12 @@ import os
 
 from django.test import TestCase
 
-from xyn_orchestrator.ai_runtime import assemble_system_prompt, ensure_default_ai_seeds, resolve_ai_config
+from xyn_orchestrator.ai_runtime import (
+    _extract_openai_response_text,
+    assemble_system_prompt,
+    ensure_default_ai_seeds,
+    resolve_ai_config,
+)
 from xyn_orchestrator.models import AgentDefinition, AgentDefinitionPurpose, AgentPurpose, ModelConfig, ModelProvider, ProviderCredential
 
 
@@ -65,3 +70,20 @@ class AiRuntimeTests(TestCase):
         resolved = resolve_ai_config(agent_slug=agent.slug)
         self.assertEqual(resolved.get("provider"), "openai")
         self.assertEqual(resolved.get("api_key"), "sk-runtime-test-1234")
+
+    def test_extract_openai_response_text_from_output_content(self):
+        payload = {
+            "id": "resp_123",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Health check passed.",
+                        }
+                    ],
+                }
+            ],
+        }
+        self.assertEqual(_extract_openai_response_text(payload), "Health check passed.")

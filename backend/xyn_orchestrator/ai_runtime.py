@@ -75,6 +75,38 @@ class AiInvokeError(RuntimeError):
     pass
 
 
+def _extract_openai_response_text(data: Dict[str, Any]) -> str:
+    direct = str(data.get("output_text") or "").strip()
+    if direct:
+        return direct
+    chunks: List[str] = []
+    output_items = data.get("output") if isinstance(data.get("output"), list) else []
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        content_items = item.get("content") if isinstance(item.get("content"), list) else []
+        for content in content_items:
+            if not isinstance(content, dict):
+                continue
+            part_type = str(content.get("type") or "").strip().lower()
+            text_value = str(content.get("text") or content.get("output_text") or "").strip()
+            if text_value:
+                chunks.append(text_value)
+                continue
+            # Some responses return structured text payloads.
+            text_obj = content.get("text")
+            if isinstance(text_obj, dict):
+                nested = str(text_obj.get("value") or "").strip()
+                if nested:
+                    chunks.append(nested)
+                    continue
+            if part_type == "refusal":
+                refusal = str(content.get("refusal") or "").strip()
+                if refusal:
+                    chunks.append(f"Model refusal: {refusal}")
+    return "\n".join(chunk for chunk in chunks if chunk).strip()
+
+
 def assemble_system_prompt(agent_prompt: Optional[str], purpose_preamble: Optional[str]) -> str:
     preamble = str(purpose_preamble or "").strip()
     prompt = str(agent_prompt or "").strip()
@@ -274,7 +306,7 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
         if response.status_code >= 400:
             raise AiInvokeError(f"OpenAI error ({response.status_code}): {response.text[:300]}")
         data = response.json()
-        content = str(data.get("output_text") or "")
+        content = _extract_openai_response_text(data)
         return {
             "content": content,
             "provider": provider,
