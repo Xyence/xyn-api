@@ -244,7 +244,7 @@ class Command(BaseCommand):
             category = str(scope.get("category") or "").strip().lower()
             updated = False
 
-            if slug == "core-concepts" and category != "guide":
+            if (slug == "core-concepts" or category == "core-concepts" or title == "core concepts") and category != "guide":
                 scope["category"] = "guide"
                 tags = [str(tag).strip().lower() for tag in (scope.get("tags") or []) if str(tag).strip()]
                 if "core-concepts" not in tags:
