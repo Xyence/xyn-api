@@ -4667,16 +4667,18 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
 
 
 def _serialize_article_category(category: ArticleCategory) -> Dict[str, Any]:
+    referenced_count = Artifact.objects.filter(article_category=category, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG).count()
     return {
         "id": str(category.id),
         "slug": category.slug,
         "name": category.name,
         "description": category.description or "",
         "enabled": bool(category.enabled),
+        "referenced_article_count": referenced_count,
         "created_at": category.created_at,
         "updated_at": category.updated_at,
         "references": {
-            "articles": Artifact.objects.filter(article_category=category, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG).count(),
+            "articles": referenced_count,
         },
     }
 
@@ -4775,13 +4777,13 @@ def article_category_detail(request: HttpRequest, category_slug: str) -> JsonRes
             return JsonResponse(
                 {
                     "error": "category_in_use",
-                    "message": f"Category is referenced by {count} articles. Disable it instead.",
+                    "message": f"Category is referenced by {count} articles and cannot be deleted. Deprecate it instead.",
                     "referenced_by": {"articles": count},
                 },
                 status=409,
             )
         category.delete()
-        return JsonResponse({"ok": True})
+        return JsonResponse(status=204)
 
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)

@@ -172,3 +172,40 @@ class GovernedArticlesApiTests(TestCase):
         self.assertEqual(delete.status_code, 409)
         payload = delete.json()
         self.assertEqual(payload.get("error"), "category_in_use")
+
+    def test_delete_unreferenced_category_returns_204(self):
+        self._set_identity(self.admin_identity)
+        category = ArticleCategory.objects.create(slug="throwaway", name="Throwaway", enabled=True)
+        delete = self.client.delete(f"/xyn/api/articles/categories/{category.slug}")
+        self.assertEqual(delete.status_code, 204)
+        self.assertFalse(ArticleCategory.objects.filter(slug="throwaway").exists())
+
+    def test_patch_disable_referenced_category_succeeds_and_counts_exposed(self):
+        self._set_identity(self.admin_identity)
+        self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Guide One",
+                    "slug": "guide-one",
+                    "category": "guide",
+                    "body_markdown": "content",
+                }
+            ),
+            content_type="application/json",
+        )
+        patch = self.client.patch(
+            "/xyn/api/articles/categories/guide",
+            data=json.dumps({"enabled": False}),
+            content_type="application/json",
+        )
+        self.assertEqual(patch.status_code, 200, patch.content.decode())
+        category = patch.json()["category"]
+        self.assertFalse(category["enabled"])
+        self.assertGreaterEqual(category["referenced_article_count"], 1)
+
+        listing = self.client.get("/xyn/api/articles/categories")
+        self.assertEqual(listing.status_code, 200)
+        guide = next(item for item in listing.json()["categories"] if item["slug"] == "guide")
+        self.assertIn("referenced_article_count", guide)
