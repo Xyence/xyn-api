@@ -209,3 +209,27 @@ class GovernedArticlesApiTests(TestCase):
         self.assertEqual(listing.status_code, 200)
         guide = next(item for item in listing.json()["categories"] if item["slug"] == "guide")
         self.assertIn("referenced_article_count", guide)
+
+    def test_convert_html_to_markdown_creates_revision(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Legacy Html",
+                    "slug": "legacy-html",
+                    "category": "web",
+                    "body_html": "<h1>Hello</h1><p>World</p>",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+        convert = self.client.post(f"/xyn/api/articles/{article_id}/convert-html")
+        self.assertEqual(convert.status_code, 200, convert.content.decode())
+        payload = convert.json()
+        self.assertTrue(payload.get("converted"))
+        revision = payload["revision"]
+        self.assertIn("# Hello", revision.get("body_markdown") or "")

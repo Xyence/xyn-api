@@ -30,6 +30,8 @@ PyJWT>=2.9,<3.0
 cryptography>=42.0,<43.0
 # OpenAI API
 openai>=1.40,<2.0
+# HTML -> Markdown conversion for migrated governed articles
+markdownify>=0.12,<1.0
 # Database driver
 psycopg[binary]>=3.1,<4.0
 # Production server

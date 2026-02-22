@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional, List, Set, Tuple
 import requests
 import boto3
 from authlib.jose import JsonWebKey, jwt
+from markdownify import markdownify as _markdownify_html
 from django.core.paginator import Paginator
 from django.db import models, transaction
 from django.http import HttpRequest, JsonResponse, HttpResponse
@@ -1203,6 +1204,14 @@ def _article_content(artifact: Artifact, revision: Optional[ArtifactRevision] = 
         "tags": tags,
         "latest_revision": latest,
     }
+
+
+def _convert_article_html_to_markdown(value: str) -> str:
+    source = str(value or "").strip()
+    if not source:
+        return ""
+    converted = _markdownify_html(source, heading_style="ATX", bullets="-")
+    return str(converted or "").strip()
 
 
 def _can_manage_articles(identity: UserIdentity) -> bool:
@@ -5113,6 +5122,58 @@ def article_revisions_collection(request: HttpRequest, article_id: str) -> JsonR
         return JsonResponse({"error": "forbidden"}, status=403)
     revisions = ArtifactRevision.objects.filter(artifact=artifact).select_related("created_by").order_by("-revision_number")
     return JsonResponse({"revisions": [_serialize_article_revision(item) for item in revisions]})
+
+
+@csrf_exempt
+def article_convert_html_to_markdown(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if not _can_edit_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    latest = _latest_artifact_revision(artifact)
+    if not latest:
+        return JsonResponse({"error": "no revision to convert"}, status=400)
+    content = dict((latest.content_json if latest else {}) or {})
+    body_markdown = str(content.get("body_markdown") or "")
+    body_html = str(content.get("body_html") or "")
+    if body_markdown.strip():
+        return JsonResponse(
+            {"article": _serialize_article_detail(artifact), "revision": _serialize_article_revision(latest), "converted": False, "reason": "already_markdown"}
+        )
+    if not body_html.strip():
+        return JsonResponse({"error": "no body_html to convert"}, status=400)
+    converted = _convert_article_html_to_markdown(body_html)
+    if not converted:
+        return JsonResponse({"error": "unable to convert body_html to markdown"}, status=400)
+    content["body_markdown"] = converted
+    provenance = dict(content.get("provenance_json") or {})
+    provenance["html_to_markdown"] = {
+        "converted_at": timezone.now().isoformat(),
+        "converted_by": str(identity.id),
+        "source": "article_convert_html_to_markdown",
+    }
+    content["provenance_json"] = provenance
+    revision_no = _next_artifact_revision_number(artifact)
+    with transaction.atomic():
+        revision = ArtifactRevision.objects.create(
+            artifact=artifact,
+            revision_number=revision_no,
+            content_json=content,
+            created_by=identity,
+        )
+        artifact.version = revision_no
+        artifact.save(update_fields=["version", "updated_at"])
+        _record_artifact_event(
+            artifact,
+            "article_revision_created",
+            identity,
+            {"revision_number": revision_no, "source": "html_to_markdown"},
+        )
+    return JsonResponse({"article": _serialize_article_detail(artifact), "revision": _serialize_article_revision(revision), "converted": True})
 
 
 @csrf_exempt
