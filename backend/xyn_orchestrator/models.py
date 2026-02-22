@@ -846,6 +846,22 @@ class ArtifactType(models.Model):
         return self.name
 
 
+class ArticleCategory(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    slug = models.SlugField(max_length=120, unique=True)
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class Artifact(models.Model):
     STATUS_CHOICES = [
         ("draft", "Draft"),
@@ -858,6 +874,9 @@ class Artifact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name="artifacts")
     type = models.ForeignKey(ArtifactType, on_delete=models.PROTECT, related_name="artifacts")
+    article_category = models.ForeignKey(
+        ArticleCategory, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifacts"
+    )
     title = models.CharField(max_length=300)
     slug = models.SlugField(max_length=240, blank=True, default="")
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="draft")
@@ -984,6 +1003,40 @@ class ArtifactComment(models.Model):
 
     class Meta:
         ordering = ["created_at"]
+
+
+class PublishBinding(models.Model):
+    SCOPE_TYPE_CHOICES = [
+        ("category", "Category"),
+        ("article", "Article"),
+    ]
+    TARGET_TYPE_CHOICES = [
+        ("xyn_ui_route", "Xyn UI Route"),
+        ("public_web_path", "Public Web Path"),
+        ("external_url", "External URL"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scope_type = models.CharField(max_length=20, choices=SCOPE_TYPE_CHOICES)
+    scope_id = models.UUIDField()
+    target_type = models.CharField(max_length=30, choices=TARGET_TYPE_CHOICES)
+    target_value = models.CharField(max_length=500)
+    label = models.CharField(max_length=200)
+    enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["label", "target_value"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope_type", "scope_id", "target_type", "target_value"],
+                name="uniq_publish_binding_scope_target",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.scope_type}:{self.scope_id}:{self.target_value}"
 
 
 class BrandProfile(models.Model):

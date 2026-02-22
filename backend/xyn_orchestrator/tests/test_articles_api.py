@@ -3,7 +3,7 @@ import json
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from xyn_orchestrator.models import Artifact, ArtifactEvent, ArtifactType, RoleBinding, UserIdentity, Workspace
+from xyn_orchestrator.models import Artifact, ArtifactEvent, ArtifactType, ArticleCategory, RoleBinding, UserIdentity, Workspace
 
 
 class GovernedArticlesApiTests(TestCase):
@@ -127,3 +127,48 @@ class GovernedArticlesApiTests(TestCase):
         payload = response.json()["doc"]
         self.assertEqual(payload["slug"], "drafts-guide")
         self.assertEqual(payload["title"], "Drafts Guide")
+
+    def test_article_detail_includes_published_to_bindings(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Guide Article",
+                    "slug": "guide-article",
+                    "category": "guide",
+                    "status": "published",
+                    "body_markdown": "content",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+        detail = self.client.get(f"/xyn/api/articles/{article_id}")
+        self.assertEqual(detail.status_code, 200)
+        published_to = detail.json()["article"].get("published_to") or []
+        self.assertTrue(any(item.get("target_value") == "/app/guides" and item.get("source") == "category" for item in published_to))
+
+    def test_category_delete_conflict_when_referenced(self):
+        self._set_identity(self.admin_identity)
+        category = ArticleCategory.objects.create(slug="playbook", name="Playbook", enabled=True)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Playbook One",
+                    "slug": "playbook-one",
+                    "category": "playbook",
+                    "body_markdown": "content",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        delete = self.client.delete(f"/xyn/api/articles/categories/{category.slug}")
+        self.assertEqual(delete.status_code, 409)
+        payload = delete.json()
+        self.assertEqual(payload.get("error"), "category_in_use")

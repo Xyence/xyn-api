@@ -76,6 +76,7 @@ from .models import (
     Workspace,
     WorkspaceMembership,
     ArtifactType,
+    ArticleCategory,
     Artifact,
     ArtifactRevision,
     ArtifactEvent,
@@ -83,6 +84,7 @@ from .models import (
     ArtifactExternalRef,
     ArtifactReaction,
     ArtifactComment,
+    PublishBinding,
     Tenant,
     Contact,
     TenantMembership,
@@ -146,6 +148,8 @@ ARTICLE_CATEGORIES = {"web", "guide", "core-concepts", "release-note", "internal
 GUIDE_ARTICLE_CATEGORIES = {"guide", "core-concepts", "tutorial"}
 ARTICLE_VISIBILITY_TYPES = {"public", "authenticated", "role_based", "private"}
 ARTICLE_STATUS_CHOICES = {"draft", "reviewed", "ratified", "published", "deprecated"}
+ARTICLE_CATEGORY_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
+PUBLISH_BINDING_TARGET_TYPES = {"xyn_ui_route", "public_web_path", "external_url"}
 ARTICLE_TRANSITIONS = {
     "draft": {"reviewed", "published", "deprecated"},
     "reviewed": {"ratified", "published", "deprecated"},
@@ -946,6 +950,7 @@ def _ensure_article_artifact_type() -> ArtifactType:
             },
         },
     )
+    _ensure_default_article_categories_and_bindings()
     return artifact_type
 
 
@@ -999,9 +1004,71 @@ def _normalize_role_slugs(raw: Any) -> list[str]:
 
 def _normalize_article_category(raw: Any, *, fallback: str = "web") -> str:
     value = str(raw or "").strip().lower()
-    if value in ARTICLE_CATEGORIES:
+    if value in ARTICLE_CATEGORIES or ARTICLE_CATEGORY_SLUG_PATTERN.match(value):
         return value
     return fallback
+
+
+def _ensure_default_article_categories_and_bindings() -> None:
+    guide, _ = ArticleCategory.objects.get_or_create(
+        slug="guide",
+        defaults={"name": "Guide", "description": "Guides and route-bound in-app docs", "enabled": True},
+    )
+    web, _ = ArticleCategory.objects.get_or_create(
+        slug="web",
+        defaults={"name": "Web", "description": "Public website articles", "enabled": True},
+    )
+    for slug, name, description in [
+        ("core-concepts", "Core Concepts", "Core concept docs"),
+        ("release-note", "Release Note", "Release note content"),
+        ("internal", "Internal", "Internal content"),
+        ("tutorial", "Tutorial", "Tutorial content"),
+    ]:
+        ArticleCategory.objects.get_or_create(
+            slug=slug,
+            defaults={"name": name, "description": description, "enabled": True},
+        )
+    PublishBinding.objects.get_or_create(
+        scope_type="category",
+        scope_id=guide.id,
+        target_type="xyn_ui_route",
+        target_value="/app/guides",
+        defaults={"label": "Guides", "enabled": True},
+    )
+    PublishBinding.objects.get_or_create(
+        scope_type="category",
+        scope_id=web.id,
+        target_type="public_web_path",
+        target_value="/articles",
+        defaults={"label": "Public Website", "enabled": True},
+    )
+
+
+def _resolve_article_category_slug(slug: str, *, allow_disabled: bool = True) -> Optional[ArticleCategory]:
+    qs = ArticleCategory.objects.filter(slug=slug)
+    if not allow_disabled:
+        qs = qs.filter(enabled=True)
+    return qs.first()
+
+
+def _article_category_record(artifact: Artifact) -> Optional[ArticleCategory]:
+    if artifact.article_category_id:
+        return ArticleCategory.objects.filter(id=artifact.article_category_id).first()
+    scope = dict(artifact.scope_json or {})
+    legacy = _normalize_article_category(scope.get("category"), fallback="web")
+    category = _resolve_article_category_slug(legacy, allow_disabled=True)
+    if category:
+        return category
+    if legacy:
+        return ArticleCategory.objects.create(slug=legacy, name=legacy.replace("-", " ").title(), enabled=True)
+    return None
+
+
+def _serialize_article_category_ref(artifact: Artifact) -> Dict[str, Any]:
+    category = _article_category_record(artifact)
+    if not category:
+        return {"id": None, "slug": "web", "name": "Web", "enabled": True}
+    return {"id": str(category.id), "slug": category.slug, "name": category.name, "enabled": bool(category.enabled)}
 
 
 def _normalize_article_visibility_type(raw: Any, *, fallback: str = "private") -> str:
@@ -1045,6 +1112,9 @@ def _article_category(artifact: Artifact) -> str:
         if "tutorial" in tags:
             return "tutorial"
         return "guide"
+    category = _article_category_record(artifact)
+    if category:
+        return category.slug
     return _normalize_article_category(scope.get("category"), fallback="web")
 
 
@@ -1057,9 +1127,74 @@ def _derive_guide_category(tags: list[str]) -> str:
     return "guide"
 
 
+def _is_valid_binding_target(target_type: str, target_value: str) -> bool:
+    if target_type not in PUBLISH_BINDING_TARGET_TYPES:
+        return False
+    value = str(target_value or "").strip()
+    if not value:
+        return False
+    if target_type in {"xyn_ui_route", "public_web_path"}:
+        return value.startswith("/")
+    if target_type == "external_url":
+        return value.startswith("http://") or value.startswith("https://")
+    return False
+
+
+def _resolve_article_published_to(artifact: Artifact) -> list[Dict[str, str]]:
+    rows: list[Dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    category = _article_category_record(artifact)
+    if category:
+        for binding in PublishBinding.objects.filter(scope_type="category", scope_id=category.id, enabled=True).order_by("label", "target_value"):
+            key = (binding.label, binding.target_type, binding.target_value)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "label": binding.label,
+                    "target_type": binding.target_type,
+                    "target_value": binding.target_value,
+                    "source": "category",
+                }
+            )
+    for binding in PublishBinding.objects.filter(scope_type="article", scope_id=artifact.id, enabled=True).order_by("label", "target_value"):
+        key = (binding.label, binding.target_type, binding.target_value)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "label": binding.label,
+                "target_type": binding.target_type,
+                "target_value": binding.target_value,
+                "source": "article",
+            }
+        )
+    # Compatibility fallback for pre-binding route metadata.
+    if not rows:
+        scope = dict(artifact.scope_json or {})
+        for value in _normalize_doc_route_bindings(scope.get("route_bindings")):
+            key = ("Route", "xyn_ui_route", value)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"label": "Route", "target_type": "xyn_ui_route", "target_value": value, "source": "article"})
+    return rows
+
+
 def _article_route_bindings(artifact: Artifact) -> list[str]:
-    scope = dict(artifact.scope_json or {})
-    return _normalize_doc_route_bindings(scope.get("route_bindings"))
+    values: list[str] = []
+    seen: set[str] = set()
+    for row in _resolve_article_published_to(artifact):
+        if row.get("target_type") != "xyn_ui_route":
+            continue
+        value = str(row.get("target_value") or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return values
 
 
 def _article_content(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
@@ -1113,6 +1248,7 @@ def _can_view_article(identity: UserIdentity, artifact: Artifact) -> bool:
 
 def _serialize_article_summary(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
     content = _article_content(artifact, revision)
+    category_ref = _serialize_article_category_ref(artifact)
     return {
         "id": str(artifact.id),
         "workspace_id": str(artifact.workspace_id),
@@ -1123,7 +1259,9 @@ def _serialize_article_summary(artifact: Artifact, revision: Optional[ArtifactRe
         "version": artifact.version,
         "published_at": artifact.published_at,
         "updated_at": artifact.updated_at,
-        "category": _article_category(artifact),
+        "category": category_ref.get("slug"),
+        "category_name": category_ref.get("name"),
+        "category_id": category_ref.get("id"),
         "visibility_type": _article_visibility_type_from_artifact(artifact),
         "allowed_roles": _article_allowed_roles(artifact),
         "route_bindings": _article_route_bindings(artifact),
@@ -1148,6 +1286,8 @@ def _serialize_article_detail(artifact: Artifact, revision: Optional[ArtifactRev
             "body_html": content.get("body_html") or "",
             "provenance_json": artifact.provenance_json or {},
             "license_json": (artifact.scope_json or {}).get("license_json") or {},
+            "category_ref": _serialize_article_category_ref(artifact),
+            "published_to": _resolve_article_published_to(artifact),
             "reactions": reaction_counts,
             "comments": [_serialize_comment(comment) for comment in comments],
             "created_at": artifact.created_at,
@@ -4394,7 +4534,10 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
             return JsonResponse({"error": "slug is required"}, status=400)
         if _artifact_slug_exists(str(workspace.id), slug):
             return JsonResponse({"error": "slug already exists in this workspace"}, status=400)
-        category = _normalize_article_category(payload.get("category"), fallback="web")
+        category_slug = _normalize_article_category(payload.get("category_slug") or payload.get("category"), fallback="web")
+        category = _resolve_article_category_slug(category_slug, allow_disabled=True)
+        if not category:
+            return JsonResponse({"error": f"unknown category: {category_slug}"}, status=400)
         visibility_type = _normalize_article_visibility_type(payload.get("visibility_type"), fallback="private")
         allowed_roles = _normalize_role_slugs(payload.get("allowed_roles"))
         if visibility_type == "role_based" and not allowed_roles:
@@ -4427,7 +4570,7 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                 ratified_at=timezone.now() if status in {"ratified", "published"} else None,
                 scope_json={
                     "slug": slug,
-                    "category": category,
+                    "category": category.slug,
                     "visibility_type": visibility_type,
                     "allowed_roles": allowed_roles,
                     "route_bindings": route_bindings,
@@ -4437,6 +4580,7 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                     "license_json": payload.get("license_json") if isinstance(payload.get("license_json"), dict) else {},
                 },
                 provenance_json=payload.get("provenance_json") if isinstance(payload.get("provenance_json"), dict) else {},
+                article_category=category,
             )
             ArtifactRevision.objects.create(
                 artifact=artifact,
@@ -4462,8 +4606,19 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                 artifact,
                 "article_created",
                 identity,
-                {"category": category, "visibility_type": visibility_type, "status": status},
+                {"category": category.slug, "visibility_type": visibility_type, "status": status},
             )
+            for route in route_bindings:
+                value = str(route or "").strip()
+                if not value:
+                    continue
+                PublishBinding.objects.get_or_create(
+                    scope_type="article",
+                    scope_id=artifact.id,
+                    target_type="xyn_ui_route",
+                    target_value=value,
+                    defaults={"label": "Route", "enabled": True},
+                )
         return JsonResponse({"article": _serialize_article_detail(artifact)})
 
     if request.method != "GET":
@@ -4511,11 +4666,287 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"articles": results})
 
 
+def _serialize_article_category(category: ArticleCategory) -> Dict[str, Any]:
+    return {
+        "id": str(category.id),
+        "slug": category.slug,
+        "name": category.name,
+        "description": category.description or "",
+        "enabled": bool(category.enabled),
+        "created_at": category.created_at,
+        "updated_at": category.updated_at,
+        "references": {
+            "articles": Artifact.objects.filter(article_category=category, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG).count(),
+        },
+    }
+
+
+def _serialize_publish_binding(binding: PublishBinding, *, source: str) -> Dict[str, Any]:
+    return {
+        "id": str(binding.id),
+        "label": binding.label,
+        "target_type": binding.target_type,
+        "target_value": binding.target_value,
+        "enabled": bool(binding.enabled),
+        "source": source,
+        "created_at": binding.created_at,
+        "updated_at": binding.updated_at,
+    }
+
+
+def _validate_publish_binding_payload(payload: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Optional[JsonResponse]]:
+    target_type = str(payload.get("target_type") or "").strip()
+    target_value = str(payload.get("target_value") or "").strip()
+    label = str(payload.get("label") or "").strip()
+    enabled = bool(payload.get("enabled", True))
+    if not label:
+        return None, JsonResponse({"error": "label is required"}, status=400)
+    if not _is_valid_binding_target(target_type, target_value):
+        return None, JsonResponse({"error": "invalid target_type/target_value"}, status=400)
+    return {"target_type": target_type, "target_value": target_value, "label": label, "enabled": enabled}, None
+
+
+@csrf_exempt
+def article_categories_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    _ensure_default_article_categories_and_bindings()
+    if request.method == "POST":
+        if not _can_manage_articles(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        slug = str(payload.get("slug") or "").strip().lower()
+        name = str(payload.get("name") or "").strip()
+        if not slug or not ARTICLE_CATEGORY_SLUG_PATTERN.match(slug):
+            return JsonResponse({"error": "invalid slug"}, status=400)
+        if not name:
+            return JsonResponse({"error": "name is required"}, status=400)
+        if ArticleCategory.objects.filter(slug=slug).exists():
+            return JsonResponse({"error": "slug already exists"}, status=400)
+        category = ArticleCategory.objects.create(
+            slug=slug,
+            name=name,
+            description=str(payload.get("description") or ""),
+            enabled=bool(payload.get("enabled", True)),
+        )
+        return JsonResponse({"category": _serialize_article_category(category)})
+
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    categories = [_serialize_article_category(item) for item in ArticleCategory.objects.all().order_by("name")]
+    return JsonResponse({"categories": categories})
+
+
+@csrf_exempt
+def article_category_detail(request: HttpRequest, category_slug: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    category = get_object_or_404(ArticleCategory, slug=category_slug)
+    if request.method in {"PATCH", "PUT"}:
+        if not _can_manage_articles(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        if "slug" in payload and str(payload.get("slug") or "").strip().lower() != category.slug:
+            return JsonResponse({"error": "Category slug is immutable. Create a new category instead."}, status=400)
+        dirty: list[str] = []
+        if "name" in payload:
+            name = str(payload.get("name") or "").strip()
+            if not name:
+                return JsonResponse({"error": "name is required"}, status=400)
+            category.name = name
+            dirty.append("name")
+        if "description" in payload:
+            category.description = str(payload.get("description") or "")
+            dirty.append("description")
+        if "enabled" in payload:
+            category.enabled = bool(payload.get("enabled"))
+            dirty.append("enabled")
+        if dirty:
+            category.save(update_fields=dirty + ["updated_at"])
+        return JsonResponse({"category": _serialize_article_category(category)})
+
+    if request.method == "DELETE":
+        if not _can_manage_articles(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        count = Artifact.objects.filter(article_category=category, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG).count()
+        if count:
+            return JsonResponse(
+                {
+                    "error": "category_in_use",
+                    "message": f"Category is referenced by {count} articles. Disable it instead.",
+                    "referenced_by": {"articles": count},
+                },
+                status=409,
+            )
+        category.delete()
+        return JsonResponse({"ok": True})
+
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    return JsonResponse({"category": _serialize_article_category(category)})
+
+
+@csrf_exempt
+def article_category_bindings_collection(request: HttpRequest, category_slug: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    category = get_object_or_404(ArticleCategory, slug=category_slug)
+    if request.method == "POST":
+        if not _can_manage_articles(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        normalized, error = _validate_publish_binding_payload(payload)
+        if error:
+            return error
+        binding = PublishBinding.objects.create(
+            scope_type="category",
+            scope_id=category.id,
+            target_type=normalized["target_type"],
+            target_value=normalized["target_value"],
+            label=normalized["label"],
+            enabled=normalized["enabled"],
+        )
+        return JsonResponse({"binding": _serialize_publish_binding(binding, source="category")})
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    bindings = PublishBinding.objects.filter(scope_type="category", scope_id=category.id).order_by("label", "target_value")
+    return JsonResponse({"bindings": [_serialize_publish_binding(item, source="category") for item in bindings]})
+
+
+@csrf_exempt
+def article_category_binding_detail(request: HttpRequest, category_slug: str, binding_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    category = get_object_or_404(ArticleCategory, slug=category_slug)
+    binding = get_object_or_404(PublishBinding, id=binding_id, scope_type="category", scope_id=category.id)
+    if request.method in {"PATCH", "PUT"}:
+        if not _can_manage_articles(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        dirty: list[str] = []
+        if "label" in payload:
+            label = str(payload.get("label") or "").strip()
+            if not label:
+                return JsonResponse({"error": "label is required"}, status=400)
+            binding.label = label
+            dirty.append("label")
+        target_type = str(payload.get("target_type") or binding.target_type)
+        target_value = str(payload.get("target_value") or binding.target_value)
+        if "target_type" in payload or "target_value" in payload:
+            if not _is_valid_binding_target(target_type, target_value):
+                return JsonResponse({"error": "invalid target_type/target_value"}, status=400)
+            binding.target_type = target_type
+            binding.target_value = target_value
+            dirty.extend(["target_type", "target_value"])
+        if "enabled" in payload:
+            binding.enabled = bool(payload.get("enabled"))
+            dirty.append("enabled")
+        if dirty:
+            binding.save(update_fields=sorted(set(dirty + ["updated_at"])))
+        return JsonResponse({"binding": _serialize_publish_binding(binding, source="category")})
+    if request.method == "DELETE":
+        if not _can_manage_articles(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        binding.delete()
+        return JsonResponse({"ok": True})
+    return JsonResponse({"error": "method not allowed"}, status=405)
+
+
+@csrf_exempt
+def article_bindings_collection(request: HttpRequest, article_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if request.method == "POST":
+        if not _can_edit_article(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        normalized, error = _validate_publish_binding_payload(payload)
+        if error:
+            return error
+        binding = PublishBinding.objects.create(
+            scope_type="article",
+            scope_id=artifact.id,
+            target_type=normalized["target_type"],
+            target_value=normalized["target_value"],
+            label=normalized["label"],
+            enabled=normalized["enabled"],
+        )
+        return JsonResponse({"binding": _serialize_publish_binding(binding, source="article")})
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    category = _article_category_record(artifact)
+    category_bindings = []
+    if category:
+        category_bindings = [
+            _serialize_publish_binding(item, source="category")
+            for item in PublishBinding.objects.filter(scope_type="category", scope_id=category.id).order_by("label", "target_value")
+        ]
+    article_bindings = [
+        _serialize_publish_binding(item, source="article")
+        for item in PublishBinding.objects.filter(scope_type="article", scope_id=artifact.id).order_by("label", "target_value")
+    ]
+    return JsonResponse({"bindings": article_bindings, "inherited_bindings": category_bindings})
+
+
+@csrf_exempt
+def article_binding_detail(request: HttpRequest, article_id: str, binding_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    binding = get_object_or_404(PublishBinding, id=binding_id, scope_type="article", scope_id=artifact.id)
+    if request.method in {"PATCH", "PUT"}:
+        if not _can_edit_article(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        dirty: list[str] = []
+        if "label" in payload:
+            label = str(payload.get("label") or "").strip()
+            if not label:
+                return JsonResponse({"error": "label is required"}, status=400)
+            binding.label = label
+            dirty.append("label")
+        target_type = str(payload.get("target_type") or binding.target_type)
+        target_value = str(payload.get("target_value") or binding.target_value)
+        if "target_type" in payload or "target_value" in payload:
+            if not _is_valid_binding_target(target_type, target_value):
+                return JsonResponse({"error": "invalid target_type/target_value"}, status=400)
+            binding.target_type = target_type
+            binding.target_value = target_value
+            dirty.extend(["target_type", "target_value"])
+        if "enabled" in payload:
+            binding.enabled = bool(payload.get("enabled"))
+            dirty.append("enabled")
+        if dirty:
+            binding.save(update_fields=sorted(set(dirty + ["updated_at"])))
+        return JsonResponse({"binding": _serialize_publish_binding(binding, source="article")})
+    if request.method == "DELETE":
+        if not _can_edit_article(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        binding.delete()
+        return JsonResponse({"ok": True})
+    return JsonResponse({"error": "method not allowed"}, status=405)
+
+
 def _resolve_article_or_404(article_id_or_slug: str) -> Artifact:
-    by_id = Artifact.objects.filter(id=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG).select_related("type", "workspace").first()
+    by_id = (
+        Artifact.objects.filter(id=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG)
+        .select_related("type", "workspace", "article_category")
+        .first()
+    )
     if by_id:
         return by_id
-    by_slug = Artifact.objects.filter(slug=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG).select_related("type", "workspace").first()
+    by_slug = (
+        Artifact.objects.filter(slug=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG)
+        .select_related("type", "workspace", "article_category")
+        .first()
+    )
     if by_slug:
         return by_slug
     return get_object_or_404(Artifact, id=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG)
@@ -4555,9 +4986,14 @@ def article_detail(request: HttpRequest, article_id: str) -> JsonResponse:
                 defaults={"external_id": str(artifact.id), "slug_path": slug},
             )
             dirty_fields.update({"slug", "scope_json"})
-        if "category" in payload:
-            scope["category"] = _normalize_article_category(payload.get("category"), fallback=_article_category(artifact))
-            dirty_fields.add("scope_json")
+        if "category" in payload or "category_slug" in payload:
+            next_slug = _normalize_article_category(payload.get("category_slug") or payload.get("category"), fallback=_article_category(artifact))
+            category = _resolve_article_category_slug(next_slug, allow_disabled=True)
+            if not category:
+                return JsonResponse({"error": f"unknown category: {next_slug}"}, status=400)
+            artifact.article_category = category
+            scope["category"] = category.slug
+            dirty_fields.update({"scope_json", "article_category"})
         if "visibility_type" in payload:
             visibility_type = _normalize_article_visibility_type(
                 payload.get("visibility_type"),
@@ -4581,7 +5017,23 @@ def article_detail(request: HttpRequest, article_id: str) -> JsonResponse:
             scope["allowed_roles"] = allowed_roles
             dirty_fields.add("scope_json")
         if "route_bindings" in payload:
-            scope["route_bindings"] = _normalize_doc_route_bindings(payload.get("route_bindings"))
+            route_bindings = _normalize_doc_route_bindings(payload.get("route_bindings"))
+            scope["route_bindings"] = route_bindings
+            existing = PublishBinding.objects.filter(scope_type="article", scope_id=artifact.id, target_type="xyn_ui_route")
+            existing_values = {row.target_value: row for row in existing}
+            requested = set(route_bindings)
+            for value, row in existing_values.items():
+                if value not in requested:
+                    row.enabled = False
+                    row.save(update_fields=["enabled", "updated_at"])
+            for value in requested:
+                PublishBinding.objects.update_or_create(
+                    scope_type="article",
+                    scope_id=artifact.id,
+                    target_type="xyn_ui_route",
+                    target_value=value,
+                    defaults={"label": "Route", "enabled": True},
+                )
             dirty_fields.add("scope_json")
         if "tags" in payload:
             scope["tags"] = _normalize_doc_tags(payload.get("tags"))
@@ -4783,7 +5235,10 @@ def docs_collection(request: HttpRequest) -> JsonResponse:
         tags = _normalize_doc_tags(payload.get("tags"))
         summary = str(payload.get("summary") or "")
         body_markdown = str(payload.get("body_markdown") or "")
-        category = _normalize_article_category(payload.get("category"), fallback=_derive_guide_category(tags))
+        category_slug = _normalize_article_category(payload.get("category"), fallback=_derive_guide_category(tags))
+        category = _resolve_article_category_slug(category_slug, allow_disabled=True)
+        if not category:
+            return JsonResponse({"error": f"unknown category: {category_slug}"}, status=400)
         with transaction.atomic():
             artifact = Artifact.objects.create(
                 workspace=docs_workspace,
@@ -4798,11 +5253,12 @@ def docs_collection(request: HttpRequest) -> JsonResponse:
                 scope_json={
                     "route_bindings": route_bindings,
                     "slug": slug,
-                    "category": category,
+                    "category": category.slug,
                     "visibility_type": visibility_type,
                     "allowed_roles": [],
                     "tags": tags,
                 },
+                article_category=category,
                 provenance_json={"source_system": "shine", "source_id": None},
             )
             revision = ArtifactRevision.objects.create(
@@ -4816,7 +5272,18 @@ def docs_collection(request: HttpRequest) -> JsonResponse:
                 },
                 created_by=identity,
             )
-            _record_artifact_event(artifact, "article_created", identity, {"category": category, "route_bindings": route_bindings})
+            _record_artifact_event(artifact, "article_created", identity, {"category": category.slug, "route_bindings": route_bindings})
+            for route in route_bindings:
+                value = str(route or "").strip()
+                if not value:
+                    continue
+                PublishBinding.objects.get_or_create(
+                    scope_type="article",
+                    scope_id=artifact.id,
+                    target_type="xyn_ui_route",
+                    target_value=value,
+                    defaults={"label": "Route", "enabled": True},
+                )
         return JsonResponse({"doc": _article_to_doc_page_payload(artifact, revision)})
 
     if request.method != "GET":
@@ -4918,7 +5385,23 @@ def doc_detail(request: HttpRequest, doc_id: str) -> JsonResponse:
                     artifact.slug = normalized_slug
                     scope["slug"] = normalized_slug
                 if "route_bindings" in article_update_payload:
-                    scope["route_bindings"] = _normalize_doc_route_bindings(article_update_payload.get("route_bindings"))
+                    route_bindings = _normalize_doc_route_bindings(article_update_payload.get("route_bindings"))
+                    scope["route_bindings"] = route_bindings
+                    existing = PublishBinding.objects.filter(scope_type="article", scope_id=artifact.id, target_type="xyn_ui_route")
+                    existing_values = {row.target_value: row for row in existing}
+                    requested = set(route_bindings)
+                    for value, row in existing_values.items():
+                        if value not in requested:
+                            row.enabled = False
+                            row.save(update_fields=["enabled", "updated_at"])
+                    for value in requested:
+                        PublishBinding.objects.update_or_create(
+                            scope_type="article",
+                            scope_id=artifact.id,
+                            target_type="xyn_ui_route",
+                            target_value=value,
+                            defaults={"label": "Route", "enabled": True},
+                        )
                 if "tags" in article_update_payload:
                     scope["tags"] = _normalize_doc_tags(article_update_payload.get("tags"))
                     content["tags"] = _normalize_doc_tags(article_update_payload.get("tags"))
@@ -4927,14 +5410,18 @@ def doc_detail(request: HttpRequest, doc_id: str) -> JsonResponse:
                     scope["visibility_type"] = visibility_type
                     artifact.visibility = _artifact_visibility_for_article_type(visibility_type)
                 if "category" in article_update_payload:
-                    scope["category"] = _normalize_article_category(article_update_payload.get("category"), fallback="guide")
+                    category_slug = _normalize_article_category(article_update_payload.get("category"), fallback="guide")
+                    category = _resolve_article_category_slug(category_slug, allow_disabled=True)
+                    if category:
+                        artifact.article_category = category
+                        scope["category"] = category.slug
                 if "summary" in payload:
                     content["summary"] = str(payload.get("summary") or "")
                 if "body_markdown" in payload:
                     content["body_markdown"] = str(payload.get("body_markdown") or "")
                 artifact.scope_json = scope
                 artifact.version = _next_artifact_revision_number(artifact)
-                artifact.save(update_fields=["title", "slug", "visibility", "scope_json", "version", "updated_at"])
+                artifact.save(update_fields=["title", "slug", "visibility", "scope_json", "article_category", "version", "updated_at"])
                 revision = ArtifactRevision.objects.create(
                     artifact=artifact,
                     revision_number=artifact.version,
