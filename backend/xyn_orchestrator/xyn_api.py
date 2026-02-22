@@ -4783,7 +4783,7 @@ def article_category_detail(request: HttpRequest, category_slug: str) -> JsonRes
                 status=409,
             )
         category.delete()
-        return JsonResponse(status=204)
+        return HttpResponse(status=204)
 
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
