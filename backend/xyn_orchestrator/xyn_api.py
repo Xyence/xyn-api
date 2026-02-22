@@ -1018,16 +1018,6 @@ def _ensure_default_article_categories_and_bindings() -> None:
         slug="web",
         defaults={"name": "Web", "description": "Public website articles", "enabled": True},
     )
-    for slug, name, description in [
-        ("core-concepts", "Core Concepts", "Core concept docs"),
-        ("release-note", "Release Note", "Release note content"),
-        ("internal", "Internal", "Internal content"),
-        ("tutorial", "Tutorial", "Tutorial content"),
-    ]:
-        ArticleCategory.objects.get_or_create(
-            slug=slug,
-            defaults={"name": name, "description": description, "enabled": True},
-        )
     PublishBinding.objects.get_or_create(
         scope_type="category",
         scope_id=guide.id,
