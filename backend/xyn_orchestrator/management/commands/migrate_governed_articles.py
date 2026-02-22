@@ -85,6 +85,7 @@ class Command(BaseCommand):
 
         migrated_django = 0
         migrated_docs = 0
+        normalized = 0
 
         for legacy in Article.objects.all().order_by("created_at"):
             if ArtifactExternalRef.objects.filter(system="django", external_id=str(legacy.id)).exists():
@@ -234,8 +235,36 @@ class Command(BaseCommand):
                     doc.save(update_fields=["status", "updated_at"])
             migrated_docs += 1
 
+        # Normalize guide taxonomy and deprecate walkthrough duplicates.
+        candidate_guides = Artifact.objects.filter(type__slug="article")
+        for article in candidate_guides:
+            scope = dict(article.scope_json or {})
+            slug = str(article.slug or scope.get("slug") or "").strip().lower()
+            title = str(article.title or "").strip().lower()
+            category = str(scope.get("category") or "").strip().lower()
+            updated = False
+
+            if slug == "core-concepts" and category != "guide":
+                scope["category"] = "guide"
+                tags = [str(tag).strip().lower() for tag in (scope.get("tags") or []) if str(tag).strip()]
+                if "core-concepts" not in tags:
+                    tags.append("core-concepts")
+                scope["tags"] = tags
+                updated = True
+
+            if slug == "subscriber-notes" or title == "subscriber notes walkthrough":
+                if article.status != "deprecated":
+                    article.status = "deprecated"
+                    updated = True
+
+            if updated:
+                article.scope_json = scope
+                article.save(update_fields=["scope_json", "status", "updated_at"])
+                normalized += 1
+
         self.stdout.write(
             self.style.SUCCESS(
-                f"Governed article migration complete. migrated_django={migrated_django}, migrated_doc_pages={migrated_docs}"
+                "Governed article migration complete. "
+                f"migrated_django={migrated_django}, migrated_doc_pages={migrated_docs}, normalized={normalized}"
             )
         )
