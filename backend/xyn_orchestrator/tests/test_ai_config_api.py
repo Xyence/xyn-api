@@ -243,3 +243,41 @@ class AiConfigApiTests(TestCase):
         self.assertEqual(payload.get("status"), "deprecated")
         config.refresh_from_db()
         self.assertFalse(config.enabled)
+
+    @patch("xyn_orchestrator.xyn_api.invoke_model")
+    def test_ai_activity_lists_ai_invocations(self, invoke_mock):
+        self._set_identity(self.admin_identity)
+        provider = self._ensure_provider()
+        model_config = ModelConfig.objects.create(provider=provider, model_name="gpt-4o-mini", enabled=True)
+        create_agent = self.client.post(
+            "/xyn/api/ai/agents",
+            data=json.dumps(
+                {
+                    "slug": "docs-activity",
+                    "name": "Docs Activity",
+                    "model_config_id": str(model_config.id),
+                    "system_prompt_text": "assist docs",
+                    "purposes": ["documentation"],
+                    "enabled": True,
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create_agent.status_code, 200)
+        invoke_mock.return_value = {"content": "ok", "provider": "openai", "model": "gpt-4o-mini", "usage": None}
+        self.client.post(
+            "/xyn/api/ai/invoke",
+            data=json.dumps(
+                {
+                    "agent_slug": "docs-activity",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "metadata": {"feature": "articles_ai_assist", "workspace_id": "ws-1", "artifact_id": "art-1"},
+                }
+            ),
+            content_type="application/json",
+        )
+        response = self.client.get("/xyn/api/ai/activity?workspace_id=ws-1")
+        self.assertEqual(response.status_code, 200)
+        items = response.json().get("items") or []
+        self.assertGreaterEqual(len(items), 1)
+        self.assertEqual(items[0].get("event_type"), "ai_invocation")

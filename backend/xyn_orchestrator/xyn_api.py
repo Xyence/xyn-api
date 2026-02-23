@@ -6342,6 +6342,107 @@ def ai_invoke(request: HttpRequest) -> JsonResponse:
 
 
 @csrf_exempt
+def ai_activity(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    workspace_id = str(request.GET.get("workspace_id") or "").strip()
+    artifact_id = str(request.GET.get("artifact_id") or "").strip()
+    limit_raw = str(request.GET.get("limit") or "100").strip()
+    try:
+        limit = max(1, min(int(limit_raw), 300))
+    except ValueError:
+        limit = 100
+
+    is_manager = _can_manage_ai(identity)
+    if workspace_id and not is_manager and not _workspace_membership(identity, workspace_id):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    artifact_lookup: Dict[str, Artifact] = {}
+    if workspace_id or artifact_id:
+        artifact_qs = Artifact.objects.all()
+        if artifact_id:
+            artifact_qs = artifact_qs.filter(id=artifact_id)
+        elif workspace_id:
+            artifact_qs = artifact_qs.filter(workspace_id=workspace_id)
+        artifact_lookup = {str(item.id): item for item in artifact_qs.select_related("type")}
+
+    items: List[Dict[str, Any]] = []
+    audit_qs = AuditLog.objects.filter(message="ai_invocation").order_by("-created_at")[:600]
+    for entry in audit_qs:
+        meta = entry.metadata_json if isinstance(entry.metadata_json, dict) else {}
+        actor_identity_id = str(meta.get("actor_identity_id") or "")
+        if not is_manager and not workspace_id and actor_identity_id and actor_identity_id != str(identity.id):
+            continue
+        payload_meta = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+        event_artifact_id = str(payload_meta.get("artifact_id") or "")
+        if artifact_id and event_artifact_id != artifact_id:
+            continue
+        if workspace_id and str(payload_meta.get("workspace_id") or "") != workspace_id:
+            if event_artifact_id and event_artifact_id in artifact_lookup:
+                pass
+            else:
+                continue
+        artifact = artifact_lookup.get(event_artifact_id) if event_artifact_id else None
+        items.append(
+            {
+                "id": str(entry.id),
+                "event_type": entry.message,
+                "status": "succeeded",
+                "summary": str(payload_meta.get("mode") or "AI invocation complete"),
+                "created_at": entry.created_at,
+                "actor_id": actor_identity_id or None,
+                "agent_slug": str(meta.get("agent_slug") or ""),
+                "provider": str(meta.get("provider") or ""),
+                "model_name": str(meta.get("model_name") or ""),
+                "artifact_id": event_artifact_id or None,
+                "artifact_type": (artifact.type.slug if artifact and artifact.type_id else "") or "article",
+                "artifact_title": artifact.title if artifact else "",
+                "source": "audit_log",
+            }
+        )
+        if len(items) >= limit:
+            break
+
+    if workspace_id and len(items) < limit:
+        events = (
+            ArtifactEvent.objects.filter(artifact__workspace_id=workspace_id, event_type__in=["ai_invoked", "article_revision_created"])
+            .select_related("artifact")
+            .order_by("-created_at")[:300]
+        )
+        for event in events:
+            if artifact_id and str(event.artifact_id) != artifact_id:
+                continue
+            payload = event.payload_json if isinstance(event.payload_json, dict) else {}
+            summary = str(payload.get("mode") or payload.get("source") or event.event_type)
+            items.append(
+                {
+                    "id": str(event.id),
+                    "event_type": event.event_type,
+                    "status": "succeeded",
+                    "summary": summary,
+                    "created_at": event.created_at,
+                    "actor_id": str(event.actor_id) if event.actor_id else None,
+                    "agent_slug": str(payload.get("agent_slug") or ""),
+                    "provider": str(payload.get("provider") or ""),
+                    "model_name": str(payload.get("model_name") or ""),
+                    "artifact_id": str(event.artifact_id),
+                    "artifact_type": event.artifact.type.slug if event.artifact.type_id else "",
+                    "artifact_title": event.artifact.title,
+                    "source": "artifact_event",
+                }
+            )
+            if len(items) >= limit:
+                break
+
+    items.sort(key=lambda entry: str(entry.get("created_at") or ""), reverse=True)
+    return JsonResponse({"items": items[:limit]})
+
+
+@csrf_exempt
 def ai_purposes_collection(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
