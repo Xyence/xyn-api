@@ -7242,7 +7242,10 @@ def tour_detail(request: HttpRequest, tour_slug: str) -> JsonResponse:
 
 
 def _ensure_default_agent_purposes() -> None:
-    ensure_default_ai_seeds()
+    try:
+        ensure_default_ai_seeds()
+    except Exception:
+        logger.exception("Failed to ensure default AI seeds; continuing without blocking request")
 
 
 def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:
