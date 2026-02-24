@@ -231,7 +231,7 @@ def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optiona
     purpose_obj = AgentPurpose.objects.filter(slug=purpose).first()
     purpose_preamble = str(getattr(purpose_obj, "preamble", "") or "")
     if agent:
-        model_config = agent.model_config
+        model_config = purpose_obj.model_config if purpose_obj and purpose_obj.model_config_id else agent.model_config
         provider = model_config.provider
         credential = model_config.credential
         api_key = _resolve_model_api_key(provider.slug, credential)
@@ -242,13 +242,17 @@ def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optiona
         return {
             "provider": provider.slug,
             "model_name": model_config.model_name,
+            "model_config_id": str(model_config.id),
             "api_key": api_key,
             "temperature": model_config.temperature,
             "top_p": model_config.top_p,
             "max_tokens": model_config.max_tokens,
             "system_prompt": assemble_system_prompt(agent.system_prompt_text, purpose_preamble),
             "agent_slug": agent.slug,
+            "agent_id": str(agent.id),
             "purpose": purpose,
+            "purpose_default_context_pack_refs_json": (purpose_obj.default_context_pack_refs_json if purpose_obj else None) or [],
+            "agent_context_pack_refs_json": agent.context_pack_refs_json or [],
         }
 
     provider_slug = str(os.environ.get("XYN_DEFAULT_MODEL_PROVIDER") or "openai").strip().lower()
@@ -266,13 +270,17 @@ def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optiona
     return {
         "provider": provider_slug,
         "model_name": model_name,
+        "model_config_id": str(purpose_obj.model_config_id) if purpose_obj and purpose_obj.model_config_id else None,
         "api_key": api_key,
         "temperature": float(os.environ.get("XYN_DEFAULT_MODEL_TEMPERATURE") or 0.2),
         "top_p": float(os.environ.get("XYN_DEFAULT_MODEL_TOP_P") or 1.0),
         "max_tokens": int(os.environ.get("XYN_DEFAULT_MODEL_MAX_TOKENS") or 1200),
         "system_prompt": "",
         "agent_slug": None,
+        "agent_id": None,
         "purpose": purpose,
+        "purpose_default_context_pack_refs_json": (purpose_obj.default_context_pack_refs_json if purpose_obj else None) or [],
+        "agent_context_pack_refs_json": [],
     }
 
 

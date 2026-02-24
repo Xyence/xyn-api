@@ -18,6 +18,7 @@ import requests
 import boto3
 from authlib.jose import JsonWebKey, jwt
 from markdownify import markdownify as _markdownify_html
+from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
 from django.db import models, transaction
 from django.http import HttpRequest, JsonResponse, HttpResponse
@@ -154,6 +155,13 @@ ARTICLE_VISIBILITY_TYPES = {"public", "authenticated", "role_based", "private"}
 ARTICLE_STATUS_CHOICES = {"draft", "reviewed", "ratified", "published", "deprecated"}
 ARTICLE_FORMAT_TYPES = {"standard", "video_explainer"}
 VIDEO_CONTEXT_PACK_PURPOSE = "video_explainer"
+EXPLAINER_PURPOSES: Dict[str, Dict[str, str]] = {
+    "explainer_script": {"name": "Script", "description": "Generate explainer narration scripts."},
+    "explainer_storyboard": {"name": "Storyboard", "description": "Generate storyboard scene structures."},
+    "explainer_visual_prompts": {"name": "Visual Prompts", "description": "Generate visual prompt sets per scene."},
+    "explainer_narration": {"name": "Narration", "description": "Refine narration for spoken delivery."},
+    "explainer_title_description": {"name": "Title/Description", "description": "Generate title and description options."},
+}
 ARTICLE_CATEGORY_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 PUBLISH_BINDING_TARGET_TYPES = {"xyn_ui_route", "public_web_path", "external_url"}
 ARTICLE_TRANSITIONS = {
@@ -1305,6 +1313,224 @@ def _video_context_metadata(pack: Optional[ContextPack]) -> Dict[str, Any]:
     }
 
 
+def _article_video_ai_config(artifact: Artifact) -> Dict[str, Any]:
+    raw = artifact.video_ai_config_json if isinstance(artifact.video_ai_config_json, dict) else {}
+    return {
+        "agents": raw.get("agents") if isinstance(raw.get("agents"), dict) else {},
+        "context_packs": raw.get("context_packs") if isinstance(raw.get("context_packs"), dict) else {},
+    }
+
+
+def _resolve_agent_value(value: Any) -> Optional[AgentDefinition]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    by_slug = AgentDefinition.objects.select_related("model_config__provider").filter(slug=raw, enabled=True).first()
+    if by_slug:
+        return by_slug
+    try:
+        return AgentDefinition.objects.select_related("model_config__provider").filter(id=raw, enabled=True).first()
+    except (ValidationError, ValueError):
+        return None
+
+
+def _is_agent_linked_to_purpose(agent: AgentDefinition, purpose_slug: str) -> bool:
+    return AgentDefinitionPurpose.objects.filter(agent_definition_id=agent.id, purpose__slug=purpose_slug).exists()
+
+
+def _resolve_agent_for_purpose(
+    artifact: Artifact,
+    purpose_slug: str,
+    explicit_override: Any = None,
+) -> Tuple[Optional[AgentDefinition], str, Optional[str]]:
+    if purpose_slug not in EXPLAINER_PURPOSES:
+        return None, "fallback", f"unknown purpose: {purpose_slug}"
+    if explicit_override is not None:
+        explicit_agent = _resolve_agent_value(explicit_override)
+        if not explicit_agent:
+            return None, "override", "override agent not found or disabled"
+        if not _is_agent_linked_to_purpose(explicit_agent, purpose_slug):
+            return None, "override", "override agent is not linked to purpose"
+        return explicit_agent, "override", None
+
+    config = _article_video_ai_config(artifact)
+    override_value = config["agents"].get(purpose_slug)
+    if override_value is not None:
+        override_agent = _resolve_agent_value(override_value)
+        if override_agent and _is_agent_linked_to_purpose(override_agent, purpose_slug):
+            return override_agent, "override", None
+        return None, "override", "configured override agent is invalid"
+
+    link_default = (
+        AgentDefinitionPurpose.objects.select_related("agent_definition", "agent_definition__model_config__provider")
+        .filter(purpose__slug=purpose_slug, is_default_for_purpose=True, agent_definition__enabled=True)
+        .order_by("agent_definition__name", "agent_definition__slug")
+        .first()
+    )
+    if link_default:
+        return link_default.agent_definition, "purpose_default", None
+
+    fallback = (
+        AgentDefinition.objects.select_related("model_config__provider")
+        .filter(enabled=True, purposes__slug=purpose_slug)
+        .order_by("-updated_at", "name", "slug")
+        .first()
+    )
+    if fallback:
+        logger.warning("No purpose default configured for %s; using fallback agent %s", purpose_slug, fallback.slug)
+        return fallback, "fallback", None
+    return None, "fallback", f"no enabled agent linked to purpose {purpose_slug}"
+
+
+def _resolve_context_pack_ref(ref: Any) -> Optional[ContextPack]:
+    if isinstance(ref, dict):
+        for key in ("id", "context_pack_id"):
+            value = str(ref.get(key) or "").strip()
+            if value:
+                row = ContextPack.objects.filter(id=value, is_active=True).first()
+                if row:
+                    return row
+        for key in ("slug", "name"):
+            value = str(ref.get(key) or "").strip()
+            if value:
+                row = ContextPack.objects.filter(name=value, is_active=True).order_by("-updated_at").first()
+                if row:
+                    return row
+        return None
+    raw = str(ref or "").strip()
+    if not raw:
+        return None
+    by_id = ContextPack.objects.filter(id=raw, is_active=True).first()
+    if by_id:
+        return by_id
+    return ContextPack.objects.filter(name=raw, is_active=True).order_by("-updated_at").first()
+
+
+def _validate_pack_purpose_for_explainer(pack: ContextPack, purpose_slug: str) -> bool:
+    return pack.purpose in {purpose_slug, "any", VIDEO_CONTEXT_PACK_PURPOSE}
+
+
+def _normalize_pack_refs_input(raw: Any) -> List[Any]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    return [raw]
+
+
+def _resolve_context_packs_for_purpose(
+    artifact: Artifact,
+    purpose_slug: str,
+    agent: Optional[AgentDefinition],
+    *,
+    explicit_override: Any = None,
+) -> Tuple[List[ContextPack], str, str, Optional[str]]:
+    config = _article_video_ai_config(artifact)
+    override_present = explicit_override is not None or purpose_slug in config["context_packs"]
+    raw_override = explicit_override if explicit_override is not None else config["context_packs"].get(purpose_slug)
+
+    def _resolve_many(raw_refs: Any) -> Tuple[List[ContextPack], Optional[str]]:
+        rows: List[ContextPack] = []
+        seen: set[str] = set()
+        for ref in _normalize_pack_refs_input(raw_refs):
+            pack = _resolve_context_pack_ref(ref)
+            if not pack:
+                return [], "context pack ref not found"
+            if not _validate_pack_purpose_for_explainer(pack, purpose_slug):
+                return [], f"context pack '{pack.name}' purpose '{pack.purpose}' does not match {purpose_slug}"
+            key = str(pack.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(pack)
+        return rows, None
+
+    if override_present:
+        rows, err = _resolve_many(raw_override)
+        if err:
+            return [], "override", "", err
+        resolved = _resolve_context_pack_list(rows)
+        return rows, "override", resolved.get("hash", ""), None
+
+    purpose_obj = AgentPurpose.objects.filter(slug=purpose_slug).first()
+    purpose_refs = purpose_obj.default_context_pack_refs_json if purpose_obj and isinstance(purpose_obj.default_context_pack_refs_json, list) else []
+    agent_refs = agent.context_pack_refs_json if agent and isinstance(agent.context_pack_refs_json, list) else []
+    combined: List[Any] = []
+    if purpose_refs:
+        combined.extend(purpose_refs)
+    if agent_refs:
+        combined.extend(agent_refs)
+    rows, err = _resolve_many(combined)
+    if err:
+        return [], "fallback", "", err
+    source = "fallback"
+    if purpose_refs:
+        source = "purpose_default"
+    elif agent_refs:
+        source = "agent_default"
+    resolved = _resolve_context_pack_list(rows)
+    return rows, source, resolved.get("hash", ""), None
+
+
+def _effective_video_ai_config(artifact: Artifact) -> Dict[str, Any]:
+    effective: Dict[str, Any] = {}
+    for purpose_slug, meta in EXPLAINER_PURPOSES.items():
+        agent, agent_source, agent_error = _resolve_agent_for_purpose(artifact, purpose_slug)
+        packs: List[ContextPack] = []
+        pack_source = "fallback"
+        pack_hash = ""
+        pack_error: Optional[str] = None
+        if agent:
+            packs, pack_source, pack_hash, pack_error = _resolve_context_packs_for_purpose(artifact, purpose_slug, agent)
+        effective[purpose_slug] = {
+            "purpose_slug": purpose_slug,
+            "purpose_name": meta["name"],
+            "description": meta["description"],
+            "agent": (
+                {
+                    "id": str(agent.id),
+                    "slug": agent.slug,
+                    "name": agent.name,
+                    "model_provider": agent.model_config.provider.slug if agent.model_config_id else None,
+                    "model_name": agent.model_config.model_name if agent.model_config_id else None,
+                }
+                if agent
+                else None
+            ),
+            "context_packs": [_serialize_video_context_pack(pack) for pack in packs],
+            "context_pack_hash": pack_hash,
+            "source": "override" if agent_source == "override" or pack_source == "override" else (agent_source if agent_source != "fallback" else pack_source),
+            "agent_source": agent_source,
+            "context_source": pack_source,
+            "warning": agent_error or pack_error,
+        }
+    return effective
+
+
+def _normalize_context_pack_override_refs(purpose_slug: str, raw_value: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    refs: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_ref in _normalize_pack_refs_input(raw_value):
+        pack = _resolve_context_pack_ref(raw_ref)
+        if not pack:
+            return [], "context pack ref not found"
+        if not _validate_pack_purpose_for_explainer(pack, purpose_slug):
+            return [], f"context pack '{pack.name}' purpose '{pack.purpose}' does not match {purpose_slug}"
+        key = str(pack.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(
+            {
+                "id": str(pack.id),
+                "name": pack.name,
+                "purpose": pack.purpose,
+                "scope": pack.scope,
+                "version": pack.version,
+            }
+        )
+    return refs, None
+
 def _normalized_json_hash(value: Any) -> str:
     try:
         encoded = json.dumps(value if value is not None else {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -1429,6 +1655,7 @@ def _serialize_article_detail(artifact: Artifact, revision: Optional[ArtifactRev
             "body_html": content.get("body_html") or "",
             "format": _article_format(artifact),
             "video_spec_json": _video_spec(artifact, latest),
+            "video_ai_config_json": _article_video_ai_config(artifact),
             "video_context_pack_id": str(artifact.video_context_pack_id) if artifact.video_context_pack_id else None,
             "video_context_pack": _serialize_video_context_pack(getattr(artifact, "video_context_pack", None)),
             "video_latest_render_id": str(artifact.video_latest_render_id) if artifact.video_latest_render_id else None,
@@ -4712,6 +4939,7 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
         if pack_error:
             return pack_error
         candidate_video_spec = payload.get("video_spec_json") if isinstance(payload.get("video_spec_json"), dict) else None
+        candidate_video_ai_config = payload.get("video_ai_config_json") if isinstance(payload.get("video_ai_config_json"), dict) else None
         if candidate_video_spec is not None:
             spec_errors = validate_video_spec(candidate_video_spec)
             if spec_errors:
@@ -4748,6 +4976,7 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                 },
                 provenance_json=payload.get("provenance_json") if isinstance(payload.get("provenance_json"), dict) else {},
                 video_spec_json=final_video_spec,
+                video_ai_config_json=candidate_video_ai_config if article_format == "video_explainer" else None,
                 video_context_pack=video_context_pack if article_format == "video_explainer" else None,
                 article_category=category,
             )
@@ -5199,6 +5428,16 @@ def article_detail(request: HttpRequest, article_id: str) -> JsonResponse:
                 dirty_fields.add("video_spec_json")
             else:
                 return JsonResponse({"error": "video_spec_json must be an object or null"}, status=400)
+        if "video_ai_config_json" in payload:
+            candidate_ai_config = payload.get("video_ai_config_json")
+            if candidate_ai_config is None:
+                artifact.video_ai_config_json = None
+                dirty_fields.add("video_ai_config_json")
+            elif isinstance(candidate_ai_config, dict):
+                artifact.video_ai_config_json = candidate_ai_config
+                dirty_fields.add("video_ai_config_json")
+            else:
+                return JsonResponse({"error": "video_ai_config_json must be an object or null"}, status=400)
         if "visibility_type" in payload:
             visibility_type = _normalize_article_visibility_type(
                 payload.get("visibility_type"),
@@ -5380,8 +5619,35 @@ def article_convert_html_to_markdown(request: HttpRequest, article_id: str) -> J
     return JsonResponse({"article": _serialize_article_detail(artifact), "revision": _serialize_article_revision(revision), "converted": True})
 
 
-def _video_generate_text(identity: UserIdentity, agent_slug: str, prompt: str, metadata: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    resolved = resolve_ai_config(agent_slug=agent_slug)
+def _video_generate_text(
+    identity: UserIdentity,
+    artifact: Artifact,
+    purpose_slug: str,
+    prompt: str,
+    metadata: Dict[str, Any],
+    *,
+    explicit_agent: Any = None,
+    explicit_context_packs: Any = None,
+) -> Tuple[str, Dict[str, Any]]:
+    resolved_agent, agent_source, agent_error = _resolve_agent_for_purpose(artifact, purpose_slug, explicit_override=explicit_agent)
+    if not resolved_agent:
+        raise AiConfigError(agent_error or f"no agent resolved for {purpose_slug}")
+    packs, context_source, context_hash, context_error = _resolve_context_packs_for_purpose(
+        artifact,
+        purpose_slug,
+        resolved_agent,
+        explicit_override=explicit_context_packs,
+    )
+    if context_error:
+        raise AiConfigError(context_error)
+    resolved_context = _resolve_context_pack_list(packs)
+    context_text = str(resolved_context.get("effective_context") or "").strip()
+
+    resolved = resolve_ai_config(agent_slug=resolved_agent.slug, purpose_slug=purpose_slug)
+    base_system_prompt = str(resolved.get("system_prompt") or "").strip()
+    if context_text:
+        resolved["system_prompt"] = f"{base_system_prompt}\n\n{context_text}".strip() if base_system_prompt else context_text
+
     result = invoke_model(
         resolved_config=resolved,
         messages=[{"role": "user", "content": prompt}],
@@ -5390,17 +5656,31 @@ def _video_generate_text(identity: UserIdentity, agent_slug: str, prompt: str, m
         message="ai_invocation",
         metadata_json={
             "actor_identity_id": str(identity.id),
-            "agent_slug": resolved.get("agent_slug") or agent_slug,
+            "agent_slug": resolved.get("agent_slug") or resolved_agent.slug,
+            "agent_id": str(resolved_agent.id),
             "provider": resolved.get("provider"),
             "model_name": resolved.get("model_name"),
             "purpose": resolved.get("purpose"),
+            "purpose_slug": purpose_slug,
+            "agent_source": agent_source,
+            "context_source": context_source,
+            "context_pack_refs": resolved_context.get("refs", []),
+            "context_pack_hash": context_hash,
             "metadata": metadata,
         },
     )
     return str(result.get("content") or "").strip(), {
-        "agent_slug": resolved.get("agent_slug") or agent_slug,
+        "agent_slug": resolved.get("agent_slug") or resolved_agent.slug,
+        "agent_id": str(resolved_agent.id),
+        "agent_name": resolved_agent.name,
+        "agent_source": agent_source,
         "provider": resolved.get("provider"),
         "model_name": resolved.get("model_name"),
+        "model_config_id": resolved.get("model_config_id"),
+        "purpose_slug": purpose_slug,
+        "context_source": context_source,
+        "context_pack_refs": resolved_context.get("refs", []),
+        "context_pack_hash": context_hash,
     }
 
 
@@ -5513,6 +5793,94 @@ def article_video_initialize(request: HttpRequest, article_id: str) -> JsonRespo
 
 
 @csrf_exempt
+def article_video_ai_config(request: HttpRequest, article_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if artifact.format != "video_explainer":
+        return JsonResponse({"error": "article format must be video_explainer"}, status=400)
+
+    if request.method == "GET":
+        if not _can_view_article(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        return JsonResponse(
+            {
+                "overrides": _article_video_ai_config(artifact),
+                "effective": _effective_video_ai_config(artifact),
+            }
+        )
+
+    if request.method != "PUT":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _can_edit_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    payload = _parse_json(request)
+    current = _article_video_ai_config(artifact)
+    next_agents = dict(current.get("agents") if isinstance(current.get("agents"), dict) else {})
+    next_context = dict(current.get("context_packs") if isinstance(current.get("context_packs"), dict) else {})
+
+    if payload.get("reset_all") is True:
+        next_agents = {}
+        next_context = {}
+
+    if "agents" in payload:
+        raw_agents = payload.get("agents")
+        if not isinstance(raw_agents, dict):
+            return JsonResponse({"error": "agents must be an object"}, status=400)
+        for purpose_slug, raw_value in raw_agents.items():
+            if purpose_slug not in EXPLAINER_PURPOSES:
+                return JsonResponse({"error": f"unsupported purpose '{purpose_slug}'"}, status=400)
+            value = str(raw_value or "").strip()
+            if not value:
+                next_agents.pop(purpose_slug, None)
+                continue
+            agent = _resolve_agent_value(value)
+            if not agent:
+                return JsonResponse({"error": f"agent not found or disabled for '{purpose_slug}'"}, status=400)
+            if not _is_agent_linked_to_purpose(agent, purpose_slug):
+                return JsonResponse({"error": f"agent '{agent.slug}' is not linked to '{purpose_slug}'"}, status=400)
+            next_agents[purpose_slug] = agent.slug
+
+    if "context_packs" in payload:
+        raw_context = payload.get("context_packs")
+        if not isinstance(raw_context, dict):
+            return JsonResponse({"error": "context_packs must be an object"}, status=400)
+        for purpose_slug, raw_value in raw_context.items():
+            if purpose_slug not in EXPLAINER_PURPOSES:
+                return JsonResponse({"error": f"unsupported purpose '{purpose_slug}'"}, status=400)
+            if raw_value is None or raw_value == "" or (isinstance(raw_value, list) and len(raw_value) == 0):
+                next_context.pop(purpose_slug, None)
+                continue
+            refs, err = _normalize_context_pack_override_refs(purpose_slug, raw_value)
+            if err:
+                return JsonResponse({"error": f"{purpose_slug}: {err}"}, status=400)
+            next_context[purpose_slug] = refs
+
+    persisted = {"agents": next_agents, "context_packs": next_context}
+    artifact.video_ai_config_json = persisted if next_agents or next_context else None
+    artifact.save(update_fields=["video_ai_config_json", "updated_at"])
+
+    _record_artifact_event(
+        artifact,
+        "article_video_ai_config_updated",
+        identity,
+        {
+            "agent_overrides": sorted(list(next_agents.keys())),
+            "context_pack_overrides": sorted(list(next_context.keys())),
+        },
+    )
+    return JsonResponse(
+        {
+            "overrides": _article_video_ai_config(artifact),
+            "effective": _effective_video_ai_config(artifact),
+            "article": _serialize_article_detail(artifact),
+        }
+    )
+
+
+@csrf_exempt
 def article_video_generate_script(request: HttpRequest, article_id: str) -> JsonResponse:
     if request.method != "POST":
         return JsonResponse({"error": "method not allowed"}, status=405)
@@ -5524,20 +5892,11 @@ def article_video_generate_script(request: HttpRequest, article_id: str) -> Json
         return JsonResponse({"error": "forbidden"}, status=403)
     payload = _parse_json(request)
     agent_slug = str(payload.get("agent_slug") or "").strip()
-    if not agent_slug:
-        return JsonResponse({"error": "agent_slug is required"}, status=400)
-    context_pack, pack_error = _resolve_video_context_pack_for_article(
-        artifact,
-        payload.get("context_pack_id") if "context_pack_id" in payload else None,
-        allow_clear=True,
-    )
-    if pack_error:
-        return pack_error
+    context_pack_override = payload.get("context_pack_id") if "context_pack_id" in payload else payload.get("context_packs")
 
     spec = _video_spec(artifact)
     script = spec.get("script") if isinstance(spec.get("script"), dict) else {}
     current_draft = str(script.get("draft") or "")
-    context_prompt = _video_context_prompt(context_pack)
     prompt = (
         "Generate a concise explainer video narration script.\n"
         "Return plain text script only.\n\n"
@@ -5548,14 +5907,15 @@ def article_video_generate_script(request: HttpRequest, article_id: str) -> Json
         f"Duration target (seconds): {spec.get('duration_seconds_target') or 150}\n\n"
         f"Source article markdown:\n{_article_content(artifact).get('body_markdown') or ''}\n"
     )
-    if context_prompt:
-        prompt = f"{prompt}\n\n{context_prompt}\n"
     try:
         generated, meta = _video_generate_text(
             identity,
-            agent_slug,
+            artifact,
+            "explainer_script",
             prompt,
             {"artifact_id": str(artifact.id), "workspace_id": str(artifact.workspace_id), "mode": "video_generate_script"},
+            explicit_agent=agent_slug or None,
+            explicit_context_packs=context_pack_override,
         )
     except (AiConfigError, AiInvokeError) as exc:
         return JsonResponse({"error": str(exc)}, status=400)
@@ -5577,22 +5937,32 @@ def article_video_generate_script(request: HttpRequest, article_id: str) -> Json
     script["proposals"] = proposals
     script["last_generated_at"] = timezone.now().isoformat()
     spec["script"] = script
-    context_meta = _video_context_metadata(context_pack)
+    resolved_pack_refs = meta.get("context_pack_refs") if isinstance(meta.get("context_pack_refs"), list) else []
+    resolved_context_pack = None
+    if resolved_pack_refs:
+        first_pack_id = str((resolved_pack_refs[0] or {}).get("id") or "").strip() if isinstance(resolved_pack_refs[0], dict) else ""
+        if first_pack_id:
+            resolved_context_pack = ContextPack.objects.filter(id=first_pack_id).first()
+    context_meta = _video_context_metadata(resolved_context_pack)
     generation = spec.get("generation") if isinstance(spec.get("generation"), dict) else {}
     generation.update(
         {
             "provider": meta.get("provider") or generation.get("provider"),
+            "model_name": meta.get("model_name") or generation.get("model_name"),
+            "purpose_slug": "explainer_script",
+            "agent_slug": meta.get("agent_slug") or generation.get("agent_slug"),
             "context_pack_id": context_meta.get("id"),
             "context_pack_version": context_meta.get("version"),
             "context_pack_updated_at": context_meta.get("updated_at"),
             "context_pack_hash": context_meta.get("hash"),
+            "context_pack_refs": meta.get("context_pack_refs") if isinstance(meta.get("context_pack_refs"), list) else [],
             "updated_at": timezone.now().isoformat(),
         }
     )
     spec["generation"] = generation
     artifact.video_spec_json = spec
     artifact.format = "video_explainer"
-    artifact.video_context_pack = context_pack
+    artifact.video_context_pack = resolved_context_pack
     artifact.save(update_fields=["video_spec_json", "format", "video_context_pack", "updated_at"])
     _record_artifact_event(
         artifact,
@@ -5615,18 +5985,9 @@ def article_video_generate_storyboard(request: HttpRequest, article_id: str) -> 
         return JsonResponse({"error": "forbidden"}, status=403)
     payload = _parse_json(request)
     agent_slug = str(payload.get("agent_slug") or "").strip()
-    if not agent_slug:
-        return JsonResponse({"error": "agent_slug is required"}, status=400)
-    context_pack, pack_error = _resolve_video_context_pack_for_article(
-        artifact,
-        payload.get("context_pack_id") if "context_pack_id" in payload else None,
-        allow_clear=True,
-    )
-    if pack_error:
-        return pack_error
+    context_pack_override = payload.get("context_pack_id") if "context_pack_id" in payload else payload.get("context_packs")
     spec = _video_spec(artifact)
     script_draft = str(((spec.get("script") or {}).get("draft") if isinstance(spec.get("script"), dict) else "") or "")
-    context_prompt = _video_context_prompt(context_pack)
     prompt = (
         "Generate a storyboard and scene breakdown for this explainer script.\n"
         "Respond with JSON object keys: storyboard_draft (array), scenes (array).\n\n"
@@ -5637,16 +5998,17 @@ def article_video_generate_storyboard(request: HttpRequest, article_id: str) -> 
         f"Duration target (seconds): {spec.get('duration_seconds_target') or 150}\n\n"
         f"Script:\n{script_draft}\n"
     )
-    if context_prompt:
-        prompt = f"{prompt}\n\n{context_prompt}\n"
     generated_text = ""
     meta: Dict[str, Any] = {}
     try:
         generated_text, meta = _video_generate_text(
             identity,
-            agent_slug,
+            artifact,
+            "explainer_storyboard",
             prompt,
             {"artifact_id": str(artifact.id), "workspace_id": str(artifact.workspace_id), "mode": "video_generate_storyboard"},
+            explicit_agent=agent_slug or None,
+            explicit_context_packs=context_pack_override,
         )
     except (AiConfigError, AiInvokeError):
         # Fallback to deterministic storyboard if AI generation fails.
@@ -5691,22 +6053,32 @@ def article_video_generate_storyboard(request: HttpRequest, article_id: str) -> 
     storyboard["proposals"] = proposals
     storyboard["last_generated_at"] = timezone.now().isoformat()
     spec["storyboard"] = storyboard
-    context_meta = _video_context_metadata(context_pack)
+    resolved_pack_refs = meta.get("context_pack_refs") if isinstance(meta.get("context_pack_refs"), list) else []
+    resolved_context_pack = None
+    if resolved_pack_refs:
+        first_pack_id = str((resolved_pack_refs[0] or {}).get("id") or "").strip() if isinstance(resolved_pack_refs[0], dict) else ""
+        if first_pack_id:
+            resolved_context_pack = ContextPack.objects.filter(id=first_pack_id).first()
+    context_meta = _video_context_metadata(resolved_context_pack)
     generation = spec.get("generation") if isinstance(spec.get("generation"), dict) else {}
     generation.update(
         {
             "provider": meta.get("provider") or generation.get("provider"),
+            "model_name": meta.get("model_name") or generation.get("model_name"),
+            "purpose_slug": "explainer_storyboard",
+            "agent_slug": meta.get("agent_slug") or generation.get("agent_slug"),
             "context_pack_id": context_meta.get("id"),
             "context_pack_version": context_meta.get("version"),
             "context_pack_updated_at": context_meta.get("updated_at"),
             "context_pack_hash": context_meta.get("hash"),
+            "context_pack_refs": meta.get("context_pack_refs") if isinstance(meta.get("context_pack_refs"), list) else [],
             "updated_at": timezone.now().isoformat(),
         }
     )
     spec["generation"] = generation
     artifact.video_spec_json = spec
     artifact.format = "video_explainer"
-    artifact.video_context_pack = context_pack
+    artifact.video_context_pack = resolved_context_pack
     artifact.save(update_fields=["video_spec_json", "format", "video_context_pack", "updated_at"])
     _record_artifact_event(
         artifact,
@@ -5715,6 +6087,230 @@ def article_video_generate_storyboard(request: HttpRequest, article_id: str) -> 
         {"proposal_id": proposal["id"], "context_pack_id": context_meta.get("id"), "context_pack_hash": context_meta.get("hash")},
     )
     return JsonResponse({"article": _serialize_article_detail(artifact), "proposal": proposal, "overwrote_draft": not isinstance(existing_draft, list) or len(existing_draft) == 0})
+
+
+def _video_stage_output(spec: Dict[str, Any], stage_key: str) -> Dict[str, Any]:
+    block = spec.get(stage_key) if isinstance(spec.get(stage_key), dict) else {}
+    return {
+        "draft": block.get("draft"),
+        "proposals": block.get("proposals") if isinstance(block.get("proposals"), list) else [],
+        "last_generated_at": block.get("last_generated_at"),
+    }
+
+
+def _save_video_stage_proposal(
+    *,
+    artifact: Artifact,
+    identity: UserIdentity,
+    stage_key: str,
+    purpose_slug: str,
+    generated_output: Any,
+    meta: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    spec = _video_spec(artifact)
+    block = spec.get(stage_key) if isinstance(spec.get(stage_key), dict) else {}
+    proposals = block.get("proposals") if isinstance(block.get("proposals"), list) else []
+    proposal = {
+        "id": str(uuid.uuid4()),
+        "output": generated_output,
+        "created_at": timezone.now().isoformat(),
+        "model": meta.get("model_name"),
+        "provider": meta.get("provider"),
+        "agent_slug": meta.get("agent_slug"),
+        "purpose_slug": purpose_slug,
+        "context_pack_refs": meta.get("context_pack_refs") if isinstance(meta.get("context_pack_refs"), list) else [],
+        "context_pack_hash": meta.get("context_pack_hash") or "",
+    }
+    proposals = [proposal, *proposals][:15]
+    if block.get("draft") in {None, "", []}:
+        block["draft"] = generated_output
+    block["proposals"] = proposals
+    block["last_generated_at"] = timezone.now().isoformat()
+    spec[stage_key] = block
+    generation = spec.get("generation") if isinstance(spec.get("generation"), dict) else {}
+    generation.update(
+        {
+            "provider": meta.get("provider") or generation.get("provider"),
+            "model_name": meta.get("model_name") or generation.get("model_name"),
+            "purpose_slug": purpose_slug,
+            "agent_slug": meta.get("agent_slug") or generation.get("agent_slug"),
+            "context_pack_hash": meta.get("context_pack_hash") or generation.get("context_pack_hash"),
+            "context_pack_refs": meta.get("context_pack_refs") if isinstance(meta.get("context_pack_refs"), list) else generation.get("context_pack_refs", []),
+            "updated_at": timezone.now().isoformat(),
+        }
+    )
+    spec["generation"] = generation
+    resolved_context_pack = None
+    refs = meta.get("context_pack_refs") if isinstance(meta.get("context_pack_refs"), list) else []
+    if refs and isinstance(refs[0], dict):
+        first_pack_id = str(refs[0].get("id") or "").strip()
+        if first_pack_id:
+            resolved_context_pack = ContextPack.objects.filter(id=first_pack_id).first()
+    artifact.video_spec_json = spec
+    artifact.format = "video_explainer"
+    artifact.video_context_pack = resolved_context_pack
+    artifact.save(update_fields=["video_spec_json", "format", "video_context_pack", "updated_at"])
+    _record_artifact_event(
+        artifact,
+        f"article_video_{stage_key}_generated",
+        identity,
+        {
+            "proposal_id": proposal["id"],
+            "purpose_slug": purpose_slug,
+            "agent_slug": meta.get("agent_slug"),
+            "context_pack_hash": meta.get("context_pack_hash"),
+        },
+    )
+    return proposal, spec
+
+
+@csrf_exempt
+def article_video_generate_visual_prompts(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if not _can_edit_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    instruction = str(payload.get("instruction") or "").strip()
+    agent_slug = str(payload.get("agent_slug") or "").strip()
+    context_pack_override = payload.get("context_pack_id") if "context_pack_id" in payload else payload.get("context_packs")
+    spec = _video_spec(artifact)
+    prompt = (
+        "Generate scene visual prompts as JSON keyed by scene_id.\n"
+        "Each value should include image_prompt, optional negative_prompt, motion_hint, and aspect_ratio=16:9.\n"
+        f"Instruction: {instruction or 'Generate clean, brand-safe visuals.'}\n\n"
+        f"Scenes JSON:\n{json.dumps(spec.get('scenes') if isinstance(spec.get('scenes'), list) else [], ensure_ascii=False)}"
+    )
+    try:
+        generated_text, meta = _video_generate_text(
+            identity,
+            artifact,
+            "explainer_visual_prompts",
+            prompt,
+            {"artifact_id": str(artifact.id), "workspace_id": str(artifact.workspace_id), "mode": "video_generate_visual_prompts"},
+            explicit_agent=agent_slug or None,
+            explicit_context_packs=context_pack_override,
+        )
+    except (AiConfigError, AiInvokeError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    output: Any = generated_text
+    try:
+        parsed = json.loads(generated_text)
+        if isinstance(parsed, dict):
+            output = parsed
+    except Exception:
+        pass
+    proposal, _ = _save_video_stage_proposal(
+        artifact=artifact,
+        identity=identity,
+        stage_key="visual_prompts",
+        purpose_slug="explainer_visual_prompts",
+        generated_output=output,
+        meta=meta,
+    )
+    return JsonResponse({"article": _serialize_article_detail(artifact), "proposal": proposal, "overwrote_draft": False})
+
+
+@csrf_exempt
+def article_video_generate_narration(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if not _can_edit_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    instruction = str(payload.get("instruction") or "").strip()
+    agent_slug = str(payload.get("agent_slug") or "").strip()
+    context_pack_override = payload.get("context_pack_id") if "context_pack_id" in payload else payload.get("context_packs")
+    spec = _video_spec(artifact)
+    storyboard_draft = ((spec.get("storyboard") or {}).get("draft") if isinstance(spec.get("storyboard"), dict) else []) or []
+    prompt = (
+        "Rewrite this narration for smooth spoken delivery while preserving meaning.\n"
+        f"Instruction: {instruction or 'Keep it clear and concise.'}\n\n"
+        f"Current script:\n{((spec.get('script') or {}).get('draft') if isinstance(spec.get('script'), dict) else '')}\n\n"
+        f"Storyboard draft:\n{json.dumps(storyboard_draft, ensure_ascii=False)}"
+    )
+    try:
+        generated_text, meta = _video_generate_text(
+            identity,
+            artifact,
+            "explainer_narration",
+            prompt,
+            {"artifact_id": str(artifact.id), "workspace_id": str(artifact.workspace_id), "mode": "video_generate_narration"},
+            explicit_agent=agent_slug or None,
+            explicit_context_packs=context_pack_override,
+        )
+    except (AiConfigError, AiInvokeError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    proposal, _ = _save_video_stage_proposal(
+        artifact=artifact,
+        identity=identity,
+        stage_key="narration",
+        purpose_slug="explainer_narration",
+        generated_output=generated_text,
+        meta=meta,
+    )
+    return JsonResponse({"article": _serialize_article_detail(artifact), "proposal": proposal, "overwrote_draft": False})
+
+
+@csrf_exempt
+def article_video_generate_title_description(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if not _can_edit_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    instruction = str(payload.get("instruction") or "").strip()
+    agent_slug = str(payload.get("agent_slug") or "").strip()
+    context_pack_override = payload.get("context_pack_id") if "context_pack_id" in payload else payload.get("context_packs")
+    spec = _video_spec(artifact)
+    prompt = (
+        "Return strict JSON with keys: titles (5), descriptions (2), ctas (3).\n"
+        f"Instruction: {instruction or 'Concrete, concise, no hype.'}\n\n"
+        f"Article title: {artifact.title}\n"
+        f"Intent: {spec.get('intent') or ''}\n"
+        f"Audience: {spec.get('audience') or ''}\n"
+        f"Tone: {spec.get('tone') or ''}\n"
+    )
+    try:
+        generated_text, meta = _video_generate_text(
+            identity,
+            artifact,
+            "explainer_title_description",
+            prompt,
+            {"artifact_id": str(artifact.id), "workspace_id": str(artifact.workspace_id), "mode": "video_generate_title_description"},
+            explicit_agent=agent_slug or None,
+            explicit_context_packs=context_pack_override,
+        )
+    except (AiConfigError, AiInvokeError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    output: Any = generated_text
+    try:
+        parsed = json.loads(generated_text)
+        if isinstance(parsed, dict):
+            output = parsed
+    except Exception:
+        pass
+    proposal, _ = _save_video_stage_proposal(
+        artifact=artifact,
+        identity=identity,
+        stage_key="title_description",
+        purpose_slug="explainer_title_description",
+        generated_output=output,
+        meta=meta,
+    )
+    return JsonResponse({"article": _serialize_article_detail(artifact), "proposal": proposal, "overwrote_draft": False})
 
 
 @csrf_exempt

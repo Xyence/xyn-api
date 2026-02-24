@@ -901,6 +901,7 @@ class Artifact(models.Model):
     provenance_json = models.JSONField(default=dict, blank=True)
     scope_json = models.JSONField(default=dict, blank=True)
     video_spec_json = models.JSONField(null=True, blank=True)
+    video_ai_config_json = models.JSONField(null=True, blank=True)
     video_context_pack = models.ForeignKey(
         "ContextPack",
         null=True,
@@ -1615,6 +1616,11 @@ class ContextPack(models.Model):
         ("deployer", "Deployer"),
         ("operator", "Operator"),
         ("video_explainer", "Video Explainer"),
+        ("explainer_script", "Explainer Script"),
+        ("explainer_storyboard", "Explainer Storyboard"),
+        ("explainer_visual_prompts", "Explainer Visual Prompts"),
+        ("explainer_narration", "Explainer Narration"),
+        ("explainer_title_description", "Explainer Title Description"),
     ]
     SCOPE_CHOICES = [
         ("global", "Global"),
@@ -1624,7 +1630,7 @@ class ContextPack(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
-    purpose = models.CharField(max_length=20, choices=PURPOSE_CHOICES, default="any")
+    purpose = models.CharField(max_length=40, choices=PURPOSE_CHOICES, default="any")
     scope = models.CharField(max_length=20, choices=SCOPE_CHOICES)
     namespace = models.CharField(max_length=120, blank=True)
     project_key = models.CharField(max_length=120, blank=True)
@@ -1890,6 +1896,7 @@ class AgentPurpose(models.Model):
     model_config = models.ForeignKey(ModelConfig, null=True, blank=True, on_delete=models.SET_NULL, related_name="purposes")
     # Short purpose-level guidance prepended to agent system prompts at runtime.
     preamble = models.TextField(blank=True, validators=[MaxLengthValidator(1000)])
+    default_context_pack_refs_json = models.JSONField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
     # Backward-compatibility field; status is the source of truth.
     enabled = models.BooleanField(default=True)
@@ -1956,10 +1963,18 @@ class AgentDefinitionPurpose(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     agent_definition = models.ForeignKey(AgentDefinition, on_delete=models.CASCADE, related_name="purpose_links")
     purpose = models.ForeignKey(AgentPurpose, on_delete=models.CASCADE, related_name="agent_links")
+    is_default_for_purpose = models.BooleanField(default=False)
 
     class Meta:
         unique_together = ("agent_definition", "purpose")
         ordering = ["agent_definition__slug", "purpose__slug"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["purpose"],
+                condition=Q(is_default_for_purpose=True),
+                name="uniq_default_agent_per_purpose",
+            )
+        ]
 
     def __str__(self) -> str:
         return f"{self.agent_definition.slug}:{self.purpose.slug}"

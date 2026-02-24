@@ -4,7 +4,21 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from xyn_orchestrator.models import Artifact, ArtifactEvent, ArtifactType, ArticleCategory, ContextPack, RoleBinding, UserIdentity, Workspace
+from xyn_orchestrator.models import (
+    AgentDefinition,
+    AgentDefinitionPurpose,
+    AgentPurpose,
+    Artifact,
+    ArtifactEvent,
+    ArtifactType,
+    ArticleCategory,
+    ContextPack,
+    ModelConfig,
+    ModelProvider,
+    RoleBinding,
+    UserIdentity,
+    Workspace,
+)
 from xyn_orchestrator import xyn_api
 
 
@@ -19,6 +33,34 @@ class GovernedArticlesApiTests(TestCase):
         RoleBinding.objects.create(user_identity=self.reader_identity, scope_kind="platform", role="app_user")
         self.workspace, _ = Workspace.objects.get_or_create(slug="platform-builder", defaults={"name": "Platform Builder"})
         self.article_type, _ = ArtifactType.objects.get_or_create(slug="article", defaults={"name": "Article"})
+
+    def _create_agent_for_purpose(self, purpose_slug: str, agent_slug: str, *, enabled: bool = True, is_default_for_purpose: bool = False):
+        provider, _ = ModelProvider.objects.get_or_create(slug="openai", defaults={"name": "OpenAI", "enabled": True})
+        model = ModelConfig.objects.create(provider=provider, model_name=f"gpt-{agent_slug}", enabled=True)
+        purpose, _ = AgentPurpose.objects.get_or_create(
+            slug=purpose_slug,
+            defaults={
+                "name": purpose_slug,
+                "description": purpose_slug,
+                "status": "active",
+                "enabled": True,
+            },
+        )
+        agent = AgentDefinition.objects.create(
+            slug=agent_slug,
+            name=agent_slug,
+            model_config=model,
+            system_prompt_text=f"Prompt for {agent_slug}",
+            enabled=enabled,
+        )
+        if is_default_for_purpose:
+            AgentDefinitionPurpose.objects.filter(purpose=purpose, is_default_for_purpose=True).update(is_default_for_purpose=False)
+        AgentDefinitionPurpose.objects.create(
+            agent_definition=agent,
+            purpose=purpose,
+            is_default_for_purpose=is_default_for_purpose,
+        )
+        return agent
 
     def _set_identity(self, identity: UserIdentity):
         session = self.client.session
@@ -447,3 +489,122 @@ class GovernedArticlesApiTests(TestCase):
         self.assertEqual(render.get("spec_snapshot_hash"), render_b.get("spec_snapshot_hash"))
         self.assertEqual(render.get("context_pack_hash"), render_b.get("context_pack_hash"))
         self.assertNotEqual(render.get("input_snapshot_hash"), render_b.get("input_snapshot_hash"))
+
+    def test_video_ai_config_get_returns_effective_resolution(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Video Config",
+                    "slug": "video-ai-config-get",
+                    "category": "guide",
+                    "format": "video_explainer",
+                    "body_markdown": "Base article",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+
+        script_agent = self._create_agent_for_purpose("explainer_script", "script-agent", is_default_for_purpose=True)
+        pack = ContextPack.objects.create(
+            name="Script Pack",
+            purpose="explainer_script",
+            scope="global",
+            version="1.0.0",
+            content_markdown="Script defaults",
+            is_active=True,
+        )
+        purpose = AgentPurpose.objects.get(slug="explainer_script")
+        purpose.default_context_pack_refs_json = [{"id": str(pack.id)}]
+        purpose.save(update_fields=["default_context_pack_refs_json", "updated_at"])
+
+        response = self.client.get(f"/xyn/api/articles/{article_id}/video/ai-config")
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        payload = response.json()
+        self.assertIn("effective", payload)
+        self.assertEqual(payload["effective"]["explainer_script"]["agent"]["slug"], script_agent.slug)
+        self.assertEqual(payload["effective"]["explainer_script"]["agent_source"], "purpose_default")
+        self.assertEqual(payload["effective"]["explainer_script"]["context_source"], "purpose_default")
+
+    def test_video_ai_config_put_validates_agent_link_and_context_pack_purpose(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Video Config",
+                    "slug": "video-ai-config-put",
+                    "category": "guide",
+                    "format": "video_explainer",
+                    "body_markdown": "Base article",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+
+        storyboard_agent = self._create_agent_for_purpose("explainer_storyboard", "storyboard-agent")
+        wrong_agent = self._create_agent_for_purpose("explainer_narration", "narration-agent")
+        disabled_script_agent = self._create_agent_for_purpose("explainer_script", "disabled-script-agent", enabled=False)
+
+        wrong_pack = ContextPack.objects.create(
+            name="Wrong Pack",
+            purpose="planner",
+            scope="global",
+            version="1.0.0",
+            content_markdown="wrong purpose",
+            is_active=True,
+        )
+        right_pack = ContextPack.objects.create(
+            name="Storyboard Pack",
+            purpose="explainer_storyboard",
+            scope="global",
+            version="1.0.0",
+            content_markdown="storyboard purpose",
+            is_active=True,
+        )
+
+        bad_agent_resp = self.client.put(
+            f"/xyn/api/articles/{article_id}/video/ai-config",
+            data=json.dumps({"agents": {"explainer_storyboard": wrong_agent.slug}}),
+            content_type="application/json",
+        )
+        self.assertEqual(bad_agent_resp.status_code, 400, bad_agent_resp.content.decode())
+        self.assertIn("not linked", bad_agent_resp.json().get("error", ""))
+
+        disabled_agent_resp = self.client.put(
+            f"/xyn/api/articles/{article_id}/video/ai-config",
+            data=json.dumps({"agents": {"explainer_script": disabled_script_agent.slug}}),
+            content_type="application/json",
+        )
+        self.assertEqual(disabled_agent_resp.status_code, 400, disabled_agent_resp.content.decode())
+        self.assertIn("not found or disabled", disabled_agent_resp.json().get("error", ""))
+
+        bad_pack_resp = self.client.put(
+            f"/xyn/api/articles/{article_id}/video/ai-config",
+            data=json.dumps({"context_packs": {"explainer_storyboard": [str(wrong_pack.id)]}}),
+            content_type="application/json",
+        )
+        self.assertEqual(bad_pack_resp.status_code, 400, bad_pack_resp.content.decode())
+        self.assertIn("does not match explainer_storyboard", bad_pack_resp.json().get("error", ""))
+
+        ok_resp = self.client.put(
+            f"/xyn/api/articles/{article_id}/video/ai-config",
+            data=json.dumps(
+                {
+                    "agents": {"explainer_storyboard": storyboard_agent.slug},
+                    "context_packs": {"explainer_storyboard": [str(right_pack.id)]},
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(ok_resp.status_code, 200, ok_resp.content.decode())
+        payload = ok_resp.json()
+        self.assertEqual(payload["overrides"]["agents"]["explainer_storyboard"], storyboard_agent.slug)
+        self.assertEqual(payload["effective"]["explainer_storyboard"]["agent"]["slug"], storyboard_agent.slug)
