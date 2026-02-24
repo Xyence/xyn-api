@@ -901,6 +901,13 @@ class Artifact(models.Model):
     provenance_json = models.JSONField(default=dict, blank=True)
     scope_json = models.JSONField(default=dict, blank=True)
     video_spec_json = models.JSONField(null=True, blank=True)
+    video_context_pack = models.ForeignKey(
+        "ContextPack",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="video_articles",
+    )
     video_latest_render = models.ForeignKey(
         "VideoRender",
         null=True,
@@ -961,6 +968,16 @@ class VideoRender(models.Model):
     request_payload_json = models.JSONField(default=dict, blank=True)
     result_payload_json = models.JSONField(default=dict, blank=True)
     output_assets = models.JSONField(default=list, blank=True)
+    context_pack = models.ForeignKey(
+        "ContextPack",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="video_renders",
+    )
+    context_pack_version = models.CharField(max_length=64, blank=True)
+    context_pack_updated_at = models.DateTimeField(null=True, blank=True)
+    context_pack_hash = models.CharField(max_length=64, blank=True)
     error_message = models.TextField(blank=True)
     error_details_json = models.JSONField(null=True, blank=True)
 
@@ -1594,6 +1611,7 @@ class ContextPack(models.Model):
         ("coder", "Coder"),
         ("deployer", "Deployer"),
         ("operator", "Operator"),
+        ("video_explainer", "Video Explainer"),
     ]
     SCOPE_CHOICES = [
         ("global", "Global"),

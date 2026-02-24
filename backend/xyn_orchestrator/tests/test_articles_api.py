@@ -4,7 +4,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from xyn_orchestrator.models import Artifact, ArtifactEvent, ArtifactType, ArticleCategory, RoleBinding, UserIdentity, Workspace
+from xyn_orchestrator.models import Artifact, ArtifactEvent, ArtifactType, ArticleCategory, ContextPack, RoleBinding, UserIdentity, Workspace
 from xyn_orchestrator import xyn_api
 
 
@@ -341,3 +341,76 @@ class GovernedArticlesApiTests(TestCase):
         processed.refresh_from_db()
         self.assertEqual(processed.status, "succeeded")
         self.assertTrue(isinstance(processed.output_assets, list) and len(processed.output_assets) >= 1)
+
+    def test_video_generate_script_rejects_non_explainer_context_pack(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Video Guide",
+                    "slug": "video-guide-pack-reject",
+                    "category": "guide",
+                    "format": "video_explainer",
+                    "body_markdown": "Base article",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+        non_video_pack = ContextPack.objects.create(
+            name="Planner Pack",
+            purpose="planner",
+            scope="global",
+            version="1.0.0",
+            content_markdown="planner instructions",
+        )
+        response = self.client.post(
+            f"/xyn/api/articles/{article_id}/video/generate-script",
+            data=json.dumps({"agent_slug": "mock-agent", "context_pack_id": str(non_video_pack.id)}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400, response.content.decode())
+        self.assertIn("context pack purpose", response.json().get("error", ""))
+
+    def test_video_render_records_context_pack_id_and_hash(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Video Guide",
+                    "slug": "video-guide-pack-hash",
+                    "category": "guide",
+                    "format": "video_explainer",
+                    "body_markdown": "Base article",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+        video_pack = ContextPack.objects.create(
+            name="Explainer Pack",
+            purpose="video_explainer",
+            scope="global",
+            version="1.0.0",
+            content_markdown="Use concrete examples and plain language.",
+        )
+        with patch("xyn_orchestrator.xyn_api._async_mode", return_value="redis"), patch("xyn_orchestrator.xyn_api._enqueue_job"):
+            queued = self.client.post(
+                f"/xyn/api/articles/{article_id}/video/renders",
+                data=json.dumps({"provider": "stub", "context_pack_id": str(video_pack.id)}),
+                content_type="application/json",
+            )
+        self.assertEqual(queued.status_code, 200, queued.content.decode())
+        render = queued.json()["render"]
+        self.assertEqual(render["context_pack_id"], str(video_pack.id))
+        self.assertTrue(bool(render.get("context_pack_hash")))
+        self.assertEqual(
+            (render.get("request_payload_json") or {}).get("context_pack", {}).get("id"),
+            str(video_pack.id),
+        )

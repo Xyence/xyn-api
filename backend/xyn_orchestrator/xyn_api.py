@@ -153,6 +153,7 @@ GUIDE_ARTICLE_CATEGORIES = {"guide", "core-concepts", "tutorial"}
 ARTICLE_VISIBILITY_TYPES = {"public", "authenticated", "role_based", "private"}
 ARTICLE_STATUS_CHOICES = {"draft", "reviewed", "ratified", "published", "deprecated"}
 ARTICLE_FORMAT_TYPES = {"standard", "video_explainer"}
+VIDEO_CONTEXT_PACK_PURPOSE = "video_explainer"
 ARTICLE_CATEGORY_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 PUBLISH_BINDING_TARGET_TYPES = {"xyn_ui_route", "public_web_path", "external_url"}
 ARTICLE_TRANSITIONS = {
@@ -1233,6 +1234,77 @@ def _video_spec(artifact: Artifact, revision: Optional[ArtifactRevision] = None)
     return _default_video_spec_for_artifact(artifact, revision)
 
 
+def _normalize_pack_markdown(value: str) -> str:
+    return re.sub(r"\r\n?", "\n", str(value or "")).strip()
+
+
+def _context_pack_content_hash(pack: ContextPack) -> str:
+    normalized = _normalize_pack_markdown(pack.content_markdown)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
+
+
+def _serialize_video_context_pack(pack: Optional[ContextPack]) -> Optional[Dict[str, Any]]:
+    if not pack:
+        return None
+    return {
+        "id": str(pack.id),
+        "name": pack.name,
+        "purpose": pack.purpose,
+        "scope": pack.scope,
+        "version": pack.version,
+        "updated_at": pack.updated_at.isoformat() if pack.updated_at else None,
+        "content_hash": _context_pack_content_hash(pack),
+    }
+
+
+def _resolve_video_context_pack_for_article(
+    artifact: Optional[Artifact],
+    raw_pack_id: Any,
+    *,
+    allow_clear: bool = True,
+) -> tuple[Optional[ContextPack], Optional[JsonResponse]]:
+    if raw_pack_id is None:
+        if artifact and artifact.video_context_pack_id:
+            attached = ContextPack.objects.filter(id=artifact.video_context_pack_id).first()
+            if attached and attached.purpose != VIDEO_CONTEXT_PACK_PURPOSE:
+                return None, JsonResponse({"error": f"context pack purpose must be {VIDEO_CONTEXT_PACK_PURPOSE}"}, status=400)
+            return attached, None
+        return None, None
+    pack_id = str(raw_pack_id or "").strip()
+    if not pack_id:
+        if allow_clear:
+            return None, None
+        if artifact and artifact.video_context_pack_id:
+            return ContextPack.objects.filter(id=artifact.video_context_pack_id).first(), None
+        return None, None
+    pack = ContextPack.objects.filter(id=pack_id).first()
+    if not pack:
+        return None, JsonResponse({"error": "context pack not found"}, status=404)
+    if pack.purpose != VIDEO_CONTEXT_PACK_PURPOSE:
+        return None, JsonResponse({"error": f"context pack purpose must be {VIDEO_CONTEXT_PACK_PURPOSE}"}, status=400)
+    return pack, None
+
+
+def _video_context_prompt(pack: Optional[ContextPack]) -> str:
+    if not pack:
+        return ""
+    return f"### Context Pack: {pack.name} (v{pack.version})\n{_normalize_pack_markdown(pack.content_markdown)}".strip()
+
+
+def _video_context_metadata(pack: Optional[ContextPack]) -> Dict[str, Any]:
+    if not pack:
+        return {}
+    return {
+        "id": str(pack.id),
+        "name": pack.name,
+        "purpose": pack.purpose,
+        "scope": pack.scope,
+        "version": pack.version,
+        "updated_at": pack.updated_at.isoformat() if pack.updated_at else None,
+        "hash": _context_pack_content_hash(pack),
+    }
+
+
 def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
     return {
         "id": str(render.id),
@@ -1245,6 +1317,11 @@ def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
         "request_payload_json": sanitize_payload(render.request_payload_json or {}),
         "result_payload_json": sanitize_payload(render.result_payload_json or {}),
         "output_assets": render.output_assets or [],
+        "context_pack_id": str(render.context_pack_id) if render.context_pack_id else None,
+        "context_pack_name": render.context_pack.name if getattr(render, "context_pack", None) else None,
+        "context_pack_version": render.context_pack_version or "",
+        "context_pack_updated_at": render.context_pack_updated_at,
+        "context_pack_hash": render.context_pack_hash or "",
         "error_message": render.error_message or "",
         "error_details_json": sanitize_payload(render.error_details_json or {}),
     }
@@ -1297,6 +1374,7 @@ def _serialize_article_summary(artifact: Artifact, revision: Optional[ArtifactRe
         "workspace_id": str(artifact.workspace_id),
         "type": artifact.type.slug,
         "format": _article_format(artifact),
+        "video_context_pack_id": str(artifact.video_context_pack_id) if artifact.video_context_pack_id else None,
         "title": artifact.title,
         "slug": _artifact_slug(artifact),
         "status": artifact.status,
@@ -1330,6 +1408,8 @@ def _serialize_article_detail(artifact: Artifact, revision: Optional[ArtifactRev
             "body_html": content.get("body_html") or "",
             "format": _article_format(artifact),
             "video_spec_json": _video_spec(artifact, latest),
+            "video_context_pack_id": str(artifact.video_context_pack_id) if artifact.video_context_pack_id else None,
+            "video_context_pack": _serialize_video_context_pack(getattr(artifact, "video_context_pack", None)),
             "video_latest_render_id": str(artifact.video_latest_render_id) if artifact.video_latest_render_id else None,
             "provenance_json": artifact.provenance_json or {},
             "license_json": (artifact.scope_json or {}).get("license_json") or {},
@@ -4602,6 +4682,14 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
         status = str(payload.get("status") or "draft").strip().lower()
         if status not in ARTICLE_STATUS_CHOICES:
             return JsonResponse({"error": "invalid status"}, status=400)
+        requested_video_pack = payload.get("video_context_pack_id") if "video_context_pack_id" in payload else None
+        video_context_pack, pack_error = _resolve_video_context_pack_for_article(
+            None,
+            requested_video_pack,
+            allow_clear=True,
+        )
+        if pack_error:
+            return pack_error
         candidate_video_spec = payload.get("video_spec_json") if isinstance(payload.get("video_spec_json"), dict) else None
         if candidate_video_spec is not None:
             spec_errors = validate_video_spec(candidate_video_spec)
@@ -4639,6 +4727,7 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                 },
                 provenance_json=payload.get("provenance_json") if isinstance(payload.get("provenance_json"), dict) else {},
                 video_spec_json=final_video_spec,
+                video_context_pack=video_context_pack if article_format == "video_explainer" else None,
                 article_category=category,
             )
             ArtifactRevision.objects.create(
@@ -4665,7 +4754,13 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                 artifact,
                 "article_created",
                 identity,
-                {"category": category.slug, "visibility_type": visibility_type, "status": status, "format": article_format},
+                {
+                    "category": category.slug,
+                    "visibility_type": visibility_type,
+                    "status": status,
+                    "format": article_format,
+                    "video_context_pack_id": str(video_context_pack.id) if video_context_pack else None,
+                },
             )
             for route in route_bindings:
                 value = str(route or "").strip()
@@ -4998,14 +5093,14 @@ def article_binding_detail(request: HttpRequest, article_id: str, binding_id: st
 def _resolve_article_or_404(article_id_or_slug: str) -> Artifact:
     by_id = (
         Artifact.objects.filter(id=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG)
-        .select_related("type", "workspace", "article_category")
+        .select_related("type", "workspace", "article_category", "video_context_pack")
         .first()
     )
     if by_id:
         return by_id
     by_slug = (
         Artifact.objects.filter(slug=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG)
-        .select_related("type", "workspace", "article_category")
+        .select_related("type", "workspace", "article_category", "video_context_pack")
         .first()
     )
     if by_slug:
@@ -5061,6 +5156,15 @@ def article_detail(request: HttpRequest, article_id: str) -> JsonResponse:
             if artifact.format == "video_explainer" and not isinstance(artifact.video_spec_json, dict):
                 artifact.video_spec_json = _default_video_spec_for_artifact(artifact)
                 dirty_fields.add("video_spec_json")
+            if artifact.format != "video_explainer" and artifact.video_context_pack_id:
+                artifact.video_context_pack = None
+                dirty_fields.add("video_context_pack")
+        if "video_context_pack_id" in payload:
+            next_pack, pack_error = _resolve_video_context_pack_for_article(artifact, payload.get("video_context_pack_id"), allow_clear=True)
+            if pack_error:
+                return pack_error
+            artifact.video_context_pack = next_pack
+            dirty_fields.add("video_context_pack")
         if "video_spec_json" in payload:
             candidate = payload.get("video_spec_json")
             if candidate is None:
@@ -5327,11 +5431,15 @@ def _process_video_render(video_render: VideoRender) -> VideoRender:
         return video_render
     spec = _video_spec(article)
     request_payload = dict(video_render.request_payload_json or {})
+    context_pack = ContextPack.objects.filter(id=video_render.context_pack_id).first() if video_render.context_pack_id else None
+    if context_pack and "context_pack" not in request_payload:
+        request_payload["context_pack"] = _video_context_metadata(context_pack)
     video_render.status = "running"
     video_render.started_at = now
     video_render.error_message = ""
     video_render.error_details_json = {}
-    video_render.save(update_fields=["status", "started_at", "error_message", "error_details_json"])
+    video_render.request_payload_json = sanitize_payload(request_payload)
+    video_render.save(update_fields=["status", "started_at", "error_message", "error_details_json", "request_payload_json", "updated_at"])
 
     provider, assets, raw_result = render_video(spec, request_payload, str(article.id))
     finished_at = timezone.now()
@@ -5349,6 +5457,10 @@ def _process_video_render(video_render: VideoRender) -> VideoRender:
         "provider": video_render.provider,
         "status": "succeeded",
         "last_render_id": str(video_render.id),
+        "context_pack_id": str(video_render.context_pack_id) if video_render.context_pack_id else None,
+        "context_pack_version": video_render.context_pack_version or "",
+        "context_pack_updated_at": video_render.context_pack_updated_at.isoformat() if video_render.context_pack_updated_at else None,
+        "context_pack_hash": video_render.context_pack_hash or "",
         "updated_at": finished_at.isoformat(),
     }
     article.video_spec_json = spec
@@ -5390,10 +5502,18 @@ def article_video_generate_script(request: HttpRequest, article_id: str) -> Json
     agent_slug = str(payload.get("agent_slug") or "").strip()
     if not agent_slug:
         return JsonResponse({"error": "agent_slug is required"}, status=400)
+    context_pack, pack_error = _resolve_video_context_pack_for_article(
+        artifact,
+        payload.get("context_pack_id") if "context_pack_id" in payload else None,
+        allow_clear=True,
+    )
+    if pack_error:
+        return pack_error
 
     spec = _video_spec(artifact)
     script = spec.get("script") if isinstance(spec.get("script"), dict) else {}
     current_draft = str(script.get("draft") or "")
+    context_prompt = _video_context_prompt(context_pack)
     prompt = (
         "Generate a concise explainer video narration script.\n"
         "Return plain text script only.\n\n"
@@ -5404,6 +5524,8 @@ def article_video_generate_script(request: HttpRequest, article_id: str) -> Json
         f"Duration target (seconds): {spec.get('duration_seconds_target') or 150}\n\n"
         f"Source article markdown:\n{_article_content(artifact).get('body_markdown') or ''}\n"
     )
+    if context_prompt:
+        prompt = f"{prompt}\n\n{context_prompt}\n"
     try:
         generated, meta = _video_generate_text(
             identity,
@@ -5431,10 +5553,29 @@ def article_video_generate_script(request: HttpRequest, article_id: str) -> Json
     script["proposals"] = proposals
     script["last_generated_at"] = timezone.now().isoformat()
     spec["script"] = script
+    context_meta = _video_context_metadata(context_pack)
+    generation = spec.get("generation") if isinstance(spec.get("generation"), dict) else {}
+    generation.update(
+        {
+            "provider": meta.get("provider") or generation.get("provider"),
+            "context_pack_id": context_meta.get("id"),
+            "context_pack_version": context_meta.get("version"),
+            "context_pack_updated_at": context_meta.get("updated_at"),
+            "context_pack_hash": context_meta.get("hash"),
+            "updated_at": timezone.now().isoformat(),
+        }
+    )
+    spec["generation"] = generation
     artifact.video_spec_json = spec
     artifact.format = "video_explainer"
-    artifact.save(update_fields=["video_spec_json", "format", "updated_at"])
-    _record_artifact_event(artifact, "article_video_script_generated", identity, {"proposal_id": proposal["id"]})
+    artifact.video_context_pack = context_pack
+    artifact.save(update_fields=["video_spec_json", "format", "video_context_pack", "updated_at"])
+    _record_artifact_event(
+        artifact,
+        "article_video_script_generated",
+        identity,
+        {"proposal_id": proposal["id"], "context_pack_id": context_meta.get("id"), "context_pack_hash": context_meta.get("hash")},
+    )
     return JsonResponse({"article": _serialize_article_detail(artifact), "proposal": proposal, "overwrote_draft": not bool(current_draft)})
 
 
@@ -5452,8 +5593,16 @@ def article_video_generate_storyboard(request: HttpRequest, article_id: str) -> 
     agent_slug = str(payload.get("agent_slug") or "").strip()
     if not agent_slug:
         return JsonResponse({"error": "agent_slug is required"}, status=400)
+    context_pack, pack_error = _resolve_video_context_pack_for_article(
+        artifact,
+        payload.get("context_pack_id") if "context_pack_id" in payload else None,
+        allow_clear=True,
+    )
+    if pack_error:
+        return pack_error
     spec = _video_spec(artifact)
     script_draft = str(((spec.get("script") or {}).get("draft") if isinstance(spec.get("script"), dict) else "") or "")
+    context_prompt = _video_context_prompt(context_pack)
     prompt = (
         "Generate a storyboard and scene breakdown for this explainer script.\n"
         "Respond with JSON object keys: storyboard_draft (array), scenes (array).\n\n"
@@ -5464,6 +5613,8 @@ def article_video_generate_storyboard(request: HttpRequest, article_id: str) -> 
         f"Duration target (seconds): {spec.get('duration_seconds_target') or 150}\n\n"
         f"Script:\n{script_draft}\n"
     )
+    if context_prompt:
+        prompt = f"{prompt}\n\n{context_prompt}\n"
     generated_text = ""
     meta: Dict[str, Any] = {}
     try:
@@ -5516,10 +5667,29 @@ def article_video_generate_storyboard(request: HttpRequest, article_id: str) -> 
     storyboard["proposals"] = proposals
     storyboard["last_generated_at"] = timezone.now().isoformat()
     spec["storyboard"] = storyboard
+    context_meta = _video_context_metadata(context_pack)
+    generation = spec.get("generation") if isinstance(spec.get("generation"), dict) else {}
+    generation.update(
+        {
+            "provider": meta.get("provider") or generation.get("provider"),
+            "context_pack_id": context_meta.get("id"),
+            "context_pack_version": context_meta.get("version"),
+            "context_pack_updated_at": context_meta.get("updated_at"),
+            "context_pack_hash": context_meta.get("hash"),
+            "updated_at": timezone.now().isoformat(),
+        }
+    )
+    spec["generation"] = generation
     artifact.video_spec_json = spec
     artifact.format = "video_explainer"
-    artifact.save(update_fields=["video_spec_json", "format", "updated_at"])
-    _record_artifact_event(artifact, "article_video_storyboard_generated", identity, {"proposal_id": proposal["id"]})
+    artifact.video_context_pack = context_pack
+    artifact.save(update_fields=["video_spec_json", "format", "video_context_pack", "updated_at"])
+    _record_artifact_event(
+        artifact,
+        "article_video_storyboard_generated",
+        identity,
+        {"proposal_id": proposal["id"], "context_pack_id": context_meta.get("id"), "context_pack_hash": context_meta.get("hash")},
+    )
     return JsonResponse({"article": _serialize_article_detail(artifact), "proposal": proposal, "overwrote_draft": not isinstance(existing_draft, list) or len(existing_draft) == 0})
 
 
@@ -5533,16 +5703,31 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
         if not _can_edit_article(identity, artifact):
             return JsonResponse({"error": "forbidden"}, status=403)
         payload = _parse_json(request)
+        context_pack, pack_error = _resolve_video_context_pack_for_article(
+            artifact,
+            payload.get("context_pack_id") if "context_pack_id" in payload else None,
+            allow_clear=True,
+        )
+        if pack_error:
+            return pack_error
         request_payload = payload.get("request_payload_json") if isinstance(payload.get("request_payload_json"), dict) else {}
         provider = str(payload.get("provider") or request_payload.get("provider") or os.environ.get("XYENCE_VIDEO_PROVIDER") or "unknown")
+        context_meta = _video_context_metadata(context_pack)
+        request_payload_with_meta = dict(request_payload)
+        if context_meta:
+            request_payload_with_meta["context_pack"] = context_meta
         with transaction.atomic():
             render_record = VideoRender.objects.create(
                 article=artifact,
                 provider=provider,
                 status="queued",
-                request_payload_json=sanitize_payload(request_payload),
+                request_payload_json=sanitize_payload(request_payload_with_meta),
                 result_payload_json={},
                 output_assets=[],
+                context_pack=context_pack,
+                context_pack_version=str(context_meta.get("version") or ""),
+                context_pack_updated_at=parse_datetime(str(context_meta.get("updated_at"))) if context_meta.get("updated_at") else None,
+                context_pack_hash=str(context_meta.get("hash") or ""),
             )
             spec = _video_spec(artifact)
             generation = spec.get("generation") if isinstance(spec.get("generation"), dict) else {}
@@ -5551,13 +5736,28 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
                     "provider": provider,
                     "status": "queued",
                     "last_render_id": str(render_record.id),
+                    "context_pack_id": context_meta.get("id"),
+                    "context_pack_version": context_meta.get("version"),
+                    "context_pack_updated_at": context_meta.get("updated_at"),
+                    "context_pack_hash": context_meta.get("hash"),
                     "updated_at": timezone.now().isoformat(),
                 }
             )
             spec["generation"] = generation
             artifact.video_spec_json = spec
-            artifact.save(update_fields=["video_spec_json", "updated_at"])
-        _record_artifact_event(artifact, "article_video_render_requested", identity, {"render_id": str(render_record.id), "provider": provider})
+            artifact.video_context_pack = context_pack
+            artifact.save(update_fields=["video_spec_json", "video_context_pack", "updated_at"])
+        _record_artifact_event(
+            artifact,
+            "article_video_render_requested",
+            identity,
+            {
+                "render_id": str(render_record.id),
+                "provider": provider,
+                "context_pack_id": context_meta.get("id"),
+                "context_pack_hash": context_meta.get("hash"),
+            },
+        )
         mode = _async_mode()
         if mode == "redis":
             _enqueue_job("xyn_orchestrator.worker_tasks.process_video_render", str(render_record.id))
@@ -5577,7 +5777,7 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
         return JsonResponse({"error": "method not allowed"}, status=405)
     if not _can_view_article(identity, artifact):
         return JsonResponse({"error": "forbidden"}, status=403)
-    rows = VideoRender.objects.filter(article=artifact).order_by("-requested_at")
+    rows = VideoRender.objects.filter(article=artifact).select_related("context_pack").order_by("-requested_at")
     return JsonResponse({"renders": [_serialize_video_render(row) for row in rows]})
 
 
@@ -5586,7 +5786,7 @@ def video_render_detail(request: HttpRequest, render_id: str) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
-    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    record = get_object_or_404(VideoRender.objects.select_related("article", "context_pack"), id=render_id)
     if request.method == "POST":
         if not _can_edit_article(identity, record.article):
             return JsonResponse({"error": "forbidden"}, status=403)
@@ -5599,6 +5799,10 @@ def video_render_detail(request: HttpRequest, render_id: str) -> JsonResponse:
                 request_payload_json=dict(record.request_payload_json or {}),
                 result_payload_json={},
                 output_assets=[],
+                context_pack=record.context_pack,
+                context_pack_version=record.context_pack_version,
+                context_pack_updated_at=record.context_pack_updated_at,
+                context_pack_hash=record.context_pack_hash,
             )
             _record_artifact_event(record.article, "article_video_render_retried", identity, {"render_id": str(record.id), "retry_id": str(retry.id)})
             if _async_mode() == "redis":
@@ -5637,7 +5841,7 @@ def video_render_cancel(request: HttpRequest, render_id: str) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
-    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    record = get_object_or_404(VideoRender.objects.select_related("article", "context_pack"), id=render_id)
     if not _can_edit_article(identity, record.article):
         return JsonResponse({"error": "forbidden"}, status=403)
     if record.status not in {"succeeded", "failed", "canceled"}:
@@ -5665,6 +5869,10 @@ def video_render_retry(request: HttpRequest, render_id: str) -> JsonResponse:
         request_payload_json=dict(record.request_payload_json or {}),
         result_payload_json={},
         output_assets=[],
+        context_pack=record.context_pack,
+        context_pack_version=record.context_pack_version,
+        context_pack_updated_at=record.context_pack_updated_at,
+        context_pack_hash=record.context_pack_hash,
     )
     _record_artifact_event(record.article, "article_video_render_retried", identity, {"render_id": str(record.id), "retry_id": str(retry.id)})
     if _async_mode() == "redis":
@@ -5772,6 +5980,10 @@ def internal_video_render_complete(request: HttpRequest, render_id: str) -> Json
         "provider": record.provider,
         "status": "succeeded",
         "last_render_id": str(record.id),
+        "context_pack_id": str(record.context_pack_id) if record.context_pack_id else None,
+        "context_pack_version": record.context_pack_version or "",
+        "context_pack_updated_at": record.context_pack_updated_at.isoformat() if record.context_pack_updated_at else None,
+        "context_pack_hash": record.context_pack_hash or "",
         "updated_at": timezone.now().isoformat(),
     }
     article.video_spec_json = spec
@@ -5802,6 +6014,10 @@ def internal_video_render_error(request: HttpRequest, render_id: str) -> JsonRes
         "provider": record.provider,
         "status": "failed",
         "last_render_id": str(record.id),
+        "context_pack_id": str(record.context_pack_id) if record.context_pack_id else None,
+        "context_pack_version": record.context_pack_version or "",
+        "context_pack_updated_at": record.context_pack_updated_at.isoformat() if record.context_pack_updated_at else None,
+        "context_pack_hash": record.context_pack_hash or "",
         "updated_at": timezone.now().isoformat(),
     }
     article.video_spec_json = spec
