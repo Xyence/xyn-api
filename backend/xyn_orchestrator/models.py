@@ -960,6 +960,7 @@ class VideoRender(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     article = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="video_renders")
     provider = models.CharField(max_length=80, default="unknown")
+    model_name = models.CharField(max_length=120, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="queued")
     requested_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -978,6 +979,8 @@ class VideoRender(models.Model):
     context_pack_version = models.CharField(max_length=64, blank=True)
     context_pack_updated_at = models.DateTimeField(null=True, blank=True)
     context_pack_hash = models.CharField(max_length=64, blank=True)
+    spec_snapshot_hash = models.CharField(max_length=64, blank=True)
+    input_snapshot_hash = models.CharField(max_length=64, blank=True)
     error_message = models.TextField(blank=True)
     error_details_json = models.JSONField(null=True, blank=True)
 

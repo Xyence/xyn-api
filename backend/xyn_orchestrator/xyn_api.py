@@ -1305,11 +1305,30 @@ def _video_context_metadata(pack: Optional[ContextPack]) -> Dict[str, Any]:
     }
 
 
+def _normalized_json_hash(value: Any) -> str:
+    try:
+        encoded = json.dumps(value if value is not None else {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except TypeError:
+        encoded = json.dumps(str(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _video_input_snapshot_hash(spec_hash: str, context_hash: str, provider: str, model_name: str) -> str:
+    payload = {
+        "spec_hash": spec_hash,
+        "context_pack_hash": context_hash,
+        "provider": provider,
+        "model_name": model_name,
+    }
+    return _normalized_json_hash(payload)
+
+
 def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
     return {
         "id": str(render.id),
         "article_id": str(render.article_id),
         "provider": render.provider,
+        "model_name": render.model_name or "",
         "status": render.status,
         "requested_at": render.requested_at,
         "started_at": render.started_at,
@@ -1322,6 +1341,8 @@ def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
         "context_pack_version": render.context_pack_version or "",
         "context_pack_updated_at": render.context_pack_updated_at,
         "context_pack_hash": render.context_pack_hash or "",
+        "spec_snapshot_hash": render.spec_snapshot_hash or "",
+        "input_snapshot_hash": render.input_snapshot_hash or "",
         "error_message": render.error_message or "",
         "error_details_json": sanitize_payload(render.error_details_json or {}),
     }
@@ -5455,8 +5476,11 @@ def _process_video_render(video_render: VideoRender) -> VideoRender:
     spec["generation"] = {
         **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
         "provider": video_render.provider,
+        "model_name": video_render.model_name or "",
         "status": "succeeded",
         "last_render_id": str(video_render.id),
+        "spec_snapshot_hash": video_render.spec_snapshot_hash or "",
+        "input_snapshot_hash": video_render.input_snapshot_hash or "",
         "context_pack_id": str(video_render.context_pack_id) if video_render.context_pack_id else None,
         "context_pack_version": video_render.context_pack_version or "",
         "context_pack_updated_at": video_render.context_pack_updated_at.isoformat() if video_render.context_pack_updated_at else None,
@@ -5712,14 +5736,27 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
             return pack_error
         request_payload = payload.get("request_payload_json") if isinstance(payload.get("request_payload_json"), dict) else {}
         provider = str(payload.get("provider") or request_payload.get("provider") or os.environ.get("XYENCE_VIDEO_PROVIDER") or "unknown")
+        model_name = str(payload.get("model_name") or request_payload.get("model_name") or request_payload.get("model") or "").strip()
+        spec = _video_spec(artifact)
+        spec_hash = _normalized_json_hash(spec)
         context_meta = _video_context_metadata(context_pack)
+        context_hash = str(context_meta.get("hash") or "")
+        input_hash = _video_input_snapshot_hash(spec_hash, context_hash, provider, model_name)
         request_payload_with_meta = dict(request_payload)
+        request_payload_with_meta["input_snapshot"] = {
+            "spec_snapshot_hash": spec_hash,
+            "context_pack_hash": context_hash,
+            "provider": provider,
+            "model_name": model_name,
+            "input_snapshot_hash": input_hash,
+        }
         if context_meta:
             request_payload_with_meta["context_pack"] = context_meta
         with transaction.atomic():
             render_record = VideoRender.objects.create(
                 article=artifact,
                 provider=provider,
+                model_name=model_name,
                 status="queued",
                 request_payload_json=sanitize_payload(request_payload_with_meta),
                 result_payload_json={},
@@ -5728,14 +5765,18 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
                 context_pack_version=str(context_meta.get("version") or ""),
                 context_pack_updated_at=parse_datetime(str(context_meta.get("updated_at"))) if context_meta.get("updated_at") else None,
                 context_pack_hash=str(context_meta.get("hash") or ""),
+                spec_snapshot_hash=spec_hash,
+                input_snapshot_hash=input_hash,
             )
-            spec = _video_spec(artifact)
             generation = spec.get("generation") if isinstance(spec.get("generation"), dict) else {}
             generation.update(
                 {
                     "provider": provider,
+                    "model_name": model_name,
                     "status": "queued",
                     "last_render_id": str(render_record.id),
+                    "spec_snapshot_hash": spec_hash,
+                    "input_snapshot_hash": input_hash,
                     "context_pack_id": context_meta.get("id"),
                     "context_pack_version": context_meta.get("version"),
                     "context_pack_updated_at": context_meta.get("updated_at"),
@@ -5754,6 +5795,9 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
             {
                 "render_id": str(render_record.id),
                 "provider": provider,
+                "model_name": model_name,
+                "spec_snapshot_hash": spec_hash,
+                "input_snapshot_hash": input_hash,
                 "context_pack_id": context_meta.get("id"),
                 "context_pack_hash": context_meta.get("hash"),
             },
@@ -5795,6 +5839,7 @@ def video_render_detail(request: HttpRequest, render_id: str) -> JsonResponse:
             retry = VideoRender.objects.create(
                 article=record.article,
                 provider=record.provider or "unknown",
+                model_name=record.model_name or "",
                 status="queued",
                 request_payload_json=dict(record.request_payload_json or {}),
                 result_payload_json={},
@@ -5803,6 +5848,8 @@ def video_render_detail(request: HttpRequest, render_id: str) -> JsonResponse:
                 context_pack_version=record.context_pack_version,
                 context_pack_updated_at=record.context_pack_updated_at,
                 context_pack_hash=record.context_pack_hash,
+                spec_snapshot_hash=record.spec_snapshot_hash,
+                input_snapshot_hash=record.input_snapshot_hash,
             )
             _record_artifact_event(record.article, "article_video_render_retried", identity, {"render_id": str(record.id), "retry_id": str(retry.id)})
             if _async_mode() == "redis":
@@ -5859,12 +5906,13 @@ def video_render_retry(request: HttpRequest, render_id: str) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
-    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    record = get_object_or_404(VideoRender.objects.select_related("article", "context_pack"), id=render_id)
     if not _can_edit_article(identity, record.article):
         return JsonResponse({"error": "forbidden"}, status=403)
     retry = VideoRender.objects.create(
         article=record.article,
         provider=record.provider or "unknown",
+        model_name=record.model_name or "",
         status="queued",
         request_payload_json=dict(record.request_payload_json or {}),
         result_payload_json={},
@@ -5873,6 +5921,8 @@ def video_render_retry(request: HttpRequest, render_id: str) -> JsonResponse:
         context_pack_version=record.context_pack_version,
         context_pack_updated_at=record.context_pack_updated_at,
         context_pack_hash=record.context_pack_hash,
+        spec_snapshot_hash=record.spec_snapshot_hash,
+        input_snapshot_hash=record.input_snapshot_hash,
     )
     _record_artifact_event(record.article, "article_video_render_retried", identity, {"render_id": str(record.id), "retry_id": str(retry.id)})
     if _async_mode() == "redis":
@@ -5978,8 +6028,11 @@ def internal_video_render_complete(request: HttpRequest, render_id: str) -> Json
     spec["generation"] = {
         **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
         "provider": record.provider,
+        "model_name": record.model_name or "",
         "status": "succeeded",
         "last_render_id": str(record.id),
+        "spec_snapshot_hash": record.spec_snapshot_hash or "",
+        "input_snapshot_hash": record.input_snapshot_hash or "",
         "context_pack_id": str(record.context_pack_id) if record.context_pack_id else None,
         "context_pack_version": record.context_pack_version or "",
         "context_pack_updated_at": record.context_pack_updated_at.isoformat() if record.context_pack_updated_at else None,
@@ -6012,8 +6065,11 @@ def internal_video_render_error(request: HttpRequest, render_id: str) -> JsonRes
     spec["generation"] = {
         **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
         "provider": record.provider,
+        "model_name": record.model_name or "",
         "status": "failed",
         "last_render_id": str(record.id),
+        "spec_snapshot_hash": record.spec_snapshot_hash or "",
+        "input_snapshot_hash": record.input_snapshot_hash or "",
         "context_pack_id": str(record.context_pack_id) if record.context_pack_id else None,
         "context_pack_version": record.context_pack_version or "",
         "context_pack_updated_at": record.context_pack_updated_at.isoformat() if record.context_pack_updated_at else None,

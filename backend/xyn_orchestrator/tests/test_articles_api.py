@@ -403,14 +403,47 @@ class GovernedArticlesApiTests(TestCase):
         with patch("xyn_orchestrator.xyn_api._async_mode", return_value="redis"), patch("xyn_orchestrator.xyn_api._enqueue_job"):
             queued = self.client.post(
                 f"/xyn/api/articles/{article_id}/video/renders",
-                data=json.dumps({"provider": "stub", "context_pack_id": str(video_pack.id)}),
+                data=json.dumps(
+                    {
+                        "provider": "stub",
+                        "model_name": "video-model-a",
+                        "context_pack_id": str(video_pack.id),
+                        "request_payload_json": {"mode": "full_render"},
+                    }
+                ),
                 content_type="application/json",
             )
         self.assertEqual(queued.status_code, 200, queued.content.decode())
         render = queued.json()["render"]
         self.assertEqual(render["context_pack_id"], str(video_pack.id))
         self.assertTrue(bool(render.get("context_pack_hash")))
+        self.assertTrue(bool(render.get("spec_snapshot_hash")))
+        self.assertTrue(bool(render.get("input_snapshot_hash")))
+        self.assertEqual(render.get("model_name"), "video-model-a")
         self.assertEqual(
             (render.get("request_payload_json") or {}).get("context_pack", {}).get("id"),
             str(video_pack.id),
         )
+        self.assertEqual(
+            (render.get("request_payload_json") or {}).get("input_snapshot", {}).get("model_name"),
+            "video-model-a",
+        )
+
+        with patch("xyn_orchestrator.xyn_api._async_mode", return_value="redis"), patch("xyn_orchestrator.xyn_api._enqueue_job"):
+            queued_model_b = self.client.post(
+                f"/xyn/api/articles/{article_id}/video/renders",
+                data=json.dumps(
+                    {
+                        "provider": "stub",
+                        "model_name": "video-model-b",
+                        "context_pack_id": str(video_pack.id),
+                        "request_payload_json": {"mode": "full_render"},
+                    }
+                ),
+                content_type="application/json",
+            )
+        self.assertEqual(queued_model_b.status_code, 200, queued_model_b.content.decode())
+        render_b = queued_model_b.json()["render"]
+        self.assertEqual(render.get("spec_snapshot_hash"), render_b.get("spec_snapshot_hash"))
+        self.assertEqual(render.get("context_pack_hash"), render_b.get("context_pack_hash"))
+        self.assertNotEqual(render.get("input_snapshot_hash"), render_b.get("input_snapshot_hash"))
