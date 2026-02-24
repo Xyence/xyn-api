@@ -146,7 +146,14 @@ from .ai_runtime import (
 from .ai_compat import compute_effective_params
 from .video_explainer import default_video_spec, validate_video_spec, sanitize_payload, render_video, export_package_text
 
-PLATFORM_ROLE_IDS = {"platform_admin", "platform_architect", "platform_operator", "app_user"}
+PLATFORM_ROLE_IDS = {"platform_owner", "platform_admin", "platform_architect", "platform_operator", "app_user"}
+PREVIEW_SESSION_KEY = "xyn.preview.v1"
+PREVIEW_TTL_SECONDS = 60 * 60
+PREVIEW_ALLOWED_TRANSITIONS: Dict[str, Set[str]] = {
+    "platform_owner": {"platform_owner", "platform_admin", "platform_architect", "platform_operator", "app_user"},
+    "platform_admin": {"platform_architect", "platform_operator", "app_user"},
+    "platform_architect": {"platform_operator", "app_user"},
+}
 DOC_ARTIFACT_TYPE_SLUG = "doc_page"
 ARTICLE_ARTIFACT_TYPE_SLUG = "article"
 ARTICLE_CATEGORIES = {"web", "guide", "core-concepts", "release-note", "internal", "tutorial"}
@@ -173,6 +180,63 @@ ARTICLE_TRANSITIONS = {
 }
 WORKSPACE_ROLE_SLUGS = {"reader", "contributor", "publisher", "moderator", "admin"}
 PURPOSE_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
+
+
+def _utc_now_ts() -> int:
+    return int(time.time())
+
+
+def _preview_allowed_roles_for_actor(actor_roles: List[str]) -> Set[str]:
+    allowed: Set[str] = set()
+    for role in actor_roles:
+        allowed.update(PREVIEW_ALLOWED_TRANSITIONS.get(role, set()))
+    return allowed
+
+
+def _load_preview_state(request: HttpRequest, actor_roles: List[str]) -> Dict[str, Any]:
+    raw = request.session.get(PREVIEW_SESSION_KEY)
+    if not isinstance(raw, dict):
+        return {"enabled": False, "roles": [], "read_only": True, "expires_at": None, "started_at": None}
+    enabled = bool(raw.get("enabled"))
+    read_only = bool(raw.get("read_only", True))
+    expires_at = int(raw.get("expires_at") or 0)
+    roles = [str(role or "").strip() for role in (raw.get("roles") or []) if str(role or "").strip()]
+    roles = [role for role in roles if role in PLATFORM_ROLE_IDS]
+    now_ts = _utc_now_ts()
+    allowed_targets = _preview_allowed_roles_for_actor(actor_roles)
+    invalid_roles = [role for role in roles if role not in allowed_targets]
+    if not enabled:
+        return {"enabled": False, "roles": [], "read_only": read_only, "expires_at": None, "started_at": None}
+    if not roles or expires_at <= now_ts or invalid_roles:
+        request.session.pop(PREVIEW_SESSION_KEY, None)
+        request.session.modified = True
+        return {"enabled": False, "roles": [], "read_only": True, "expires_at": None, "started_at": None}
+    return {
+        "enabled": True,
+        "roles": roles,
+        "read_only": read_only,
+        "expires_at": expires_at,
+        "started_at": int(raw.get("started_at") or now_ts),
+    }
+
+
+def _set_preview_state(request: HttpRequest, *, roles: List[str], read_only: bool) -> Dict[str, Any]:
+    now_ts = _utc_now_ts()
+    state = {
+        "enabled": True,
+        "roles": roles,
+        "read_only": bool(read_only),
+        "started_at": now_ts,
+        "expires_at": now_ts + PREVIEW_TTL_SECONDS,
+    }
+    request.session[PREVIEW_SESSION_KEY] = state
+    request.session.modified = True
+    return state
+
+
+def _clear_preview_state(request: HttpRequest) -> None:
+    request.session.pop(PREVIEW_SESSION_KEY, None)
+    request.session.modified = True
 
 
 def _parse_json(request: HttpRequest) -> Dict[str, Any]:
@@ -890,7 +954,22 @@ def _require_authenticated(request: HttpRequest) -> Optional[UserIdentity]:
     identity_id = request.session.get("user_identity_id")
     if not identity_id:
         return None
-    return UserIdentity.objects.filter(id=identity_id).first()
+    identity = UserIdentity.objects.filter(id=identity_id).first()
+    if not identity:
+        return None
+    actor_roles = list(
+        RoleBinding.objects.filter(user_identity=identity, scope_kind="platform")
+        .values_list("role", flat=True)
+    )
+    preview = _load_preview_state(request, actor_roles)
+    effective_roles = preview.get("roles") if preview.get("enabled") else actor_roles
+    setattr(identity, "_xyn_actor_roles", actor_roles)
+    setattr(identity, "_xyn_effective_roles", list(effective_roles or []))
+    setattr(identity, "_xyn_preview", preview)
+    setattr(request, "actor_roles", actor_roles)
+    setattr(request, "effective_roles", list(effective_roles or []))
+    setattr(request, "preview_state", preview)
+    return identity
 
 
 def _require_platform_architect(request: HttpRequest) -> Optional[JsonResponse]:
@@ -904,6 +983,9 @@ def _require_platform_architect(request: HttpRequest) -> Optional[JsonResponse]:
 
 
 def _get_roles(identity: UserIdentity) -> List[str]:
+    effective_roles = getattr(identity, "_xyn_effective_roles", None)
+    if isinstance(effective_roles, list):
+        return [str(role or "") for role in effective_roles if str(role or "")]
     return list(
         RoleBinding.objects.filter(user_identity=identity)
         .values_list("role", flat=True)
@@ -911,11 +993,18 @@ def _get_roles(identity: UserIdentity) -> List[str]:
 
 
 def _is_platform_admin(identity: UserIdentity) -> bool:
-    return RoleBinding.objects.filter(user_identity=identity, role="platform_admin").exists()
+    effective = set(_get_roles(identity))
+    return bool(effective.intersection({"platform_owner", "platform_admin"}))
 
 
 def _has_platform_role(identity: UserIdentity, roles: List[str]) -> bool:
-    return RoleBinding.objects.filter(user_identity=identity, role__in=roles).exists()
+    effective = set(_get_roles(identity))
+    expanded = set(roles)
+    if "platform_admin" in expanded:
+        expanded.add("platform_owner")
+    if "platform_architect" in expanded:
+        expanded.update({"platform_admin", "platform_owner"})
+    return bool(effective.intersection(expanded))
 
 
 def _is_platform_architect(identity: UserIdentity) -> bool:
@@ -2582,7 +2671,7 @@ def require_role(role: str):
             identity = _require_authenticated(request)
             if not identity:
                 return JsonResponse({"error": "not authenticated"}, status=401)
-            if not RoleBinding.objects.filter(user_identity=identity, role=role).exists():
+            if role not in set(_get_roles(identity)):
                 return JsonResponse({"error": "forbidden"}, status=403)
             request.user_identity = identity  # type: ignore[attr-defined]
             return view(request, *args, **kwargs)
@@ -2601,7 +2690,7 @@ def require_any_role(*roles: str):
             identity = _require_authenticated(request)
             if not identity:
                 return JsonResponse({"error": "not authenticated"}, status=401)
-            if not RoleBinding.objects.filter(user_identity=identity, role__in=role_set).exists():
+            if not set(_get_roles(identity)).intersection(role_set):
                 return JsonResponse({"error": "forbidden"}, status=403)
             request.user_identity = identity  # type: ignore[attr-defined]
             return view(request, *args, **kwargs)
@@ -3753,13 +3842,13 @@ def oidc_callback(request: HttpRequest, provider_id: str) -> HttpResponse:
         username=username,
         defaults={
             "email": email,
-            "is_staff": ("platform_admin" in roles or "platform_architect" in roles),
+            "is_staff": bool(set(roles).intersection({"platform_owner", "platform_admin", "platform_architect"})),
             "is_active": True,
         },
     )
     if email and user.email != email:
         user.email = email
-    user.is_staff = ("platform_admin" in roles or "platform_architect" in roles)
+    user.is_staff = bool(set(roles).intersection({"platform_owner", "platform_admin", "platform_architect"}))
     user.is_superuser = False
     user.is_active = True
     user.save()
@@ -3982,13 +4071,13 @@ def auth_callback(request: HttpRequest) -> HttpResponse:
         username=username,
         defaults={
             "email": email,
-            "is_staff": ("platform_admin" in roles or "platform_architect" in roles),
+            "is_staff": bool(set(roles).intersection({"platform_owner", "platform_admin", "platform_architect"})),
             "is_active": True,
         },
     )
     if email and user.email != email:
         user.email = email
-    user.is_staff = ("platform_admin" in roles or "platform_architect" in roles)
+    user.is_staff = bool(set(roles).intersection({"platform_owner", "platform_admin", "platform_architect"}))
     user.is_superuser = False
     user.is_active = True
     user.save()
@@ -4039,6 +4128,110 @@ def auth_session_check(request: HttpRequest) -> HttpResponse:
     return redirect(login_url)
 
 
+def _serialize_preview_status(identity: UserIdentity, request: HttpRequest) -> Dict[str, Any]:
+    actor_roles = getattr(request, "actor_roles", None)
+    if not isinstance(actor_roles, list):
+        actor_roles = list(
+            RoleBinding.objects.filter(user_identity=identity, scope_kind="platform").values_list("role", flat=True)
+        )
+    preview = getattr(request, "preview_state", None)
+    if not isinstance(preview, dict):
+        preview = _load_preview_state(request, actor_roles)
+    effective_roles = getattr(request, "effective_roles", None)
+    if not isinstance(effective_roles, list):
+        effective_roles = preview.get("roles") if preview.get("enabled") else actor_roles
+    return {
+        "enabled": bool(preview.get("enabled")),
+        "roles": list(preview.get("roles") or []),
+        "read_only": bool(preview.get("read_only", True)),
+        "started_at": preview.get("started_at"),
+        "expires_at": preview.get("expires_at"),
+        "actor_roles": actor_roles,
+        "effective_roles": list(effective_roles or []),
+    }
+
+
+@csrf_exempt
+def preview_enable(request: HttpRequest) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    actor_roles = getattr(request, "actor_roles", None) or []
+    payload = _parse_json(request)
+    requested_roles = [str(role or "").strip() for role in (payload.get("roles") or []) if str(role or "").strip()]
+    requested_roles = [role for role in requested_roles if role in PLATFORM_ROLE_IDS]
+    read_only = bool(payload.get("readOnly", payload.get("read_only", True)))
+    allowed_targets = _preview_allowed_roles_for_actor(actor_roles)
+    if not requested_roles or any(role not in allowed_targets for role in requested_roles):
+        _audit_action(
+            "PreviewRejected",
+            metadata={
+                "actor_id": str(identity.id),
+                "actor_roles": actor_roles,
+                "requested_roles": requested_roles,
+                "reason": "requested roles not allowed",
+                "ip": request.META.get("REMOTE_ADDR", ""),
+                "user_agent": request.META.get("HTTP_USER_AGENT", "")[:512],
+            },
+            request=request,
+        )
+        return JsonResponse({"error": "forbidden"}, status=403)
+    state = _set_preview_state(request, roles=requested_roles, read_only=read_only)
+    _audit_action(
+        "PreviewEnabled",
+        metadata={
+            "actor_id": str(identity.id),
+            "actor_roles": actor_roles,
+            "preview_roles": requested_roles,
+            "read_only": bool(state.get("read_only", True)),
+            "started_at": state.get("started_at"),
+            "expires_at": state.get("expires_at"),
+            "ip": request.META.get("REMOTE_ADDR", ""),
+            "user_agent": request.META.get("HTTP_USER_AGENT", "")[:512],
+        },
+        request=request,
+    )
+    # Refresh request-scoped attrs immediately for current response consistency.
+    _require_authenticated(request)
+    return JsonResponse({"preview": _serialize_preview_status(identity, request)})
+
+
+@csrf_exempt
+def preview_disable(request: HttpRequest) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    current = _serialize_preview_status(identity, request)
+    _clear_preview_state(request)
+    _audit_action(
+        "PreviewDisabled",
+        metadata={
+            "actor_id": str(identity.id),
+            "preview_roles": current.get("roles") or [],
+            "ended_at": _utc_now_ts(),
+            "ip": request.META.get("REMOTE_ADDR", ""),
+            "user_agent": request.META.get("HTTP_USER_AGENT", "")[:512],
+        },
+        request=request,
+    )
+    _require_authenticated(request)
+    return JsonResponse({"preview": _serialize_preview_status(identity, request)})
+
+
+@csrf_exempt
+def preview_status(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    return JsonResponse({"preview": _serialize_preview_status(identity, request)})
+
+
 def api_me(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
@@ -4054,6 +4247,8 @@ def api_me(request: HttpRequest) -> JsonResponse:
                 "display_name": identity.display_name,
             },
             "roles": roles,
+            "actor_roles": list(getattr(request, "actor_roles", []) or roles),
+            "preview": _serialize_preview_status(identity, request),
             "workspaces": [
                 {
                     "id": str(m.workspace_id),

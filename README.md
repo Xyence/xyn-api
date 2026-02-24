@@ -213,3 +213,19 @@ Overrides (optional):
   - `Cache-Control: public, max-age=300`
   - `Access-Control-Allow-Origin: *`
 - Generated web apps can load this stylesheet directly from the control-plane domain and keep local fallbacks for resilience.
+
+## Preview As Role (Authorization Simulation)
+- Endpoints:
+  - `POST /xyn/api/preview/enable` with `{ roles: string[], readOnly: boolean }`
+  - `POST /xyn/api/preview/disable`
+  - `GET /xyn/api/preview/status`
+- Downward-only policy:
+  - `platform_owner` -> may preview any platform role
+  - `platform_admin` -> may preview `platform_architect`, `platform_operator`, `app_user`
+  - `platform_architect` -> may preview `platform_operator`, `app_user`
+  - `platform_operator` / `app_user` -> preview denied
+- Preview state is server session scoped and expires automatically after 60 minutes.
+- In preview mode, write requests are blocked server-side with:
+  - `{ "code": "PREVIEW_READ_ONLY", "message": "Preview mode is read-only." }`
+- Audit messages emitted:
+  - `PreviewEnabled`, `PreviewDisabled`, `PreviewRejected`

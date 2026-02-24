@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 import jwt
 import requests
+from django.http import JsonResponse
 from django.contrib.auth import get_user_model
 from xyn_orchestrator.models import UserIdentity, RoleBinding
 
@@ -38,6 +39,45 @@ class ApiTokenAuthMiddleware:
                     if user:
                         request.user = user
                         request._cached_user = user
+        return self.get_response(request)
+
+
+PREVIEW_SESSION_KEY = "xyn.preview.v1"
+PREVIEW_TTL_SECONDS = 60 * 60
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+PREVIEW_WRITE_ALLOWLIST = {
+    "/xyn/api/preview/enable",
+    "/xyn/api/preview/disable",
+}
+
+
+class PreviewModeMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        session = getattr(request, "session", None)
+        if not session:
+            return self.get_response(request)
+        preview = session.get(PREVIEW_SESSION_KEY)
+        if not isinstance(preview, dict):
+            return self.get_response(request)
+        if not bool(preview.get("enabled")):
+            return self.get_response(request)
+        expires_at = int(preview.get("expires_at") or 0)
+        if expires_at <= int(time.time()):
+            session.pop(PREVIEW_SESSION_KEY, None)
+            session.modified = True
+            return self.get_response(request)
+        is_xyn_api_path = request.path.startswith("/xyn/api/") or request.path.startswith("/xyn/internal/")
+        if is_xyn_api_path and request.method.upper() in UNSAFE_METHODS and request.path not in PREVIEW_WRITE_ALLOWLIST:
+            return JsonResponse(
+                {
+                    "code": "PREVIEW_READ_ONLY",
+                    "message": "Preview mode is read-only.",
+                },
+                status=403,
+            )
         return self.get_response(request)
 
 
@@ -140,7 +180,8 @@ def _get_or_create_user_from_identity(identity: UserIdentity):
         defaults={"email": identity.email or "", "is_staff": False, "is_active": True},
     )
     roles = RoleBinding.objects.filter(user_identity=identity).values_list("role", flat=True)
-    is_staff = "platform_admin" in set(roles)
+    role_set = set(roles)
+    is_staff = bool(role_set.intersection({"platform_owner", "platform_admin", "platform_architect"}))
     changed = False
     if user.email != (identity.email or ""):
         user.email = identity.email or ""
