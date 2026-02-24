@@ -145,6 +145,13 @@ from .ai_runtime import (
 )
 from .ai_compat import compute_effective_params
 from .video_explainer import default_video_spec, validate_video_spec, sanitize_payload, render_video, export_package_text
+from .access_explorer import (
+    canonical_registry as access_canonical_registry,
+    search_users as access_search_users,
+    user_roles as access_user_roles_data,
+    compute_effective_permissions as access_compute_effective_permissions,
+    role_detail as access_role_detail_data,
+)
 
 PLATFORM_ROLE_IDS = {"platform_owner", "platform_admin", "platform_architect", "platform_operator", "app_user"}
 PREVIEW_SESSION_KEY = "xyn.preview.v1"
@@ -4230,6 +4237,80 @@ def preview_status(request: HttpRequest) -> JsonResponse:
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
     return JsonResponse({"preview": _serialize_preview_status(identity, request)})
+
+
+@csrf_exempt
+@require_any_role("platform_owner", "platform_admin")
+def access_registry(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = getattr(request, "user_identity", None)
+    _audit_action(
+        "AccessExplorerViewed",
+        metadata={"endpoint": "registry", "actor_id": str(identity.id) if identity else ""},
+        request=request,
+    )
+    return JsonResponse(access_canonical_registry())
+
+
+@csrf_exempt
+@require_any_role("platform_owner", "platform_admin")
+def access_users_collection(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = getattr(request, "user_identity", None)
+    query = str(request.GET.get("query") or "").strip()
+    _audit_action(
+        "AccessExplorerViewed",
+        metadata={"endpoint": "users", "query": query, "actor_id": str(identity.id) if identity else ""},
+        request=request,
+    )
+    return JsonResponse({"users": access_search_users(query=query)})
+
+
+@csrf_exempt
+@require_any_role("platform_owner", "platform_admin")
+def access_user_roles(request: HttpRequest, user_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = getattr(request, "user_identity", None)
+    _audit_action(
+        "AccessExplorerViewed",
+        metadata={"endpoint": "user_roles", "target_user_id": str(user_id), "actor_id": str(identity.id) if identity else ""},
+        request=request,
+    )
+    return JsonResponse({"roles": access_user_roles_data(str(user_id))})
+
+
+@csrf_exempt
+@require_any_role("platform_owner", "platform_admin")
+def access_user_effective(request: HttpRequest, user_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = getattr(request, "user_identity", None)
+    _audit_action(
+        "AccessExplorerViewed",
+        metadata={"endpoint": "user_effective", "target_user_id": str(user_id), "actor_id": str(identity.id) if identity else ""},
+        request=request,
+    )
+    return JsonResponse(access_compute_effective_permissions(str(user_id)))
+
+
+@csrf_exempt
+@require_any_role("platform_owner", "platform_admin")
+def access_role_detail(request: HttpRequest, role_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = getattr(request, "user_identity", None)
+    _audit_action(
+        "AccessExplorerViewed",
+        metadata={"endpoint": "role_detail", "target_role_id": str(role_id), "actor_id": str(identity.id) if identity else ""},
+        request=request,
+    )
+    try:
+        return JsonResponse(access_role_detail_data(role_id))
+    except KeyError:
+        return JsonResponse({"error": "role not found"}, status=404)
 
 
 def api_me(request: HttpRequest) -> JsonResponse:
