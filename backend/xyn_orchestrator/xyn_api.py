@@ -46,6 +46,7 @@ from .blueprints import (
     _write_run_artifact,
     _write_run_summary,
     instantiate_blueprint,
+    _require_internal_token,
 )
 from .models import (
     Blueprint,
@@ -86,6 +87,7 @@ from .models import (
     ArtifactReaction,
     ArtifactComment,
     PublishBinding,
+    VideoRender,
     Tenant,
     Contact,
     TenantMembership,
@@ -141,6 +143,7 @@ from .ai_runtime import (
     resolve_ai_config,
 )
 from .ai_compat import compute_effective_params
+from .video_explainer import default_video_spec, validate_video_spec, sanitize_payload, render_video, export_package_text
 
 PLATFORM_ROLE_IDS = {"platform_admin", "platform_architect", "platform_operator", "app_user"}
 DOC_ARTIFACT_TYPE_SLUG = "doc_page"
@@ -149,6 +152,7 @@ ARTICLE_CATEGORIES = {"web", "guide", "core-concepts", "release-note", "internal
 GUIDE_ARTICLE_CATEGORIES = {"guide", "core-concepts", "tutorial"}
 ARTICLE_VISIBILITY_TYPES = {"public", "authenticated", "role_based", "private"}
 ARTICLE_STATUS_CHOICES = {"draft", "reviewed", "ratified", "published", "deprecated"}
+ARTICLE_FORMAT_TYPES = {"standard", "video_explainer"}
 ARTICLE_CATEGORY_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 PUBLISH_BINDING_TARGET_TYPES = {"xyn_ui_route", "public_web_path", "external_url"}
 ARTICLE_TRANSITIONS = {
@@ -948,6 +952,7 @@ def _ensure_article_artifact_type() -> ArtifactType:
                 "category": sorted(ARTICLE_CATEGORIES),
                 "visibility_type": sorted(ARTICLE_VISIBILITY_TYPES),
                 "status": sorted(ARTICLE_STATUS_CHOICES),
+                "format": sorted(ARTICLE_FORMAT_TYPES),
             },
         },
     )
@@ -1069,6 +1074,13 @@ def _normalize_article_visibility_type(raw: Any, *, fallback: str = "private") -
     return fallback
 
 
+def _normalize_article_format(raw: Any, *, fallback: str = "standard") -> str:
+    value = str(raw or "").strip().lower()
+    if value in ARTICLE_FORMAT_TYPES:
+        return value
+    return fallback
+
+
 def _artifact_visibility_for_article_type(visibility_type: str) -> str:
     if visibility_type == "public":
         return "public"
@@ -1107,6 +1119,10 @@ def _article_category(artifact: Artifact) -> str:
     if category:
         return category.slug
     return _normalize_article_category(scope.get("category"), fallback="web")
+
+
+def _article_format(artifact: Artifact) -> str:
+    return _normalize_article_format(getattr(artifact, "format", None), fallback="standard")
 
 
 def _derive_guide_category(tags: list[str]) -> str:
@@ -1206,6 +1222,34 @@ def _article_content(artifact: Artifact, revision: Optional[ArtifactRevision] = 
     }
 
 
+def _default_video_spec_for_artifact(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
+    content = _article_content(artifact, revision)
+    return default_video_spec(title=str(content.get("title") or artifact.title), summary=str(content.get("summary") or ""))
+
+
+def _video_spec(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
+    if isinstance(artifact.video_spec_json, dict):
+        return dict(artifact.video_spec_json)
+    return _default_video_spec_for_artifact(artifact, revision)
+
+
+def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
+    return {
+        "id": str(render.id),
+        "article_id": str(render.article_id),
+        "provider": render.provider,
+        "status": render.status,
+        "requested_at": render.requested_at,
+        "started_at": render.started_at,
+        "completed_at": render.completed_at,
+        "request_payload_json": sanitize_payload(render.request_payload_json or {}),
+        "result_payload_json": sanitize_payload(render.result_payload_json or {}),
+        "output_assets": render.output_assets or [],
+        "error_message": render.error_message or "",
+        "error_details_json": sanitize_payload(render.error_details_json or {}),
+    }
+
+
 def _convert_article_html_to_markdown(value: str) -> str:
     source = str(value or "").strip()
     if not source:
@@ -1252,6 +1296,7 @@ def _serialize_article_summary(artifact: Artifact, revision: Optional[ArtifactRe
         "id": str(artifact.id),
         "workspace_id": str(artifact.workspace_id),
         "type": artifact.type.slug,
+        "format": _article_format(artifact),
         "title": artifact.title,
         "slug": _artifact_slug(artifact),
         "status": artifact.status,
@@ -1283,6 +1328,9 @@ def _serialize_article_detail(artifact: Artifact, revision: Optional[ArtifactRev
         {
             "body_markdown": content.get("body_markdown") or "",
             "body_html": content.get("body_html") or "",
+            "format": _article_format(artifact),
+            "video_spec_json": _video_spec(artifact, latest),
+            "video_latest_render_id": str(artifact.video_latest_render_id) if artifact.video_latest_render_id else None,
             "provenance_json": artifact.provenance_json or {},
             "license_json": (artifact.scope_json or {}).get("license_json") or {},
             "category_ref": _serialize_article_category_ref(artifact),
@@ -1321,6 +1369,7 @@ def _article_to_doc_page_payload(artifact: Artifact, revision: Optional[Artifact
         "artifact_id": serialized["id"],
         "workspace_id": serialized["workspace_id"],
         "type": "article",
+        "format": serialized.get("format") or "standard",
         "title": serialized["title"],
         "slug": serialized["slug"],
         "status": serialized["status"],
@@ -4538,6 +4587,7 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
         if not category:
             return JsonResponse({"error": f"unknown category: {category_slug}"}, status=400)
         visibility_type = _normalize_article_visibility_type(payload.get("visibility_type"), fallback="private")
+        article_format = _normalize_article_format(payload.get("format"), fallback="standard")
         allowed_roles = _normalize_role_slugs(payload.get("allowed_roles"))
         if visibility_type == "role_based" and not allowed_roles:
             return JsonResponse({"error": "allowed_roles is required for role_based visibility"}, status=400)
@@ -4552,13 +4602,22 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
         status = str(payload.get("status") or "draft").strip().lower()
         if status not in ARTICLE_STATUS_CHOICES:
             return JsonResponse({"error": "invalid status"}, status=400)
+        candidate_video_spec = payload.get("video_spec_json") if isinstance(payload.get("video_spec_json"), dict) else None
+        if candidate_video_spec is not None:
+            spec_errors = validate_video_spec(candidate_video_spec)
+            if spec_errors:
+                return JsonResponse({"error": "invalid video_spec_json", "details": spec_errors}, status=400)
         published_at = timezone.now() if status == "published" else None
         with transaction.atomic():
+            final_video_spec = candidate_video_spec if candidate_video_spec is not None else (
+                default_video_spec(title=title, summary=summary) if article_format == "video_explainer" else None
+            )
             artifact = Artifact.objects.create(
                 workspace=workspace,
                 type=article_type,
                 title=title,
                 slug=slug,
+                format=article_format,
                 status=status,
                 version=1,
                 visibility=_artifact_visibility_for_article_type(visibility_type),
@@ -4579,6 +4638,7 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                     "license_json": payload.get("license_json") if isinstance(payload.get("license_json"), dict) else {},
                 },
                 provenance_json=payload.get("provenance_json") if isinstance(payload.get("provenance_json"), dict) else {},
+                video_spec_json=final_video_spec,
                 article_category=category,
             )
             ArtifactRevision.objects.create(
@@ -4605,7 +4665,7 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                 artifact,
                 "article_created",
                 identity,
-                {"category": category.slug, "visibility_type": visibility_type, "status": status},
+                {"category": category.slug, "visibility_type": visibility_type, "status": status, "format": article_format},
             )
             for route in route_bindings:
                 value = str(route or "").strip()
@@ -4995,6 +5055,25 @@ def article_detail(request: HttpRequest, article_id: str) -> JsonResponse:
             artifact.article_category = category
             scope["category"] = category.slug
             dirty_fields.update({"scope_json", "article_category"})
+        if "format" in payload:
+            artifact.format = _normalize_article_format(payload.get("format"), fallback=_article_format(artifact))
+            dirty_fields.add("format")
+            if artifact.format == "video_explainer" and not isinstance(artifact.video_spec_json, dict):
+                artifact.video_spec_json = _default_video_spec_for_artifact(artifact)
+                dirty_fields.add("video_spec_json")
+        if "video_spec_json" in payload:
+            candidate = payload.get("video_spec_json")
+            if candidate is None:
+                artifact.video_spec_json = None
+                dirty_fields.add("video_spec_json")
+            elif isinstance(candidate, dict):
+                spec_errors = validate_video_spec(candidate)
+                if spec_errors:
+                    return JsonResponse({"error": "invalid video_spec_json", "details": spec_errors}, status=400)
+                artifact.video_spec_json = candidate
+                dirty_fields.add("video_spec_json")
+            else:
+                return JsonResponse({"error": "video_spec_json must be an object or null"}, status=400)
         if "visibility_type" in payload:
             visibility_type = _normalize_article_visibility_type(
                 payload.get("visibility_type"),
@@ -5174,6 +5253,560 @@ def article_convert_html_to_markdown(request: HttpRequest, article_id: str) -> J
             {"revision_number": revision_no, "source": "html_to_markdown"},
         )
     return JsonResponse({"article": _serialize_article_detail(artifact), "revision": _serialize_article_revision(revision), "converted": True})
+
+
+def _video_generate_text(identity: UserIdentity, agent_slug: str, prompt: str, metadata: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    resolved = resolve_ai_config(agent_slug=agent_slug)
+    result = invoke_model(
+        resolved_config=resolved,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    AuditLog.objects.create(
+        message="ai_invocation",
+        metadata_json={
+            "actor_identity_id": str(identity.id),
+            "agent_slug": resolved.get("agent_slug") or agent_slug,
+            "provider": resolved.get("provider"),
+            "model_name": resolved.get("model_name"),
+            "purpose": resolved.get("purpose"),
+            "metadata": metadata,
+        },
+    )
+    return str(result.get("content") or "").strip(), {
+        "agent_slug": resolved.get("agent_slug") or agent_slug,
+        "provider": resolved.get("provider"),
+        "model_name": resolved.get("model_name"),
+    }
+
+
+def _generate_storyboard_from_script(script_text: str, duration_seconds_target: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    cleaned = [line.strip() for line in script_text.splitlines() if line.strip()]
+    if not cleaned:
+        cleaned = ["Intro", "Problem", "Approach", "Outcome", "Call to action"]
+    scene_count = min(max(3, len(cleaned)), 8)
+    per_scene = max(8, int(duration_seconds_target / max(scene_count, 1)))
+    storyboard: List[Dict[str, Any]] = []
+    scenes: List[Dict[str, Any]] = []
+    start_seconds = 0
+    for index in range(scene_count):
+        source = cleaned[index] if index < len(cleaned) else f"Scene {index + 1}"
+        end_seconds = start_seconds + per_scene
+        time_range = f"{start_seconds // 60}:{start_seconds % 60:02d}-{end_seconds // 60}:{end_seconds % 60:02d}"
+        storyboard.append(
+            {
+                "scene": index + 1,
+                "time_range": time_range,
+                "on_screen_text": source[:120],
+                "visual_description": f"Visual for: {source[:180]}",
+                "motion": "subtle camera move",
+                "assets": [{"type": "image_prompt", "value": f"cinematic explainer frame for: {source[:200]}"}],
+                "narration": source,
+            }
+        )
+        scenes.append(
+            {
+                "id": f"s{index + 1}",
+                "name": source[:64] or f"Scene {index + 1}",
+                "duration_seconds": per_scene,
+                "narration": source,
+                "visual_prompt": f"cinematic explainer frame for: {source[:200]}",
+                "on_screen_text": source[:120],
+                "camera_motion": "subtle camera move",
+                "style_constraints": ["brand-safe", "no photoreal humans unless requested"],
+                "generated": {"image_asset_url": None, "video_clip_url": None},
+            }
+        )
+        start_seconds = end_seconds
+    return storyboard, scenes
+
+
+def _process_video_render(video_render: VideoRender) -> VideoRender:
+    now = timezone.now()
+    article = video_render.article
+    if video_render.status == "canceled":
+        return video_render
+    spec = _video_spec(article)
+    request_payload = dict(video_render.request_payload_json or {})
+    video_render.status = "running"
+    video_render.started_at = now
+    video_render.error_message = ""
+    video_render.error_details_json = {}
+    video_render.save(update_fields=["status", "started_at", "error_message", "error_details_json"])
+
+    provider, assets, raw_result = render_video(spec, request_payload, str(article.id))
+    finished_at = timezone.now()
+    video_render.provider = provider or "unknown"
+    video_render.status = "succeeded"
+    video_render.completed_at = finished_at
+    video_render.result_payload_json = sanitize_payload(raw_result)
+    video_render.output_assets = sanitize_payload(assets)
+    video_render.save(
+        update_fields=["provider", "status", "completed_at", "result_payload_json", "output_assets", "updated_at"]
+    )
+
+    spec["generation"] = {
+        **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
+        "provider": video_render.provider,
+        "status": "succeeded",
+        "last_render_id": str(video_render.id),
+        "updated_at": finished_at.isoformat(),
+    }
+    article.video_spec_json = spec
+    article.video_latest_render = video_render
+    article.save(update_fields=["video_spec_json", "video_latest_render", "updated_at"])
+    return video_render
+
+
+@csrf_exempt
+def article_video_initialize(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if not _can_edit_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if artifact.format != "video_explainer":
+        artifact.format = "video_explainer"
+    if not isinstance(artifact.video_spec_json, dict):
+        artifact.video_spec_json = _default_video_spec_for_artifact(artifact)
+    artifact.save(update_fields=["format", "video_spec_json", "updated_at"])
+    _record_artifact_event(artifact, "article_video_initialized", identity, {"format": artifact.format})
+    return JsonResponse({"article": _serialize_article_detail(artifact)})
+
+
+@csrf_exempt
+def article_video_generate_script(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if not _can_edit_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    agent_slug = str(payload.get("agent_slug") or "").strip()
+    if not agent_slug:
+        return JsonResponse({"error": "agent_slug is required"}, status=400)
+
+    spec = _video_spec(artifact)
+    script = spec.get("script") if isinstance(spec.get("script"), dict) else {}
+    current_draft = str(script.get("draft") or "")
+    prompt = (
+        "Generate a concise explainer video narration script.\n"
+        "Return plain text script only.\n\n"
+        f"Title: {artifact.title}\n"
+        f"Intent: {spec.get('intent') or ''}\n"
+        f"Audience: {spec.get('audience') or 'mixed'}\n"
+        f"Tone: {spec.get('tone') or 'clear, confident, warm'}\n"
+        f"Duration target (seconds): {spec.get('duration_seconds_target') or 150}\n\n"
+        f"Source article markdown:\n{_article_content(artifact).get('body_markdown') or ''}\n"
+    )
+    try:
+        generated, meta = _video_generate_text(
+            identity,
+            agent_slug,
+            prompt,
+            {"artifact_id": str(artifact.id), "workspace_id": str(artifact.workspace_id), "mode": "video_generate_script"},
+        )
+    except (AiConfigError, AiInvokeError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    if not generated:
+        return JsonResponse({"error": "AI returned empty content"}, status=400)
+
+    proposals = script.get("proposals") if isinstance(script.get("proposals"), list) else []
+    proposal = {
+        "id": str(uuid.uuid4()),
+        "text": generated,
+        "created_at": timezone.now().isoformat(),
+        "model": meta.get("model_name"),
+        "provider": meta.get("provider"),
+        "agent_slug": meta.get("agent_slug"),
+    }
+    proposals = [proposal, *proposals][:15]
+    if not current_draft:
+        script["draft"] = generated
+    script["proposals"] = proposals
+    script["last_generated_at"] = timezone.now().isoformat()
+    spec["script"] = script
+    artifact.video_spec_json = spec
+    artifact.format = "video_explainer"
+    artifact.save(update_fields=["video_spec_json", "format", "updated_at"])
+    _record_artifact_event(artifact, "article_video_script_generated", identity, {"proposal_id": proposal["id"]})
+    return JsonResponse({"article": _serialize_article_detail(artifact), "proposal": proposal, "overwrote_draft": not bool(current_draft)})
+
+
+@csrf_exempt
+def article_video_generate_storyboard(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if not _can_edit_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    agent_slug = str(payload.get("agent_slug") or "").strip()
+    if not agent_slug:
+        return JsonResponse({"error": "agent_slug is required"}, status=400)
+    spec = _video_spec(artifact)
+    script_draft = str(((spec.get("script") or {}).get("draft") if isinstance(spec.get("script"), dict) else "") or "")
+    prompt = (
+        "Generate a storyboard and scene breakdown for this explainer script.\n"
+        "Respond with JSON object keys: storyboard_draft (array), scenes (array).\n\n"
+        f"Title: {artifact.title}\n"
+        f"Intent: {spec.get('intent') or ''}\n"
+        f"Audience: {spec.get('audience') or 'mixed'}\n"
+        f"Tone: {spec.get('tone') or 'clear, confident, warm'}\n"
+        f"Duration target (seconds): {spec.get('duration_seconds_target') or 150}\n\n"
+        f"Script:\n{script_draft}\n"
+    )
+    generated_text = ""
+    meta: Dict[str, Any] = {}
+    try:
+        generated_text, meta = _video_generate_text(
+            identity,
+            agent_slug,
+            prompt,
+            {"artifact_id": str(artifact.id), "workspace_id": str(artifact.workspace_id), "mode": "video_generate_storyboard"},
+        )
+    except (AiConfigError, AiInvokeError):
+        # Fallback to deterministic storyboard if AI generation fails.
+        generated_text = ""
+
+    generated_storyboard: List[Dict[str, Any]] = []
+    generated_scenes: List[Dict[str, Any]] = []
+    if generated_text:
+        try:
+            parsed = json.loads(generated_text)
+            if isinstance(parsed, dict):
+                if isinstance(parsed.get("storyboard_draft"), list):
+                    generated_storyboard = parsed.get("storyboard_draft") or []
+                if isinstance(parsed.get("scenes"), list):
+                    generated_scenes = parsed.get("scenes") or []
+        except json.JSONDecodeError:
+            generated_storyboard = []
+            generated_scenes = []
+
+    if not generated_storyboard or not generated_scenes:
+        generated_storyboard, generated_scenes = _generate_storyboard_from_script(
+            script_draft or _article_content(artifact).get("body_markdown") or "",
+            int(spec.get("duration_seconds_target") or 150),
+        )
+
+    storyboard = spec.get("storyboard") if isinstance(spec.get("storyboard"), dict) else {}
+    existing_draft = storyboard.get("draft")
+    proposals = storyboard.get("proposals") if isinstance(storyboard.get("proposals"), list) else []
+    proposal = {
+        "id": str(uuid.uuid4()),
+        "storyboard_draft": generated_storyboard,
+        "scenes": generated_scenes,
+        "created_at": timezone.now().isoformat(),
+        "model": meta.get("model_name"),
+        "provider": meta.get("provider"),
+        "agent_slug": meta.get("agent_slug"),
+    }
+    proposals = [proposal, *proposals][:15]
+    if not isinstance(existing_draft, list) or len(existing_draft) == 0:
+        storyboard["draft"] = generated_storyboard
+        spec["scenes"] = generated_scenes
+    storyboard["proposals"] = proposals
+    storyboard["last_generated_at"] = timezone.now().isoformat()
+    spec["storyboard"] = storyboard
+    artifact.video_spec_json = spec
+    artifact.format = "video_explainer"
+    artifact.save(update_fields=["video_spec_json", "format", "updated_at"])
+    _record_artifact_event(artifact, "article_video_storyboard_generated", identity, {"proposal_id": proposal["id"]})
+    return JsonResponse({"article": _serialize_article_detail(artifact), "proposal": proposal, "overwrote_draft": not isinstance(existing_draft, list) or len(existing_draft) == 0})
+
+
+@csrf_exempt
+def article_video_renders_collection(request: HttpRequest, article_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if request.method == "POST":
+        if not _can_edit_article(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        request_payload = payload.get("request_payload_json") if isinstance(payload.get("request_payload_json"), dict) else {}
+        provider = str(payload.get("provider") or request_payload.get("provider") or os.environ.get("XYENCE_VIDEO_PROVIDER") or "unknown")
+        with transaction.atomic():
+            render_record = VideoRender.objects.create(
+                article=artifact,
+                provider=provider,
+                status="queued",
+                request_payload_json=sanitize_payload(request_payload),
+                result_payload_json={},
+                output_assets=[],
+            )
+            spec = _video_spec(artifact)
+            generation = spec.get("generation") if isinstance(spec.get("generation"), dict) else {}
+            generation.update(
+                {
+                    "provider": provider,
+                    "status": "queued",
+                    "last_render_id": str(render_record.id),
+                    "updated_at": timezone.now().isoformat(),
+                }
+            )
+            spec["generation"] = generation
+            artifact.video_spec_json = spec
+            artifact.save(update_fields=["video_spec_json", "updated_at"])
+        _record_artifact_event(artifact, "article_video_render_requested", identity, {"render_id": str(render_record.id), "provider": provider})
+        mode = _async_mode()
+        if mode == "redis":
+            _enqueue_job("xyn_orchestrator.worker_tasks.process_video_render", str(render_record.id))
+        else:
+            try:
+                _process_video_render(render_record)
+            except Exception as exc:
+                render_record.status = "failed"
+                render_record.error_message = str(exc)
+                render_record.error_details_json = {"mode": "inline"}
+                render_record.completed_at = timezone.now()
+                render_record.save(update_fields=["status", "error_message", "error_details_json", "completed_at", "updated_at"])
+        render_record.refresh_from_db()
+        return JsonResponse({"render": _serialize_video_render(render_record), "article": _serialize_article_detail(artifact)})
+
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _can_view_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    rows = VideoRender.objects.filter(article=artifact).order_by("-requested_at")
+    return JsonResponse({"renders": [_serialize_video_render(row) for row in rows]})
+
+
+@csrf_exempt
+def video_render_detail(request: HttpRequest, render_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    if request.method == "POST":
+        if not _can_edit_article(identity, record.article):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        action = str((_parse_json(request).get("action") or "").strip().lower())
+        if action == "retry":
+            retry = VideoRender.objects.create(
+                article=record.article,
+                provider=record.provider or "unknown",
+                status="queued",
+                request_payload_json=dict(record.request_payload_json or {}),
+                result_payload_json={},
+                output_assets=[],
+            )
+            _record_artifact_event(record.article, "article_video_render_retried", identity, {"render_id": str(record.id), "retry_id": str(retry.id)})
+            if _async_mode() == "redis":
+                _enqueue_job("xyn_orchestrator.worker_tasks.process_video_render", str(retry.id))
+            else:
+                try:
+                    _process_video_render(retry)
+                except Exception as exc:
+                    retry.status = "failed"
+                    retry.error_message = str(exc)
+                    retry.error_details_json = {"mode": "inline"}
+                    retry.completed_at = timezone.now()
+                    retry.save(update_fields=["status", "error_message", "error_details_json", "completed_at", "updated_at"])
+            retry.refresh_from_db()
+            return JsonResponse({"render": _serialize_video_render(retry)})
+        if action == "cancel":
+            if record.status in {"succeeded", "failed", "canceled"}:
+                return JsonResponse({"render": _serialize_video_render(record)})
+            record.status = "canceled"
+            record.completed_at = timezone.now()
+            record.save(update_fields=["status", "completed_at", "updated_at"])
+            _record_artifact_event(record.article, "article_video_render_canceled", identity, {"render_id": str(record.id)})
+            return JsonResponse({"render": _serialize_video_render(record)})
+        return JsonResponse({"error": "unsupported action"}, status=400)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _can_view_article(identity, record.article):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    return JsonResponse({"render": _serialize_video_render(record)})
+
+
+@csrf_exempt
+def video_render_cancel(request: HttpRequest, render_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    if not _can_edit_article(identity, record.article):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if record.status not in {"succeeded", "failed", "canceled"}:
+        record.status = "canceled"
+        record.completed_at = timezone.now()
+        record.save(update_fields=["status", "completed_at", "updated_at"])
+        _record_artifact_event(record.article, "article_video_render_canceled", identity, {"render_id": str(record.id)})
+    return JsonResponse({"render": _serialize_video_render(record)})
+
+
+@csrf_exempt
+def video_render_retry(request: HttpRequest, render_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    if not _can_edit_article(identity, record.article):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    retry = VideoRender.objects.create(
+        article=record.article,
+        provider=record.provider or "unknown",
+        status="queued",
+        request_payload_json=dict(record.request_payload_json or {}),
+        result_payload_json={},
+        output_assets=[],
+    )
+    _record_artifact_event(record.article, "article_video_render_retried", identity, {"render_id": str(record.id), "retry_id": str(retry.id)})
+    if _async_mode() == "redis":
+        _enqueue_job("xyn_orchestrator.worker_tasks.process_video_render", str(retry.id))
+    else:
+        try:
+            _process_video_render(retry)
+        except Exception as exc:
+            retry.status = "failed"
+            retry.error_message = str(exc)
+            retry.error_details_json = {"mode": "inline"}
+            retry.completed_at = timezone.now()
+            retry.save(update_fields=["status", "error_message", "error_details_json", "completed_at", "updated_at"])
+    retry.refresh_from_db()
+    return JsonResponse({"render": _serialize_video_render(retry)})
+
+
+@csrf_exempt
+def article_video_export_package(request: HttpRequest, article_id: str) -> HttpResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_article_or_404(article_id)
+    if not _can_view_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    article_payload = _serialize_article_detail(artifact)
+    latest_render = VideoRender.objects.filter(article=artifact, status="succeeded").order_by("-requested_at").first()
+    package_text = export_package_text(article_payload, _serialize_video_render(latest_render) if latest_render else None)
+    response = HttpResponse(package_text, content_type="application/json; charset=utf-8")
+    response["Content-Disposition"] = f'attachment; filename="article-{_artifact_slug(artifact) or artifact.id}-video-package.json"'
+    return response
+
+
+@csrf_exempt
+def internal_video_render_detail(request: HttpRequest, render_id: str) -> JsonResponse:
+    if auth_error := _require_internal_token(request):
+        return auth_error
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    return JsonResponse(
+        {
+            "render": _serialize_video_render(record),
+            "article": _serialize_article_detail(record.article),
+            "video_spec_json": _video_spec(record.article),
+        }
+    )
+
+
+@csrf_exempt
+def internal_video_render_status(request: HttpRequest, render_id: str) -> JsonResponse:
+    if auth_error := _require_internal_token(request):
+        return auth_error
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    record = get_object_or_404(VideoRender, id=render_id)
+    payload = _parse_json(request)
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"queued", "running", "canceled"}:
+        return JsonResponse({"error": "invalid status"}, status=400)
+    record.status = status
+    if status == "running" and not record.started_at:
+        record.started_at = timezone.now()
+    if status == "canceled":
+        record.completed_at = timezone.now()
+    record.save(update_fields=["status", "started_at", "completed_at", "updated_at"])
+    return JsonResponse({"render": _serialize_video_render(record)})
+
+
+@csrf_exempt
+def internal_video_render_complete(request: HttpRequest, render_id: str) -> JsonResponse:
+    if auth_error := _require_internal_token(request):
+        return auth_error
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    payload = _parse_json(request)
+    record.provider = str(payload.get("provider") or record.provider or "unknown")
+    record.status = "succeeded"
+    record.started_at = record.started_at or timezone.now()
+    record.completed_at = timezone.now()
+    record.result_payload_json = sanitize_payload(payload.get("result_payload_json") if isinstance(payload.get("result_payload_json"), dict) else {})
+    record.output_assets = sanitize_payload(payload.get("output_assets") if isinstance(payload.get("output_assets"), list) else [])
+    record.error_message = ""
+    record.error_details_json = {}
+    record.save(
+        update_fields=[
+            "provider",
+            "status",
+            "started_at",
+            "completed_at",
+            "result_payload_json",
+            "output_assets",
+            "error_message",
+            "error_details_json",
+            "updated_at",
+        ]
+    )
+    article = record.article
+    spec = _video_spec(article)
+    spec["generation"] = {
+        **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
+        "provider": record.provider,
+        "status": "succeeded",
+        "last_render_id": str(record.id),
+        "updated_at": timezone.now().isoformat(),
+    }
+    article.video_spec_json = spec
+    article.video_latest_render = record
+    article.save(update_fields=["video_spec_json", "video_latest_render", "updated_at"])
+    return JsonResponse({"render": _serialize_video_render(record)})
+
+
+@csrf_exempt
+def internal_video_render_error(request: HttpRequest, render_id: str) -> JsonResponse:
+    if auth_error := _require_internal_token(request):
+        return auth_error
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    payload = _parse_json(request)
+    record.status = "failed"
+    record.started_at = record.started_at or timezone.now()
+    record.completed_at = timezone.now()
+    record.error_message = str(payload.get("error") or "render failed")
+    details = payload.get("error_details_json") if isinstance(payload.get("error_details_json"), dict) else {}
+    record.error_details_json = sanitize_payload(details)
+    record.save(update_fields=["status", "started_at", "completed_at", "error_message", "error_details_json", "updated_at"])
+    article = record.article
+    spec = _video_spec(article)
+    spec["generation"] = {
+        **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
+        "provider": record.provider,
+        "status": "failed",
+        "last_render_id": str(record.id),
+        "updated_at": timezone.now().isoformat(),
+    }
+    article.video_spec_json = spec
+    article.save(update_fields=["video_spec_json", "updated_at"])
+    return JsonResponse({"render": _serialize_video_render(record)})
 
 
 @csrf_exempt

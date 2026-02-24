@@ -879,6 +879,14 @@ class Artifact(models.Model):
     )
     title = models.CharField(max_length=300)
     slug = models.SlugField(max_length=240, blank=True, default="")
+    format = models.CharField(
+        max_length=30,
+        choices=[
+            ("standard", "Standard"),
+            ("video_explainer", "Video Explainer"),
+        ],
+        default="standard",
+    )
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="draft")
     version = models.PositiveIntegerField(default=1)
     lineage_json = models.JSONField(null=True, blank=True)
@@ -892,6 +900,14 @@ class Artifact(models.Model):
     verifiers_satisfied_json = models.JSONField(default=list, blank=True)
     provenance_json = models.JSONField(default=dict, blank=True)
     scope_json = models.JSONField(default=dict, blank=True)
+    video_spec_json = models.JSONField(null=True, blank=True)
+    video_latest_render = models.ForeignKey(
+        "VideoRender",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -923,6 +939,36 @@ class ArtifactRevision(models.Model):
 
     def __str__(self) -> str:
         return f"{self.artifact_id}:r{self.revision_number}"
+
+
+class VideoRender(models.Model):
+    STATUS_CHOICES = [
+        ("queued", "Queued"),
+        ("running", "Running"),
+        ("succeeded", "Succeeded"),
+        ("failed", "Failed"),
+        ("canceled", "Canceled"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    article = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="video_renders")
+    provider = models.CharField(max_length=80, default="unknown")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="queued")
+    requested_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    request_payload_json = models.JSONField(default=dict, blank=True)
+    result_payload_json = models.JSONField(default=dict, blank=True)
+    output_assets = models.JSONField(default=list, blank=True)
+    error_message = models.TextField(blank=True)
+    error_details_json = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-requested_at"]
+
+    def __str__(self) -> str:
+        return f"{self.article_id}:{self.status}:{self.provider}"
 
 
 class ArtifactEvent(models.Model):

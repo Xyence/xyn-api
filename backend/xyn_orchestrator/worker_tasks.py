@@ -15,6 +15,7 @@ import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
 from jsonschema import Draft202012Validator, RefResolver
+from .video_explainer import render_video, sanitize_payload
 
 
 INTERNAL_BASE_URL = os.environ.get("XYENCE_INTERNAL_BASE_URL", "http://backend:8000").rstrip("/")
@@ -3085,6 +3086,30 @@ def revise_blueprint_draft(session_id: str, instruction: str) -> None:
         _post_json(
             f"/xyn/internal/draft-sessions/{session_id}/error",
             {"error": str(exc)},
+        )
+
+
+def process_video_render(render_id: str) -> None:
+    try:
+        _post_json(f"/xyn/internal/video-renders/{render_id}/status", {"status": "running"})
+        payload = _get_json(f"/xyn/internal/video-renders/{render_id}")
+        render = payload.get("render") if isinstance(payload.get("render"), dict) else {}
+        article = payload.get("article") if isinstance(payload.get("article"), dict) else {}
+        spec = payload.get("video_spec_json") if isinstance(payload.get("video_spec_json"), dict) else {}
+        request_payload = render.get("request_payload_json") if isinstance(render.get("request_payload_json"), dict) else {}
+        provider, assets, raw_result = render_video(spec, request_payload, str(article.get("id") or ""))
+        _post_json(
+            f"/xyn/internal/video-renders/{render_id}/complete",
+            {
+                "provider": provider,
+                "result_payload_json": sanitize_payload(raw_result),
+                "output_assets": sanitize_payload(assets),
+            },
+        )
+    except Exception as exc:
+        _post_json(
+            f"/xyn/internal/video-renders/{render_id}/error",
+            {"error": str(exc), "error_details_json": {"worker": "process_video_render"}},
         )
 
 

@@ -1,9 +1,11 @@
 import json
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from xyn_orchestrator.models import Artifact, ArtifactEvent, ArtifactType, ArticleCategory, RoleBinding, UserIdentity, Workspace
+from xyn_orchestrator import xyn_api
 
 
 class GovernedArticlesApiTests(TestCase):
@@ -233,3 +235,109 @@ class GovernedArticlesApiTests(TestCase):
         self.assertTrue(payload.get("converted"))
         revision = payload["revision"]
         self.assertIn("# Hello", revision.get("body_markdown") or "")
+
+    def test_video_initialize_creates_default_spec(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Video Guide",
+                    "slug": "video-guide-init",
+                    "category": "guide",
+                    "body_markdown": "seed content",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+
+        initialize = self.client.post(f"/xyn/api/articles/{article_id}/video/initialize")
+        self.assertEqual(initialize.status_code, 200, initialize.content.decode())
+        payload = initialize.json()["article"]
+        self.assertEqual(payload["format"], "video_explainer")
+        self.assertIsInstance(payload.get("video_spec_json"), dict)
+        self.assertEqual(payload["video_spec_json"].get("version"), 1)
+        self.assertIn("script", payload["video_spec_json"])
+
+    def test_generate_script_adds_proposal_without_overwriting_existing_draft(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Video Guide",
+                    "slug": "video-guide-script",
+                    "category": "guide",
+                    "format": "video_explainer",
+                    "video_spec_json": {
+                        "version": 1,
+                        "title": "Video Guide",
+                        "intent": "Explain the feature",
+                        "audience": "mixed",
+                        "tone": "clear",
+                        "duration_seconds_target": 120,
+                        "voice": {"style": "conversational", "speaker": "neutral", "pace": "medium"},
+                        "script": {"draft": "Human-authored draft", "last_generated_at": None, "notes": "", "proposals": []},
+                        "storyboard": {"draft": [], "last_generated_at": None, "notes": "", "proposals": []},
+                        "scenes": [],
+                        "generation": {"provider": None, "status": "not_started", "last_render_id": None},
+                    },
+                    "body_markdown": "Base article",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+
+        with patch("xyn_orchestrator.xyn_api._video_generate_text", return_value=("AI script proposal", {"agent_slug": "mock-agent"})):
+            generated = self.client.post(
+                f"/xyn/api/articles/{article_id}/video/generate-script",
+                data=json.dumps({"agent_slug": "mock-agent"}),
+                content_type="application/json",
+            )
+        self.assertEqual(generated.status_code, 200, generated.content.decode())
+        payload = generated.json()
+        self.assertFalse(payload.get("overwrote_draft"))
+        self.assertEqual(payload["article"]["video_spec_json"]["script"]["draft"], "Human-authored draft")
+        self.assertEqual(payload["article"]["video_spec_json"]["script"]["proposals"][0]["text"], "AI script proposal")
+
+    def test_video_render_enqueue_and_process_transitions_state(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Video Guide",
+                    "slug": "video-guide-render",
+                    "category": "guide",
+                    "format": "video_explainer",
+                    "body_markdown": "Base article",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+
+        with patch("xyn_orchestrator.xyn_api._async_mode", return_value="redis"), patch("xyn_orchestrator.xyn_api._enqueue_job") as enqueue_job:
+            queued = self.client.post(
+                f"/xyn/api/articles/{article_id}/video/renders",
+                data=json.dumps({"provider": "stub"}),
+                content_type="application/json",
+            )
+        self.assertEqual(queued.status_code, 200, queued.content.decode())
+        render_payload = queued.json()["render"]
+        self.assertEqual(render_payload["status"], "queued")
+        enqueue_job.assert_called_once()
+
+        render = xyn_api.VideoRender.objects.get(id=render_payload["id"])
+        processed = xyn_api._process_video_render(render)
+        processed.refresh_from_db()
+        self.assertEqual(processed.status, "succeeded")
+        self.assertTrue(isinstance(processed.output_assets, list) and len(processed.output_assets) >= 1)
