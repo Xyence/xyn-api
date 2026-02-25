@@ -4691,6 +4691,7 @@ def get_draft_session(request: HttpRequest, session_id: str) -> JsonResponse:
     return JsonResponse(
         {
             "id": str(session.id),
+            "artifact_id": str(session.artifact_id) if session.artifact_id else None,
             "title": session.title or session.name,
             "kind": session.draft_kind,
             "blueprint_kind": session.blueprint_kind,

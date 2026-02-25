@@ -5276,6 +5276,78 @@ def artifacts_create_blueprint(request: HttpRequest) -> JsonResponse:
 
 
 @csrf_exempt
+@login_required
+def artifact_canonize_to_blueprint(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+
+    draft_artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    if draft_artifact.type.slug != "draft_session":
+        return JsonResponse({"error": "artifact_type must be draft_session"}, status=400)
+    if draft_artifact.source_ref_type != "BlueprintDraftSession" or not draft_artifact.source_ref_id:
+        return JsonResponse({"error": "artifact source is not a draft session"}, status=400)
+
+    session = BlueprintDraftSession.objects.filter(id=draft_artifact.source_ref_id).first()
+    if not session:
+        return JsonResponse({"error": "draft session not found"}, status=404)
+
+    payload = _parse_json(request)
+    title = str(payload.get("title") or session.title or session.name or "").strip()
+    if not title:
+        title = "untitled-blueprint"
+    name = str(payload.get("name") or slugify(title) or f"blueprint-{session.id.hex[:8]}").strip()
+    namespace = str(payload.get("namespace") or session.namespace or "core").strip() or "core"
+    description = str(payload.get("description") or session.requirements_summary or "").strip()
+    spec_text = ""
+    if isinstance(session.current_draft_json, dict) and session.current_draft_json:
+        spec_text = json.dumps(session.current_draft_json, indent=2, ensure_ascii=False)
+    elif session.current_draft_json:
+        spec_text = str(session.current_draft_json)
+    metadata_json = session.metadata_json if isinstance(session.metadata_json, dict) else {}
+
+    with transaction.atomic():
+        blueprint, created = Blueprint.objects.get_or_create(
+            name=name,
+            namespace=namespace,
+            defaults={
+                "description": description,
+                "spec_text": spec_text,
+                "metadata_json": metadata_json,
+                "created_by": request.user,
+                "updated_by": request.user,
+            },
+        )
+        if not created:
+            blueprint.description = description or blueprint.description
+            if spec_text:
+                blueprint.spec_text = spec_text
+            if metadata_json:
+                blueprint.metadata_json = metadata_json
+            blueprint.updated_by = request.user
+            blueprint.save(update_fields=["description", "spec_text", "metadata_json", "updated_by", "updated_at"])
+        blueprint_artifact = ensure_blueprint_artifact(
+            blueprint,
+            owner_user=request.user,
+            parent_artifact=draft_artifact,
+        )
+        draft_artifact.artifact_state = "deprecated"
+        draft_artifact.save(update_fields=["artifact_state", "updated_at"])
+        session.linked_blueprint = blueprint
+        session.save(update_fields=["linked_blueprint", "updated_at"])
+
+    return JsonResponse(
+        {
+            "blueprint_id": str(blueprint.id),
+            "blueprint_artifact_id": str(blueprint_artifact.id),
+            "parent_artifact_id": str(draft_artifact.id),
+            "lineage_root_id": str(blueprint_artifact.lineage_root_id) if blueprint_artifact.lineage_root_id else None,
+        }
+    )
+
+
+@csrf_exempt
 def workspaces_collection(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
@@ -10294,6 +10366,7 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
     data = [
         {
             "id": str(b.id),
+            "artifact_id": str(b.artifact_id) if b.artifact_id else None,
             "name": b.name,
             "namespace": b.namespace,
             "description": b.description,
@@ -10368,6 +10441,12 @@ def blueprint_detail(request: HttpRequest, blueprint_id: str) -> JsonResponse:
     return JsonResponse(
         {
             "id": str(blueprint.id),
+            "artifact_id": str(blueprint.artifact_id) if blueprint.artifact_id else None,
+            "derived_from_artifact_id": (
+                str(blueprint.artifact.parent_artifact_id)
+                if blueprint.artifact_id and blueprint.artifact and blueprint.artifact.parent_artifact_id
+                else None
+            ),
             "name": blueprint.name,
             "namespace": blueprint.namespace,
             "description": blueprint.description,

@@ -79,3 +79,29 @@ class UnifiedArtifactsApiTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["artifact_type"], "draft_session")
         self.assertEqual(payload["source"]["id"], str(session.id))
+
+    def test_canonize_to_blueprint_creates_lineage(self):
+        session = BlueprintDraftSession.objects.create(
+            name="session one",
+            title="Session One",
+            namespace="core",
+            current_draft_json={"apiVersion": "xyn.blueprint/v1", "kind": "SolutionBlueprint", "metadata": {"name": "session-one"}},
+            created_by=self.staff,
+            updated_by=self.staff,
+        )
+        draft_artifact = ensure_draft_session_artifact(session, owner_user=self.staff)
+
+        response = self.client.post(
+            f"/xyn/api/artifacts/{draft_artifact.id}/canonize-to-blueprint",
+            data='{"name":"session-one","namespace":"core"}',
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        payload = response.json()
+        blueprint = Blueprint.objects.get(id=payload["blueprint_id"])
+        blueprint_artifact = Artifact.objects.get(id=payload["blueprint_artifact_id"])
+        draft_artifact.refresh_from_db()
+        self.assertEqual(blueprint_artifact.parent_artifact_id, draft_artifact.id)
+        self.assertEqual(blueprint_artifact.lineage_root_id, draft_artifact.id)
+        self.assertEqual(draft_artifact.artifact_state, "deprecated")
+        self.assertEqual(str(blueprint.artifact_id), payload["blueprint_artifact_id"])
