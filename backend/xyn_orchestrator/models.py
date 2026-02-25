@@ -182,6 +182,14 @@ class Blueprint(models.Model):
     description = models.TextField(blank=True)
     spec_text = models.TextField(blank=True)
     repo_slug = models.CharField(max_length=120, blank=True, default="")
+    blueprint_family_id = models.CharField(max_length=120, blank=True, default="")
+    derived_from_artifact = models.ForeignKey(
+        "Artifact",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="derived_blueprints",
+    )
     artifact = models.OneToOneField(
         "Artifact",
         null=True,
@@ -905,6 +913,7 @@ class Artifact(models.Model):
     slug = models.SlugField(max_length=240, blank=True, default="")
     source_ref_type = models.CharField(max_length=80, blank=True, default="")
     source_ref_id = models.CharField(max_length=120, blank=True, default="")
+    family_id = models.CharField(max_length=120, blank=True, default="")
     parent_artifact = models.ForeignKey(
         "self",
         null=True,
@@ -975,6 +984,11 @@ class Artifact(models.Model):
                 fields=["source_ref_type", "source_ref_id"],
                 condition=(~Q(source_ref_type="") & ~Q(source_ref_id="")),
                 name="uniq_artifact_source_ref",
+            ),
+            models.UniqueConstraint(
+                fields=["family_id", "artifact_state"],
+                condition=(~Q(family_id="") & Q(artifact_state="canonical")),
+                name="uniq_artifact_canonical_per_family",
             ),
         ]
 

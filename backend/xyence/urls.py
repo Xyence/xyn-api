@@ -107,6 +107,8 @@ from xyn_orchestrator.public_views import public_article_detail, public_articles
 from xyn_orchestrator.xyn_api import (
     blueprints_collection,
     blueprint_detail,
+    blueprint_revise,
+    blueprint_publish,
     blueprint_archive,
     blueprint_deprovision,
     blueprint_deprovision_plan,
@@ -461,6 +463,8 @@ urlpatterns = [
     path("xyn/studio/blueprints/draft-sessions/<uuid:session_id>/", blueprint_studio_view, name="blueprint-studio"),
     path("xyn/api/blueprints", blueprints_collection),
     path("xyn/api/blueprints/<uuid:blueprint_id>", blueprint_detail),
+    path("xyn/api/blueprints/<uuid:artifact_id>/revise", blueprint_revise),
+    path("xyn/api/blueprints/<uuid:artifact_id>/publish", blueprint_publish),
     path("xyn/api/blueprints/<uuid:blueprint_id>/archive", blueprint_archive),
     path("xyn/api/blueprints/<uuid:blueprint_id>/deprovision_plan", blueprint_deprovision_plan),
     path("xyn/api/blueprints/<uuid:blueprint_id>/deprovision", blueprint_deprovision),

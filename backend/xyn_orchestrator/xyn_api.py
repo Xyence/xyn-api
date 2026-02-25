@@ -163,6 +163,7 @@ from .seeds import (
 from .artifact_links import (
     ensure_blueprint_artifact,
     ensure_draft_session_artifact,
+    get_current_canonical,
 )
 from .ledger import (
     compute_artifact_diff,
@@ -5100,6 +5101,7 @@ def _serialize_unified_artifact(artifact: Artifact, source_record: Any = None) -
         "owner": _artifact_owner_payload(artifact),
         "source_ref_type": artifact.source_ref_type or "",
         "source_ref_id": artifact.source_ref_id or "",
+        "family_id": artifact.family_id or "",
         "parent_artifact_id": str(artifact.parent_artifact_id) if artifact.parent_artifact_id else None,
         "lineage_root_id": str(artifact.lineage_root_id) if artifact.lineage_root_id else None,
         "tags": artifact.tags_json or [],
@@ -10699,7 +10701,7 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
         ensure_blueprint_artifact(blueprint, owner_user=request.user)
         return JsonResponse({"id": str(blueprint.id)})
 
-    qs = Blueprint.objects.all().order_by("namespace", "name")
+    qs = Blueprint.objects.select_related("artifact").all().order_by("namespace", "name")
     include_archived = (request.GET.get("include_archived") or "").strip() in {"1", "true", "yes"}
     if not include_archived:
         qs = qs.exclude(status="archived")
@@ -10721,7 +10723,12 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
         {
             "id": str(b.id),
             "artifact_id": str(b.artifact_id) if b.artifact_id else None,
-            "name": b.name,
+            "artifact_state": (b.artifact.artifact_state if b.artifact_id and b.artifact else None),
+            "family_id": (b.artifact.family_id if b.artifact_id and b.artifact else (b.blueprint_family_id or "")),
+            "parent_artifact_id": (
+                str(b.artifact.parent_artifact_id) if b.artifact_id and b.artifact and b.artifact.parent_artifact_id else None
+            ),
+            "name": (b.artifact.title if b.artifact_id and b.artifact and b.artifact.title else b.name),
             "namespace": b.namespace,
             "description": b.description,
             "status": b.status,
@@ -10796,12 +10803,16 @@ def blueprint_detail(request: HttpRequest, blueprint_id: str) -> JsonResponse:
         {
             "id": str(blueprint.id),
             "artifact_id": str(blueprint.artifact_id) if blueprint.artifact_id else None,
+            "artifact_state": blueprint.artifact.artifact_state if blueprint.artifact_id and blueprint.artifact else None,
+            "family_id": (
+                blueprint.artifact.family_id if blueprint.artifact_id and blueprint.artifact else (blueprint.blueprint_family_id or "")
+            ),
             "derived_from_artifact_id": (
                 str(blueprint.artifact.parent_artifact_id)
                 if blueprint.artifact_id and blueprint.artifact and blueprint.artifact.parent_artifact_id
                 else None
             ),
-            "name": blueprint.name,
+            "name": (blueprint.artifact.title if blueprint.artifact_id and blueprint.artifact and blueprint.artifact.title else blueprint.name),
             "namespace": blueprint.namespace,
             "description": blueprint.description,
             "status": blueprint.status,
@@ -10814,6 +10825,209 @@ def blueprint_detail(request: HttpRequest, blueprint_id: str) -> JsonResponse:
             "updated_at": blueprint.updated_at,
             "latest_revision": latest.revision if latest else None,
             "spec_json": latest.spec_json if latest else None,
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def blueprint_revise(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    identity = _identity_from_user(request.user)
+
+    base_artifact = get_object_or_404(
+        Artifact.objects.select_related("type", "workspace", "lineage_root", "parent_artifact"),
+        id=artifact_id,
+    )
+    if base_artifact.type.slug != "blueprint":
+        return JsonResponse({"error": "artifact_type must be blueprint"}, status=400)
+    if base_artifact.artifact_state != "canonical":
+        return JsonResponse({"error": "only canonical blueprints can be revised"}, status=400)
+    if base_artifact.source_ref_type != "Blueprint" or not base_artifact.source_ref_id:
+        return JsonResponse({"error": "artifact source is not a blueprint"}, status=400)
+
+    source_blueprint = Blueprint.objects.filter(id=base_artifact.source_ref_id).first()
+    if not source_blueprint:
+        return JsonResponse({"error": "source blueprint not found"}, status=404)
+
+    family_id = str(base_artifact.family_id or base_artifact.id)
+    seed = {
+        "name": source_blueprint.name,
+        "namespace": source_blueprint.namespace,
+        "description": source_blueprint.description or "",
+        "spec_text_hash": hashlib.sha256((source_blueprint.spec_text or "").encode("utf-8")).hexdigest(),
+        "metadata_hash": hashlib.sha256(json.dumps(source_blueprint.metadata_json or {}, sort_keys=True).encode("utf-8")).hexdigest(),
+        "parent_artifact_id": str(base_artifact.id),
+    }
+    seed_hash = hashlib.sha256(json.dumps(seed, sort_keys=True).encode("utf-8")).hexdigest()
+
+    existing = (
+        Artifact.objects.select_related("type")
+        .filter(
+            type__slug="blueprint",
+            artifact_state="provisional",
+            family_id=family_id,
+            parent_artifact_id=base_artifact.id,
+        )
+        .filter(provenance_json__revision_seed_hash=seed_hash)
+        .order_by("-created_at")
+        .first()
+    )
+    if existing:
+        return JsonResponse(
+            {
+                "artifact_id": str(existing.id),
+                "blueprint_id": existing.source_ref_id,
+                "family_id": family_id,
+                "parent_artifact_id": str(base_artifact.id),
+            }
+        )
+
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug="blueprint",
+        defaults={
+            "name": "Blueprint",
+            "description": "Blueprint artifact",
+            "icon": "LayoutTemplate",
+            "schema_json": {"entity": "Blueprint"},
+        },
+    )
+
+    with transaction.atomic():
+        suffix = uuid.uuid4().hex[:8]
+        revision_blueprint = Blueprint.objects.create(
+            name=f"{source_blueprint.name}--rev-{suffix}",
+            namespace=source_blueprint.namespace,
+            status="active",
+            description=source_blueprint.description or "",
+            spec_text=source_blueprint.spec_text or "",
+            metadata_json=source_blueprint.metadata_json if isinstance(source_blueprint.metadata_json, dict) else {},
+            blueprint_family_id=family_id,
+            derived_from_artifact=base_artifact,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        provisional_artifact = Artifact.objects.create(
+            workspace=base_artifact.workspace,
+            type=artifact_type,
+            artifact_state="provisional",
+            family_id=family_id,
+            title=base_artifact.title or source_blueprint.name,
+            summary=base_artifact.summary or source_blueprint.description or "",
+            schema_version=base_artifact.schema_version or "v1",
+            tags_json=base_artifact.tags_json or [],
+            source_ref_type="Blueprint",
+            source_ref_id=str(revision_blueprint.id),
+            parent_artifact=base_artifact,
+            lineage_root=base_artifact.lineage_root or base_artifact,
+            status="draft",
+            version=1,
+            visibility=base_artifact.visibility,
+            author=base_artifact.author,
+            custodian=base_artifact.custodian,
+            provenance_json={
+                **(base_artifact.provenance_json or {}),
+                "source_system": "xyn",
+                "source_model": "Blueprint",
+                "source_id": str(revision_blueprint.id),
+                "revision_seed_hash": seed_hash,
+            },
+            scope_json=base_artifact.scope_json or {},
+        )
+        revision_blueprint.artifact = provisional_artifact
+        revision_blueprint.save(update_fields=["artifact", "updated_at"])
+
+    emit_ledger_event(
+        actor=identity,
+        action="artifact.create",
+        artifact=provisional_artifact,
+        summary="Created provisional Blueprint revision",
+        metadata={
+            "title": provisional_artifact.title,
+            "initial_artifact_state": provisional_artifact.artifact_state,
+            "family_id": family_id,
+            "parent_artifact_id": str(base_artifact.id),
+        },
+        dedupe_key=make_dedupe_key("artifact.create", str(provisional_artifact.id)),
+    )
+    return JsonResponse(
+        {
+            "artifact_id": str(provisional_artifact.id),
+            "blueprint_id": str(revision_blueprint.id),
+            "family_id": family_id,
+            "parent_artifact_id": str(base_artifact.id),
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def blueprint_publish(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    identity = _identity_from_user(request.user)
+
+    artifact = get_object_or_404(
+        Artifact.objects.select_related("type", "workspace", "lineage_root", "parent_artifact"),
+        id=artifact_id,
+    )
+    if artifact.type.slug != "blueprint":
+        return JsonResponse({"error": "artifact_type must be blueprint"}, status=400)
+    if artifact.artifact_state != "provisional":
+        return JsonResponse({"error": "artifact_state must be provisional"}, status=400)
+    family_id = str(artifact.family_id or "").strip()
+    if not family_id:
+        return JsonResponse({"error": "family_id is required for blueprint artifacts"}, status=400)
+
+    with transaction.atomic():
+        hinted_canonical = get_current_canonical(family_id)
+        family_rows = list(
+            Artifact.objects.select_for_update()
+            .select_related("type")
+            .filter(type__slug="blueprint", family_id=family_id)
+            .order_by("-created_at")
+        )
+        target = next((row for row in family_rows if row.id == artifact.id), artifact)
+        superseded = next((row for row in family_rows if row.id != target.id and row.artifact_state == "canonical"), None)
+        if not superseded and hinted_canonical and hinted_canonical.id != target.id:
+            superseded = next((row for row in family_rows if row.id == hinted_canonical.id), hinted_canonical)
+        superseded_id = str(superseded.id) if superseded else None
+
+        if superseded:
+            superseded.artifact_state = "deprecated"
+            superseded.save(update_fields=["artifact_state", "updated_at"])
+            emit_ledger_event(
+                actor=identity,
+                action="artifact.deprecate",
+                artifact=superseded,
+                summary="Deprecated Blueprint artifact",
+                metadata={"reason": "superseded_by_publish", "superseded_by_artifact_id": str(target.id)},
+                dedupe_key=make_dedupe_key("artifact.deprecate", str(superseded.id), state="deprecated"),
+            )
+
+        target.artifact_state = "canonical"
+        target.save(update_fields=["artifact_state", "updated_at"])
+        publish_metadata = {"superseded_artifact_id": superseded_id}
+        emit_ledger_event(
+            actor=identity,
+            action="artifact.update",
+            artifact=target,
+            summary="Published Blueprint version",
+            metadata=publish_metadata,
+            dedupe_key=make_dedupe_key("artifact.update", str(target.id), diff_payload=publish_metadata),
+        )
+
+    return JsonResponse(
+        {
+            "artifact_id": str(artifact.id),
+            "artifact_state": "canonical",
+            "family_id": family_id,
+            "superseded_artifact_id": superseded_id,
         }
     )
 

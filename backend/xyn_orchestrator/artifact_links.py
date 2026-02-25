@@ -56,6 +56,18 @@ def _ensure_blueprint_type() -> ArtifactType:
     return artifact_type
 
 
+def get_current_canonical(family_id: str) -> Optional[Artifact]:
+    value = str(family_id or "").strip()
+    if not value:
+        return None
+    return (
+        Artifact.objects.select_related("type")
+        .filter(type__slug=BLUEPRINT_ARTIFACT_TYPE_SLUG, family_id=value, artifact_state="canonical")
+        .order_by("-updated_at", "-created_at")
+        .first()
+    )
+
+
 def ensure_draft_session_artifact(session: BlueprintDraftSession, *, owner_user=None) -> Artifact:
     if session.artifact_id:
         return session.artifact
@@ -75,6 +87,7 @@ def ensure_draft_session_artifact(session: BlueprintDraftSession, *, owner_user=
             workspace=workspace,
             type=artifact_type,
             artifact_state="provisional",
+            family_id="",
             title=title,
             summary="",
             schema_version="v1",
@@ -106,19 +119,44 @@ def ensure_blueprint_artifact(
     owner_user=None,
     parent_artifact: Optional[Artifact] = None,
 ) -> Artifact:
+    family_id = str(blueprint.blueprint_family_id or "").strip()
     if blueprint.artifact_id:
         artifact = blueprint.artifact
+        dirty_fields = []
+        if family_id and artifact.family_id != family_id:
+            artifact.family_id = family_id
+            dirty_fields.append("family_id")
+        elif not artifact.family_id:
+            artifact.family_id = str(artifact.id)
+            dirty_fields.append("family_id")
         if parent_artifact and artifact.parent_artifact_id != parent_artifact.id:
             artifact.parent_artifact = parent_artifact
             artifact.lineage_root = parent_artifact.lineage_root or parent_artifact
-            artifact.save(update_fields=["parent_artifact", "lineage_root", "updated_at"])
+            dirty_fields.extend(["parent_artifact", "lineage_root"])
+        if dirty_fields:
+            artifact.save(update_fields=list(dict.fromkeys([*dirty_fields, "updated_at"])))
+        if not blueprint.blueprint_family_id:
+            blueprint.blueprint_family_id = artifact.family_id
+            blueprint.save(update_fields=["blueprint_family_id", "updated_at"])
         return artifact
     existing = Artifact.objects.filter(source_ref_type="Blueprint", source_ref_id=str(blueprint.id)).first()
     if existing:
+        dirty_fields = []
+        if family_id and existing.family_id != family_id:
+            existing.family_id = family_id
+            dirty_fields.append("family_id")
+        elif not existing.family_id:
+            existing.family_id = str(existing.id)
+            dirty_fields.append("family_id")
         if parent_artifact and existing.parent_artifact_id != parent_artifact.id:
             existing.parent_artifact = parent_artifact
             existing.lineage_root = parent_artifact.lineage_root or parent_artifact
-            existing.save(update_fields=["parent_artifact", "lineage_root", "updated_at"])
+            dirty_fields.extend(["parent_artifact", "lineage_root"])
+        if dirty_fields:
+            existing.save(update_fields=list(dict.fromkeys([*dirty_fields, "updated_at"])))
+        if not blueprint.blueprint_family_id:
+            blueprint.blueprint_family_id = existing.family_id
+            blueprint.save(update_fields=["blueprint_family_id", "updated_at"])
         blueprint.artifact = existing
         blueprint.save(update_fields=["artifact", "updated_at"])
         return existing
@@ -128,12 +166,15 @@ def ensure_blueprint_artifact(
     owner = _identity_for_user(owner_user or blueprint.created_by)
     artifact_state = "deprecated" if blueprint.status in {"archived", "deprovisioned"} else "canonical"
     artifact_status = "deprecated" if artifact_state == "deprecated" else "reviewed"
+    if not family_id:
+        family_id = str(blueprint.id)
 
     with transaction.atomic():
         artifact = Artifact.objects.create(
             workspace=workspace,
             type=artifact_type,
             artifact_state=artifact_state,
+            family_id=family_id,
             title=(blueprint.name or "Untitled blueprint").strip() or "Untitled blueprint",
             summary=blueprint.description or "",
             schema_version="v1",
@@ -152,7 +193,13 @@ def ensure_blueprint_artifact(
         )
         if not artifact.lineage_root_id:
             artifact.lineage_root = artifact
-            artifact.save(update_fields=["lineage_root", "updated_at"])
+            if not artifact.family_id:
+                artifact.family_id = str(artifact.id)
+                artifact.save(update_fields=["lineage_root", "family_id", "updated_at"])
+            else:
+                artifact.save(update_fields=["lineage_root", "updated_at"])
+        if not blueprint.blueprint_family_id:
+            blueprint.blueprint_family_id = artifact.family_id
         blueprint.artifact = artifact
-        blueprint.save(update_fields=["artifact", "updated_at"])
+        blueprint.save(update_fields=["artifact", "blueprint_family_id", "updated_at"])
     return artifact
