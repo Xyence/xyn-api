@@ -1415,13 +1415,20 @@ def _resolve_video_context_pack_for_article(
     *,
     allow_clear: bool = True,
 ) -> tuple[Optional[ContextPack], Optional[JsonResponse]]:
+    def _default_video_context_pack() -> Optional[ContextPack]:
+        return (
+            ContextPack.objects.filter(purpose=VIDEO_CONTEXT_PACK_PURPOSE, is_active=True, is_default=True)
+            .order_by("-updated_at")
+            .first()
+        )
+
     if raw_pack_id is None:
         if artifact and artifact.video_context_pack_id:
             attached = ContextPack.objects.filter(id=artifact.video_context_pack_id).first()
             if attached and attached.purpose != VIDEO_CONTEXT_PACK_PURPOSE:
                 return None, JsonResponse({"error": f"context pack purpose must be {VIDEO_CONTEXT_PACK_PURPOSE}"}, status=400)
             return attached, None
-        return None, None
+        return _default_video_context_pack(), None
     pack_id = str(raw_pack_id or "").strip()
     if not pack_id:
         if allow_clear:
@@ -7465,11 +7472,24 @@ def article_video_initialize(request: HttpRequest, article_id: str) -> JsonRespo
     artifact = _resolve_article_or_404(article_id)
     if not _can_edit_article(identity, artifact):
         return JsonResponse({"error": "forbidden"}, status=403)
+    dirty_fields: Set[str] = set()
     if artifact.format != "video_explainer":
         artifact.format = "video_explainer"
+        dirty_fields.add("format")
     if not isinstance(artifact.video_spec_json, dict):
         artifact.video_spec_json = _default_video_spec_for_artifact(artifact)
-    artifact.save(update_fields=["format", "video_spec_json", "updated_at"])
+        dirty_fields.add("video_spec_json")
+    if not artifact.video_context_pack_id:
+        default_pack = (
+            ContextPack.objects.filter(purpose=VIDEO_CONTEXT_PACK_PURPOSE, is_active=True, is_default=True)
+            .order_by("-updated_at")
+            .first()
+        )
+        if default_pack:
+            artifact.video_context_pack = default_pack
+            dirty_fields.add("video_context_pack")
+    if dirty_fields:
+        artifact.save(update_fields=[*sorted(dirty_fields), "updated_at"])
     _record_artifact_event(artifact, "article_video_initialized", identity, {"format": artifact.format})
     return JsonResponse({"article": _serialize_article_detail(artifact)})
 
