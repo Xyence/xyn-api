@@ -132,6 +132,7 @@ def backward(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
+    atomic = False
 
     dependencies = [
         ("xyn_orchestrator", "0080_seed_default_tour_workflow"),
