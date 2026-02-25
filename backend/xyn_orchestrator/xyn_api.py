@@ -159,6 +159,10 @@ from .seeds import (
     get_seed_pack_status,
     list_seed_packs_status,
 )
+from .artifact_links import (
+    ensure_blueprint_artifact,
+    ensure_draft_session_artifact,
+)
 
 PLATFORM_ROLE_IDS = {"platform_owner", "platform_admin", "platform_architect", "platform_operator", "app_user"}
 PREVIEW_SESSION_KEY = "xyn.preview.v1"
@@ -5026,6 +5030,249 @@ def _serialize_comment(comment: ArtifactComment) -> Dict[str, Any]:
         "status": comment.status,
         "created_at": comment.created_at,
     }
+
+
+def _artifact_owner_payload(artifact: Artifact) -> Optional[Dict[str, Any]]:
+    if not artifact.author_id:
+        return None
+    return {
+        "id": str(artifact.author_id),
+        "email": artifact.author.email,
+        "display_name": artifact.author.display_name,
+    }
+
+
+def _serialize_blueprint_source(blueprint: Blueprint) -> Dict[str, Any]:
+    return {
+        "id": str(blueprint.id),
+        "name": blueprint.name,
+        "namespace": blueprint.namespace,
+        "status": blueprint.status,
+        "description": blueprint.description,
+        "created_at": blueprint.created_at,
+        "updated_at": blueprint.updated_at,
+        "artifact_id": str(blueprint.artifact_id) if blueprint.artifact_id else None,
+    }
+
+
+def _serialize_draft_session_source(session: BlueprintDraftSession) -> Dict[str, Any]:
+    return {
+        "id": str(session.id),
+        "name": session.name,
+        "title": session.title or session.name,
+        "status": session.status,
+        "kind": session.draft_kind,
+        "blueprint_kind": session.blueprint_kind,
+        "namespace": session.namespace or None,
+        "project_key": session.project_key or None,
+        "blueprint_id": str(session.blueprint_id) if session.blueprint_id else None,
+        "linked_blueprint_id": str(session.linked_blueprint_id) if session.linked_blueprint_id else None,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+        "artifact_id": str(session.artifact_id) if session.artifact_id else None,
+    }
+
+
+def _serialize_unified_artifact(artifact: Artifact, source_record: Any = None) -> Dict[str, Any]:
+    payload = {
+        "id": str(artifact.id),
+        "artifact_id": str(artifact.id),
+        "artifact_type": artifact.type.slug,
+        "artifact_state": artifact.artifact_state,
+        "title": artifact.title,
+        "summary": artifact.summary or "",
+        "schema_version": artifact.schema_version or "",
+        "owner": _artifact_owner_payload(artifact),
+        "source_ref_type": artifact.source_ref_type or "",
+        "source_ref_id": artifact.source_ref_id or "",
+        "parent_artifact_id": str(artifact.parent_artifact_id) if artifact.parent_artifact_id else None,
+        "lineage_root_id": str(artifact.lineage_root_id) if artifact.lineage_root_id else None,
+        "tags": artifact.tags_json or [],
+        "created_at": artifact.created_at,
+        "updated_at": artifact.updated_at,
+    }
+    if source_record is not None:
+        if isinstance(source_record, Blueprint):
+            payload["source"] = _serialize_blueprint_source(source_record)
+        elif isinstance(source_record, BlueprintDraftSession):
+            payload["source"] = _serialize_draft_session_source(source_record)
+        else:
+            payload["source"] = source_record
+    return payload
+
+
+@csrf_exempt
+@login_required
+def artifacts_collection(request: HttpRequest) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    artifact_type = str(request.GET.get("type") or "").strip().lower()
+    artifact_state = str(request.GET.get("state") or "").strip().lower()
+    query = str(request.GET.get("query") or request.GET.get("q") or "").strip()
+    owner = str(request.GET.get("owner") or "").strip()
+
+    try:
+        limit = max(1, min(500, int(request.GET.get("limit") or 100)))
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        offset = max(0, int(request.GET.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+
+    qs = Artifact.objects.select_related("type", "author", "parent_artifact", "lineage_root").all()
+    if artifact_type:
+        qs = qs.filter(type__slug=artifact_type)
+    if artifact_state:
+        qs = qs.filter(artifact_state=artifact_state)
+    if owner:
+        qs = qs.filter(author_id=owner)
+    if query:
+        qs = qs.filter(
+            models.Q(title__icontains=query)
+            | models.Q(summary__icontains=query)
+            | models.Q(source_ref_id__icontains=query)
+            | models.Q(source_ref_type__icontains=query)
+        )
+    qs = qs.order_by("-updated_at", "-created_at")
+    total = qs.count()
+    items = list(qs[offset : offset + limit])
+
+    blueprint_ids = [item.source_ref_id for item in items if item.source_ref_type == "Blueprint" and item.source_ref_id]
+    draft_ids = [item.source_ref_id for item in items if item.source_ref_type == "BlueprintDraftSession" and item.source_ref_id]
+    blueprints_by_id = {str(item.id): item for item in Blueprint.objects.filter(id__in=blueprint_ids)} if blueprint_ids else {}
+    drafts_by_id = {str(item.id): item for item in BlueprintDraftSession.objects.filter(id__in=draft_ids)} if draft_ids else {}
+
+    data: List[Dict[str, Any]] = []
+    for artifact in items:
+        source = None
+        if artifact.source_ref_type == "Blueprint":
+            source = blueprints_by_id.get(artifact.source_ref_id)
+        elif artifact.source_ref_type == "BlueprintDraftSession":
+            source = drafts_by_id.get(artifact.source_ref_id)
+        data.append(_serialize_unified_artifact(artifact, source))
+    return JsonResponse({"artifacts": data, "count": total, "limit": limit, "offset": offset})
+
+
+@csrf_exempt
+@login_required
+def artifact_detail(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    artifact = get_object_or_404(
+        Artifact.objects.select_related("type", "author", "parent_artifact", "lineage_root"),
+        id=artifact_id,
+    )
+    source = None
+    if artifact.source_ref_type == "Blueprint" and artifact.source_ref_id:
+        source = Blueprint.objects.filter(id=artifact.source_ref_id).first()
+    elif artifact.source_ref_type == "BlueprintDraftSession" and artifact.source_ref_id:
+        source = BlueprintDraftSession.objects.filter(id=artifact.source_ref_id).first()
+    return JsonResponse(_serialize_unified_artifact(artifact, source))
+
+
+@csrf_exempt
+@login_required
+def artifacts_create_draft_session(request: HttpRequest) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+
+    payload = _parse_json(request)
+    draft_kind = str(payload.get("kind") or payload.get("draft_kind") or "blueprint").strip().lower()
+    if draft_kind not in {"blueprint", "solution"}:
+        return JsonResponse({"error": "kind must be blueprint or solution"}, status=400)
+    title = (payload.get("title") or payload.get("name") or "").strip() or "Untitled draft"
+    blueprint_kind = str(payload.get("blueprint_kind") or "solution").strip().lower()
+    namespace = str(payload.get("namespace") or "").strip()
+    project_key = str(payload.get("project_key") or "").strip()
+    initial_prompt = str(payload.get("initial_prompt") or "").strip()
+    revision_instruction = str(payload.get("revision_instruction") or "").strip()
+    selected_context_pack_ids = payload.get("selected_context_pack_ids")
+    if selected_context_pack_ids is None:
+        selected_context_pack_ids = payload.get("context_pack_ids")
+    if not isinstance(selected_context_pack_ids, list):
+        selected_context_pack_ids = []
+
+    blueprint = None
+    blueprint_id = payload.get("blueprint_id")
+    if blueprint_id:
+        blueprint = Blueprint.objects.filter(id=blueprint_id).first()
+        if not blueprint:
+            return JsonResponse({"error": "blueprint_id not found"}, status=404)
+        namespace = namespace or blueprint.namespace
+        project_key = project_key or f"{blueprint.namespace}.{blueprint.name}"
+
+    with transaction.atomic():
+        session = BlueprintDraftSession.objects.create(
+            name=title,
+            title=title,
+            blueprint=blueprint,
+            draft_kind=draft_kind,
+            blueprint_kind=blueprint_kind if blueprint_kind in {"solution", "module", "bundle"} else "solution",
+            status="drafting",
+            namespace=namespace,
+            project_key=project_key,
+            initial_prompt=initial_prompt,
+            revision_instruction=revision_instruction,
+            selected_context_pack_ids=selected_context_pack_ids,
+            context_pack_ids=selected_context_pack_ids,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        artifact = ensure_draft_session_artifact(session, owner_user=request.user)
+    return JsonResponse({"artifact_id": str(artifact.id), "session_id": str(session.id)})
+
+
+@csrf_exempt
+@login_required
+def artifacts_create_blueprint(request: HttpRequest) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+
+    payload = _parse_json(request)
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return JsonResponse({"error": "name is required"}, status=400)
+    namespace = str(payload.get("namespace") or "core").strip() or "core"
+    description = str(payload.get("description") or "").strip()
+    spec_text = str(payload.get("spec_text") or "")
+    metadata_json = payload.get("metadata_json") if isinstance(payload.get("metadata_json"), dict) else None
+    parent_artifact_id = str(payload.get("parent_artifact_id") or "").strip()
+    parent_artifact = Artifact.objects.filter(id=parent_artifact_id).first() if parent_artifact_id else None
+
+    with transaction.atomic():
+        blueprint, created = Blueprint.objects.get_or_create(
+            name=name,
+            namespace=namespace,
+            defaults={
+                "description": description,
+                "spec_text": spec_text,
+                "metadata_json": metadata_json,
+                "created_by": request.user,
+                "updated_by": request.user,
+            },
+        )
+        if not created:
+            blueprint.description = description
+            if "spec_text" in payload:
+                blueprint.spec_text = spec_text
+            if "metadata_json" in payload:
+                blueprint.metadata_json = metadata_json
+            blueprint.updated_by = request.user
+            blueprint.save(update_fields=["description", "spec_text", "metadata_json", "updated_by", "updated_at"])
+        artifact = ensure_blueprint_artifact(blueprint, owner_user=request.user, parent_artifact=parent_artifact)
+
+    return JsonResponse({"artifact_id": str(artifact.id), "blueprint_id": str(blueprint.id)})
 
 
 @csrf_exempt
@@ -10023,6 +10270,7 @@ def blueprints_collection(request: HttpRequest) -> JsonResponse:
                 blueprint_kind=payload.get("blueprint_kind", "solution"),
                 created_by=request.user,
             )
+        ensure_blueprint_artifact(blueprint, owner_user=request.user)
         return JsonResponse({"id": str(blueprint.id)})
 
     qs = Blueprint.objects.all().order_by("namespace", "name")
@@ -10107,6 +10355,7 @@ def blueprint_detail(request: HttpRequest, blueprint_id: str) -> JsonResponse:
                 blueprint_kind=payload.get("blueprint_kind", "solution"),
                 created_by=request.user,
             )
+        ensure_blueprint_artifact(blueprint, owner_user=request.user)
         return JsonResponse({"id": str(blueprint.id)})
     if request.method == "DELETE":
         blueprint.status = "archived"

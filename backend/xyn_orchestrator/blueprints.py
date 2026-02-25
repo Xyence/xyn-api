@@ -64,6 +64,7 @@ from .deployments import (
     load_release_plan_json,
     maybe_trigger_rollback,
 )
+from .artifact_links import ensure_blueprint_artifact, ensure_draft_session_artifact
 
 _executor = ThreadPoolExecutor(max_workers=2)
 logger = logging.getLogger(__name__)
@@ -3044,6 +3045,11 @@ def _publish_draft_session(session: BlueprintDraftSession, user) -> Dict[str, An
             blueprint_kind=kind,
             created_by=user,
         )
+        ensure_blueprint_artifact(
+            blueprint,
+            owner_user=user,
+            parent_artifact=(session.artifact if session.artifact_id else None),
+        )
         session.linked_blueprint = blueprint
         session.status = "published"
         session.save(update_fields=["linked_blueprint", "status", "updated_at"])
@@ -3193,6 +3199,7 @@ def new_draft_session_view(request: HttpRequest) -> HttpResponse:
             created_by=request.user,
             updated_by=request.user,
         )
+        ensure_draft_session_artifact(session, owner_user=request.user)
         resolved = _resolve_context_packs(session, context_pack_ids)
         session.context_pack_refs_json = resolved["refs"]
         session.effective_context_hash = resolved["hash"]
@@ -3611,6 +3618,7 @@ def create_draft_session(request: HttpRequest) -> JsonResponse:
         created_by=request.user,
         updated_by=request.user,
     )
+    ensure_draft_session_artifact(session, owner_user=request.user)
     resolved = _resolve_context_packs(
         session,
         context_pack_ids,

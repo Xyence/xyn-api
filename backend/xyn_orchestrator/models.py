@@ -182,6 +182,13 @@ class Blueprint(models.Model):
     description = models.TextField(blank=True)
     spec_text = models.TextField(blank=True)
     repo_slug = models.CharField(max_length=120, blank=True, default="")
+    artifact = models.OneToOneField(
+        "Artifact",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="source_blueprint",
+    )
     metadata_json = models.JSONField(null=True, blank=True)
     deprovision_last_run = models.ForeignKey(
         "Run", null=True, blank=True, on_delete=models.SET_NULL, related_name="blueprints_deprovisioned"
@@ -290,6 +297,13 @@ class BlueprintDraftSession(models.Model):
     context_resolved_at = models.DateTimeField(null=True, blank=True)
     linked_blueprint = models.ForeignKey(
         Blueprint, null=True, blank=True, on_delete=models.SET_NULL, related_name="draft_sessions"
+    )
+    artifact = models.OneToOneField(
+        "Artifact",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="source_draft_session",
     )
     metadata_json = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -863,6 +877,12 @@ class ArticleCategory(models.Model):
 
 
 class Artifact(models.Model):
+    ARTIFACT_STATE_CHOICES = [
+        ("provisional", "Provisional"),
+        ("canonical", "Canonical"),
+        ("immutable", "Immutable"),
+        ("deprecated", "Deprecated"),
+    ]
     STATUS_CHOICES = [
         ("draft", "Draft"),
         ("reviewed", "Reviewed"),
@@ -877,8 +897,28 @@ class Artifact(models.Model):
     article_category = models.ForeignKey(
         ArticleCategory, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifacts"
     )
+    artifact_state = models.CharField(max_length=20, choices=ARTIFACT_STATE_CHOICES, default="provisional")
     title = models.CharField(max_length=300)
+    summary = models.TextField(blank=True, default="")
+    schema_version = models.CharField(max_length=80, blank=True, default="")
+    tags_json = models.JSONField(default=list, blank=True)
     slug = models.SlugField(max_length=240, blank=True, default="")
+    source_ref_type = models.CharField(max_length=80, blank=True, default="")
+    source_ref_id = models.CharField(max_length=120, blank=True, default="")
+    parent_artifact = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="derived_artifacts",
+    )
+    lineage_root = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="lineage_descendants",
+    )
     format = models.CharField(
         max_length=30,
         choices=[
@@ -930,7 +970,12 @@ class Artifact(models.Model):
                 fields=["workspace", "slug"],
                 condition=~Q(slug=""),
                 name="uniq_artifact_workspace_slug",
-            )
+            ),
+            models.UniqueConstraint(
+                fields=["source_ref_type", "source_ref_id"],
+                condition=(~Q(source_ref_type="") & ~Q(source_ref_id="")),
+                name="uniq_artifact_source_ref",
+            ),
         ]
 
     def __str__(self) -> str:
