@@ -18,6 +18,7 @@ import requests
 import boto3
 from authlib.jose import JsonWebKey, jwt
 from markdownify import markdownify as _markdownify_html
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
 from django.db import models, transaction
@@ -174,6 +175,16 @@ from .ledger import (
     emit_ledger_event,
     make_dedupe_key,
 )
+from .intent_engine import (
+    DraftIntakeContractRegistry,
+    IntentResolutionEngine,
+    ResolutionContext,
+    LlmIntentProposalProvider,
+    PatchValidationError,
+    apply_patch as intent_apply_patch,
+)
+from .intent_engine.patch_service import to_internal_format as intent_to_internal_format
+from .intent_engine.telemetry import increment as intent_telemetry_increment
 
 PLATFORM_ROLE_IDS = {"platform_owner", "platform_admin", "platform_architect", "platform_operator", "app_user"}
 PREVIEW_SESSION_KEY = "xyn.preview.v1"
@@ -213,6 +224,57 @@ ARTICLE_TRANSITIONS = {
 }
 WORKSPACE_ROLE_SLUGS = {"reader", "contributor", "publisher", "moderator", "admin"}
 PURPOSE_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
+
+
+def _truthy_env(value: Any, *, default: bool) -> bool:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _intent_engine_enabled() -> bool:
+    if "XYN_INTENT_ENGINE_V1" in os.environ:
+        return _truthy_env(os.environ.get("XYN_INTENT_ENGINE_V1"), default=False)
+    return bool(getattr(settings, "DEBUG", False))
+
+
+def _intent_category_options() -> List[Dict[str, str]]:
+    _ensure_default_article_categories_and_bindings()
+    rows = ArticleCategory.objects.filter(enabled=True).order_by("name")
+    return [{"slug": str(row.slug), "name": str(row.name)} for row in rows]
+
+
+def _intent_contract_registry() -> DraftIntakeContractRegistry:
+    return DraftIntakeContractRegistry(category_options_provider=_intent_category_options)
+
+
+def _intent_engine() -> IntentResolutionEngine:
+    return IntentResolutionEngine(
+        proposal_provider=LlmIntentProposalProvider(),
+        contracts=_intent_contract_registry(),
+    )
+
+
+def _audit_intent_event(
+    *,
+    message: str,
+    identity: Optional[UserIdentity],
+    request_id: str,
+    artifact_id: Optional[str],
+    proposal: Dict[str, Any],
+    resolution: Dict[str, Any],
+) -> None:
+    AuditLog.objects.create(
+        message=message,
+        metadata_json={
+            "request_id": request_id,
+            "actor_identity_id": str(identity.id) if identity else None,
+            "artifact_id": artifact_id,
+            "proposal": proposal,
+            "resolution": resolution,
+        },
+    )
 
 
 def _utc_now_ts() -> int:
@@ -10146,6 +10208,323 @@ def ai_agent_detail(request: HttpRequest, agent_id: str) -> JsonResponse:
             AgentDefinitionPurpose.objects.get_or_create(agent_definition=agent, purpose=purpose)
     agent.refresh_from_db()
     return JsonResponse({"agent": _serialize_agent_definition(agent)})
+
+
+def _intent_apply_create_draft(
+    *,
+    identity: UserIdentity,
+    payload: Dict[str, Any],
+    request_id: str,
+) -> JsonResponse:
+    if not _can_manage_articles(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    contract = _intent_contract_registry().get("ArticleDraft")
+    if contract is None:
+        return JsonResponse({"error": "intake contract unavailable"}, status=500)
+    merged = contract.merge_defaults(payload or {})
+    merged["format"] = contract.normalize_format(merged.get("format"))
+    missing = contract.missing_fields(merged)
+    if missing:
+        return JsonResponse(
+            {
+                "status": "MissingFields",
+                "action_type": "CreateDraft",
+                "artifact_type": "ArticleDraft",
+                "summary": "Draft requires additional fields before it can proceed.",
+                "missing_fields": [
+                    {
+                        "field": field_name,
+                        "reason": "required by intake contract",
+                        "options_available": contract.options_available(field_name),
+                    }
+                    for field_name in missing
+                ],
+                "audit": {
+                    "request_id": request_id,
+                    "timestamp": timezone.now().isoformat(),
+                },
+            },
+            status=400,
+        )
+
+    title = str(merged.get("title") or "").strip()
+    category_slug = str(merged.get("category") or "").strip().lower()
+    external_format = str(merged.get("format") or "article").strip().lower()
+    intent_value = str(merged.get("intent") or "").strip()
+    duration_value = str(merged.get("duration") or "").strip()
+    tags = _normalize_doc_tags(merged.get("tags"))
+    summary = str(merged.get("summary") or "")
+    body_markdown = str(merged.get("body") or "")
+
+    category = _resolve_article_category_slug(category_slug, allow_disabled=False)
+    if not category:
+        return JsonResponse({"error": f"unknown category: {category_slug}"}, status=400)
+
+    workspace = _resolve_article_workspace(identity, str(payload.get("workspace_id") or "")) or _docs_workspace()
+    slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=title)
+    if not slug:
+        slug = _normalize_artifact_slug("", fallback_title=title)
+    if _artifact_slug_exists(str(workspace.id), slug):
+        slug = _normalize_artifact_slug(f"{slug}-{uuid.uuid4().hex[:6]}", fallback_title=title)
+
+    article_type = _ensure_article_artifact_type()
+    try:
+        internal_format = intent_to_internal_format(external_format)
+    except PatchValidationError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    video_spec = None
+    if internal_format == "video_explainer":
+        video_spec = default_video_spec(title=title, summary=summary)
+        video_spec["intent"] = intent_value
+        if duration_value:
+            video_spec["duration"] = duration_value
+        spec_errors = validate_video_spec(video_spec)
+        if spec_errors:
+            return JsonResponse({"error": "invalid video spec", "details": spec_errors}, status=400)
+
+    with transaction.atomic():
+        artifact = Artifact.objects.create(
+            workspace=workspace,
+            type=article_type,
+            title=title,
+            slug=slug,
+            format=internal_format,
+            status="draft",
+            version=1,
+            visibility=_artifact_visibility_for_article_type("private"),
+            author=identity,
+            custodian=identity,
+            scope_json={
+                "slug": slug,
+                "category": category.slug,
+                "visibility_type": "private",
+                "allowed_roles": [],
+                "route_bindings": [],
+                "tags": tags,
+            },
+            article_category=category,
+            video_spec_json=video_spec,
+        )
+        ArtifactRevision.objects.create(
+            artifact=artifact,
+            revision_number=1,
+            content_json={
+                "title": title,
+                "summary": summary,
+                "body_markdown": body_markdown,
+                "body_html": "",
+                "tags": tags,
+            },
+            created_by=identity,
+        )
+        ArtifactExternalRef.objects.update_or_create(
+            artifact=artifact,
+            system="shine",
+            defaults={"external_id": str(artifact.id), "slug_path": slug},
+        )
+        emit_ledger_event(
+            actor=identity,
+            action="draft.created",
+            artifact=artifact,
+            summary="Created Article draft via intent engine",
+            metadata={"fields_set": sorted([k for k in ["title", "category", "format", "intent", "duration"] if str(merged.get(k) or "").strip()])},
+            dedupe_key=f"draft.created:{artifact.id}",
+        )
+
+    intent_telemetry_increment("apply_success")
+    payload_response = {
+        "status": "DraftReady",
+        "action_type": "CreateDraft",
+        "artifact_type": "ArticleDraft",
+        "artifact_id": str(artifact.id),
+        "summary": "Draft created successfully.",
+        "next_actions": [{"label": "Open editor", "action": "OpenEditor"}],
+        "audit": {
+            "request_id": request_id,
+            "timestamp": timezone.now().isoformat(),
+        },
+    }
+    _audit_intent_event(
+        message="intent.apply",
+        identity=identity,
+        request_id=request_id,
+        artifact_id=str(artifact.id),
+        proposal={},
+        resolution=payload_response,
+    )
+    return JsonResponse(payload_response)
+
+
+def _intent_apply_patch(
+    *,
+    identity: UserIdentity,
+    artifact_id: str,
+    patch_object: Dict[str, Any],
+    request_id: str,
+) -> JsonResponse:
+    artifact = _resolve_article_or_404(artifact_id)
+    if not _can_edit_article(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    try:
+        updated = intent_apply_patch(
+            artifact=artifact,
+            actor=identity,
+            patch_object=patch_object,
+            category_resolver=lambda: _intent_category_options(),
+        )
+    except PatchValidationError as exc:
+        intent_telemetry_increment("apply_error")
+        return JsonResponse(
+            {
+                "status": "ValidationError",
+                "action_type": "ApplyPatch",
+                "artifact_type": "ArticleDraft",
+                "artifact_id": str(artifact.id),
+                "summary": "Patch failed deterministic validation.",
+                "validation_errors": [str(exc)],
+                "audit": {"request_id": request_id, "timestamp": timezone.now().isoformat()},
+            },
+            status=400,
+        )
+
+    latest = ArtifactRevision.objects.filter(artifact=updated).order_by("-revision_number").first()
+    current_content = dict((latest.content_json if latest else {}) or {})
+    metadata = {
+        "title": updated.title,
+        "category": _article_category(updated),
+        "format": _article_format(updated),
+        "summary_hash": hashlib.sha256(str(current_content.get("summary") or "").encode("utf-8")).hexdigest(),
+        "body_hash": hashlib.sha256(str(current_content.get("body_markdown") or "").encode("utf-8")).hexdigest(),
+    }
+    emit_ledger_event(
+        actor=identity,
+        action="draft.patched",
+        artifact=updated,
+        summary="Patched Article draft via intent engine",
+        metadata=metadata,
+        dedupe_key=f"draft.patched:{updated.id}:{hashlib.sha256(json.dumps(metadata, sort_keys=True).encode('utf-8')).hexdigest()}",
+    )
+    intent_telemetry_increment("apply_success")
+    payload_response = {
+        "status": "DraftReady",
+        "action_type": "ApplyPatch",
+        "artifact_type": "ArticleDraft",
+        "artifact_id": str(updated.id),
+        "summary": "Patch applied successfully.",
+        "next_actions": [{"label": "Open editor", "action": "OpenEditor"}],
+        "audit": {
+            "request_id": request_id,
+            "timestamp": timezone.now().isoformat(),
+        },
+    }
+    _audit_intent_event(
+        message="intent.apply",
+        identity=identity,
+        request_id=request_id,
+        artifact_id=str(updated.id),
+        proposal={"patch_object": patch_object},
+        resolution=payload_response,
+    )
+    return JsonResponse(payload_response)
+
+
+@csrf_exempt
+def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
+    if not _intent_engine_enabled():
+        return JsonResponse({"error": "intent engine disabled"}, status=404)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        return JsonResponse({"error": "message is required"}, status=400)
+
+    context_payload = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    context_artifact_id = str(context_payload.get("artifact_id") or "").strip()
+    context_artifact_type = str(context_payload.get("artifact_type") or "").strip()
+    context_artifact = None
+    if context_artifact_id:
+        context_artifact = _resolve_article_or_404(context_artifact_id)
+        if not _can_edit_article(identity, context_artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        if context_artifact_type and context_artifact_type not in {"ArticleDraft", "article"}:
+            return JsonResponse({"error": "unsupported artifact_type context"}, status=400)
+
+    engine = _intent_engine()
+    result, proposal = engine.resolve(message=message, context=ResolutionContext(artifact=context_artifact))
+    if context_artifact is not None:
+        result["artifact_id"] = str(context_artifact.id)
+
+    request_id = str((result.get("audit") or {}).get("request_id") or uuid.uuid4())
+    intent_telemetry_increment(
+        {
+            "DraftReady": "resolve_success",
+            "MissingFields": "resolve_missing_fields",
+            "ValidationError": "resolve_validation_error",
+        }.get(str(result.get("status") or ""), "resolve_success")
+    )
+    _audit_intent_event(
+        message="intent.resolve",
+        identity=identity,
+        request_id=request_id,
+        artifact_id=str(context_artifact.id) if context_artifact else None,
+        proposal=proposal,
+        resolution=result,
+    )
+    return JsonResponse(result)
+
+
+@csrf_exempt
+def xyn_intent_apply(request: HttpRequest) -> JsonResponse:
+    if not _intent_engine_enabled():
+        return JsonResponse({"error": "intent engine disabled"}, status=404)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    payload = _parse_json(request)
+    action_type = str(payload.get("action_type") or "").strip()
+    artifact_type = str(payload.get("artifact_type") or "").strip()
+    body_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    request_id = str(uuid.uuid4())
+
+    if action_type not in {"CreateDraft", "ApplyPatch"}:
+        return JsonResponse({"error": "action_type must be CreateDraft or ApplyPatch"}, status=400)
+    if artifact_type != "ArticleDraft":
+        return JsonResponse({"error": "artifact_type must be ArticleDraft"}, status=400)
+
+    if action_type == "CreateDraft":
+        return _intent_apply_create_draft(identity=identity, payload=body_payload, request_id=request_id)
+
+    artifact_id = str(payload.get("artifact_id") or "").strip()
+    if not artifact_id:
+        return JsonResponse({"error": "artifact_id is required for ApplyPatch"}, status=400)
+    return _intent_apply_patch(identity=identity, artifact_id=artifact_id, patch_object=body_payload, request_id=request_id)
+
+
+def xyn_intent_options(request: HttpRequest) -> JsonResponse:
+    if not _intent_engine_enabled():
+        return JsonResponse({"error": "intent engine disabled"}, status=404)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    artifact_type = str(request.GET.get("artifact_type") or "").strip()
+    field_name = str(request.GET.get("field") or "").strip().lower()
+    if artifact_type != "ArticleDraft":
+        return JsonResponse({"error": "artifact_type must be ArticleDraft"}, status=400)
+    if field_name not in {"category", "format", "duration"}:
+        return JsonResponse({"error": "field must be category|format|duration"}, status=400)
+    contract = _intent_contract_registry().get("ArticleDraft")
+    options = contract.options_for_field(field_name) if contract else []
+    return JsonResponse({"artifact_type": artifact_type, "field": field_name, "options": options})
 
 
 @csrf_exempt
