@@ -16,7 +16,9 @@ class XynOrchestratorConfig(AppConfig):
             return
         try:
             from xyn_orchestrator.instances.bootstrap import bootstrap_instance_registration
+            from xyn_orchestrator.seeds import auto_apply_core_seed_packs
 
             bootstrap_instance_registration()
+            auto_apply_core_seed_packs()
         except Exception:
             return

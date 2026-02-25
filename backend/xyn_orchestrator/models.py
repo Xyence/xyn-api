@@ -1647,6 +1647,10 @@ class ContextPack(models.Model):
     updated_by = models.ForeignKey(
         "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="context_packs_updated"
     )
+    seeded_by_pack_slug = models.CharField(max_length=200, blank=True)
+    seeded_version = models.CharField(max_length=64, blank=True)
+    seeded_content_hash = models.CharField(max_length=128, blank=True)
+    seeded_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["name"]
@@ -1654,6 +1658,98 @@ class ContextPack(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.scope}) v{self.version}"
+
+
+class SeedPack(models.Model):
+    SCOPE_CHOICES = [
+        ("core", "Core"),
+        ("optional", "Optional"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    slug = models.SlugField(max_length=160, unique=True)
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    version = models.CharField(max_length=64)
+    scope = models.CharField(max_length=20, choices=SCOPE_CHOICES, default="optional")
+    namespace = models.CharField(max_length=120, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["slug"]
+
+    def __str__(self) -> str:
+        return f"{self.slug}@{self.version}"
+
+
+class SeedItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    seed_pack = models.ForeignKey(SeedPack, on_delete=models.CASCADE, related_name="items")
+    entity_type = models.CharField(max_length=60)
+    entity_slug = models.CharField(max_length=200)
+    entity_unique_key_json = models.JSONField(default=dict)
+    payload_json = models.JSONField(default=dict)
+    content_hash = models.CharField(max_length=128)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["seed_pack__slug", "entity_type", "entity_slug"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["seed_pack", "entity_type", "entity_slug"],
+                name="uniq_seed_item_per_pack_entity",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.seed_pack.slug}:{self.entity_type}:{self.entity_slug}"
+
+
+class SeedApplication(models.Model):
+    STATUS_CHOICES = [
+        ("succeeded", "Succeeded"),
+        ("failed", "Failed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    seed_pack = models.ForeignKey(SeedPack, on_delete=models.CASCADE, related_name="applications")
+    applied_at = models.DateTimeField(auto_now_add=True)
+    applied_by = models.ForeignKey(
+        "xyn_orchestrator.UserIdentity", null=True, blank=True, on_delete=models.SET_NULL, related_name="seed_applications"
+    )
+    result_summary_json = models.JSONField(default=dict)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="succeeded")
+    error_message = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-applied_at"]
+
+    def __str__(self) -> str:
+        return f"{self.seed_pack.slug}:{self.status}@{self.applied_at.isoformat() if self.applied_at else 'n/a'}"
+
+
+class SeedApplicationItem(models.Model):
+    ACTION_CHOICES = [
+        ("created", "Created"),
+        ("updated", "Updated"),
+        ("unchanged", "Unchanged"),
+        ("skipped", "Skipped"),
+        ("failed", "Failed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    seed_application = models.ForeignKey(SeedApplication, on_delete=models.CASCADE, related_name="items")
+    seed_item = models.ForeignKey(SeedItem, on_delete=models.CASCADE, related_name="application_items")
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
+    target_entity_id = models.UUIDField(null=True, blank=True)
+    message = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["seed_application__applied_at", "seed_item__entity_type", "seed_item__entity_slug"]
+
+    def __str__(self) -> str:
+        return f"{self.seed_item.entity_slug}:{self.action}"
 
 
 class EnvironmentAppState(models.Model):

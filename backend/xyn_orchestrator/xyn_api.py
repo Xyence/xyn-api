@@ -152,6 +152,11 @@ from .access_explorer import (
     compute_effective_permissions as access_compute_effective_permissions,
     role_detail as access_role_detail_data,
 )
+from .seeds import (
+    apply_seed_packs,
+    get_seed_pack_status,
+    list_seed_packs_status,
+)
 
 PLATFORM_ROLE_IDS = {"platform_owner", "platform_admin", "platform_architect", "platform_operator", "app_user"}
 PREVIEW_SESSION_KEY = "xyn.preview.v1"
@@ -4311,6 +4316,50 @@ def access_role_detail(request: HttpRequest, role_id: str) -> JsonResponse:
         return JsonResponse(access_role_detail_data(role_id))
     except KeyError:
         return JsonResponse({"error": "role not found"}, status=404)
+
+
+@csrf_exempt
+@require_any_role("platform_owner", "platform_admin")
+def seed_packs_collection(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    include_items = str(request.GET.get("include_items") or "").strip().lower() in {"1", "true", "yes"}
+    rows = list_seed_packs_status(include_items=include_items)
+    return JsonResponse({"packs": rows})
+
+
+@csrf_exempt
+@require_any_role("platform_owner", "platform_admin")
+def seed_pack_detail(request: HttpRequest, slug: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    row = get_seed_pack_status(slug)
+    if not row:
+        return JsonResponse({"error": "seed pack not found"}, status=404)
+    return JsonResponse({"pack": row})
+
+
+@csrf_exempt
+@require_any_role("platform_owner", "platform_admin")
+def seed_apply(request: HttpRequest) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    try:
+        payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "invalid json body"}, status=400)
+    raw_slugs = payload.get("pack_slugs")
+    pack_slugs = [str(value).strip() for value in raw_slugs] if isinstance(raw_slugs, list) else None
+    apply_core = bool(payload.get("apply_core"))
+    dry_run = bool(payload.get("dry_run"))
+    identity = getattr(request, "user_identity", None)
+    result = apply_seed_packs(
+        pack_slugs=pack_slugs or None,
+        apply_core=apply_core,
+        dry_run=dry_run,
+        applied_by=identity,
+    )
+    return JsonResponse(result)
 
 
 def api_me(request: HttpRequest) -> JsonResponse:

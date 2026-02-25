@@ -1,0 +1,139 @@
+{
+  "seed_pack": {
+    "slug": "xyn-core-context-packs",
+    "name": "Xyn Core Context Packs",
+    "description": "Baseline context packs required by Xyn draft and explainer workflows.",
+    "version": "v1.0.0",
+    "scope": "core"
+  },
+  "items": [
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "xyn-platform-canon",
+      "unique_key": { "scope": "global", "slug": "xyn-platform-canon" },
+      "payload": {
+        "name": "xyn-platform-canon",
+        "scope": "global",
+        "namespace": "",
+        "purpose": "any",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": true,
+        "content_markdown": "# Xyn Platform Canon (Global)\n\nPurpose: any\nScope: global\n\n## Governance Defaults\n- All durable outputs are provisional until ratified.\n- Prefer deterministic, explicit lifecycle transitions.\n- Preserve auditability for generated and human-authored artifacts.\n\n## Composition Rules\n- Keep naming predictable across namespace and project scopes.\n- Prefer additive metadata changes over destructive rewrites.\n- Avoid embedding secrets or credentials in generated output.\n",
+        "applies_to_json": { "purpose": "any", "artifact_type": "any" }
+      }
+    },
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "xyn-coder-canon",
+      "unique_key": { "scope": "global", "slug": "xyn-coder-canon" },
+      "payload": {
+        "name": "xyn-coder-canon",
+        "scope": "global",
+        "namespace": "",
+        "purpose": "coder",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": true,
+        "content_markdown": "# Xyn Coder Canon (Global)\n\nPurpose: coder\nScope: global\n\n## CodegenResult v1\n- Schema file: `schemas/codegen_result.v1.schema.json`\n- Output must conform to `schema_version: codegen_result.v1`.\n- Always emit `patches` (unified diff) for changes. `write_files` may appear for new files, but patches are preferred.\n\n## Repo Targets (Defaults)\n- `xyn-api`:\n  - Python + Django backend\n  - Reuse existing service/modules before introducing new ones\n  - Keep migrations reversible and deterministic\n- `xyn-ui`:\n  - React + TypeScript frontend\n  - Favor existing design system patterns and token-driven styling\n\n## Validation\n- Include focused tests for changed behavior.\n- Mention assumptions and unresolved risks explicitly.\n",
+        "applies_to_json": { "purpose": "coder", "artifact_type": "any" }
+      }
+    },
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "xyn-planner-canon",
+      "unique_key": { "scope": "global", "slug": "xyn-planner-canon" },
+      "payload": {
+        "name": "xyn-planner-canon",
+        "scope": "global",
+        "namespace": "",
+        "purpose": "planner",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": true,
+        "content_markdown": "# Xyn Planner Canon (Global)\n\nPurpose: planner\nScope: global\n\n## ImplementationPlan v1\n- Schema file: `schemas/implementation_plan.v1.schema.json`\n- Output must conform to `schema_version: implementation_plan.v1`.\n- Primary output is `work_items[]` with actionable steps.\n- Include `capabilities_required` and `module_refs` per work_item.\n- Include `plan_rationale` with gaps detected and why the next slice was chosen.\n- Use `module_catalog.v1.json` and `run_history_summary.v1.json` artifacts as inputs.\n\n## Lifecycle Defaults\n- Treat generated plans as drafts unless explicitly ratified.\n- Prefer smallest viable delivery slices with explicit dependencies.\n\n## Safety\n- Avoid destructive commands in plan outputs.\n- Call out missing prerequisites before proposing execution steps.\n",
+        "applies_to_json": { "purpose": "planner", "artifact_type": "any" }
+      }
+    },
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "explainer-script-default",
+      "unique_key": { "scope": "global", "slug": "explainer-script-default" },
+      "payload": {
+        "name": "explainer-script-default",
+        "scope": "global",
+        "namespace": "",
+        "purpose": "explainer_script",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": false,
+        "content_markdown": "# Explainer Script Defaults\n- Audience: mixed technical/non-technical\n- Tone: clear, confident, warm, governance-substrate feel\n- Structure: problem -> approach -> why it matters -> concrete example\n- Avoid: unverified claims, competitor callouts, political content\n- Output: spoken narration text, optionally HOOK/BODY/CLOSE markers\n",
+        "applies_to_json": { "purpose": "explainer_script", "artifact_type": "video_explainer" }
+      }
+    },
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "explainer-storyboard-default",
+      "unique_key": { "scope": "global", "slug": "explainer-storyboard-default" },
+      "payload": {
+        "name": "explainer-storyboard-default",
+        "scope": "global",
+        "namespace": "",
+        "purpose": "explainer_storyboard",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": false,
+        "content_markdown": "# Explainer Storyboard Defaults\n- Output MUST be strict JSON matching canonical video_spec_json shape\n- Typical scene duration: 8-20 seconds\n- Include timing, on-screen text, visuals, narration per scene\n- Do not invent facts; structure only from provided inputs\n",
+        "applies_to_json": { "purpose": "explainer_storyboard", "artifact_type": "video_explainer" }
+      }
+    },
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "explainer-visual-prompts-default",
+      "unique_key": { "scope": "global", "slug": "explainer-visual-prompts-default" },
+      "payload": {
+        "name": "explainer-visual-prompts-default",
+        "scope": "global",
+        "namespace": "",
+        "purpose": "explainer_visual_prompts",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": false,
+        "content_markdown": "# Explainer Visual Prompt Defaults\n- Visual language: clean diagrams, UI callouts, minimal iconography, brand-safe\n- Default: avoid photoreal humans\n- For each scene include: image_prompt, optional negative_prompt, motion_hint, aspect_ratio=16:9\n- Output: JSON keyed by scene_id\n",
+        "applies_to_json": { "purpose": "explainer_visual_prompts", "artifact_type": "video_explainer" }
+      }
+    },
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "explainer-narration-default",
+      "unique_key": { "scope": "global", "slug": "explainer-narration-default" },
+      "payload": {
+        "name": "explainer-narration-default",
+        "scope": "global",
+        "namespace": "",
+        "purpose": "explainer_narration",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": false,
+        "content_markdown": "# Explainer Narration Defaults\n- Spoken-friendly rewrite with smooth cadence\n- Avoid jargon unless explicitly requested\n- Optional SSML only when requested\n- Optional caption chunking guidance\n",
+        "applies_to_json": { "purpose": "explainer_narration", "artifact_type": "video_explainer" }
+      }
+    },
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "explainer-title-description-default",
+      "unique_key": { "scope": "global", "slug": "explainer-title-description-default" },
+      "payload": {
+        "name": "explainer-title-description-default",
+        "scope": "global",
+        "namespace": "",
+        "purpose": "explainer_title_description",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": false,
+        "content_markdown": "# Explainer Title/Description Defaults\n- Produce 5 title options, 2 descriptions, and 3 CTAs\n- No hype; concise and concrete\n- Output JSON: {titles, descriptions, ctas}\n",
+        "applies_to_json": { "purpose": "explainer_title_description", "artifact_type": "video_explainer" }
+      }
+    }
+  ]
+}

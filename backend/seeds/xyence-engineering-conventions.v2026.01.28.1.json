@@ -1,0 +1,28 @@
+{
+  "seed_pack": {
+    "slug": "xyence-engineering-conventions",
+    "name": "Xyence Engineering Conventions",
+    "description": "Optional namespace-scoped conventions for Xyence engineering teams.",
+    "version": "v2026.01.28.1",
+    "scope": "optional",
+    "namespace": "xyence"
+  },
+  "items": [
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "xyence-engineering-conventions",
+      "unique_key": { "scope": "namespace", "namespace": "xyence", "slug": "xyence-engineering-conventions" },
+      "payload": {
+        "name": "xyence-engineering-conventions",
+        "scope": "namespace",
+        "namespace": "xyence",
+        "purpose": "planner",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": true,
+        "content_markdown": "# Xyence Engineering Conventions\n\n- Preserve governance lifecycle semantics in naming and UI copy.\n- Keep code changes scoped and reversible.\n- Prefer deterministic identifiers and explicit versioning metadata.\n- Avoid embedding environment-specific secrets or values in artifacts.\n",
+        "applies_to_json": { "purpose": "planner", "artifact_type": "any" }
+      }
+    }
+  ]
+}
