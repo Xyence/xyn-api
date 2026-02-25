@@ -162,7 +162,9 @@ from .seeds import (
 )
 from .artifact_links import (
     ensure_blueprint_artifact,
+    ensure_context_pack_artifact,
     ensure_draft_session_artifact,
+    ensure_module_artifact,
     get_current_canonical,
     _default_workspace,
 )
@@ -5035,6 +5037,14 @@ def _serialize_artifact_summary(artifact: Artifact) -> Dict[str, Any]:
         "status": artifact.status,
         "version": artifact.version,
         "visibility": artifact.visibility,
+        "artifact_state": artifact.artifact_state,
+        "schema_version": artifact.schema_version or "",
+        "family_id": artifact.family_id or "",
+        "content_hash": artifact.content_hash or "",
+        "validation_status": artifact.validation_status or "unknown",
+        "validation_errors": artifact.validation_errors_json or [],
+        "created_via": _artifact_created_via(artifact),
+        "last_touched_by_agent": _artifact_last_touched_by_agent(artifact),
         "published_at": artifact.published_at,
         "updated_at": artifact.updated_at,
         "content": {
@@ -5064,6 +5074,23 @@ def _artifact_owner_payload(artifact: Artifact) -> Optional[Dict[str, Any]]:
         "email": artifact.author.email,
         "display_name": artifact.author.display_name,
     }
+
+
+def _artifact_created_via(artifact: Artifact) -> str:
+    provenance = artifact.provenance_json if isinstance(artifact.provenance_json, dict) else {}
+    created_via = str(provenance.get("created_via") or "").strip()
+    if created_via:
+        return created_via
+    source_system = str(provenance.get("source_system") or "").strip()
+    if source_system:
+        return source_system
+    return "ui"
+
+
+def _artifact_last_touched_by_agent(artifact: Artifact) -> Optional[str]:
+    provenance = artifact.provenance_json if isinstance(artifact.provenance_json, dict) else {}
+    value = str(provenance.get("last_touched_by_agent") or "").strip()
+    return value or None
 
 
 def _serialize_blueprint_source(blueprint: Blueprint) -> Dict[str, Any]:
@@ -5106,7 +5133,12 @@ def _serialize_unified_artifact(artifact: Artifact, source_record: Any = None) -
         "title": artifact.title,
         "summary": artifact.summary or "",
         "schema_version": artifact.schema_version or "",
+        "content_hash": artifact.content_hash or "",
+        "validation_status": artifact.validation_status or "unknown",
+        "validation_errors": artifact.validation_errors_json or [],
         "owner": _artifact_owner_payload(artifact),
+        "created_via": _artifact_created_via(artifact),
+        "last_touched_by_agent": _artifact_last_touched_by_agent(artifact),
         "source_ref_type": artifact.source_ref_type or "",
         "source_ref_id": artifact.source_ref_id or "",
         "family_id": artifact.family_id or "",
@@ -5157,6 +5189,128 @@ def _parse_optional_dt(value: str) -> Optional[Any]:
     if not raw:
         return None
     return parse_datetime(raw)
+
+
+def _artifact_source_record(artifact: Artifact) -> Any:
+    ref_type = str(artifact.source_ref_type or "").strip()
+    ref_id = str(artifact.source_ref_id or "").strip()
+    if not ref_type or not ref_id:
+        return None
+    if ref_type == "Blueprint":
+        return Blueprint.objects.filter(id=ref_id).first()
+    if ref_type == "BlueprintDraftSession":
+        return BlueprintDraftSession.objects.filter(id=ref_id).first()
+    if ref_type == "Module":
+        return Module.objects.filter(id=ref_id).first()
+    if ref_type == "ContextPack":
+        return ContextPack.objects.filter(id=ref_id).first()
+    return None
+
+
+def _artifact_payload_for_hash(artifact: Artifact) -> Dict[str, Any]:
+    source = _artifact_source_record(artifact)
+    payload: Dict[str, Any] = {
+        "artifact_type": artifact.type.slug,
+        "artifact_state": artifact.artifact_state,
+        "title": artifact.title,
+        "summary": artifact.summary or "",
+        "schema_version": artifact.schema_version or "",
+        "format": artifact.format or "",
+    }
+    if artifact.type.slug == "article":
+        latest = _latest_artifact_revision(artifact)
+        content = latest.content_json if latest and isinstance(latest.content_json, dict) else {}
+        payload["article"] = {
+            "title": content.get("title") or artifact.title,
+            "summary": content.get("summary") or artifact.summary or "",
+            "body_markdown": content.get("body_markdown") or "",
+            "format": artifact.format,
+            "video_spec_json": artifact.video_spec_json if isinstance(artifact.video_spec_json, dict) else {},
+        }
+    elif artifact.type.slug == "workflow":
+        payload["workflow"] = {
+            "profile": artifact.workflow_profile or "",
+            "spec": artifact.workflow_spec_json if isinstance(artifact.workflow_spec_json, dict) else {},
+            "schema_version": artifact.workflow_state_schema_version,
+        }
+    elif artifact.type.slug == "blueprint" and isinstance(source, Blueprint):
+        payload["blueprint"] = {
+            "name": source.name,
+            "namespace": source.namespace,
+            "description": source.description or "",
+            "spec_text": source.spec_text or "",
+            "metadata_json": source.metadata_json or {},
+            "status": source.status,
+            "family_id": artifact.family_id or "",
+        }
+    elif artifact.type.slug == "module" and isinstance(source, Module):
+        payload["module"] = {
+            "fqn": source.fqn,
+            "type": source.type,
+            "current_version": source.current_version,
+            "status": source.status,
+            "spec": source.latest_module_spec_json or {},
+        }
+    elif artifact.type.slug == "context_pack" and isinstance(source, ContextPack):
+        payload["context_pack"] = {
+            "name": source.name,
+            "purpose": source.purpose,
+            "scope": source.scope,
+            "namespace": source.namespace,
+            "project_key": source.project_key,
+            "version": source.version,
+            "is_default": bool(source.is_default),
+            "is_active": bool(source.is_active),
+            "content_markdown": source.content_markdown or "",
+        }
+    return payload
+
+
+def compute_content_hash(artifact: Artifact) -> str:
+    normalized = json.dumps(_artifact_payload_for_hash(artifact), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def validate_artifact(artifact: Artifact) -> Tuple[str, List[str]]:
+    source = _artifact_source_record(artifact)
+    slug = artifact.type.slug
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    if slug == "blueprint":
+        if not isinstance(source, Blueprint):
+            errors.append("blueprint source record not found")
+        elif not str(source.spec_text or "").strip():
+            errors.append("blueprint spec_text is required")
+    elif slug == "article":
+        latest = _latest_artifact_revision(artifact)
+        content = latest.content_json if latest and isinstance(latest.content_json, dict) else {}
+        if not str(content.get("body_markdown") or "").strip():
+            errors.append("article body_markdown is required")
+        if not str(content.get("summary") or "").strip():
+            warnings.append("article summary is empty")
+    elif slug == "workflow":
+        spec = artifact.workflow_spec_json if isinstance(artifact.workflow_spec_json, dict) else {}
+        profile = str(artifact.workflow_profile or spec.get("profile") or "").strip().lower() or "tour"
+        workflow_errors = _validate_workflow_spec(spec, profile=profile)
+        if workflow_errors:
+            errors.extend([str(entry) for entry in workflow_errors])
+    elif slug == "module":
+        if not isinstance(source, Module):
+            errors.append("module source record not found")
+        elif not source.latest_module_spec_json:
+            warnings.append("module spec is empty")
+    elif slug == "context_pack":
+        if not isinstance(source, ContextPack):
+            errors.append("context pack source record not found")
+        elif not str(source.content_markdown or "").strip():
+            errors.append("context pack content is required")
+
+    if errors:
+        return "fail", errors
+    if warnings:
+        return "warning", warnings
+    return "pass", []
 
 
 @csrf_exempt
@@ -5319,6 +5473,39 @@ def artifact_detail(request: HttpRequest, artifact_id: str) -> JsonResponse:
     elif artifact.source_ref_type == "BlueprintDraftSession" and artifact.source_ref_id:
         source = BlueprintDraftSession.objects.filter(id=artifact.source_ref_id).first()
     return JsonResponse(_serialize_unified_artifact(artifact, source))
+
+
+@csrf_exempt
+@login_required
+def artifact_activity(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    get_object_or_404(Artifact, id=artifact_id)
+    qs = LedgerEvent.objects.select_related("actor_user", "artifact").filter(artifact_id=artifact_id)
+    action = str(request.GET.get("action") or "").strip()
+    since = _parse_optional_dt(str(request.GET.get("since") or ""))
+    until = _parse_optional_dt(str(request.GET.get("until") or ""))
+    try:
+        limit = max(1, min(500, int(request.GET.get("limit") or 100)))
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        offset = max(0, int(request.GET.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+
+    if action:
+        qs = qs.filter(action=action)
+    if since:
+        qs = qs.filter(created_at__gte=since)
+    if until:
+        qs = qs.filter(created_at__lte=until)
+
+    total = qs.count()
+    rows = list(qs.order_by("-created_at")[offset : offset + limit])
+    return JsonResponse({"events": [_serialize_ledger_event(row) for row in rows], "count": total, "limit": limit, "offset": offset})
 
 
 @csrf_exempt
@@ -6493,12 +6680,46 @@ def workflow_transition(request: HttpRequest, workflow_id: str) -> JsonResponse:
     if to_status not in allowed:
         return JsonResponse({"error": f"invalid transition: {from_status} -> {to_status}"}, status=400)
     artifact.status = to_status
+    update_fields = ["status", "updated_at"]
     if to_status == "published":
+        validation_status, validation_errors = validate_artifact(artifact)
+        content_hash = compute_content_hash(artifact)
+        artifact.content_hash = content_hash
+        artifact.validation_status = validation_status
+        artifact.validation_errors_json = validation_errors or []
+        update_fields.extend(["content_hash", "validation_status", "validation_errors_json"])
+        if validation_status == "fail":
+            return JsonResponse(
+                {"error": "artifact validation failed", "validation_status": validation_status, "validation_errors": validation_errors},
+                status=400,
+            )
         artifact.published_at = timezone.now()
         artifact.ratified_by = identity
         artifact.ratified_at = timezone.now()
-    artifact.save(update_fields=["status", "published_at", "ratified_by", "ratified_at", "updated_at"])
+        update_fields.extend(["published_at", "ratified_by", "ratified_at"])
+    artifact.save(update_fields=list(dict.fromkeys(update_fields)))
     _record_artifact_event(artifact, "workflow_status_changed", identity, {"from": from_status, "to": to_status})
+    if to_status == "published":
+        emit_ledger_event(
+            actor=identity,
+            action="artifact.update",
+            artifact=artifact,
+            summary="Published Workflow artifact",
+            metadata={
+                "validation_status": artifact.validation_status,
+                "content_hash": artifact.content_hash,
+                "status": "published",
+            },
+            dedupe_key=make_dedupe_key(
+                "artifact.update",
+                str(artifact.id),
+                diff_payload={
+                    "validation_status": artifact.validation_status,
+                    "content_hash": artifact.content_hash,
+                    "status": "published",
+                },
+            ),
+        )
     return JsonResponse({"workflow": _serialize_workflow_detail(artifact)})
 
 
@@ -8402,6 +8623,17 @@ def article_transition(request: HttpRequest, article_id: str) -> JsonResponse:
     artifact.status = to_status
     update_fields = ["status", "updated_at"]
     if to_status == "published":
+        validation_status, validation_errors = validate_artifact(artifact)
+        content_hash = compute_content_hash(artifact)
+        artifact.content_hash = content_hash
+        artifact.validation_status = validation_status
+        artifact.validation_errors_json = validation_errors or []
+        update_fields.extend(["content_hash", "validation_status", "validation_errors_json"])
+        if validation_status == "fail":
+            return JsonResponse(
+                {"error": "artifact validation failed", "validation_status": validation_status, "validation_errors": validation_errors},
+                status=400,
+            )
         artifact.published_at = timezone.now()
         artifact.ratified_by = identity
         artifact.ratified_at = timezone.now()
@@ -8416,6 +8648,26 @@ def article_transition(request: HttpRequest, article_id: str) -> JsonResponse:
     _record_artifact_event(artifact, "article_status_changed", identity, {"from": from_status, "to": to_status})
     if to_status == "published":
         _record_artifact_event(artifact, "article_published", identity, {"status": "published"})
+        emit_ledger_event(
+            actor=identity,
+            action="artifact.update",
+            artifact=artifact,
+            summary="Published Article artifact",
+            metadata={
+                "validation_status": artifact.validation_status,
+                "content_hash": artifact.content_hash,
+                "status": "published",
+            },
+            dedupe_key=make_dedupe_key(
+                "artifact.update",
+                str(artifact.id),
+                diff_payload={
+                    "validation_status": artifact.validation_status,
+                    "content_hash": artifact.content_hash,
+                    "status": "published",
+                },
+            ),
+        )
     if to_status == "deprecated":
         _record_artifact_event(artifact, "article_deprecated", identity, {"status": "deprecated"})
     return JsonResponse({"article": _serialize_article_detail(artifact)})
@@ -11056,6 +11308,20 @@ def blueprint_publish(request: HttpRequest, artifact_id: str) -> JsonResponse:
             .order_by("-created_at")
         )
         target = next((row for row in family_rows if row.id == artifact.id), artifact)
+        validation_status, validation_errors = validate_artifact(target)
+        content_hash = compute_content_hash(target)
+        target.content_hash = content_hash
+        target.validation_status = validation_status
+        target.validation_errors_json = validation_errors or []
+        if validation_status == "fail":
+            return JsonResponse(
+                {
+                    "error": "artifact validation failed",
+                    "validation_status": validation_status,
+                    "validation_errors": validation_errors,
+                },
+                status=400,
+            )
         superseded = next((row for row in family_rows if row.id != target.id and row.artifact_state == "canonical"), None)
         if not superseded and hinted_canonical and hinted_canonical.id != target.id:
             superseded = next((row for row in family_rows if row.id == hinted_canonical.id), hinted_canonical)
@@ -11074,8 +11340,12 @@ def blueprint_publish(request: HttpRequest, artifact_id: str) -> JsonResponse:
             )
 
         target.artifact_state = "canonical"
-        target.save(update_fields=["artifact_state", "updated_at"])
-        publish_metadata = {"superseded_artifact_id": superseded_id}
+        target.save(update_fields=["artifact_state", "content_hash", "validation_status", "validation_errors_json", "updated_at"])
+        publish_metadata = {
+            "superseded_artifact_id": superseded_id,
+            "validation_status": validation_status,
+            "content_hash": content_hash,
+        }
         emit_ledger_event(
             actor=identity,
             action="artifact.update",
@@ -11474,13 +11744,16 @@ def module_detail(request: HttpRequest, module_ref: str) -> JsonResponse:
             module.fqn = f"{module.namespace}.{module.name}"
         module.updated_by = request.user
         module.save()
-        return JsonResponse({"id": str(module.id)})
+        artifact = ensure_module_artifact(module, owner_user=request.user)
+        return JsonResponse({"id": str(module.id), "artifact_id": str(artifact.id)})
     if request.method == "DELETE":
         module.delete()
         return JsonResponse({"status": "deleted"})
+    artifact = ensure_module_artifact(module, owner_user=request.user)
     return JsonResponse(
         {
             "id": str(module.id),
+            "artifact_id": str(artifact.id),
             "name": module.name,
             "namespace": module.namespace,
             "fqn": module.fqn,

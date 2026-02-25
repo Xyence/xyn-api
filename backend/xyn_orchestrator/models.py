@@ -909,6 +909,18 @@ class Artifact(models.Model):
     title = models.CharField(max_length=300)
     summary = models.TextField(blank=True, default="")
     schema_version = models.CharField(max_length=80, blank=True, default="")
+    content_hash = models.CharField(max_length=128, blank=True, default="")
+    validation_status = models.CharField(
+        max_length=20,
+        choices=[
+            ("pass", "Pass"),
+            ("fail", "Fail"),
+            ("warning", "Warning"),
+            ("unknown", "Unknown"),
+        ],
+        default="unknown",
+    )
+    validation_errors_json = models.JSONField(null=True, blank=True)
     tags_json = models.JSONField(default=list, blank=True)
     slug = models.SlugField(max_length=240, blank=True, default="")
     source_ref_type = models.CharField(max_length=80, blank=True, default="")

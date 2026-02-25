@@ -64,7 +64,7 @@ from .deployments import (
     load_release_plan_json,
     maybe_trigger_rollback,
 )
-from .artifact_links import ensure_blueprint_artifact, ensure_draft_session_artifact
+from .artifact_links import ensure_blueprint_artifact, ensure_context_pack_artifact, ensure_draft_session_artifact, ensure_module_artifact
 
 _executor = ThreadPoolExecutor(max_workers=2)
 logger = logging.getLogger(__name__)
@@ -3685,7 +3685,8 @@ def list_modules(request: HttpRequest) -> JsonResponse:
         if errors:
             return JsonResponse({"error": "Invalid ModuleSpec", "details": errors}, status=400)
         module = _module_from_spec(payload, request.user)
-        return JsonResponse({"id": str(module.id), "fqn": module.fqn})
+        artifact = ensure_module_artifact(module, owner_user=request.user)
+        return JsonResponse({"id": str(module.id), "fqn": module.fqn, "artifact_id": str(artifact.id)})
     qs = Module.objects.all()
     if capability := request.GET.get("capability"):
         qs = qs.filter(capabilities_provided_json__contains=[capability])
@@ -3695,18 +3696,21 @@ def list_modules(request: HttpRequest) -> JsonResponse:
         qs = qs.filter(namespace=namespace)
     if query := request.GET.get("q"):
         qs = qs.filter(models.Q(name__icontains=query) | models.Q(fqn__icontains=query))
-    data = [
-        {
-            "id": str(module.id),
-            "fqn": module.fqn,
-            "name": module.name,
-            "namespace": module.namespace,
-            "type": module.type,
-            "current_version": module.current_version,
-            "status": module.status,
-        }
-        for module in qs.order_by("namespace", "name")
-    ]
+    data = []
+    for module in qs.order_by("namespace", "name"):
+        artifact = ensure_module_artifact(module, owner_user=request.user)
+        data.append(
+            {
+                "id": str(module.id),
+                "artifact_id": str(artifact.id),
+                "fqn": module.fqn,
+                "name": module.name,
+                "namespace": module.namespace,
+                "type": module.type,
+                "current_version": module.current_version,
+                "status": module.status,
+            }
+        )
     return JsonResponse({"modules": data})
 
 
@@ -3718,9 +3722,11 @@ def get_module(request: HttpRequest, module_ref: str) -> JsonResponse:
         module = Module.objects.get(id=module_ref)
     except (Module.DoesNotExist, ValueError):
         module = get_object_or_404(Module, fqn=module_ref)
+    artifact = ensure_module_artifact(module, owner_user=request.user)
     return JsonResponse(
         {
             "id": str(module.id),
+            "artifact_id": str(artifact.id),
             "fqn": module.fqn,
             "name": module.name,
             "namespace": module.namespace,
@@ -3940,8 +3946,10 @@ def _recommended_context_pack_ids(
 
 
 def _serialize_context_pack(pack: ContextPack) -> Dict[str, Any]:
+    artifact = ensure_context_pack_artifact(pack, owner_user=pack.updated_by or pack.created_by)
     return {
         "id": str(pack.id),
+        "artifact_id": str(artifact.id),
         "name": pack.name,
         "purpose": pack.purpose,
         "scope": pack.scope,
@@ -4023,7 +4031,8 @@ def list_context_packs(request: HttpRequest) -> JsonResponse:
             created_by=request.user,
             updated_by=request.user,
         )
-        return JsonResponse({"id": str(pack.id)})
+        artifact = ensure_context_pack_artifact(pack, owner_user=request.user)
+        return JsonResponse({"id": str(pack.id), "artifact_id": str(artifact.id)})
     qs = ContextPack.objects.all()
     if scope := request.GET.get("scope"):
         qs = qs.filter(scope=scope)
@@ -4036,22 +4045,25 @@ def list_context_packs(request: HttpRequest) -> JsonResponse:
     if active_param := request.GET.get("active"):
         if (active_val := _coerce_bool(active_param)) is not None:
             qs = qs.filter(is_active=active_val)
-    data = [
-        {
-            "id": str(pack.id),
-            "name": pack.name,
-            "purpose": pack.purpose,
-            "scope": pack.scope,
-            "namespace": pack.namespace,
-            "project_key": pack.project_key,
-            "version": pack.version,
-            "is_active": pack.is_active,
-            "is_default": pack.is_default,
-            "applies_to_json": pack.applies_to_json or {},
-            "updated_at": pack.updated_at,
-        }
-        for pack in qs.order_by("name", "version")
-    ]
+    data = []
+    for pack in qs.order_by("name", "version"):
+        artifact = ensure_context_pack_artifact(pack, owner_user=request.user)
+        data.append(
+            {
+                "id": str(pack.id),
+                "artifact_id": str(artifact.id),
+                "name": pack.name,
+                "purpose": pack.purpose,
+                "scope": pack.scope,
+                "namespace": pack.namespace,
+                "project_key": pack.project_key,
+                "version": pack.version,
+                "is_active": pack.is_active,
+                "is_default": pack.is_default,
+                "applies_to_json": pack.applies_to_json or {},
+                "updated_at": pack.updated_at,
+            }
+        )
     return JsonResponse({"context_packs": data})
 
 
@@ -4115,9 +4127,11 @@ def context_pack_detail(request: HttpRequest, pack_id: str) -> JsonResponse:
             _clear_default_for_scope(pack.scope, pack.namespace, pack.project_key, exclude_id=str(pack.id))
         pack.updated_by = request.user
         pack.save()
+    artifact = ensure_context_pack_artifact(pack, owner_user=request.user)
     return JsonResponse(
         {
             "id": str(pack.id),
+            "artifact_id": str(artifact.id),
             "name": pack.name,
             "purpose": pack.purpose,
             "scope": pack.scope,
