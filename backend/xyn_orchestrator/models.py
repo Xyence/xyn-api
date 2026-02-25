@@ -884,6 +884,7 @@ class Artifact(models.Model):
         choices=[
             ("standard", "Standard"),
             ("video_explainer", "Video Explainer"),
+            ("workflow", "Workflow"),
         ],
         default="standard",
     )
@@ -901,6 +902,9 @@ class Artifact(models.Model):
     provenance_json = models.JSONField(default=dict, blank=True)
     scope_json = models.JSONField(default=dict, blank=True)
     video_spec_json = models.JSONField(null=True, blank=True)
+    workflow_profile = models.CharField(max_length=40, blank=True, default="")
+    workflow_spec_json = models.JSONField(null=True, blank=True)
+    workflow_state_schema_version = models.PositiveIntegerField(null=True, blank=True)
     video_ai_config_json = models.JSONField(null=True, blank=True)
     video_context_pack = models.ForeignKey(
         "ContextPack",
@@ -990,6 +994,44 @@ class VideoRender(models.Model):
 
     def __str__(self) -> str:
         return f"{self.article_id}:{self.status}:{self.provider}"
+
+
+class WorkflowRun(models.Model):
+    STATUS_CHOICES = [
+        ("running", "Running"),
+        ("completed", "Completed"),
+        ("failed", "Failed"),
+        ("aborted", "Aborted"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workflow_artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="workflow_runs")
+    user = models.ForeignKey(UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="workflow_runs")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="running")
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    metadata_json = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    def __str__(self) -> str:
+        return f"{self.workflow_artifact_id}:{self.status}:{self.id}"
+
+
+class WorkflowRunEvent(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.ForeignKey(WorkflowRun, on_delete=models.CASCADE, related_name="events")
+    step_id = models.CharField(max_length=120, blank=True)
+    event_type = models.CharField(max_length=80)
+    payload_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.run_id}:{self.event_type}:{self.step_id}"
 
 
 class ArtifactEvent(models.Model):

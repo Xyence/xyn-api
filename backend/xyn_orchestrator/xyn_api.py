@@ -89,6 +89,8 @@ from .models import (
     ArtifactComment,
     PublishBinding,
     VideoRender,
+    WorkflowRun,
+    WorkflowRunEvent,
     Tenant,
     Contact,
     TenantMembership,
@@ -168,11 +170,15 @@ PREVIEW_ALLOWED_TRANSITIONS: Dict[str, Set[str]] = {
 }
 DOC_ARTIFACT_TYPE_SLUG = "doc_page"
 ARTICLE_ARTIFACT_TYPE_SLUG = "article"
+WORKFLOW_ARTIFACT_TYPE_SLUG = "workflow"
 ARTICLE_CATEGORIES = {"web", "guide", "core-concepts", "release-note", "internal", "tutorial"}
 GUIDE_ARTICLE_CATEGORIES = {"guide", "core-concepts", "tutorial"}
 ARTICLE_VISIBILITY_TYPES = {"public", "authenticated", "role_based", "private"}
 ARTICLE_STATUS_CHOICES = {"draft", "reviewed", "ratified", "published", "deprecated"}
 ARTICLE_FORMAT_TYPES = {"standard", "video_explainer"}
+WORKFLOW_PROFILE_TYPES = {"tour"}
+WORKFLOW_SCHEMA_VERSION = 1
+WORKFLOW_DEFAULT_CATEGORY = "xyn_usage"
 VIDEO_CONTEXT_PACK_PURPOSE = "video_explainer"
 EXPLAINER_PURPOSES: Dict[str, Dict[str, str]] = {
     "explainer_script": {"name": "Script", "description": "Generate explainer narration scripts."},
@@ -1070,6 +1076,31 @@ def _ensure_article_artifact_type() -> ArtifactType:
     return artifact_type
 
 
+def _ensure_default_workflow_categories() -> None:
+    ArticleCategory.objects.get_or_create(
+        slug=WORKFLOW_DEFAULT_CATEGORY,
+        defaults={"name": "Xyn Usage", "description": "Guided tours for Xyn usage and onboarding", "enabled": True},
+    )
+
+
+def _ensure_workflow_artifact_type() -> ArtifactType:
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug=WORKFLOW_ARTIFACT_TYPE_SLUG,
+        defaults={
+            "name": "Workflow",
+            "description": "Governed workflow artifacts (tour profile)",
+            "icon": "Route",
+            "schema_json": {
+                "profile": sorted(WORKFLOW_PROFILE_TYPES),
+                "status": sorted(ARTICLE_STATUS_CHOICES),
+                "category": [WORKFLOW_DEFAULT_CATEGORY],
+            },
+        },
+    )
+    _ensure_default_workflow_categories()
+    return artifact_type
+
+
 def _normalize_doc_route_bindings(raw: Any) -> list[str]:
     values: list[str] = []
     if not isinstance(raw, list):
@@ -1770,6 +1801,196 @@ def _serialize_article_detail(artifact: Artifact, revision: Optional[ArtifactRev
             "created_by": str(artifact.author_id) if artifact.author_id else None,
             "updated_by": str(latest.created_by_id) if latest and latest.created_by_id else None,
             "updated_by_email": latest.created_by.email if latest and latest.created_by else None,
+        }
+    )
+    return payload
+
+
+def _normalize_workflow_profile(raw: Any, *, fallback: str = "tour") -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in WORKFLOW_PROFILE_TYPES else fallback
+
+
+def _normalize_workflow_spec(spec: Dict[str, Any], *, profile: str, title: str, category_slug: str) -> Dict[str, Any]:
+    steps = spec.get("steps") if isinstance(spec.get("steps"), list) else []
+    normalized_steps: List[Dict[str, Any]] = []
+    for idx, raw_step in enumerate(steps):
+        if not isinstance(raw_step, dict):
+            continue
+        step_id = str(raw_step.get("id") or f"step-{idx+1}").strip()
+        if not step_id:
+            step_id = f"step-{idx+1}"
+        normalized_steps.append(
+            {
+                "id": step_id,
+                "title": str(raw_step.get("title") or step_id).strip(),
+                "body_md": str(raw_step.get("body_md") or "").strip(),
+                "type": str(raw_step.get("type") or "callout").strip().lower(),
+                "route": str(raw_step.get("route") or "").strip(),
+                "anchor": raw_step.get("anchor") if isinstance(raw_step.get("anchor"), dict) else {},
+                "gating": raw_step.get("gating") if isinstance(raw_step.get("gating"), dict) else {},
+                "next": raw_step.get("next") if isinstance(raw_step.get("next"), dict) else {},
+                "ui": raw_step.get("ui") if isinstance(raw_step.get("ui"), dict) else {},
+                "clipboard_text": str(raw_step.get("clipboard_text") or "").strip(),
+                "toast_on_copy": str(raw_step.get("toast_on_copy") or "").strip(),
+                "action_id": str(raw_step.get("action_id") or "").strip(),
+                "params": raw_step.get("params") if isinstance(raw_step.get("params"), dict) else {},
+                "success_toast": str(raw_step.get("success_toast") or "").strip(),
+            }
+        )
+    settings = spec.get("settings") if isinstance(spec.get("settings"), dict) else {}
+    return {
+        "profile": profile,
+        "schema_version": int(spec.get("schema_version") or WORKFLOW_SCHEMA_VERSION),
+        "title": str(spec.get("title") or title).strip(),
+        "description": str(spec.get("description") or "").strip(),
+        "category_slug": str(spec.get("category_slug") or category_slug).strip().lower() or category_slug,
+        "entry": spec.get("entry") if isinstance(spec.get("entry"), dict) else {},
+        "steps": normalized_steps,
+        "settings": {
+            "allow_skip": bool(settings.get("allow_skip", True)),
+            "show_progress": bool(settings.get("show_progress", True)),
+        },
+    }
+
+
+def _validate_workflow_spec(spec: Any, *, profile: str) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(spec, dict):
+        return ["workflow_spec_json must be an object"]
+    if str(spec.get("profile") or profile).strip().lower() != profile:
+        errors.append(f"profile must be '{profile}'")
+    steps = spec.get("steps")
+    if not isinstance(steps, list) or not steps:
+        errors.append("steps must be a non-empty array")
+        return errors
+    seen_ids: Set[str] = set()
+    valid_step_types = {"callout", "modal", "check", "action", "copy"}
+    valid_placements = {"top", "right", "bottom", "left"}
+    valid_check_kinds = {"entity_exists", "field_nonempty", "route_is"}
+    for idx, step in enumerate(steps):
+        path = f"steps[{idx}]"
+        if not isinstance(step, dict):
+            errors.append(f"{path} must be an object")
+            continue
+        step_id = str(step.get("id") or "").strip()
+        if not step_id:
+            errors.append(f"{path}.id is required")
+        elif step_id in seen_ids:
+            errors.append(f"{path}.id must be unique")
+        else:
+            seen_ids.add(step_id)
+        step_type = str(step.get("type") or "").strip().lower()
+        if step_type not in valid_step_types:
+            errors.append(f"{path}.type must be one of {', '.join(sorted(valid_step_types))}")
+        title = str(step.get("title") or "").strip()
+        if not title:
+            errors.append(f"{path}.title is required")
+        anchor = step.get("anchor")
+        if anchor is not None and not isinstance(anchor, dict):
+            errors.append(f"{path}.anchor must be an object")
+        elif isinstance(anchor, dict):
+            anchor_refs = [str(anchor.get("selector") or "").strip(), str(anchor.get("test_id") or "").strip(), str(anchor.get("anchor_id") or "").strip()]
+            if any(anchor_refs):
+                pass
+            placement = str(anchor.get("placement") or "").strip().lower()
+            if placement and placement not in valid_placements:
+                errors.append(f"{path}.anchor.placement is invalid")
+        if step_type == "copy" and not str(step.get("clipboard_text") or "").strip():
+            errors.append(f"{path}.clipboard_text is required for copy step")
+        if step_type == "action":
+            if not str(step.get("action_id") or "").strip():
+                errors.append(f"{path}.action_id is required for action step")
+            params = step.get("params")
+            if params is not None and not isinstance(params, dict):
+                errors.append(f"{path}.params must be an object")
+        gating = step.get("gating")
+        if gating is not None:
+            if not isinstance(gating, dict):
+                errors.append(f"{path}.gating must be an object")
+            else:
+                requires = gating.get("requires")
+                if requires is not None:
+                    if not isinstance(requires, list):
+                        errors.append(f"{path}.gating.requires must be an array")
+                    else:
+                        for ridx, check in enumerate(requires):
+                            cpath = f"{path}.gating.requires[{ridx}]"
+                            if not isinstance(check, dict):
+                                errors.append(f"{cpath} must be an object")
+                                continue
+                            if not str(check.get("id") or "").strip():
+                                errors.append(f"{cpath}.id is required")
+                            kind = str(check.get("kind") or "").strip().lower()
+                            if kind not in valid_check_kinds:
+                                errors.append(f"{cpath}.kind must be one of {', '.join(sorted(valid_check_kinds))}")
+                            params = check.get("params")
+                            if params is not None and not isinstance(params, dict):
+                                errors.append(f"{cpath}.params must be an object")
+    return errors
+
+
+def _workflow_visibility_type_from_artifact(artifact: Artifact) -> str:
+    return _normalize_article_visibility_type((artifact.scope_json or {}).get("visibility_type"), fallback="private")
+
+
+def _workflow_allowed_roles(artifact: Artifact) -> List[str]:
+    return _normalize_role_slugs((artifact.scope_json or {}).get("allowed_roles"))
+
+
+def _can_edit_workflow(identity: UserIdentity, artifact: Artifact) -> bool:
+    return _can_edit_article(identity, artifact)
+
+
+def _can_view_workflow(identity: UserIdentity, artifact: Artifact) -> bool:
+    if _can_manage_articles(identity):
+        return True
+    if artifact.status != "published":
+        return bool(artifact.author_id and str(artifact.author_id) == str(identity.id))
+    visibility_type = _workflow_visibility_type_from_artifact(artifact)
+    if visibility_type == "public":
+        return True
+    if visibility_type == "authenticated":
+        return identity is not None
+    if visibility_type == "private":
+        return bool(artifact.author_id and str(artifact.author_id) == str(identity.id))
+    allowed = set(_workflow_allowed_roles(artifact))
+    return bool(set(_get_roles(identity)).intersection(allowed))
+
+
+def _serialize_workflow_summary(artifact: Artifact) -> Dict[str, Any]:
+    spec = artifact.workflow_spec_json if isinstance(artifact.workflow_spec_json, dict) else {}
+    category = _article_category_record(artifact)
+    return {
+        "id": str(artifact.id),
+        "workspace_id": str(artifact.workspace_id),
+        "type": artifact.type.slug,
+        "format": artifact.format,
+        "profile": str(artifact.workflow_profile or spec.get("profile") or "tour"),
+        "title": artifact.title,
+        "slug": _artifact_slug(artifact),
+        "description": str(spec.get("description") or ""),
+        "status": artifact.status,
+        "version": artifact.version,
+        "visibility_type": _workflow_visibility_type_from_artifact(artifact),
+        "allowed_roles": _workflow_allowed_roles(artifact),
+        "category": category.slug if category else "",
+        "category_name": category.name if category else "",
+        "category_id": str(category.id) if category else None,
+        "updated_at": artifact.updated_at,
+        "published_at": artifact.published_at,
+    }
+
+
+def _serialize_workflow_detail(artifact: Artifact) -> Dict[str, Any]:
+    payload = _serialize_workflow_summary(artifact)
+    payload.update(
+        {
+            "workflow_profile": artifact.workflow_profile or "tour",
+            "workflow_spec_json": artifact.workflow_spec_json if isinstance(artifact.workflow_spec_json, dict) else {},
+            "workflow_state_schema_version": artifact.workflow_state_schema_version,
+            "created_at": artifact.created_at,
+            "created_by": str(artifact.author_id) if artifact.author_id else None,
         }
     )
     return payload
@@ -5212,6 +5433,424 @@ def _resolve_article_workspace(identity: UserIdentity, requested_workspace_id: s
     return None
 
 
+def _resolve_workflow_or_404(workflow_id_or_slug: str) -> Artifact:
+    by_id = (
+        Artifact.objects.filter(id=workflow_id_or_slug, type__slug=WORKFLOW_ARTIFACT_TYPE_SLUG)
+        .select_related("type", "workspace", "article_category", "author")
+        .first()
+    )
+    if by_id:
+        return by_id
+    by_slug = (
+        Artifact.objects.filter(slug=workflow_id_or_slug, type__slug=WORKFLOW_ARTIFACT_TYPE_SLUG)
+        .select_related("type", "workspace", "article_category", "author")
+        .first()
+    )
+    if by_slug:
+        return by_slug
+    return get_object_or_404(Artifact, id=workflow_id_or_slug, type__slug=WORKFLOW_ARTIFACT_TYPE_SLUG)
+
+
+def _execute_action_blueprint_create_demo_draft(
+    *,
+    identity: UserIdentity,
+    params: Dict[str, Any],
+    idempotency_key: str,
+) -> Dict[str, Any]:
+    namespace = str(params.get("namespace") or "core").strip() or "core"
+    project_key = str(params.get("project_key") or "").strip()
+    title = str(params.get("title") or "subscriber-notes-demo").strip() or "subscriber-notes-demo"
+    initial_prompt = str(params.get("initial_prompt") or "").strip()
+    if not project_key:
+        suffix = re.sub(r"[^a-z0-9-]+", "-", title.lower()).strip("-") or "demo"
+        project_key = f"{namespace}.{suffix}"
+    existing = BlueprintDraftSession.objects.filter(metadata_json__workflow_action_idempotency_key=idempotency_key).order_by("-created_at").first()
+    if existing:
+        return {"resource_id": str(existing.id), "resource_type": "draft_session", "reused": True, "title": existing.title or existing.name}
+    context_pack_ids = _recommended_context_pack_ids(
+        draft_kind="blueprint",
+        namespace=namespace or None,
+        project_key=project_key or None,
+        generate_code=False,
+    )
+    session = BlueprintDraftSession.objects.create(
+        name=title,
+        title=title,
+        draft_kind="blueprint",
+        blueprint_kind="solution",
+        namespace=namespace,
+        project_key=project_key,
+        initial_prompt=initial_prompt,
+        selected_context_pack_ids=context_pack_ids,
+        context_pack_ids=context_pack_ids,
+        status="drafting",
+        metadata_json={"workflow_action_idempotency_key": idempotency_key},
+    )
+    return {"resource_id": str(session.id), "resource_type": "draft_session", "reused": False, "title": session.title or session.name}
+
+
+WORKFLOW_ACTION_CATALOG: Dict[str, Dict[str, Any]] = {
+    "blueprint.create_demo_draft": {
+        "name": "Create demo draft session",
+        "description": "Create a draft session for onboarding/workflow tours.",
+        "required_permissions": ["platform_admin", "platform_architect"],
+        "supports_dry_run": True,
+        "idempotent": True,
+        "params_schema_json": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "namespace": {"type": "string"},
+                "project_key": {"type": "string"},
+                "initial_prompt": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "handler": _execute_action_blueprint_create_demo_draft,
+    }
+}
+
+
+def _validate_action_params(schema: Dict[str, Any], params: Dict[str, Any]) -> Optional[str]:
+    if schema.get("type") == "object" and not isinstance(params, dict):
+        return "params must be an object"
+    allowed = set((schema.get("properties") or {}).keys())
+    for key in params.keys():
+        if key not in allowed:
+            return f"unsupported param: {key}"
+    return None
+
+
+@csrf_exempt
+def workflows_actions_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_articles(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    rows = []
+    for action_id, meta in sorted(WORKFLOW_ACTION_CATALOG.items()):
+        rows.append(
+            {
+                "action_id": action_id,
+                "name": meta.get("name"),
+                "description": meta.get("description"),
+                "params_schema_json": meta.get("params_schema_json") or {},
+                "required_permissions": meta.get("required_permissions") or [],
+                "supports_dry_run": bool(meta.get("supports_dry_run")),
+                "idempotent": bool(meta.get("idempotent")),
+            }
+        )
+    return JsonResponse({"actions": rows})
+
+
+@csrf_exempt
+def workflows_actions_execute(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_articles(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    action_id = str(payload.get("action_id") or "").strip()
+    if action_id not in WORKFLOW_ACTION_CATALOG:
+        return JsonResponse({"error": "unknown action_id"}, status=404)
+    action_meta = WORKFLOW_ACTION_CATALOG[action_id]
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    validation_error = _validate_action_params(action_meta.get("params_schema_json") or {}, params)
+    if validation_error:
+        return JsonResponse({"error": validation_error}, status=400)
+    dry_run = bool(payload.get("dry_run"))
+    idempotency_key = str(payload.get("idempotency_key") or "").strip() or f"{action_id}:{_normalized_json_hash(params)}"
+    if dry_run and action_meta.get("supports_dry_run"):
+        return JsonResponse({"ok": True, "dry_run": True, "action_id": action_id, "idempotency_key": idempotency_key})
+    handler = action_meta.get("handler")
+    if not callable(handler):
+        return JsonResponse({"error": "action handler unavailable"}, status=500)
+    try:
+        result = handler(identity=identity, params=params, idempotency_key=idempotency_key)
+    except Exception as exc:
+        return JsonResponse({"error": str(exc) or "action execution failed"}, status=500)
+    return JsonResponse({"ok": True, "action_id": action_id, "idempotency_key": idempotency_key, "result": result})
+
+
+@csrf_exempt
+def workflows_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    workflow_type = _ensure_workflow_artifact_type()
+    if request.method == "POST":
+        if not _can_manage_articles(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return JsonResponse({"error": "title is required"}, status=400)
+        workspace = _resolve_article_workspace(identity, str(payload.get("workspace_id") or "").strip())
+        if not workspace:
+            return JsonResponse({"error": "workspace not found or forbidden"}, status=404)
+        slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=title)
+        if not slug:
+            return JsonResponse({"error": "slug is required"}, status=400)
+        if _artifact_slug_exists(str(workspace.id), slug):
+            return JsonResponse({"error": "slug already exists in this workspace"}, status=400)
+        profile = _normalize_workflow_profile(payload.get("profile"), fallback="tour")
+        category_slug = _normalize_article_category(payload.get("category_slug") or payload.get("category"), fallback=WORKFLOW_DEFAULT_CATEGORY)
+        category = _resolve_article_category_slug(category_slug, allow_disabled=True)
+        if not category:
+            return JsonResponse({"error": f"unknown category: {category_slug}"}, status=400)
+        visibility_type = _normalize_article_visibility_type(payload.get("visibility_type"), fallback="private")
+        allowed_roles = _normalize_role_slugs(payload.get("allowed_roles"))
+        spec_input = payload.get("workflow_spec_json") if isinstance(payload.get("workflow_spec_json"), dict) else {}
+        spec = _normalize_workflow_spec(spec_input, profile=profile, title=title, category_slug=category.slug)
+        errors = _validate_workflow_spec(spec, profile=profile)
+        if errors:
+            return JsonResponse({"error": "invalid workflow_spec_json", "details": errors}, status=400)
+        with transaction.atomic():
+            artifact = Artifact.objects.create(
+                workspace=workspace,
+                type=workflow_type,
+                title=title,
+                slug=slug,
+                format="workflow",
+                status="draft",
+                version=1,
+                author=identity,
+                custodian=identity,
+                visibility=_artifact_visibility_for_article_type(visibility_type),
+                scope_json={
+                    "slug": slug,
+                    "category": category.slug,
+                    "visibility_type": visibility_type,
+                    "allowed_roles": allowed_roles,
+                    "tags": _normalize_doc_tags(payload.get("tags")),
+                },
+                article_category=category,
+                workflow_profile=profile,
+                workflow_spec_json=spec,
+                workflow_state_schema_version=int(spec.get("schema_version") or WORKFLOW_SCHEMA_VERSION),
+            )
+            _record_artifact_event(artifact, "workflow_created", identity, {"profile": profile, "category": category.slug})
+        return JsonResponse({"workflow": _serialize_workflow_detail(artifact)})
+
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    profile_filter = _normalize_workflow_profile(request.GET.get("profile"), fallback="")
+    category_filter = str(request.GET.get("category") or "").strip().lower()
+    status_filter = str(request.GET.get("status") or "").strip().lower()
+    query = str(request.GET.get("q") or "").strip().lower()
+    include_unpublished = request.GET.get("include_unpublished") == "1"
+    workspace_id = str(request.GET.get("workspace_id") or "").strip()
+    qs = Artifact.objects.filter(type=workflow_type).select_related("type", "workspace", "article_category")
+    if workspace_id:
+        qs = qs.filter(workspace_id=workspace_id)
+    rows: List[Dict[str, Any]] = []
+    for artifact in qs.order_by("-updated_at", "-created_at"):
+        if not include_unpublished and artifact.status != "published":
+            continue
+        if status_filter and artifact.status != status_filter:
+            continue
+        if not _can_view_workflow(identity, artifact):
+            continue
+        spec = artifact.workflow_spec_json if isinstance(artifact.workflow_spec_json, dict) else {}
+        profile = str(artifact.workflow_profile or spec.get("profile") or "").strip().lower()
+        if profile_filter and profile != profile_filter:
+            continue
+        category_slug = _article_category(artifact)
+        if category_filter and category_slug != category_filter:
+            continue
+        serialized = _serialize_workflow_summary(artifact)
+        if query:
+            haystack = f"{serialized.get('title', '')} {serialized.get('slug', '')} {serialized.get('description', '')}".lower()
+            if query not in haystack:
+                continue
+        rows.append(serialized)
+    return JsonResponse({"workflows": rows})
+
+
+@csrf_exempt
+def workflow_detail(request: HttpRequest, workflow_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_workflow_or_404(workflow_id)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _can_view_workflow(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    return JsonResponse({"workflow": _serialize_workflow_detail(artifact)})
+
+
+@csrf_exempt
+def workflow_spec_update(request: HttpRequest, workflow_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_workflow_or_404(workflow_id)
+    if not _can_edit_workflow(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method not in {"PUT", "PATCH"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    profile = _normalize_workflow_profile(payload.get("profile"), fallback=artifact.workflow_profile or "tour")
+    spec_input = payload.get("workflow_spec_json") if isinstance(payload.get("workflow_spec_json"), dict) else (artifact.workflow_spec_json or {})
+    category_slug = _normalize_article_category(payload.get("category_slug") or _article_category(artifact), fallback=WORKFLOW_DEFAULT_CATEGORY)
+    category = _resolve_article_category_slug(category_slug, allow_disabled=True)
+    if not category:
+        return JsonResponse({"error": f"unknown category: {category_slug}"}, status=400)
+    next_title = str(payload.get("title") or artifact.title).strip() or artifact.title
+    next_slug = _normalize_artifact_slug(payload.get("slug"), fallback_title=next_title) if "slug" in payload else _artifact_slug(artifact)
+    if next_slug and next_slug != _artifact_slug(artifact) and _artifact_slug_exists(str(artifact.workspace_id), next_slug):
+        return JsonResponse({"error": "slug already exists in this workspace"}, status=400)
+    spec = _normalize_workflow_spec(spec_input, profile=profile, title=next_title, category_slug=category.slug)
+    errors = _validate_workflow_spec(spec, profile=profile)
+    if errors:
+        return JsonResponse({"error": "invalid workflow_spec_json", "details": errors}, status=400)
+    artifact.title = next_title
+    artifact.slug = next_slug or ""
+    artifact.workflow_profile = profile
+    artifact.workflow_spec_json = spec
+    artifact.workflow_state_schema_version = int(spec.get("schema_version") or WORKFLOW_SCHEMA_VERSION)
+    scope = dict(artifact.scope_json or {})
+    scope["category"] = category.slug
+    if "visibility_type" in payload:
+        visibility_type = _normalize_article_visibility_type(payload.get("visibility_type"), fallback=_workflow_visibility_type_from_artifact(artifact))
+        scope["visibility_type"] = visibility_type
+        artifact.visibility = _artifact_visibility_for_article_type(visibility_type)
+    if "allowed_roles" in payload:
+        scope["allowed_roles"] = _normalize_role_slugs(payload.get("allowed_roles"))
+    if "tags" in payload:
+        scope["tags"] = _normalize_doc_tags(payload.get("tags"))
+    artifact.scope_json = scope
+    artifact.article_category = category
+    artifact.version += 1
+    artifact.save(
+        update_fields=[
+            "title",
+            "slug",
+            "workflow_profile",
+            "workflow_spec_json",
+            "workflow_state_schema_version",
+            "scope_json",
+            "article_category",
+            "visibility",
+            "version",
+            "updated_at",
+        ]
+    )
+    _record_artifact_event(artifact, "workflow_updated", identity, {"profile": profile, "version": artifact.version})
+    return JsonResponse({"workflow": _serialize_workflow_detail(artifact)})
+
+
+@csrf_exempt
+def workflow_transition(request: HttpRequest, workflow_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _can_manage_articles(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    artifact = _resolve_workflow_or_404(workflow_id)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    to_status = str(payload.get("to_status") or "").strip().lower()
+    if to_status not in ARTICLE_STATUS_CHOICES:
+        return JsonResponse({"error": "invalid status"}, status=400)
+    from_status = artifact.status
+    if to_status == from_status:
+        return JsonResponse({"workflow": _serialize_workflow_detail(artifact)})
+    allowed = ARTICLE_TRANSITIONS.get(from_status, set())
+    if to_status not in allowed:
+        return JsonResponse({"error": f"invalid transition: {from_status} -> {to_status}"}, status=400)
+    artifact.status = to_status
+    if to_status == "published":
+        artifact.published_at = timezone.now()
+        artifact.ratified_by = identity
+        artifact.ratified_at = timezone.now()
+    artifact.save(update_fields=["status", "published_at", "ratified_by", "ratified_at", "updated_at"])
+    _record_artifact_event(artifact, "workflow_status_changed", identity, {"from": from_status, "to": to_status})
+    return JsonResponse({"workflow": _serialize_workflow_detail(artifact)})
+
+
+def _serialize_workflow_run(run: WorkflowRun) -> Dict[str, Any]:
+    return {
+        "id": str(run.id),
+        "workflow_id": str(run.workflow_artifact_id),
+        "user_id": str(run.user_id) if run.user_id else None,
+        "status": run.status,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "metadata_json": run.metadata_json or {},
+    }
+
+
+@csrf_exempt
+def workflow_run_start(request: HttpRequest, workflow_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_workflow_or_404(workflow_id)
+    if not _can_view_workflow(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    run = WorkflowRun.objects.create(
+        workflow_artifact=artifact,
+        user=identity,
+        status="running",
+        metadata_json={"started_from": str(payload.get("started_from") or "ui"), "user_agent": request.META.get("HTTP_USER_AGENT", "")[:256]},
+    )
+    WorkflowRunEvent.objects.create(run=run, event_type="run_started", payload_json={"at": timezone.now().isoformat()})
+    return JsonResponse({"run": _serialize_workflow_run(run)})
+
+
+@csrf_exempt
+def workflow_run_event(request: HttpRequest, workflow_id: str, run_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_workflow_or_404(workflow_id)
+    if not _can_view_workflow(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    run = get_object_or_404(WorkflowRun, id=run_id, workflow_artifact=artifact)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    step_id = str(payload.get("step_id") or "").strip()
+    event_type = str(payload.get("type") or payload.get("event_type") or "event").strip().lower()
+    details = payload.get("payload_json") if isinstance(payload.get("payload_json"), dict) else payload
+    event = WorkflowRunEvent.objects.create(run=run, step_id=step_id, event_type=event_type, payload_json=details or {})
+    return JsonResponse({"event_id": str(event.id)})
+
+
+@csrf_exempt
+def workflow_run_complete(request: HttpRequest, workflow_id: str, run_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    artifact = _resolve_workflow_or_404(workflow_id)
+    if not _can_view_workflow(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    run = get_object_or_404(WorkflowRun, id=run_id, workflow_artifact=artifact)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    status = str(payload.get("status") or "completed").strip().lower()
+    if status not in {"completed", "failed", "aborted"}:
+        return JsonResponse({"error": "invalid status"}, status=400)
+    run.status = status
+    run.completed_at = timezone.now()
+    run.save(update_fields=["status", "completed_at"])
+    WorkflowRunEvent.objects.create(run=run, event_type="run_completed", payload_json={"status": status})
+    return JsonResponse({"run": _serialize_workflow_run(run)})
+
+
 @csrf_exempt
 def articles_collection(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
@@ -7558,11 +8197,42 @@ def tour_detail(request: HttpRequest, tour_slug: str) -> JsonResponse:
         return JsonResponse({"error": "not authenticated"}, status=401)
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
-    payload = _default_tour_payload(tour_slug)
-    if payload.get("error"):
-        return JsonResponse(payload, status=404)
-    if "schema_version" not in payload:
-        payload["schema_version"] = 1
+    _ensure_workflow_artifact_type()
+    artifact = (
+        Artifact.objects.filter(
+            type__slug=WORKFLOW_ARTIFACT_TYPE_SLUG,
+            slug=tour_slug,
+            workflow_profile="tour",
+            status="published",
+        )
+        .select_related("type", "workspace", "article_category")
+        .first()
+    )
+    if not artifact:
+        return JsonResponse({"error": "tour not found"}, status=404)
+    if not _can_view_workflow(identity, artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    spec = _normalize_workflow_spec(
+        artifact.workflow_spec_json if isinstance(artifact.workflow_spec_json, dict) else {},
+        profile="tour",
+        title=artifact.title,
+        category_slug=_article_category(artifact),
+    )
+    errors = _validate_workflow_spec(spec, profile="tour")
+    if errors:
+        return JsonResponse({"error": "invalid workflow spec", "details": errors}, status=500)
+    payload = {
+        "workflow_id": str(artifact.id),
+        "slug": _artifact_slug(artifact),
+        "title": artifact.title,
+        "description": str(spec.get("description") or ""),
+        "schema_version": int(spec.get("schema_version") or WORKFLOW_SCHEMA_VERSION),
+        "profile": "tour",
+        "category_slug": str(spec.get("category_slug") or WORKFLOW_DEFAULT_CATEGORY),
+        "settings": spec.get("settings") if isinstance(spec.get("settings"), dict) else {"allow_skip": True, "show_progress": True},
+        "steps": spec.get("steps") if isinstance(spec.get("steps"), list) else [],
+        "entry": spec.get("entry") if isinstance(spec.get("entry"), dict) else {},
+    }
     return JsonResponse(payload)
 
 
