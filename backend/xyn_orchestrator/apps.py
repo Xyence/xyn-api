@@ -12,7 +12,7 @@ class XynOrchestratorConfig(AppConfig):
         if os.environ.get("XYENCE_BOOTSTRAP_DISABLE", "").strip() == "1":
             return
         argv = " ".join(sys.argv).lower()
-        if any(cmd in argv for cmd in ("migrate", "makemigrations", "collectstatic", "shell", "test")):
+        if any(cmd in argv for cmd in ("migrate", "makemigrations", "collectstatic", "shell", "test", "seed_packs")):
             return
         try:
             from xyn_orchestrator.instances.bootstrap import bootstrap_instance_registration
