@@ -105,3 +105,16 @@ class UnifiedArtifactsApiTests(TestCase):
         self.assertEqual(blueprint_artifact.lineage_root_id, draft_artifact.id)
         self.assertEqual(draft_artifact.artifact_state, "deprecated")
         self.assertEqual(str(blueprint.artifact_id), payload["blueprint_artifact_id"])
+
+    def test_create_blueprint_artifact_supports_provisional_state(self):
+        response = self.client.post(
+            "/xyn/api/artifacts/create-blueprint",
+            data='{"name":"draft-bp","namespace":"core","artifact_state":"provisional"}',
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        payload = response.json()
+        blueprint = Blueprint.objects.get(id=payload["blueprint_id"])
+        artifact = Artifact.objects.get(id=payload["artifact_id"])
+        self.assertEqual(artifact.artifact_state, "provisional")
+        self.assertEqual(artifact.family_id, str(blueprint.blueprint_family_id))

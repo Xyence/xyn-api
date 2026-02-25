@@ -164,6 +164,7 @@ from .artifact_links import (
     ensure_blueprint_artifact,
     ensure_draft_session_artifact,
     get_current_canonical,
+    _default_workspace,
 )
 from .ledger import (
     compute_artifact_diff,
@@ -5518,6 +5519,9 @@ def artifacts_create_blueprint(request: HttpRequest) -> JsonResponse:
     metadata_json = payload.get("metadata_json") if isinstance(payload.get("metadata_json"), dict) else None
     parent_artifact_id = str(payload.get("parent_artifact_id") or "").strip()
     parent_artifact = Artifact.objects.filter(id=parent_artifact_id).first() if parent_artifact_id else None
+    requested_state = str(payload.get("artifact_state") or "canonical").strip().lower()
+    if requested_state not in {"canonical", "provisional"}:
+        return JsonResponse({"error": "artifact_state must be canonical or provisional"}, status=400)
 
     identity = _identity_from_user(request.user)
 
@@ -5542,7 +5546,46 @@ def artifacts_create_blueprint(request: HttpRequest) -> JsonResponse:
                 blueprint.metadata_json = metadata_json
             blueprint.updated_by = request.user
             blueprint.save(update_fields=["description", "spec_text", "metadata_json", "updated_by", "updated_at"])
-        artifact = ensure_blueprint_artifact(blueprint, owner_user=request.user, parent_artifact=parent_artifact)
+        if requested_state == "provisional":
+            artifact_type, _ = ArtifactType.objects.get_or_create(
+                slug="blueprint",
+                defaults={
+                    "name": "Blueprint",
+                    "description": "Blueprint artifact",
+                    "icon": "LayoutTemplate",
+                    "schema_json": {"entity": "Blueprint"},
+                },
+            )
+            family_id = str(blueprint.blueprint_family_id or "").strip() or str(blueprint.id)
+            artifact = Artifact.objects.create(
+                workspace=_default_workspace(),
+                type=artifact_type,
+                artifact_state="provisional",
+                family_id=family_id,
+                title=name,
+                summary=description or "",
+                schema_version="v1",
+                tags_json=[],
+                status="draft",
+                version=1,
+                visibility="team",
+                author=identity,
+                custodian=identity,
+                source_ref_type="Blueprint",
+                source_ref_id=str(blueprint.id),
+                parent_artifact=parent_artifact,
+                lineage_root=(parent_artifact.lineage_root or parent_artifact) if parent_artifact else None,
+                scope_json={"namespace": namespace, "name": blueprint.name, "fqn": f"{namespace}.{blueprint.name}"},
+                provenance_json={"source_system": "xyn", "source_model": "Blueprint", "source_id": str(blueprint.id)},
+            )
+            if not artifact.lineage_root_id:
+                artifact.lineage_root = artifact
+                artifact.save(update_fields=["lineage_root", "updated_at"])
+            blueprint.artifact = artifact
+            blueprint.blueprint_family_id = family_id
+            blueprint.save(update_fields=["artifact", "blueprint_family_id", "updated_at"])
+        else:
+            artifact = ensure_blueprint_artifact(blueprint, owner_user=request.user, parent_artifact=parent_artifact)
         emit_ledger_event(
             actor=identity,
             action="artifact.create",
