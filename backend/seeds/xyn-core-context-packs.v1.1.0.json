@@ -3,7 +3,7 @@
     "slug": "xyn-core-context-packs",
     "name": "Xyn Core Context Packs",
     "description": "Baseline context packs required by Xyn draft and explainer workflows.",
-    "version": "v1.0.0",
+    "version": "v1.1.0",
     "scope": "core"
   },
   "items": [
@@ -53,6 +53,22 @@
         "is_default": true,
         "content_markdown": "# Xyn Planner Canon (Global)\n\nPurpose: planner\nScope: global\n\n## ImplementationPlan v1\n- Schema file: `schemas/implementation_plan.v1.schema.json`\n- Output must conform to `schema_version: implementation_plan.v1`.\n- Primary output is `work_items[]` with actionable steps.\n- Include `capabilities_required` and `module_refs` per work_item.\n- Include `plan_rationale` with gaps detected and why the next slice was chosen.\n- Use `module_catalog.v1.json` and `run_history_summary.v1.json` artifacts as inputs.\n\n## Lifecycle Defaults\n- Treat generated plans as drafts unless explicitly ratified.\n- Prefer smallest viable delivery slices with explicit dependencies.\n\n## Safety\n- Avoid destructive commands in plan outputs.\n- Call out missing prerequisites before proposing execution steps.\n",
         "applies_to_json": { "purpose": "planner", "artifact_type": "any" }
+      }
+    },
+    {
+      "entity_type": "context_pack",
+      "entity_slug": "explainer-video-default",
+      "unique_key": { "scope": "global", "slug": "explainer-video-default" },
+      "payload": {
+        "name": "explainer-video-default",
+        "scope": "global",
+        "namespace": "",
+        "purpose": "video_explainer",
+        "version": "1.0.0",
+        "is_active": true,
+        "is_default": false,
+        "content_markdown": "# Explainer Video Defaults\n- Use as canonical context for video_explainer article workflows\n- Ground generation in Intent, Audience, Tone, and duration target from video spec\n- Keep outputs provisional until explicitly accepted or published\n- Prefer clear, structured outputs that preserve factual constraints\n",
+        "applies_to_json": { "purpose": "video_explainer", "artifact_type": "video_explainer" }
       }
     },
     {
