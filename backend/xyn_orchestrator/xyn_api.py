@@ -91,6 +91,7 @@ from .models import (
     VideoRender,
     WorkflowRun,
     WorkflowRunEvent,
+    IntentScript,
     LedgerEvent,
     Tenant,
     Contact,
@@ -5188,6 +5189,175 @@ def _serialize_ledger_event(event: LedgerEvent) -> Dict[str, Any]:
     }
 
 
+def _serialize_intent_script(script: IntentScript) -> Dict[str, Any]:
+    return {
+        "intent_script_id": str(script.id),
+        "title": script.title,
+        "scope_type": script.scope_type,
+        "scope_ref_id": script.scope_ref_id,
+        "format_version": script.format_version,
+        "script_json": script.script_json if isinstance(script.script_json, dict) else {},
+        "script_text": script.script_text or "",
+        "status": script.status,
+        "created_by": str(script.created_by_id) if script.created_by_id else None,
+        "created_at": script.created_at,
+        "updated_at": script.updated_at,
+        "artifact_id": str(script.artifact_id) if script.artifact_id else None,
+    }
+
+
+def _can_view_generic_artifact(identity: UserIdentity, artifact: Artifact) -> bool:
+    slug = str(artifact.type.slug or "").strip()
+    if slug == "article":
+        return _can_view_article(identity, artifact)
+    if slug == "workflow":
+        return _can_view_workflow(identity, artifact)
+    if slug == DOC_ARTIFACT_TYPE_SLUG:
+        return _can_view_doc(identity, artifact)
+    if _is_platform_admin(identity):
+        return True
+    if artifact.visibility == "public":
+        return True
+    if artifact.visibility == "team":
+        return True
+    return bool(artifact.author_id and str(artifact.author_id) == str(identity.id))
+
+
+def _intent_scene(scene_id: str, title: str, *, route: str = "", body: str = "", outcome: str = "", highlights: Optional[List[str]] = None) -> Dict[str, Any]:
+    return {
+        "id": scene_id,
+        "title": title,
+        "duration_hint": "12-20s",
+        "voiceover": outcome or body or title,
+        "on_screen": body or title,
+        "ui_route": route or "",
+        "highlights": highlights or [],
+        "assets": [],
+        "notes": "",
+    }
+
+
+def _compose_intent_text(title: str, scenes: List[Dict[str, Any]]) -> str:
+    lines: List[str] = [f"# {title}", ""]
+    for idx, scene in enumerate(scenes, start=1):
+        lines.append(f"{idx}. {scene.get('title') or f'Scene {idx}'}")
+        lines.append(f"   Route: {scene.get('ui_route') or 'n/a'}")
+        lines.append(f"   Voiceover: {scene.get('voiceover') or ''}")
+        lines.append(f"   On-screen: {scene.get('on_screen') or ''}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _generate_intent_script_for_tour(artifact: Artifact, *, audience: str, tone: str, length_target: str) -> Tuple[Dict[str, Any], str]:
+    spec = artifact.workflow_spec_json if isinstance(artifact.workflow_spec_json, dict) else {}
+    steps = spec.get("steps") if isinstance(spec.get("steps"), list) else []
+    scenes: List[Dict[str, Any]] = []
+    for idx, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            continue
+        scene = _intent_scene(
+            f"s{idx}",
+            str(step.get("title") or f"Step {idx}"),
+            route=str(step.get("route") or ""),
+            body=str(step.get("body_md") or ""),
+            outcome=f"Guide the viewer through {str(step.get('title') or '').strip().lower() or 'the current step'} with clear expected outcome.",
+            highlights=[str(step.get("type") or "callout"), str((step.get("anchor") or {}).get("test_id") or "")],
+        )
+        scenes.append(scene)
+    if not scenes:
+        scenes.append(
+            _intent_scene(
+                "s1",
+                artifact.title,
+                route=str((spec.get("entry") or {}).get("route") or ""),
+                outcome="Introduce the tour objective and expected result.",
+            )
+        )
+    script_json = {
+        "scenes": scenes,
+        "metadata": {
+            "audience": audience,
+            "tone": tone,
+            "length_target": length_target,
+            "dependencies": ["xyn-ui", "workflow_runner"],
+        },
+    }
+    return script_json, _compose_intent_text(f"{artifact.title} Intent Script", scenes)
+
+
+def _generate_intent_script_for_artifact(artifact: Artifact, *, audience: str, tone: str, length_target: str) -> Tuple[Dict[str, Any], str]:
+    source = _artifact_source_record(artifact)
+    scenes: List[Dict[str, Any]] = []
+    scenes.append(
+        _intent_scene(
+            "s1",
+            f"{artifact.title} overview",
+            route=f"/app/artifacts/{artifact.id}",
+            outcome=(
+                f"This is a {artifact.type.slug} artifact in {artifact.artifact_state} state, "
+                f"with validation {artifact.validation_status or 'unknown'}."
+            ),
+            highlights=[artifact.type.slug, artifact.artifact_state, artifact.validation_status or "unknown"],
+        )
+    )
+    scenes.append(
+        _intent_scene(
+            "s2",
+            "Provenance and trust signals",
+            route=f"/app/artifacts/{artifact.id}",
+            outcome=(
+                f"Show owner, schema version, and content hash {str(artifact.content_hash or '')[:16]} "
+                "to explain traceability."
+            ),
+            highlights=[str(artifact.schema_version or ""), str(artifact.content_hash or "")[:16]],
+        )
+    )
+    if artifact.type.slug == "article":
+        latest = _latest_artifact_revision(artifact)
+        content = latest.content_json if latest and isinstance(latest.content_json, dict) else {}
+        narrative = str(content.get("summary") or content.get("body_markdown") or "").strip()
+        scenes.append(
+            _intent_scene(
+                "s3",
+                "Content narrative",
+                route=f"/app/artifacts/{artifact.id}",
+                outcome=narrative[:480] or "Describe the article narrative and intended audience outcome.",
+                highlights=["article", artifact.format or "standard"],
+            )
+        )
+    elif artifact.type.slug == "workflow":
+        spec = artifact.workflow_spec_json if isinstance(artifact.workflow_spec_json, dict) else {}
+        scenes.append(
+            _intent_scene(
+                "s3",
+                "Workflow path",
+                route=f"/app/artifacts/workflows?workflow={artifact.id}",
+                outcome=f"Walk through {len(spec.get('steps') or [])} deterministic workflow steps.",
+                highlights=[artifact.workflow_profile or "workflow"],
+            )
+        )
+    elif artifact.type.slug == "blueprint" and isinstance(source, Blueprint):
+        scenes.append(
+            _intent_scene(
+                "s3",
+                "Blueprint intent",
+                route=f"/app/blueprints/{source.id}",
+                outcome=(source.description or source.spec_text or "").strip()[:480] or "Explain blueprint intent and expected deployment outcome.",
+                highlights=[source.namespace, source.name],
+            )
+        )
+    script_json = {
+        "scenes": scenes,
+        "metadata": {
+            "audience": audience,
+            "tone": tone,
+            "length_target": length_target,
+            "dependencies": ["xyn-api", "xyn-ui", "ledger"],
+        },
+    }
+    return script_json, _compose_intent_text(f"{artifact.title} Intent Script", scenes)
+
+
 def _parse_optional_dt(value: str) -> Optional[Any]:
     raw = str(value or "").strip()
     if not raw:
@@ -9280,6 +9450,144 @@ def tour_detail(request: HttpRequest, tour_slug: str) -> JsonResponse:
         "entry": spec.get("entry") if isinstance(spec.get("entry"), dict) else {},
     }
     return JsonResponse(payload)
+
+
+@csrf_exempt
+def intent_scripts_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    scope_type = str(request.GET.get("scope_type") or "").strip().lower()
+    scope_ref_id = str(request.GET.get("scope_ref_id") or "").strip()
+    scope = str(request.GET.get("scope") or "").strip()
+    if scope and ":" in scope:
+        lhs, rhs = scope.split(":", 1)
+        scope_type = scope_type or lhs.strip().lower()
+        scope_ref_id = scope_ref_id or rhs.strip()
+    elif scope:
+        scope_type = scope_type or scope.lower()
+    qs = IntentScript.objects.select_related("created_by", "artifact").order_by("-created_at")
+    if scope_type:
+        qs = qs.filter(scope_type=scope_type)
+    if scope_ref_id:
+        qs = qs.filter(scope_ref_id=scope_ref_id)
+    rows: List[Dict[str, Any]] = []
+    for row in qs[:300]:
+        if row.artifact_id and row.artifact and not _can_view_generic_artifact(identity, row.artifact):
+            continue
+        rows.append(_serialize_intent_script(row))
+    return JsonResponse({"items": rows})
+
+
+@csrf_exempt
+def intent_script_detail(request: HttpRequest, script_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    script = get_object_or_404(IntentScript.objects.select_related("artifact", "created_by"), id=script_id)
+    if script.artifact_id and script.artifact and not _can_view_generic_artifact(identity, script.artifact):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method == "GET":
+        return JsonResponse({"item": _serialize_intent_script(script)})
+    if request.method not in {"PUT", "PATCH"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    if "title" in payload:
+        script.title = str(payload.get("title") or "").strip() or script.title
+    if "status" in payload:
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {"draft", "final"}:
+            script.status = status
+    if "script_text" in payload:
+        script.script_text = str(payload.get("script_text") or "")
+    if "script_json" in payload and isinstance(payload.get("script_json"), dict):
+        script.script_json = payload.get("script_json")
+    script.save(update_fields=["title", "status", "script_text", "script_json", "updated_at"])
+    return JsonResponse({"item": _serialize_intent_script(script)})
+
+
+@csrf_exempt
+def intent_script_generate(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    payload = _parse_json(request)
+    scope_type = str(payload.get("scope_type") or "").strip().lower()
+    scope_ref_id = str(payload.get("scope_ref_id") or "").strip()
+    audience = str(payload.get("audience") or "developer").strip().lower()
+    tone = str(payload.get("tone") or "clear, confident").strip()
+    length_target = str(payload.get("length_target") or "short").strip()
+    if scope_type not in {"tour", "artifact", "manual"}:
+        return JsonResponse({"error": "scope_type must be tour|artifact|manual"}, status=400)
+    if not scope_ref_id and scope_type != "manual":
+        return JsonResponse({"error": "scope_ref_id required"}, status=400)
+
+    title = "Intent Script"
+    script_json: Dict[str, Any] = {"scenes": [], "metadata": {"audience": audience, "tone": tone, "length_target": length_target, "dependencies": []}}
+    script_text = ""
+    linked_artifact: Optional[Artifact] = None
+
+    if scope_type == "tour":
+        artifact = Artifact.objects.filter(type__slug=WORKFLOW_ARTIFACT_TYPE_SLUG, id=scope_ref_id).first()
+        if not artifact:
+            artifact = Artifact.objects.filter(type__slug=WORKFLOW_ARTIFACT_TYPE_SLUG, slug=scope_ref_id).first()
+        if not artifact:
+            return JsonResponse({"error": "tour not found"}, status=404)
+        if not _can_view_workflow(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        linked_artifact = artifact
+        title = f"{artifact.title} Intent Script"
+        script_json, script_text = _generate_intent_script_for_tour(artifact, audience=audience, tone=tone, length_target=length_target)
+    elif scope_type == "artifact":
+        artifact = Artifact.objects.select_related("type").filter(id=scope_ref_id).first()
+        if not artifact:
+            return JsonResponse({"error": "artifact not found"}, status=404)
+        if not _can_view_generic_artifact(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        linked_artifact = artifact
+        title = f"{artifact.title} Intent Script"
+        script_json, script_text = _generate_intent_script_for_artifact(artifact, audience=audience, tone=tone, length_target=length_target)
+    else:
+        title = str(payload.get("title") or "Manual Intent Script").strip() or "Manual Intent Script"
+        script_json = {
+            "scenes": [
+                _intent_scene(
+                    "s1",
+                    "Narrative setup",
+                    outcome="Describe the objective, inputs, and expected output.",
+                )
+            ],
+            "metadata": {"audience": audience, "tone": tone, "length_target": length_target, "dependencies": []},
+        }
+        script_text = _compose_intent_text(title, script_json["scenes"])
+
+    row = IntentScript.objects.create(
+        title=title,
+        scope_type=scope_type,
+        scope_ref_id=scope_ref_id or "",
+        format_version="1",
+        script_json=script_json,
+        script_text=script_text,
+        artifact=linked_artifact,
+        created_by=identity,
+        status="draft",
+    )
+
+    if linked_artifact is not None:
+        emit_ledger_event(
+            actor=identity,
+            action="artifact.update",
+            artifact=linked_artifact,
+            summary=f"Generated intent script for {linked_artifact.type.slug}",
+            metadata={"intent_script_id": str(row.id), "scope_type": scope_type, "audience": audience},
+            dedupe_key=make_dedupe_key("artifact.update", str(linked_artifact.id), diff_payload={"intent_script_id": str(row.id)}),
+        )
+
+    return JsonResponse({"item": _serialize_intent_script(row)})
 
 
 def _ensure_default_agent_purposes() -> None:

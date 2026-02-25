@@ -1105,6 +1105,43 @@ class WorkflowRunEvent(models.Model):
         return f"{self.run_id}:{self.event_type}:{self.step_id}"
 
 
+class IntentScript(models.Model):
+    SCOPE_CHOICES = [
+        ("tour", "Tour"),
+        ("artifact", "Artifact"),
+        ("manual", "Manual"),
+    ]
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("final", "Final"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=240)
+    scope_type = models.CharField(max_length=20, choices=SCOPE_CHOICES)
+    scope_ref_id = models.CharField(max_length=120)
+    format_version = models.CharField(max_length=40, default="1")
+    script_json = models.JSONField(default=dict, blank=True)
+    script_text = models.TextField(blank=True, default="")
+    artifact = models.ForeignKey(Artifact, null=True, blank=True, on_delete=models.SET_NULL, related_name="intent_scripts")
+    created_by = models.ForeignKey(
+        "xyn_orchestrator.UserIdentity",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="intent_scripts_created",
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.scope_type}:{self.scope_ref_id}:{self.title}"
+
+
 class ArtifactEvent(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="events")

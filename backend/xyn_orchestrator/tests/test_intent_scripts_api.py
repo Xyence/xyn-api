@@ -1,0 +1,122 @@
+import json
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+
+from xyn_orchestrator.models import IntentScript, LedgerEvent, RoleBinding, UserIdentity, Workspace
+
+
+class IntentScriptsApiTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(username="intent-admin", password="pass", is_staff=True)
+        self.client.force_login(self.user)
+        self.identity = UserIdentity.objects.create(provider="oidc", issuer="https://issuer", subject="intent-admin", email="intent-admin@example.com")
+        RoleBinding.objects.create(user_identity=self.identity, scope_kind="platform", role="platform_admin")
+        self.workspace, _ = Workspace.objects.get_or_create(slug="platform-builder", defaults={"name": "Platform Builder"})
+        session = self.client.session
+        session["user_identity_id"] = str(self.identity.id)
+        session.save()
+
+    def _create_workflow(self) -> str:
+        response = self.client.post(
+            "/xyn/api/workflows",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Intent Tour",
+                    "slug": "intent-tour",
+                    "profile": "tour",
+                    "category_slug": "xyn_usage",
+                    "visibility_type": "authenticated",
+                    "workflow_spec_json": {
+                        "profile": "tour",
+                        "schema_version": 1,
+                        "title": "Intent Tour",
+                        "description": "tour for testing",
+                        "category_slug": "xyn_usage",
+                        "steps": [
+                            {
+                                "id": "s1",
+                                "type": "modal",
+                                "title": "Open home",
+                                "body_md": "Open workspace home.",
+                                "route": "/app/home",
+                            }
+                        ],
+                    },
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        return response.json()["workflow"]["id"]
+
+    def _create_artifact(self) -> str:
+        response = self.client.post(
+            "/xyn/api/artifacts/create-draft-session",
+            data=json.dumps({"title": "Intent Draft", "kind": "blueprint"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        return response.json()["artifact_id"]
+
+    def test_generate_intent_script_from_tour(self):
+        workflow_id = self._create_workflow()
+        response = self.client.post(
+            "/xyn/api/intent-scripts/generate",
+            data=json.dumps(
+                {
+                    "scope_type": "tour",
+                    "scope_ref_id": workflow_id,
+                    "audience": "developer",
+                    "length_target": "short",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        payload = response.json()["item"]
+        self.assertEqual(payload["scope_type"], "tour")
+        self.assertTrue(payload["script_json"]["scenes"])
+
+    def test_generate_and_update_intent_script_from_artifact_emits_ledger_update(self):
+        artifact_id = self._create_artifact()
+        response = self.client.post(
+            "/xyn/api/intent-scripts/generate",
+            data=json.dumps(
+                {
+                    "scope_type": "artifact",
+                    "scope_ref_id": artifact_id,
+                    "audience": "investor",
+                    "length_target": "medium",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        script_id = response.json()["item"]["intent_script_id"]
+        script = IntentScript.objects.get(id=script_id)
+        self.assertEqual(script.scope_type, "artifact")
+        self.assertEqual(str(script.artifact_id), artifact_id)
+        self.assertTrue(
+            LedgerEvent.objects.filter(
+                artifact_id=artifact_id,
+                action="artifact.update",
+                summary__icontains="Generated intent script",
+            ).exists()
+        )
+
+        patch = self.client.patch(
+            f"/xyn/api/intent-scripts/{script_id}",
+            data=json.dumps({"status": "final", "title": "Updated Intent Script"}),
+            content_type="application/json",
+        )
+        self.assertEqual(patch.status_code, 200, patch.content.decode())
+        script.refresh_from_db()
+        self.assertEqual(script.status, "final")
+        self.assertEqual(script.title, "Updated Intent Script")
+
+        listing = self.client.get("/xyn/api/intent-scripts", {"scope_type": "artifact", "scope_ref_id": artifact_id})
+        self.assertEqual(listing.status_code, 200, listing.content.decode())
+        self.assertTrue(any(item["intent_script_id"] == script_id for item in listing.json().get("items", [])))
