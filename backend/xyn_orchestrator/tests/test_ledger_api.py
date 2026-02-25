@@ -96,13 +96,28 @@ class LedgerApiTests(TestCase):
 
     def test_ledger_query_and_summary_endpoints(self):
         artifact = self._create_draft_artifact()
-        response = self.client.get("/xyn/api/ledger", {"artifact_id": str(artifact.id), "action": "artifact.create"})
+        response = self.client.get(
+            "/xyn/api/ledger",
+            {
+                "artifact_id": str(artifact.id),
+                "action": "artifact.create",
+                "workspace": str(artifact.workspace_id),
+                "artifact_type": "draft_session",
+            },
+        )
         self.assertEqual(response.status_code, 200, response.content.decode())
         self.assertEqual(response.json()["count"], 1)
+        event = response.json()["events"][0]
+        self.assertEqual(event["artifact_type"], "draft_session")
+        self.assertEqual(event["artifact_title"], artifact.title)
+        self.assertEqual(event["artifact_workspace_id"], str(artifact.workspace_id))
 
-        by_user = self.client.get("/xyn/api/ledger/summary/by-user")
+        by_user = self.client.get("/xyn/api/ledger/summary/by-user", {"workspace": str(artifact.workspace_id)})
         self.assertEqual(by_user.status_code, 200, by_user.content.decode())
-        self.assertTrue(any(row["action"] == "artifact.create" for row in by_user.json()["rows"]))
+        self.assertTrue(any(int(row.get("create_count", 0)) >= 1 for row in by_user.json()["rows"]))
+        first = by_user.json()["rows"][0]
+        self.assertIn("top_artifacts", first)
+        self.assertIn("total_count", first)
 
         by_artifact = self.client.get("/xyn/api/ledger/summary/by-artifact", {"artifact_id": str(artifact.id)})
         self.assertEqual(by_artifact.status_code, 200, by_artifact.content.decode())

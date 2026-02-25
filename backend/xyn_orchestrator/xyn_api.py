@@ -5159,6 +5159,7 @@ def _serialize_unified_artifact(artifact: Artifact, source_record: Any = None) -
 
 
 def _serialize_ledger_event(event: LedgerEvent) -> Dict[str, Any]:
+    artifact = event.artifact
     return {
         "ledger_event_id": str(event.id),
         "created_at": event.created_at,
@@ -5181,6 +5182,9 @@ def _serialize_ledger_event(event: LedgerEvent) -> Dict[str, Any]:
         "dedupe_key": event.dedupe_key or "",
         "source_ref_type": event.source_ref_type or "",
         "source_ref_id": event.source_ref_id or "",
+        "artifact_title": artifact.title if artifact else "",
+        "artifact_slug": _artifact_slug(artifact) if artifact else "",
+        "artifact_workspace_id": str(artifact.workspace_id) if artifact and artifact.workspace_id else "",
     }
 
 
@@ -5518,7 +5522,9 @@ def ledger_collection(request: HttpRequest) -> JsonResponse:
 
     qs = LedgerEvent.objects.select_related("actor_user", "artifact")
     actor = str(request.GET.get("actor") or "").strip()
+    workspace = str(request.GET.get("workspace") or "").strip()
     artifact_id = str(request.GET.get("artifact_id") or "").strip()
+    artifact_type = str(request.GET.get("artifact_type") or "").strip()
     action = str(request.GET.get("action") or "").strip()
     since_raw = str(request.GET.get("since") or "").strip()
     until_raw = str(request.GET.get("until") or "").strip()
@@ -5532,8 +5538,12 @@ def ledger_collection(request: HttpRequest) -> JsonResponse:
 
     if actor:
         qs = qs.filter(actor_user_id=actor)
+    if workspace:
+        qs = qs.filter(artifact__workspace_id=workspace)
     if artifact_id:
         qs = qs.filter(artifact_id=artifact_id)
+    if artifact_type:
+        qs = qs.filter(artifact_type=artifact_type)
     if action:
         qs = qs.filter(action=action)
     if since:
@@ -5570,6 +5580,7 @@ def ledger_summary_by_user(request: HttpRequest) -> JsonResponse:
         return staff_error
 
     qs = LedgerEvent.objects.select_related("actor_user")
+    workspace = str(request.GET.get("workspace") or "").strip()
     since_raw = str(request.GET.get("since") or "").strip()
     until_raw = str(request.GET.get("until") or "").strip()
     since = _parse_optional_dt(since_raw) if since_raw else None
@@ -5578,30 +5589,75 @@ def ledger_summary_by_user(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "invalid since datetime"}, status=400)
     if until_raw and until is None:
         return JsonResponse({"error": "invalid until datetime"}, status=400)
+    if workspace:
+        qs = qs.filter(artifact__workspace_id=workspace)
     if since:
         qs = qs.filter(created_at__gte=since)
     if until:
         qs = qs.filter(created_at__lte=until)
+    rows = list(
+        qs.values(
+            "actor_user_id",
+            "actor_user__email",
+            "actor_user__display_name",
+            "action",
+            "summary",
+            "artifact_id",
+            "artifact__title",
+        ).order_by("-created_at")
+    )
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        actor_id = str(row["actor_user_id"] or "")
+        if not actor_id:
+            continue
+        summary = grouped.setdefault(
+            actor_id,
+            {
+                "actor_user_id": actor_id,
+                "email": row["actor_user__email"] or "",
+                "display_name": row["actor_user__display_name"] or "",
+                "create_count": 0,
+                "update_count": 0,
+                "publish_count": 0,
+                "canonize_count": 0,
+                "deprecate_count": 0,
+                "archive_count": 0,
+                "total_count": 0,
+                "top_artifacts": {},
+            },
+        )
+        action = str(row["action"] or "")
+        event_summary = str(row["summary"] or "").lower()
+        artifact_id = str(row["artifact_id"] or "")
+        artifact_title = str(row["artifact__title"] or "").strip() or artifact_id
+        summary["total_count"] += 1
+        if action == "artifact.create":
+            summary["create_count"] += 1
+        elif action == "artifact.update":
+            summary["update_count"] += 1
+            if "published" in event_summary:
+                summary["publish_count"] += 1
+        elif action == "artifact.canonize":
+            summary["canonize_count"] += 1
+        elif action == "artifact.deprecate":
+            summary["deprecate_count"] += 1
+        elif action == "artifact.archive":
+            summary["archive_count"] += 1
+        if artifact_id:
+            top_artifacts = summary["top_artifacts"]
+            current = top_artifacts.get(artifact_id) or {"artifact_id": artifact_id, "title": artifact_title, "count": 0}
+            current["count"] += 1
+            top_artifacts[artifact_id] = current
 
-    grouped = (
-        qs.values("actor_user_id", "actor_user__email", "actor_user__display_name", "action")
-        .annotate(count=models.Count("id"))
-        .order_by("actor_user__email", "action")
-    )
-    return JsonResponse(
-        {
-            "rows": [
-                {
-                    "actor_user_id": str(row["actor_user_id"]),
-                    "email": row["actor_user__email"] or "",
-                    "display_name": row["actor_user__display_name"] or "",
-                    "action": row["action"],
-                    "count": int(row["count"]),
-                }
-                for row in grouped
-            ]
-        }
-    )
+    result_rows: List[Dict[str, Any]] = []
+    for item in grouped.values():
+        artifacts = sorted(item["top_artifacts"].values(), key=lambda value: (-int(value["count"]), str(value["title"])))[:5]
+        row = dict(item)
+        row["top_artifacts"] = artifacts
+        result_rows.append(row)
+    result_rows.sort(key=lambda item: (-int(item["total_count"]), str(item["email"] or item["display_name"] or item["actor_user_id"])))
+    return JsonResponse({"rows": result_rows})
 
 
 @csrf_exempt
