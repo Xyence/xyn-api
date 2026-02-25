@@ -1094,6 +1094,56 @@ class ArtifactEvent(models.Model):
         return f"{self.artifact_id}:{self.event_type}"
 
 
+class LedgerEvent(models.Model):
+    ACTION_CHOICES = [
+        ("artifact.create", "Artifact Create"),
+        ("artifact.update", "Artifact Update"),
+        ("artifact.canonize", "Artifact Canonize"),
+        ("artifact.deprecate", "Artifact Deprecate"),
+        ("artifact.archive", "Artifact Archive"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    actor_user = models.ForeignKey(UserIdentity, on_delete=models.PROTECT, related_name="ledger_events")
+    action = models.CharField(max_length=40, choices=ACTION_CHOICES)
+    artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="ledger_events")
+    artifact_type = models.CharField(max_length=80, blank=True, default="")
+    artifact_state = models.CharField(max_length=20, blank=True, default="")
+    parent_artifact = models.ForeignKey(
+        Artifact,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ledger_child_events",
+    )
+    lineage_root = models.ForeignKey(
+        Artifact,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ledger_lineage_events",
+    )
+    summary = models.CharField(max_length=280, blank=True, default="")
+    metadata_json = models.JSONField(default=dict, blank=True)
+    dedupe_key = models.CharField(max_length=320, blank=True, default="")
+    source_ref_type = models.CharField(max_length=80, blank=True, default="")
+    source_ref_id = models.CharField(max_length=120, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dedupe_key"],
+                condition=~Q(dedupe_key=""),
+                name="uniq_ledger_event_dedupe_key",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.action}:{self.artifact_id}:{self.created_at.isoformat()}"
+
+
 class ArtifactLink(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     from_artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="links_from")

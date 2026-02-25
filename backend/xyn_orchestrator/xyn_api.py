@@ -91,6 +91,7 @@ from .models import (
     VideoRender,
     WorkflowRun,
     WorkflowRunEvent,
+    LedgerEvent,
     Tenant,
     Contact,
     TenantMembership,
@@ -162,6 +163,11 @@ from .seeds import (
 from .artifact_links import (
     ensure_blueprint_artifact,
     ensure_draft_session_artifact,
+)
+from .ledger import (
+    compute_artifact_diff,
+    emit_ledger_event,
+    make_dedupe_key,
 )
 
 PLATFORM_ROLE_IDS = {"platform_owner", "platform_admin", "platform_architect", "platform_operator", "app_user"}
@@ -2121,6 +2127,15 @@ def _record_artifact_event(
         actor=actor,
         payload_json=payload or {},
     )
+
+
+def _identity_from_user(user) -> Optional[UserIdentity]:
+    if not user or not getattr(user, "is_authenticated", False):
+        return None
+    email = str(getattr(user, "email", "") or "").strip()
+    if not email:
+        return None
+    return UserIdentity.objects.filter(email__iexact=email).order_by("-updated_at").first()
 
 
 def _control_plane_app_ids() -> set[str]:
@@ -5101,6 +5116,39 @@ def _serialize_unified_artifact(artifact: Artifact, source_record: Any = None) -
     return payload
 
 
+def _serialize_ledger_event(event: LedgerEvent) -> Dict[str, Any]:
+    return {
+        "ledger_event_id": str(event.id),
+        "created_at": event.created_at,
+        "actor_user_id": str(event.actor_user_id),
+        "actor": {
+            "id": str(event.actor_user_id),
+            "email": event.actor_user.email or "",
+            "display_name": event.actor_user.display_name or "",
+        }
+        if event.actor_user_id
+        else None,
+        "action": event.action,
+        "artifact_id": str(event.artifact_id),
+        "artifact_type": event.artifact_type or "",
+        "artifact_state": event.artifact_state or "",
+        "parent_artifact_id": str(event.parent_artifact_id) if event.parent_artifact_id else None,
+        "lineage_root_id": str(event.lineage_root_id) if event.lineage_root_id else None,
+        "summary": event.summary or "",
+        "metadata_json": event.metadata_json or {},
+        "dedupe_key": event.dedupe_key or "",
+        "source_ref_type": event.source_ref_type or "",
+        "source_ref_id": event.source_ref_id or "",
+    }
+
+
+def _parse_optional_dt(value: str) -> Optional[Any]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    return parse_datetime(raw)
+
+
 @csrf_exempt
 @login_required
 def artifacts_collection(request: HttpRequest) -> JsonResponse:
@@ -5162,19 +5210,226 @@ def artifacts_collection(request: HttpRequest) -> JsonResponse:
 def artifact_detail(request: HttpRequest, artifact_id: str) -> JsonResponse:
     if staff_error := _require_staff(request):
         return staff_error
-    if request.method != "GET":
+    if request.method not in {"GET", "PATCH"}:
         return JsonResponse({"error": "method not allowed"}, status=405)
 
     artifact = get_object_or_404(
         Artifact.objects.select_related("type", "author", "parent_artifact", "lineage_root"),
         id=artifact_id,
     )
+    identity = _identity_from_user(request.user)
+    if request.method == "PATCH":
+        payload = _parse_json(request)
+        old_artifact = Artifact.objects.get(id=artifact.id)
+        old_source = None
+        if artifact.source_ref_type == "Blueprint" and artifact.source_ref_id:
+            old_source = Blueprint.objects.filter(id=artifact.source_ref_id).first()
+        elif artifact.source_ref_type == "BlueprintDraftSession" and artifact.source_ref_id:
+            old_source = BlueprintDraftSession.objects.filter(id=artifact.source_ref_id).first()
+
+        updates: Dict[str, Any] = {}
+        if "title" in payload:
+            updates["title"] = str(payload.get("title") or "").strip() or artifact.title
+        if "summary" in payload:
+            updates["summary"] = str(payload.get("summary") or "").strip()
+        if "schema_version" in payload:
+            updates["schema_version"] = str(payload.get("schema_version") or "").strip()
+        if "tags" in payload or "tags_json" in payload:
+            tags_payload = payload.get("tags") if "tags" in payload else payload.get("tags_json")
+            if not isinstance(tags_payload, list):
+                return JsonResponse({"error": "tags must be an array"}, status=400)
+            updates["tags_json"] = [str(tag).strip() for tag in tags_payload if str(tag).strip()]
+        if "artifact_state" in payload:
+            next_state = str(payload.get("artifact_state") or "").strip()
+            valid_states = {choice[0] for choice in Artifact.ARTIFACT_STATE_CHOICES}
+            if next_state not in valid_states:
+                return JsonResponse({"error": "invalid artifact_state"}, status=400)
+            updates["artifact_state"] = next_state
+        if "parent_artifact_id" in payload:
+            parent_id = str(payload.get("parent_artifact_id") or "").strip()
+            if parent_id:
+                parent = Artifact.objects.filter(id=parent_id).first()
+                if not parent:
+                    return JsonResponse({"error": "parent_artifact_id not found"}, status=404)
+                updates["parent_artifact"] = parent
+                updates["lineage_root"] = parent.lineage_root or parent
+            else:
+                updates["parent_artifact"] = None
+                updates["lineage_root"] = artifact
+
+        if updates:
+            for field, value in updates.items():
+                setattr(artifact, field, value)
+            update_fields = list(updates.keys()) + ["updated_at"]
+            artifact.save(update_fields=update_fields)
+
+        new_artifact = Artifact.objects.get(id=artifact.id)
+        new_source = None
+        if artifact.source_ref_type == "Blueprint" and artifact.source_ref_id:
+            new_source = Blueprint.objects.filter(id=artifact.source_ref_id).first()
+        elif artifact.source_ref_type == "BlueprintDraftSession" and artifact.source_ref_id:
+            new_source = BlueprintDraftSession.objects.filter(id=artifact.source_ref_id).first()
+        diff_payload = compute_artifact_diff(old_artifact, new_artifact, old_source=old_source, new_source=new_source)
+        changed_fields = diff_payload.get("changed_fields") or []
+        if changed_fields:
+            summary = f"Updated {artifact.type.name} artifact: {', '.join(changed_fields[:3])}"
+            emit_ledger_event(
+                actor=identity,
+                action="artifact.update",
+                artifact=new_artifact,
+                summary=summary,
+                metadata=diff_payload,
+                dedupe_key=make_dedupe_key("artifact.update", str(new_artifact.id), diff_payload=diff_payload),
+            )
+            if "artifact_state" in changed_fields:
+                state = new_artifact.artifact_state
+                if state == "deprecated":
+                    emit_ledger_event(
+                        actor=identity,
+                        action="artifact.deprecate",
+                        artifact=new_artifact,
+                        summary=f"Deprecated {artifact.type.name} artifact",
+                        metadata={"reason": str(payload.get("reason") or "").strip()},
+                        dedupe_key=make_dedupe_key("artifact.deprecate", str(new_artifact.id), state=state),
+                    )
+                elif state == "immutable":
+                    emit_ledger_event(
+                        actor=identity,
+                        action="artifact.archive",
+                        artifact=new_artifact,
+                        summary=f"Archived {artifact.type.name} artifact",
+                        metadata={"reason": str(payload.get("reason") or "").strip()},
+                        dedupe_key=make_dedupe_key("artifact.archive", str(new_artifact.id), state=state),
+                    )
+        artifact = new_artifact
+
     source = None
     if artifact.source_ref_type == "Blueprint" and artifact.source_ref_id:
         source = Blueprint.objects.filter(id=artifact.source_ref_id).first()
     elif artifact.source_ref_type == "BlueprintDraftSession" and artifact.source_ref_id:
         source = BlueprintDraftSession.objects.filter(id=artifact.source_ref_id).first()
     return JsonResponse(_serialize_unified_artifact(artifact, source))
+
+
+@csrf_exempt
+@login_required
+def ledger_collection(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+
+    qs = LedgerEvent.objects.select_related("actor_user", "artifact")
+    actor = str(request.GET.get("actor") or "").strip()
+    artifact_id = str(request.GET.get("artifact_id") or "").strip()
+    action = str(request.GET.get("action") or "").strip()
+    since_raw = str(request.GET.get("since") or "").strip()
+    until_raw = str(request.GET.get("until") or "").strip()
+
+    since = _parse_optional_dt(since_raw) if since_raw else None
+    until = _parse_optional_dt(until_raw) if until_raw else None
+    if since_raw and since is None:
+        return JsonResponse({"error": "invalid since datetime"}, status=400)
+    if until_raw and until is None:
+        return JsonResponse({"error": "invalid until datetime"}, status=400)
+
+    if actor:
+        qs = qs.filter(actor_user_id=actor)
+    if artifact_id:
+        qs = qs.filter(artifact_id=artifact_id)
+    if action:
+        qs = qs.filter(action=action)
+    if since:
+        qs = qs.filter(created_at__gte=since)
+    if until:
+        qs = qs.filter(created_at__lte=until)
+
+    try:
+        limit = max(1, min(500, int(request.GET.get("limit") or 100)))
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        offset = max(0, int(request.GET.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    total = qs.count()
+    rows = list(qs.order_by("-created_at")[offset : offset + limit])
+    return JsonResponse(
+        {
+            "events": [_serialize_ledger_event(row) for row in rows],
+            "count": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def ledger_summary_by_user(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+
+    qs = LedgerEvent.objects.select_related("actor_user")
+    since_raw = str(request.GET.get("since") or "").strip()
+    until_raw = str(request.GET.get("until") or "").strip()
+    since = _parse_optional_dt(since_raw) if since_raw else None
+    until = _parse_optional_dt(until_raw) if until_raw else None
+    if since_raw and since is None:
+        return JsonResponse({"error": "invalid since datetime"}, status=400)
+    if until_raw and until is None:
+        return JsonResponse({"error": "invalid until datetime"}, status=400)
+    if since:
+        qs = qs.filter(created_at__gte=since)
+    if until:
+        qs = qs.filter(created_at__lte=until)
+
+    grouped = (
+        qs.values("actor_user_id", "actor_user__email", "actor_user__display_name", "action")
+        .annotate(count=models.Count("id"))
+        .order_by("actor_user__email", "action")
+    )
+    return JsonResponse(
+        {
+            "rows": [
+                {
+                    "actor_user_id": str(row["actor_user_id"]),
+                    "email": row["actor_user__email"] or "",
+                    "display_name": row["actor_user__display_name"] or "",
+                    "action": row["action"],
+                    "count": int(row["count"]),
+                }
+                for row in grouped
+            ]
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def ledger_summary_by_artifact(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact_id = str(request.GET.get("artifact_id") or "").strip()
+    if not artifact_id:
+        return JsonResponse({"error": "artifact_id required"}, status=400)
+    qs = LedgerEvent.objects.select_related("actor_user").filter(artifact_id=artifact_id).order_by("-created_at")
+    counts = (
+        qs.values("action")
+        .annotate(count=models.Count("id"))
+        .order_by("action")
+    )
+    return JsonResponse(
+        {
+            "artifact_id": artifact_id,
+            "counts": [{"action": row["action"], "count": int(row["count"])} for row in counts],
+            "events": [_serialize_ledger_event(event) for event in qs[:200]],
+        }
+    )
 
 
 @csrf_exempt
@@ -5228,6 +5483,18 @@ def artifacts_create_draft_session(request: HttpRequest) -> JsonResponse:
             updated_by=request.user,
         )
         artifact = ensure_draft_session_artifact(session, owner_user=request.user)
+        emit_ledger_event(
+            actor=_identity_from_user(request.user),
+            action="artifact.create",
+            artifact=artifact,
+            summary="Created Draft Session artifact",
+            metadata={
+                "title": artifact.title,
+                "initial_artifact_state": artifact.artifact_state,
+                "schema_version": artifact.schema_version,
+            },
+            dedupe_key=make_dedupe_key("artifact.create", str(artifact.id)),
+        )
     return JsonResponse({"artifact_id": str(artifact.id), "session_id": str(session.id)})
 
 
@@ -5250,7 +5517,10 @@ def artifacts_create_blueprint(request: HttpRequest) -> JsonResponse:
     parent_artifact_id = str(payload.get("parent_artifact_id") or "").strip()
     parent_artifact = Artifact.objects.filter(id=parent_artifact_id).first() if parent_artifact_id else None
 
+    identity = _identity_from_user(request.user)
+
     with transaction.atomic():
+        old_source = Blueprint.objects.filter(name=name, namespace=namespace).first()
         blueprint, created = Blueprint.objects.get_or_create(
             name=name,
             namespace=namespace,
@@ -5271,6 +5541,37 @@ def artifacts_create_blueprint(request: HttpRequest) -> JsonResponse:
             blueprint.updated_by = request.user
             blueprint.save(update_fields=["description", "spec_text", "metadata_json", "updated_by", "updated_at"])
         artifact = ensure_blueprint_artifact(blueprint, owner_user=request.user, parent_artifact=parent_artifact)
+        emit_ledger_event(
+            actor=identity,
+            action="artifact.create",
+            artifact=artifact,
+            summary="Created Blueprint artifact",
+            metadata={
+                "title": artifact.title,
+                "initial_artifact_state": artifact.artifact_state,
+                "schema_version": artifact.schema_version,
+            },
+            dedupe_key=make_dedupe_key("artifact.create", str(artifact.id)),
+        )
+        if old_source and not created:
+            old_artifact = Artifact.objects.get(id=artifact.id)
+            old_artifact.title = old_source.name or old_artifact.title
+            old_artifact.summary = old_source.description or old_artifact.summary
+            diff_payload = compute_artifact_diff(
+                old_artifact,
+                artifact,
+                old_source=old_source,
+                new_source=blueprint,
+            )
+            if diff_payload.get("changed_fields"):
+                emit_ledger_event(
+                    actor=identity,
+                    action="artifact.update",
+                    artifact=artifact,
+                    summary=f"Updated Blueprint artifact: {', '.join(diff_payload['changed_fields'][:3])}",
+                    metadata=diff_payload,
+                    dedupe_key=make_dedupe_key("artifact.update", str(artifact.id), diff_payload=diff_payload),
+                )
 
     return JsonResponse({"artifact_id": str(artifact.id), "blueprint_id": str(blueprint.id)})
 
@@ -5292,6 +5593,7 @@ def artifact_canonize_to_blueprint(request: HttpRequest, artifact_id: str) -> Js
     session = BlueprintDraftSession.objects.filter(id=draft_artifact.source_ref_id).first()
     if not session:
         return JsonResponse({"error": "draft session not found"}, status=404)
+    identity = _identity_from_user(request.user)
 
     payload = _parse_json(request)
     title = str(payload.get("title") or session.title or session.name or "").strip()
@@ -5332,8 +5634,49 @@ def artifact_canonize_to_blueprint(request: HttpRequest, artifact_id: str) -> Js
             owner_user=request.user,
             parent_artifact=draft_artifact,
         )
+        emit_ledger_event(
+            actor=identity,
+            action="artifact.create",
+            artifact=blueprint_artifact,
+            summary="Created Blueprint artifact",
+            metadata={
+                "title": blueprint_artifact.title,
+                "initial_artifact_state": blueprint_artifact.artifact_state,
+                "schema_version": blueprint_artifact.schema_version,
+            },
+            dedupe_key=make_dedupe_key("artifact.create", str(blueprint_artifact.id)),
+        )
+        emit_ledger_event(
+            actor=identity,
+            action="artifact.canonize",
+            artifact=draft_artifact,
+            summary="Canonized Draft Session into Blueprint",
+            metadata={
+                "blueprint_artifact_id": str(blueprint_artifact.id),
+                "blueprint_source_ref_id": str(blueprint.id),
+                "link": {
+                    "from_artifact_id": str(draft_artifact.id),
+                    "to_artifact_id": str(blueprint_artifact.id),
+                },
+            },
+            dedupe_key=make_dedupe_key(
+                "artifact.canonize",
+                str(draft_artifact.id),
+                target_artifact_id=str(blueprint_artifact.id),
+            ),
+        )
+        previous_state = draft_artifact.artifact_state
         draft_artifact.artifact_state = "deprecated"
         draft_artifact.save(update_fields=["artifact_state", "updated_at"])
+        if previous_state != "deprecated":
+            emit_ledger_event(
+                actor=identity,
+                action="artifact.deprecate",
+                artifact=draft_artifact,
+                summary="Deprecated Draft Session artifact",
+                metadata={"reason": "canonized_to_blueprint"},
+                dedupe_key=make_dedupe_key("artifact.deprecate", str(draft_artifact.id), state="deprecated"),
+            )
         session.linked_blueprint = blueprint
         session.save(update_fields=["linked_blueprint", "updated_at"])
 
@@ -5570,9 +5913,20 @@ def workspace_artifact_deprecate(request: HttpRequest, workspace_id: str, artifa
     if not _workspace_has_role(identity, workspace_id, "publisher"):
         return JsonResponse({"error": "forbidden"}, status=403)
     artifact = get_object_or_404(Artifact, id=artifact_id, workspace_id=workspace_id)
+    previous_state = artifact.artifact_state
     artifact.status = "deprecated"
-    artifact.save(update_fields=["status", "updated_at"])
+    artifact.artifact_state = "deprecated"
+    artifact.save(update_fields=["status", "artifact_state", "updated_at"])
     _record_artifact_event(artifact, "artifact_deprecated", identity, {})
+    if previous_state != "deprecated":
+        emit_ledger_event(
+            actor=identity,
+            action="artifact.deprecate",
+            artifact=artifact,
+            summary=f"Deprecated {artifact.type.name} artifact",
+            metadata={},
+            dedupe_key=make_dedupe_key("artifact.deprecate", str(artifact.id), state="deprecated"),
+        )
     return JsonResponse({"id": str(artifact.id), "status": artifact.status})
 
 
