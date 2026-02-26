@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 
@@ -18,10 +19,44 @@ class DraftIntakeContract:
 
     def infer_fields(self, *, message: str, inferred_fields: Mapping[str, Any]) -> Dict[str, Any]:
         merged: Dict[str, Any] = dict(inferred_fields or {})
-        prompt = str(message or "").lower()
+        raw_message = str(message or "")
+        prompt = raw_message.lower()
         if not str(merged.get("format") or "").strip():
             if any(token in prompt for token in ["explainer video", "video explainer", "explainer", "video"]):
                 merged["format"] = "explainer_video"
+            elif "guide" in prompt:
+                merged["format"] = "guide"
+            elif "tour" in prompt:
+                merged["format"] = "tour"
+
+        if not str(merged.get("title") or "").strip():
+            # title: "My title" or title is "My title"
+            title_match = re.search(r"\btitle\b\s*(?:is|:)\s*[\"']([^\"']+)[\"']", raw_message, flags=re.IGNORECASE)
+            if not title_match:
+                title_match = re.search(r"\btitle\b\s*(?:is|:)\s*([^\n.;]+)", raw_message, flags=re.IGNORECASE)
+            if title_match:
+                merged["title"] = str(title_match.group(1)).strip()
+
+        if not str(merged.get("category") or "").strip():
+            category_match = re.search(r"\bcategory\b\s*(?:is|:)\s*([a-z0-9_-]+)", prompt, flags=re.IGNORECASE)
+            if category_match:
+                merged["category"] = str(category_match.group(1)).strip().lower()
+
+        if not str(merged.get("intent") or "").strip():
+            # intent: ... or intent is ...
+            intent_match = re.search(r"\bintent\b\s*(?:is|:)\s*([^\n]+)", raw_message, flags=re.IGNORECASE)
+            if intent_match:
+                merged["intent"] = str(intent_match.group(1)).strip().strip(".")
+            elif str(merged.get("format") or "").strip().lower() in {"explainer_video", "video_explainer"}:
+                # Fallback: for explainer prompts, use the main request sentence as intent.
+                sentence_match = re.search(r"(create|make|build|write)\s+an?\s+.*", raw_message, flags=re.IGNORECASE)
+                if sentence_match:
+                    merged["intent"] = str(sentence_match.group(0)).strip().strip(".")
+
+        if not str(merged.get("duration") or "").strip():
+            duration_match = re.search(r"\bduration\b\s*(?:is|:)\s*([0-9]{1,2}m)\b", prompt, flags=re.IGNORECASE)
+            if duration_match:
+                merged["duration"] = str(duration_match.group(1)).strip().lower()
         return merged
 
     def merge_defaults(self, values: Mapping[str, Any]) -> Dict[str, Any]:

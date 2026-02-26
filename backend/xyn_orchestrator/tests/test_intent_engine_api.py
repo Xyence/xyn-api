@@ -47,6 +47,20 @@ class IntentEngineApiTests(TestCase):
         merged = contract.merge_defaults({"title": "x", "category": "web", "format": "explainer_video"})
         self.assertIn("intent", contract.missing_fields(merged))
 
+    def test_contract_infers_explicit_fields_from_message(self):
+        registry = DraftIntakeContractRegistry(category_options_provider=lambda: [{"slug": "demo", "name": "Demo"}])
+        contract = registry.get("ArticleDraft")
+        self.assertIsNotNone(contract)
+        assert contract is not None
+        inferred = contract.infer_fields(
+            message='Intent: Create an explainer video about Xyn governance ledger for telecom engineers. title: "What I Did On My Summer Vacation". category: demo',
+            inferred_fields={},
+        )
+        self.assertEqual(inferred.get("format"), "explainer_video")
+        self.assertEqual(inferred.get("title"), "What I Did On My Summer Vacation")
+        self.assertEqual(inferred.get("category"), "demo")
+        self.assertTrue(str(inferred.get("intent") or "").lower().startswith("create an explainer video"))
+
     def test_engine_rejects_unknown_action_type(self):
         registry = DraftIntakeContractRegistry(category_options_provider=lambda: [{"slug": "web", "name": "Web"}])
         engine = IntentResolutionEngine(
@@ -106,6 +120,32 @@ class IntentEngineApiTests(TestCase):
         self.assertEqual(payload["action_type"], "CreateDraft")
         self.assertEqual(payload["artifact_type"], "ArticleDraft")
         self.assertNotEqual(payload["summary"], "Intent is ambiguous; provide clearer draft instructions.")
+
+    def test_resolve_low_confidence_with_explicit_fields_returns_draft_ready(self):
+        with patch(
+            "xyn_orchestrator.intent_engine.proposal_provider.LlmIntentProposalProvider.propose",
+            return_value={
+                "action_type": "ValidateDraft",
+                "artifact_type": "ArticleDraft",
+                "inferred_fields": {},
+                "confidence": 0.1,
+                "_model": "fake",
+            },
+        ):
+            response = self.client.post(
+                "/xyn/api/xyn/intent/resolve",
+                data=json.dumps(
+                    {
+                        "message": 'Intent: Create an explainer video about Xyn governance ledger for telecom engineers. title: "What I Did On My Summer Vacation". category: demo'
+                    }
+                ),
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        payload = response.json()
+        self.assertEqual(payload["status"], "DraftReady")
+        self.assertEqual((payload.get("draft_payload") or {}).get("category"), "demo")
+        self.assertEqual((payload.get("draft_payload") or {}).get("title"), "What I Did On My Summer Vacation")
 
     def test_apply_patch_rejects_unauthorized_fields(self):
         create_response = self.client.post(
