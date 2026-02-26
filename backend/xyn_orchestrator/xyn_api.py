@@ -149,7 +149,15 @@ from .ai_runtime import (
     resolve_ai_config,
 )
 from .ai_compat import compute_effective_params
-from .video_explainer import default_video_spec, validate_video_spec, sanitize_payload, render_video, export_package_text
+from .video_explainer import (
+    default_video_spec,
+    validate_video_spec,
+    sanitize_payload,
+    render_video,
+    export_package_text,
+    deterministic_scene_scaffold,
+    normalize_video_scene,
+)
 from .access_explorer import (
     canonical_registry as access_canonical_registry,
     search_users as access_search_users,
@@ -254,6 +262,22 @@ def _intent_engine() -> IntentResolutionEngine:
         proposal_provider=LlmIntentProposalProvider(),
         contracts=_intent_contract_registry(),
     )
+
+
+def _intent_context_pack_audit(force_refresh: bool = False) -> Dict[str, Any]:
+    try:
+        meta = LlmIntentProposalProvider().context_pack_meta(force_refresh=force_refresh)
+        return {
+            "context_pack_slug": str(meta.get("slug") or ""),
+            "context_pack_version": str(meta.get("version") or ""),
+            "context_pack_hash": str(meta.get("hash") or ""),
+        }
+    except Exception:
+        return {
+            "context_pack_slug": LlmIntentProposalProvider.CONTEXT_PACK_SLUG,
+            "context_pack_version": "",
+            "context_pack_hash": "",
+        }
 
 
 def _audit_intent_event(
@@ -1442,6 +1466,14 @@ def _article_content(artifact: Artifact, revision: Optional[ArtifactRevision] = 
 
 def _default_video_spec_for_artifact(artifact: Artifact, revision: Optional[ArtifactRevision] = None) -> Dict[str, Any]:
     content = _article_content(artifact, revision)
+    if artifact.format == "video_explainer":
+        spec, _ = _build_explainer_video_spec(
+            title=str(content.get("title") or artifact.title),
+            summary=str(content.get("summary") or ""),
+            intent=str(content.get("summary") or artifact.title),
+            description=str(content.get("body_markdown") or content.get("summary") or ""),
+        )
+        return spec
     return default_video_spec(title=str(content.get("title") or artifact.title), summary=str(content.get("summary") or ""))
 
 
@@ -1449,6 +1481,194 @@ def _video_spec(artifact: Artifact, revision: Optional[ArtifactRevision] = None)
     if isinstance(artifact.video_spec_json, dict):
         return dict(artifact.video_spec_json)
     return _default_video_spec_for_artifact(artifact, revision)
+
+
+def _minutes_to_seconds(value: str) -> Optional[int]:
+    raw = str(value or "").strip().lower()
+    match = re.fullmatch(r"([0-9]{1,2})m", raw)
+    if not match:
+        return None
+    return max(30, int(match.group(1)) * 60)
+
+
+def _storyboard_from_scenes(scenes: List[Dict[str, Any]], *, duration_seconds_target: int) -> List[Dict[str, Any]]:
+    if not scenes:
+        return []
+    per_scene = max(8, int(duration_seconds_target / max(len(scenes), 1)))
+    rows: List[Dict[str, Any]] = []
+    start_seconds = 0
+    for index, scene in enumerate(scenes, start=1):
+        end_seconds = start_seconds + per_scene
+        title = str(scene.get("title") or f"Scene {index}")
+        rows.append(
+            {
+                "scene": index,
+                "time_range": f"{start_seconds // 60}:{start_seconds % 60:02d}-{end_seconds // 60}:{end_seconds % 60:02d}",
+                "on_screen_text": str(scene.get("on_screen") or "")[:120] or title[:120],
+                "visual_description": title[:200],
+                "motion": "subtle camera move",
+                "assets": [],
+                "narration": str(scene.get("voiceover") or title),
+            }
+        )
+        start_seconds = end_seconds
+    return rows
+
+
+def _parse_scene_scaffold_response(content: str) -> Optional[List[Dict[str, Any]]]:
+    try:
+        parsed = json.loads(_strip_code_fence(content))
+    except Exception:
+        return None
+    rows = parsed.get("scenes") if isinstance(parsed, dict) and isinstance(parsed.get("scenes"), list) else None
+    if not rows:
+        return None
+    normalized: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            continue
+        normalized.append(normalize_video_scene(row, index=idx))
+    if len(normalized) < 3:
+        return None
+    return normalized[:7]
+
+
+def _generate_explainer_scene_scaffold(
+    *,
+    title: str,
+    topic: str,
+    audience: str = "",
+    description: str = "",
+) -> Tuple[List[Dict[str, Any]], str]:
+    base_title = str(title or "Explainer Video").strip() or "Explainer Video"
+    base_topic = str(topic or base_title).strip() or base_title
+    base_audience = str(audience or "").strip()
+    base_description = str(description or "").strip()
+    default_count = 3 if len(base_description) < 700 else 5 if len(base_description) < 2500 else 6
+    scene_count = max(3, min(default_count, 7))
+    plan_rows = deterministic_scene_scaffold(
+        title=base_title,
+        topic=base_topic,
+        audience=base_audience,
+        description=base_description,
+        scene_count=scene_count,
+    )
+    plan = [
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "purpose": "Populate with grounded content from title/topic/description only.",
+            "on_screen_hint": row["on_screen"],
+        }
+        for row in plan_rows
+    ]
+    payload = {
+        "title": base_title,
+        "topic": base_topic,
+        "audience": base_audience,
+        "description": base_description,
+        "scene_plan": plan,
+        "constraints": [
+            "Use only title/topic/audience/description.",
+            "Do not mention routes, ids, lifecycle state, validation, hash, owner, schema, lineage, timestamps.",
+            "Return strict JSON only.",
+        ],
+        "output_schema": {"scenes": [{"id": "s1", "title": "string", "voiceover": "string", "on_screen": "string"}]},
+    }
+    try:
+        try:
+            resolved = resolve_ai_config(purpose_slug="explainer_storyboard")
+        except AiConfigError:
+            resolved = resolve_ai_config(purpose_slug="documentation")
+        response = invoke_model(
+            resolved_config=resolved,
+            messages=[
+                {"role": "system", "content": "Return strict JSON only."},
+                {"role": "developer", "content": "Fill the scene plan in order and keep every line grounded in supplied content."},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+        )
+        scenes = _parse_scene_scaffold_response(str(response.get("content") or ""))
+        if scenes:
+            return scenes, "model"
+        repaired = invoke_model(
+            resolved_config=resolved,
+            messages=[
+                {"role": "system", "content": "Repair previous output and return strict JSON only."},
+                {"role": "developer", "content": "Return {\"scenes\": [...]} and no prose."},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"payload": payload, "invalid_output": str(response.get("content") or "")},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        )
+        scenes = _parse_scene_scaffold_response(str(repaired.get("content") or ""))
+        if scenes:
+            return scenes, "model_repair"
+    except Exception:
+        pass
+    return plan_rows, "fallback"
+
+
+def _build_explainer_video_spec(
+    *,
+    title: str,
+    summary: str,
+    intent: str = "",
+    duration: str = "",
+    audience: str = "",
+    description: str = "",
+    existing_scenes: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    quality = "provided"
+    if existing_scenes and len(existing_scenes) >= 3:
+        scenes = [normalize_video_scene(item, index=idx) for idx, item in enumerate(existing_scenes, start=1)]
+    else:
+        scenes, quality = _generate_explainer_scene_scaffold(
+            title=title,
+            topic=intent or title,
+            audience=audience,
+            description=description or summary,
+        )
+    spec = default_video_spec(title=title, summary=summary, scenes=scenes)
+    spec["intent"] = str(intent or summary or title).strip()
+    if duration:
+        spec["duration"] = duration
+        seconds = _minutes_to_seconds(duration)
+        if seconds:
+            spec["duration_seconds_target"] = seconds
+    duration_seconds_target = int(spec.get("duration_seconds_target") or 150)
+    spec["script"] = {
+        **(spec.get("script") if isinstance(spec.get("script"), dict) else {}),
+        "draft": "\n\n".join([str(scene.get("voiceover") or "").strip() for scene in scenes if str(scene.get("voiceover") or "").strip()]),
+    }
+    spec["storyboard"] = {
+        **(spec.get("storyboard") if isinstance(spec.get("storyboard"), dict) else {}),
+        "draft": _storyboard_from_scenes(scenes, duration_seconds_target=duration_seconds_target),
+    }
+    return spec, quality
+
+
+def _derive_explainer_initial_content(
+    *,
+    title: str,
+    summary: str,
+    body_markdown: str,
+    scenes: List[Dict[str, Any]],
+) -> Tuple[str, str]:
+    normalized_summary = str(summary or "").strip()
+    normalized_body = str(body_markdown or "").strip()
+    if normalized_summary and normalized_body:
+        return normalized_summary, normalized_body
+    fallback_lines = [str(scene.get("voiceover") or "").strip() for scene in (scenes or []) if str(scene.get("voiceover") or "").strip()]
+    if not normalized_summary:
+        normalized_summary = fallback_lines[0] if fallback_lines else f"Explainer draft for {str(title or 'this topic').strip() or 'this topic'}."
+    if not normalized_body:
+        normalized_body = "\n\n".join(fallback_lines) if fallback_lines else normalized_summary
+    return normalized_summary, normalized_body
 
 
 def _normalize_pack_markdown(value: str) -> str:
@@ -5342,12 +5562,41 @@ def _generate_intent_script_for_tour(artifact: Artifact, *, audience: str, tone:
 def _article_content_payload_for_intent_script(artifact: Artifact) -> Dict[str, Any]:
     latest = _latest_artifact_revision(artifact)
     content = latest.content_json if latest and isinstance(latest.content_json, dict) else {}
+    fallback_tags = artifact.tags_json if isinstance(getattr(artifact, "tags_json", None), list) else []
     return {
         "title": str(content.get("title") or artifact.title or "").strip(),
         "summary": str(content.get("summary") or artifact.summary or "").strip(),
         "body": str(content.get("body_markdown") or "").strip(),
-        "tags": [str(tag).strip() for tag in (content.get("tags") or artifact.tags or []) if str(tag).strip()],
+        "tags": [str(tag).strip() for tag in (content.get("tags") or fallback_tags) if str(tag).strip()],
     }
+
+
+def _explainer_scenes_payload_for_intent_script(artifact: Artifact) -> List[Dict[str, Any]]:
+    spec = artifact.video_spec_json if isinstance(artifact.video_spec_json, dict) else {}
+    rows = spec.get("scenes") if isinstance(spec.get("scenes"), list) else []
+    normalized: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            continue
+        normalized.append(normalize_video_scene(row, index=idx))
+    return normalized
+
+
+def _intent_script_from_existing_scenes(title: str, scenes: List[Dict[str, Any]], *, audience: str, tone: str, length_target: str) -> Tuple[Dict[str, Any], str]:
+    script_title = f"{str(title or 'Explainer').strip() or 'Explainer'} Intent Script"
+    normalized = [normalize_video_scene(scene, index=idx) for idx, scene in enumerate(scenes, start=1)]
+    script_json = {
+        "title": script_title,
+        "scenes": normalized,
+        "duration_hint": "60-90s",
+        "metadata": {
+            "audience": audience,
+            "tone": tone,
+            "length_target": length_target,
+            "dependencies": [],
+        },
+    }
+    return script_json, _compose_intent_text(script_title, normalized)
 
 
 def _article_intent_script_validation_error(payload: Dict[str, Any]) -> Optional[str]:
@@ -5370,51 +5619,128 @@ def _sentence_chunks(value: str, *, limit: int = 3) -> List[str]:
     return [text[:320]]
 
 
-def _generate_intent_script_for_article_content(payload: Dict[str, Any], *, audience: str, tone: str, length_target: str) -> Tuple[Dict[str, Any], str]:
-    title = str(payload.get("title") or "Article").strip() or "Article"
+def _on_screen_text(value: str) -> str:
+    words = [w for w in str(value or "").strip().split() if w]
+    if not words:
+        return ""
+    return " ".join(words[:12])
+
+
+def _article_story_kind(payload: Dict[str, Any]) -> str:
+    tags = [str(tag).strip().lower() for tag in (payload.get("tags") or []) if str(tag).strip()]
+    body = str(payload.get("body") or "").strip()
+    lowered = body.lower()
+    if any(tag in {"guide", "how-to", "howto", "tutorial"} for tag in tags):
+        return "guide"
+    if re.search(r"(^|\n)\s*\d+[\).\s]", body):
+        return "guide"
+    if any(token in lowered for token in ["step ", "steps", "first,", "next,", "finally"]):
+        return "guide"
+    if any(token in lowered for token in [" i ", " my ", " we ", " our ", "summer", "vacation", "when "]):
+        return "narrative"
+    return "informative"
+
+
+def _article_scene_count(payload: Dict[str, Any]) -> int:
+    body_len = len(str(payload.get("body") or "").strip())
+    if body_len < 700:
+        return 3
+    if body_len > 4500:
+        return 7
+    if body_len > 2500:
+        return 6
+    return 5
+
+
+def _article_script_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
+    story_kind = _article_story_kind(payload)
+    scene_count = _article_scene_count(payload)
+    if scene_count == 3:
+        scenes = [
+            {"id": "s1", "title": "Hook / Premise", "purpose": "Establish the topic in plain language.", "on_screen": "What this is about"},
+            {"id": "s2", "title": "Core", "purpose": "Combine context and key points.", "on_screen": "Core ideas"},
+            {"id": "s3", "title": "Takeaway / Close", "purpose": "Summarize outcome and close naturally.", "on_screen": "Closing thought"},
+        ]
+        return {"story_kind": story_kind, "scene_count": scene_count, "scenes": scenes}
+
+    if story_kind == "guide":
+        base = [
+            {"id": "s1", "title": "Hook / Premise", "purpose": "State the guide objective.", "on_screen": "What this is about"},
+            {"id": "s2", "title": "Goal", "purpose": "Define the target outcome.", "on_screen": "Goal"},
+            {"id": "s3", "title": "Steps", "purpose": "Present the main steps.", "on_screen": "Steps"},
+            {"id": "s4", "title": "Common pitfalls", "purpose": "Warn about likely mistakes.", "on_screen": "Common pitfalls"},
+            {"id": "s5", "title": "Recap", "purpose": "Close with concise recap.", "on_screen": "Recap"},
+        ]
+    elif story_kind == "informative":
+        base = [
+            {"id": "s1", "title": "Hook / Premise", "purpose": "Establish the core subject.", "on_screen": "What this is about"},
+            {"id": "s2", "title": "Setup / Context", "purpose": "Provide context to frame the argument.", "on_screen": "The setup"},
+            {"id": "s3", "title": "Argument / Evidence", "purpose": "Present key points and support.", "on_screen": "Key points"},
+            {"id": "s4", "title": "Implications", "purpose": "Explain why the argument matters.", "on_screen": "What it means"},
+            {"id": "s5", "title": "Close / Next Step", "purpose": "End with a grounded close.", "on_screen": "Closing thought"},
+        ]
+    else:
+        base = [
+            {"id": "s1", "title": "Hook / Premise", "purpose": "Establish what this story is about.", "on_screen": "What this is about"},
+            {"id": "s2", "title": "Setup / Context", "purpose": "Provide people/time/context.", "on_screen": "The setup"},
+            {"id": "s3", "title": "Key Moments", "purpose": "Summarize 2–4 meaningful moments.", "on_screen": "The highlights"},
+            {"id": "s4", "title": "Outcome / Takeaways", "purpose": "State what changed or was learned.", "on_screen": "What it means"},
+            {"id": "s5", "title": "Close / Next Step", "purpose": "Provide a natural close.", "on_screen": "Closing thought"},
+        ]
+
+    # Expand long content to 6–7 scenes by splitting core segments.
+    next_index = 6
+    while len(base) < scene_count:
+        base.insert(-1, {"id": f"s{next_index}", "title": f"Detail {next_index - 4}", "purpose": "Add grounded detail from content.", "on_screen": "More detail"})
+        next_index += 1
+    return {"story_kind": story_kind, "scene_count": scene_count, "scenes": base}
+
+
+def _article_source_chunks(payload: Dict[str, Any], *, target: int) -> List[str]:
     summary = str(payload.get("summary") or "").strip()
     body = str(payload.get("body") or "").strip()
-    tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
-    tag_text = ", ".join(str(tag).strip() for tag in tags if str(tag).strip())
+    title = str(payload.get("title") or "Article").strip() or "Article"
+    chunks: List[str] = []
+    if summary:
+        chunks.extend(_sentence_chunks(summary, limit=2))
+    for paragraph in [part.strip() for part in re.split(r"\n\s*\n", body) if part.strip()]:
+        chunks.extend(_sentence_chunks(paragraph, limit=2))
+    if not chunks:
+        chunks = [title]
+    while len(chunks) < target:
+        chunks.append(chunks[-1])
+    return chunks[:target]
 
-    summary_chunks = _sentence_chunks(summary, limit=2)
-    body_chunks = _sentence_chunks(body, limit=6)
-    primary = summary_chunks[0] if summary_chunks else (body_chunks[0] if body_chunks else title)
-    detail = body_chunks[1] if len(body_chunks) > 1 else (summary_chunks[1] if len(summary_chunks) > 1 else primary)
-    outcome = body_chunks[2] if len(body_chunks) > 2 else detail
 
-    scenes: List[Dict[str, Any]] = [
-        _intent_scene(
-            "s1",
-            "Core message",
-            body=primary[:240],
-            outcome=f"{title}: {primary[:280]}",
-        ),
-        _intent_scene(
-            "s2",
-            "Key details",
-            body=detail[:240],
-            outcome=detail[:280] if detail else primary[:280],
-        ),
-        _intent_scene(
-            "s3",
-            "Practical takeaway",
-            body=outcome[:240],
-            outcome=outcome[:280] if outcome else detail[:280],
-        ),
-    ]
-    if tag_text:
+def _article_script_from_plan_deterministic(
+    payload: Dict[str, Any],
+    plan: Dict[str, Any],
+    *,
+    audience: str,
+    tone: str,
+    length_target: str,
+) -> Tuple[Dict[str, Any], str]:
+    title = str(payload.get("title") or "Article").strip() or "Article"
+    plan_scenes = plan.get("scenes") if isinstance(plan.get("scenes"), list) else []
+    chunks = _article_source_chunks(payload, target=max(len(plan_scenes), 3))
+    scenes: List[Dict[str, Any]] = []
+    for idx, plan_scene in enumerate(plan_scenes):
+        if not isinstance(plan_scene, dict):
+            continue
+        content = chunks[idx] if idx < len(chunks) else chunks[-1]
+        voice = " ".join(_sentence_chunks(content, limit=2))[:420]
         scenes.append(
-            _intent_scene(
-                "s4",
-                "Topic focus",
-                body=f"Topics: {tag_text[:220]}",
-                outcome=f"Reinforce the article focus areas: {tag_text[:240]}",
-            )
+            {
+                "id": str(plan_scene.get("id") or f"s{idx + 1}"),
+                "title": str(plan_scene.get("title") or f"Scene {idx + 1}"),
+                "voiceover": voice,
+                "on_screen": _on_screen_text(str(plan_scene.get("on_screen") or content)),
+            }
         )
 
+    script_title = f"{title} Intent Script"
     script_json = {
-        "title": f"{title} Intent Script",
+        "title": script_title,
         "scenes": scenes,
         "duration_hint": "60-90s",
         "metadata": {
@@ -5422,9 +5748,106 @@ def _generate_intent_script_for_article_content(payload: Dict[str, Any], *, audi
             "tone": tone,
             "length_target": length_target,
             "dependencies": [],
+            "story_kind": plan.get("story_kind"),
         },
     }
-    return script_json, _compose_intent_text(f"{title} Intent Script", scenes)
+    return script_json, _compose_intent_text(script_title, scenes)
+
+
+def _strip_code_fence(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    return text.strip()
+
+
+def _article_script_from_model(
+    payload: Dict[str, Any],
+    plan: Dict[str, Any],
+    *,
+    audience: str,
+    tone: str,
+    length_target: str,
+) -> Optional[Tuple[Dict[str, Any], str]]:
+    try:
+        resolved = resolve_ai_config(purpose_slug="documentation")
+        user_payload = {
+            "title": payload.get("title") or "",
+            "summary": payload.get("summary") or "",
+            "body": payload.get("body") or "",
+            "tags": payload.get("tags") or [],
+            "scene_plan": plan,
+            "constraints": [
+                "Use ONLY supplied title/summary/body/tags.",
+                "Do not mention URLs, IDs, lifecycle state, validation, schema version, hash, owner, lineage, timestamps.",
+                "Do not invent events not present in content.",
+                "If detail is missing, keep wording generic.",
+            ],
+            "output_schema": {
+                "title": "string",
+                "scenes": [{"id": "s1", "title": "string", "voiceover": "string", "on_screen": "string <= 12 words"}],
+                "duration_hint": "60-90s",
+            },
+        }
+        response = invoke_model(
+            resolved_config=resolved,
+            messages=[
+                {"role": "system", "content": "Return strict JSON only. Fill scene skeleton in order."},
+                {"role": "developer", "content": "Ground every line in supplied article content. No metadata narration."},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+        )
+        raw = _strip_code_fence(str(response.get("content") or ""))
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return None
+        scenes_input = parsed.get("scenes") if isinstance(parsed.get("scenes"), list) else []
+        if not scenes_input:
+            return None
+        scenes: List[Dict[str, Any]] = []
+        for idx, item in enumerate(scenes_input):
+            if not isinstance(item, dict):
+                continue
+            voiceover = str(item.get("voiceover") or "").strip()
+            on_screen = _on_screen_text(str(item.get("on_screen") or ""))
+            if not voiceover:
+                continue
+            scenes.append(
+                {
+                    "id": str(item.get("id") or f"s{idx + 1}"),
+                    "title": str(item.get("title") or f"Scene {idx + 1}"),
+                    "voiceover": voiceover[:500],
+                    "on_screen": on_screen or _on_screen_text(voiceover),
+                }
+            )
+        if len(scenes) < 3:
+            return None
+        title = str(parsed.get("title") or payload.get("title") or "Article").strip() or "Article"
+        script_title = f"{title} Intent Script"
+        script_json = {
+            "title": script_title,
+            "scenes": scenes,
+            "duration_hint": "60-90s",
+            "metadata": {
+                "audience": audience,
+                "tone": tone,
+                "length_target": length_target,
+                "dependencies": [],
+                "story_kind": plan.get("story_kind"),
+            },
+        }
+        return script_json, _compose_intent_text(script_title, scenes)
+    except Exception:
+        return None
+
+
+def _generate_intent_script_for_article_content(payload: Dict[str, Any], *, audience: str, tone: str, length_target: str) -> Tuple[Dict[str, Any], str]:
+    plan = _article_script_plan(payload)
+    generated = _article_script_from_model(payload, plan, audience=audience, tone=tone, length_target=length_target)
+    if generated:
+        return generated
+    return _article_script_from_plan_deterministic(payload, plan, audience=audience, tone=tone, length_target=length_target)
 
 
 def _generate_intent_script_for_artifact(artifact: Artifact, *, audience: str, tone: str, length_target: str) -> Tuple[Dict[str, Any], str]:
@@ -7211,14 +7634,36 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
         candidate_video_spec = payload.get("video_spec_json") if isinstance(payload.get("video_spec_json"), dict) else None
         candidate_video_ai_config = payload.get("video_ai_config_json") if isinstance(payload.get("video_ai_config_json"), dict) else None
         if candidate_video_spec is not None:
-            spec_errors = validate_video_spec(candidate_video_spec)
+            spec_errors = validate_video_spec(candidate_video_spec, require_scenes=article_format == "video_explainer")
             if spec_errors:
                 return JsonResponse({"error": "invalid video_spec_json", "details": spec_errors}, status=400)
         published_at = timezone.now() if status == "published" else None
-        with transaction.atomic():
-            final_video_spec = candidate_video_spec if candidate_video_spec is not None else (
-                default_video_spec(title=title, summary=summary) if article_format == "video_explainer" else None
+        scaffold_quality = "none"
+        if article_format == "video_explainer":
+            if candidate_video_spec is not None:
+                final_video_spec = candidate_video_spec
+                scaffold_quality = "provided"
+            else:
+                final_video_spec, scaffold_quality = _build_explainer_video_spec(
+                    title=title,
+                    summary=summary,
+                    intent=str(payload.get("intent") or summary or title),
+                    duration=str(payload.get("duration") or ""),
+                    audience=str(payload.get("audience") or ""),
+                    description=str(payload.get("description") or body_markdown or summary),
+                )
+        else:
+            final_video_spec = None
+        initial_summary = summary
+        initial_body_markdown = body_markdown
+        if article_format == "video_explainer" and isinstance(final_video_spec, dict):
+            initial_summary, initial_body_markdown = _derive_explainer_initial_content(
+                title=title,
+                summary=summary,
+                body_markdown=body_markdown,
+                scenes=final_video_spec.get("scenes") if isinstance(final_video_spec.get("scenes"), list) else [],
             )
+        with transaction.atomic():
             artifact = Artifact.objects.create(
                 workspace=workspace,
                 type=article_type,
@@ -7255,8 +7700,8 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                 revision_number=1,
                 content_json={
                     "title": title,
-                    "summary": summary,
-                    "body_markdown": body_markdown,
+                    "summary": initial_summary,
+                    "body_markdown": initial_body_markdown,
                     "body_html": body_html,
                     "tags": tags,
                     "provenance_json": payload.get("revision_provenance_json")
@@ -7282,6 +7727,18 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                     "video_context_pack_id": str(video_context_pack.id) if video_context_pack else None,
                 },
             )
+            if article_format == "video_explainer" and isinstance(final_video_spec, dict):
+                emit_ledger_event(
+                    actor=identity,
+                    action="draft.scaffolded",
+                    artifact=artifact,
+                    summary="Generated initial explainer scenes scaffold",
+                    metadata={
+                        "scene_count": len(final_video_spec.get("scenes") or []) if isinstance(final_video_spec.get("scenes"), list) else 0,
+                        "scaffold_quality": scaffold_quality,
+                    },
+                    dedupe_key=f"draft.scaffolded:{artifact.id}",
+                )
             for route in route_bindings:
                 value = str(route or "").strip()
                 if not value:
@@ -7691,7 +8148,8 @@ def article_detail(request: HttpRequest, article_id: str) -> JsonResponse:
                 artifact.video_spec_json = None
                 dirty_fields.add("video_spec_json")
             elif isinstance(candidate, dict):
-                spec_errors = validate_video_spec(candidate)
+                require_scenes = artifact.format == "video_explainer" or str(payload.get("format") or "").strip().lower() == "video_explainer"
+                spec_errors = validate_video_spec(candidate, require_scenes=require_scenes)
                 if spec_errors:
                     return JsonResponse({"error": "invalid video_spec_json", "details": spec_errors}, status=400)
                 artifact.video_spec_json = candidate
@@ -8057,8 +8515,26 @@ def article_video_initialize(request: HttpRequest, article_id: str) -> JsonRespo
     if artifact.format != "video_explainer":
         artifact.format = "video_explainer"
         dirty_fields.add("format")
+    content = _article_content(artifact)
     if not isinstance(artifact.video_spec_json, dict):
-        artifact.video_spec_json = _default_video_spec_for_artifact(artifact)
+        artifact.video_spec_json, _ = _build_explainer_video_spec(
+            title=str(content.get("title") or artifact.title),
+            summary=str(content.get("summary") or ""),
+            intent=str(content.get("summary") or artifact.title),
+            description=str(content.get("body_markdown") or content.get("summary") or ""),
+        )
+        dirty_fields.add("video_spec_json")
+    elif not isinstance(artifact.video_spec_json.get("scenes"), list) or len(artifact.video_spec_json.get("scenes") or []) < 3:
+        spec, _ = _build_explainer_video_spec(
+            title=str(content.get("title") or artifact.title),
+            summary=str(content.get("summary") or ""),
+            intent=str((artifact.video_spec_json or {}).get("intent") or content.get("summary") or artifact.title),
+            duration=str((artifact.video_spec_json or {}).get("duration") or ""),
+            audience=str((artifact.video_spec_json or {}).get("audience") or ""),
+            description=str(content.get("body_markdown") or content.get("summary") or ""),
+            existing_scenes=(artifact.video_spec_json or {}).get("scenes") if isinstance(artifact.video_spec_json, dict) else None,
+        )
+        artifact.video_spec_json = spec
         dirty_fields.add("video_spec_json")
     if not artifact.video_context_pack_id:
         default_pack = (
@@ -9685,23 +10161,45 @@ def intent_script_generate(request: HttpRequest) -> JsonResponse:
         linked_artifact = artifact
         title = f"{artifact.title} Intent Script"
         if artifact.type.slug == "article":
-            content_payload = _article_content_payload_for_intent_script(artifact)
-            validation_error = _article_intent_script_validation_error(content_payload)
-            if validation_error:
-                return JsonResponse(
-                    {
-                        "status": "MissingFields",
-                        "message": validation_error,
-                        "missing_fields": [
-                            {"field": "summary", "reason": "Add summary text or article body", "options_available": False},
-                            {"field": "body", "reason": "Add summary text or article body", "options_available": False},
-                        ],
-                    },
-                    status=400,
+            if artifact.format == "video_explainer":
+                existing_scenes = _explainer_scenes_payload_for_intent_script(artifact)
+                if len(existing_scenes) >= 3:
+                    script_json, script_text = _intent_script_from_existing_scenes(
+                        artifact.title,
+                        existing_scenes,
+                        audience=audience,
+                        tone=tone,
+                        length_target=length_target,
+                    )
+                else:
+                    return JsonResponse(
+                        {
+                            "status": "MissingFields",
+                            "message": "Add scenes to the explainer draft before generating an intent script.",
+                            "missing_fields": [
+                                {"field": "scenes", "reason": "Explainer scenes are required", "options_available": False},
+                            ],
+                        },
+                        status=400,
+                    )
+            else:
+                content_payload = _article_content_payload_for_intent_script(artifact)
+                validation_error = _article_intent_script_validation_error(content_payload)
+                if validation_error:
+                    return JsonResponse(
+                        {
+                            "status": "MissingFields",
+                            "message": validation_error,
+                            "missing_fields": [
+                                {"field": "summary", "reason": "Add summary text or article body", "options_available": False},
+                                {"field": "body", "reason": "Add summary text or article body", "options_available": False},
+                            ],
+                        },
+                        status=400,
+                    )
+                script_json, script_text = _generate_intent_script_for_article_content(
+                    content_payload, audience=audience, tone=tone, length_target=length_target
                 )
-            script_json, script_text = _generate_intent_script_for_article_content(
-                content_payload, audience=audience, tone=tone, length_target=length_target
-            )
             title = str(script_json.get("title") or title)
         else:
             script_json, script_text = _generate_intent_script_for_artifact(artifact, audience=audience, tone=tone, length_target=length_target)
@@ -10335,6 +10833,7 @@ def _intent_apply_create_draft(
                 "audit": {
                     "request_id": request_id,
                     "timestamp": timezone.now().isoformat(),
+                    **_intent_context_pack_audit(),
                 },
             },
             status=400,
@@ -10366,14 +10865,25 @@ def _intent_apply_create_draft(
     except PatchValidationError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
     video_spec = None
+    scaffold_quality = "none"
     if internal_format == "video_explainer":
-        video_spec = default_video_spec(title=title, summary=summary)
-        video_spec["intent"] = intent_value
-        if duration_value:
-            video_spec["duration"] = duration_value
-        spec_errors = validate_video_spec(video_spec)
+        video_spec, scaffold_quality = _build_explainer_video_spec(
+            title=title,
+            summary=summary,
+            intent=intent_value or title,
+            duration=duration_value,
+            audience=str(merged.get("audience") or ""),
+            description=str(merged.get("description") or body_markdown or summary),
+        )
+        spec_errors = validate_video_spec(video_spec, require_scenes=True)
         if spec_errors:
             return JsonResponse({"error": "invalid video spec", "details": spec_errors}, status=400)
+        summary, body_markdown = _derive_explainer_initial_content(
+            title=title,
+            summary=summary,
+            body_markdown=body_markdown,
+            scenes=video_spec.get("scenes") if isinstance(video_spec.get("scenes"), list) else [],
+        )
 
     with transaction.atomic():
         artifact = Artifact.objects.create(
@@ -10423,6 +10933,18 @@ def _intent_apply_create_draft(
             metadata={"fields_set": sorted([k for k in ["title", "category", "format", "intent", "duration"] if str(merged.get(k) or "").strip()])},
             dedupe_key=f"draft.created:{artifact.id}",
         )
+        if internal_format == "video_explainer" and isinstance(video_spec, dict):
+            emit_ledger_event(
+                actor=identity,
+                action="draft.scaffolded",
+                artifact=artifact,
+                summary="Generated initial explainer scenes scaffold",
+                metadata={
+                    "scene_count": len(video_spec.get("scenes") or []) if isinstance(video_spec.get("scenes"), list) else 0,
+                    "scaffold_quality": scaffold_quality,
+                },
+                dedupe_key=f"draft.scaffolded:{artifact.id}",
+            )
 
     intent_telemetry_increment("apply_success")
     payload_response = {
@@ -10435,6 +10957,7 @@ def _intent_apply_create_draft(
         "audit": {
             "request_id": request_id,
             "timestamp": timezone.now().isoformat(),
+            **_intent_context_pack_audit(),
         },
     }
     _audit_intent_event(
@@ -10475,7 +10998,11 @@ def _intent_apply_patch(
                 "artifact_id": str(artifact.id),
                 "summary": "Patch failed deterministic validation.",
                 "validation_errors": [str(exc)],
-                "audit": {"request_id": request_id, "timestamp": timezone.now().isoformat()},
+                "audit": {
+                    "request_id": request_id,
+                    "timestamp": timezone.now().isoformat(),
+                    **_intent_context_pack_audit(),
+                },
             },
             status=400,
         )
@@ -10508,6 +11035,7 @@ def _intent_apply_patch(
         "audit": {
             "request_id": request_id,
             "timestamp": timezone.now().isoformat(),
+            **_intent_context_pack_audit(),
         },
     }
     _audit_intent_event(

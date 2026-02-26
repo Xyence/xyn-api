@@ -34,9 +34,11 @@ class SeedPackTests(TestCase):
 
     def test_apply_core_seeds_creates_missing_context_packs(self):
         ContextPack.objects.filter(name="xyn-platform-canon", scope="global").delete()
+        ContextPack.objects.filter(name="xyn-console-default", scope="global").delete()
         result = apply_seed_packs(apply_core=True)
         self.assertGreaterEqual(result["summary"].get("created", 0), 1)
         self.assertTrue(ContextPack.objects.filter(name="xyn-platform-canon", scope="global").exists())
+        self.assertTrue(ContextPack.objects.filter(name="xyn-console-default", scope="global").exists())
 
     def test_reapply_core_seeds_is_idempotent(self):
         first = apply_seed_packs(apply_core=True)

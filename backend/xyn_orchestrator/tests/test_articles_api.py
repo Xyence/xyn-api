@@ -319,6 +319,36 @@ class GovernedArticlesApiTests(TestCase):
         self.assertIn("script", payload["video_spec_json"])
         self.assertEqual(payload.get("video_context_pack_id"), str(default_pack.id))
 
+    def test_create_explainer_article_scaffolds_scenes(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Summer Vacation Explainer",
+                    "slug": "summer-vacation-explainer",
+                    "category": "guide",
+                    "format": "video_explainer",
+                    "summary": "What I did on my summer vacation.",
+                    "body_markdown": "I spent summer documenting governance changes and delivery outcomes.",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        payload = create.json()["article"]
+        spec = payload.get("video_spec_json") or {}
+        scenes = spec.get("scenes") if isinstance(spec, dict) else []
+        self.assertTrue(isinstance(scenes, list) and len(scenes) >= 3)
+        self.assertTrue(str(payload.get("summary") or "").strip())
+        self.assertTrue(str(payload.get("body_markdown") or "").strip())
+        serialized = json.dumps(scenes).lower()
+        self.assertNotIn("/app/artifacts", serialized)
+        self.assertNotIn("validation", serialized)
+        self.assertNotIn("content hash", serialized)
+        self.assertNotIn("owner", serialized)
+
     def test_generate_script_adds_proposal_without_overwriting_existing_draft(self):
         self._set_identity(self.admin_identity)
         create = self.client.post(
@@ -340,7 +370,11 @@ class GovernedArticlesApiTests(TestCase):
                         "voice": {"style": "conversational", "speaker": "neutral", "pace": "medium"},
                         "script": {"draft": "Human-authored draft", "last_generated_at": None, "notes": "", "proposals": []},
                         "storyboard": {"draft": [], "last_generated_at": None, "notes": "", "proposals": []},
-                        "scenes": [],
+                        "scenes": [
+                            {"id": "s1", "title": "Hook / Premise", "voiceover": "Hook line", "on_screen": "What this is about"},
+                            {"id": "s2", "title": "Setup / Context", "voiceover": "Context line", "on_screen": "The setup"},
+                            {"id": "s3", "title": "Close / Next Step", "voiceover": "Close line", "on_screen": "Closing thought"},
+                        ],
                         "generation": {"provider": None, "status": "not_started", "last_render_id": None},
                     },
                     "body_markdown": "Base article",

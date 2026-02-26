@@ -1,4 +1,6 @@
 import json
+import os
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
@@ -17,6 +19,10 @@ class IntentScriptsApiTests(TestCase):
         session = self.client.session
         session["user_identity_id"] = str(self.identity.id)
         session.save()
+        os.environ["XYN_INTENT_ENGINE_V1"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("XYN_INTENT_ENGINE_V1", None)
 
     def _create_workflow(self) -> str:
         response = self.client.post(
@@ -61,7 +67,16 @@ class IntentScriptsApiTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content.decode())
         return response.json()["artifact_id"]
 
-    def _create_article_artifact(self, *, title: str, category: str = "web", summary: str = "", body: str = "") -> str:
+    def _create_article_artifact(
+        self,
+        *,
+        title: str,
+        category: str = "web",
+        summary: str = "",
+        body: str = "",
+        format: str = "article",
+        intent: str = "",
+    ) -> str:
         response = self.client.post(
             "/xyn/api/xyn/intent/apply",
             data=json.dumps(
@@ -71,7 +86,8 @@ class IntentScriptsApiTests(TestCase):
                     "payload": {
                         "title": title,
                         "category": category,
-                        "format": "article",
+                        "format": format,
+                        "intent": intent,
                         "summary": summary,
                         "body": body,
                     },
@@ -181,6 +197,65 @@ class IntentScriptsApiTests(TestCase):
         self.assertNotIn("owner", script_text)
         self.assertIn("summer vacation", script_text)
 
+    def test_article_intent_script_model_prompt_uses_content_only_payload(self):
+        body = (
+            "This article explains governance ledger design choices. "
+            "It focuses on deterministic transitions and clear accountability."
+        )
+        artifact_id = self._create_article_artifact(
+            title="Governance Ledger Notes",
+            summary="Design notes for accountability.",
+            body=body,
+        )
+        captured = {}
+
+        def _fake_invoke(*, resolved_config, messages):
+            captured["messages"] = messages
+            return {
+                "content": json.dumps(
+                    {
+                        "title": "Governance Ledger Notes",
+                        "scenes": [
+                            {"id": "s1", "title": "Hook / Premise", "voiceover": "Intro", "on_screen": "What this is about"},
+                            {"id": "s2", "title": "Setup / Context", "voiceover": "Context", "on_screen": "The setup"},
+                            {"id": "s3", "title": "Close / Next Step", "voiceover": "Close", "on_screen": "Closing thought"},
+                        ],
+                        "duration_hint": "60-90s",
+                    }
+                ),
+                "model": "fake-model",
+            }
+
+        with patch("xyn_orchestrator.xyn_api.resolve_ai_config", return_value={"model_name": "fake-model"}):
+            with patch("xyn_orchestrator.xyn_api.invoke_model", side_effect=_fake_invoke):
+                response = self.client.post(
+                    "/xyn/api/intent-scripts/generate",
+                    data=json.dumps(
+                        {
+                            "scope_type": "artifact",
+                            "scope_ref_id": artifact_id,
+                            "audience": "developer",
+                            "length_target": "short",
+                        }
+                    ),
+                    content_type="application/json",
+                )
+
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        user_message = next(
+            (msg for msg in (captured.get("messages") or []) if isinstance(msg, dict) and msg.get("role") == "user"),
+            {},
+        )
+        payload = json.loads(str(user_message.get("content") or "{}"))
+        content_only = {key: value for key, value in payload.items() if key not in {"constraints", "output_schema"}}
+        serialized = json.dumps(content_only).lower()
+        self.assertNotIn("artifact_id", serialized)
+        self.assertNotIn("/app/artifacts", serialized)
+        self.assertNotIn("schema_version", serialized)
+        self.assertNotIn("content_hash", serialized)
+        self.assertNotIn("owner", serialized)
+        self.assertNotIn("lineage", serialized)
+
     def test_generate_intent_script_from_article_requires_summary_or_body(self):
         artifact_id = self._create_article_artifact(title="Empty Article", summary="", body="")
         response = self.client.post(
@@ -199,3 +274,26 @@ class IntentScriptsApiTests(TestCase):
         payload = response.json()
         self.assertEqual(payload.get("status"), "MissingFields")
         self.assertIn("Add a summary or body", str(payload.get("message") or ""))
+
+    def test_generate_intent_script_for_explainer_article_uses_existing_scenes(self):
+        artifact_id = self._create_article_artifact(
+            title="Summer Vacation Explainer",
+            category="web",
+            format="explainer_video",
+            intent="Explain summer vacation outcomes for telecom engineers.",
+        )
+        response = self.client.post(
+            "/xyn/api/intent-scripts/generate",
+            data=json.dumps(
+                {
+                    "scope_type": "artifact",
+                    "scope_ref_id": artifact_id,
+                    "audience": "developer",
+                    "length_target": "short",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        scenes = (((response.json() or {}).get("item") or {}).get("script_json") or {}).get("scenes") or []
+        self.assertTrue(len(scenes) >= 3)

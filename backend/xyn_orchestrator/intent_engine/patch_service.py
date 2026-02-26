@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from django.db import transaction
 
 from xyn_orchestrator.models import Artifact, ArtifactRevision, UserIdentity
-from xyn_orchestrator.video_explainer import default_video_spec, validate_video_spec
+from xyn_orchestrator.video_explainer import default_video_spec, normalize_video_scene, validate_video_spec
 
 from .types import PATCHABLE_FIELDS
 
@@ -53,6 +53,7 @@ def _current_values(artifact: Artifact) -> Dict[str, Any]:
         "format": from_internal_format(artifact.format),
         "intent": str(video_spec.get("intent") or ""),
         "duration": str(video_spec.get("duration") or ""),
+        "scenes": list(video_spec.get("scenes") or []) if isinstance(video_spec.get("scenes"), list) else [],
         "tags": list(content.get("tags") or scope.get("tags") or []),
         "summary": str(content.get("summary") or ""),
         "body": str(content.get("body_markdown") or ""),
@@ -95,6 +96,13 @@ def validate_patch(*, artifact: Artifact, patch_object: Dict[str, Any], allowed_
             if value and value not in DURATION_OPTIONS:
                 raise PatchValidationError("invalid duration")
             normalized[field_name] = value
+        elif field_name == "scenes":
+            if not isinstance(next_value, list):
+                raise PatchValidationError("scenes must be a list")
+            scenes = [normalize_video_scene(item, index=idx) for idx, item in enumerate(next_value, start=1) if isinstance(item, dict)]
+            if scenes and len(scenes) < 3:
+                raise PatchValidationError("scenes must include at least 3 items")
+            normalized[field_name] = scenes
         elif field_name == "tags":
             if not isinstance(next_value, list):
                 raise PatchValidationError("tags must be a list")
@@ -130,13 +138,15 @@ def apply_patch(*, artifact: Artifact, actor: UserIdentity, patch_object: Dict[s
             artifact.format = to_internal_format(normalized["format"])
             dirty_fields.add("format")
 
-        if "intent" in normalized or "duration" in normalized or artifact.format == "video_explainer":
+        if "intent" in normalized or "duration" in normalized or "scenes" in normalized or artifact.format == "video_explainer":
             spec = dict(artifact.video_spec_json or {}) if isinstance(artifact.video_spec_json, dict) else default_video_spec(title=artifact.title, summary="")
             if "intent" in normalized:
                 spec["intent"] = normalized["intent"]
             if "duration" in normalized and normalized["duration"]:
                 spec["duration"] = normalized["duration"]
-            spec_errors = validate_video_spec(spec)
+            if "scenes" in normalized:
+                spec["scenes"] = normalized["scenes"]
+            spec_errors = validate_video_spec(spec, require_scenes=(artifact.format == "video_explainer" or str(normalized.get("format") or "") == "explainer_video"))
             if spec_errors:
                 raise PatchValidationError("invalid resulting video spec")
             artifact.video_spec_json = spec

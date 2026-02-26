@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from xyn_orchestrator.models import Artifact
 
 from .contracts import DraftIntakeContractRegistry
-from .proposal_provider import IntentProposalProvider
+from .proposal_provider import IntentContextPackMissingError, IntentProposalProvider
 from .types import ALLOWED_ACTIONS, ALLOWED_ARTIFACT_TYPES, ResolutionResult
 
 
@@ -90,15 +90,36 @@ class IntentResolutionEngine:
         artifact_type_hint = "ArticleDraft"
         has_context = context.artifact is not None
 
-        proposal = self.proposal_provider.propose(
-            message=message,
-            artifact_type_hint=artifact_type_hint,
-            has_artifact_context=has_context,
-        )
+        try:
+            proposal = self.proposal_provider.propose(
+                message=message,
+                artifact_type_hint=artifact_type_hint,
+                has_artifact_context=has_context,
+            )
+        except IntentContextPackMissingError as exc:
+            result = self._base_result(
+                action_type="ValidateDraft",
+                artifact_type=artifact_type_hint,
+                request_id=request_id,
+                confidence=0.0,
+                llm_model="",
+            )
+            result["status"] = "UnsupportedIntent"
+            result["summary"] = str(exc)
+            result["audit"] = {
+                **(result.get("audit") or {}),
+                "context_pack_slug": exc.slug,
+                "context_pack_version": "",
+                "context_pack_hash": "",
+            }
+            return result, {}
         action_type = str(proposal.get("action_type") or "").strip()
         artifact_type = proposal.get("artifact_type")
         confidence = float(proposal.get("confidence") or 0.0)
         llm_model = str(proposal.get("_model") or "")
+        context_pack_slug = str(proposal.get("_context_pack_slug") or "")
+        context_pack_version = str(proposal.get("_context_pack_version") or "")
+        context_pack_hash = str(proposal.get("_context_pack_hash") or "")
 
         if confidence < 0.55:
             heuristic = self._heuristic_proposal(message=message, has_context=has_context)
@@ -116,6 +137,12 @@ class IntentResolutionEngine:
             confidence=confidence,
             llm_model=llm_model,
         )
+        result["audit"] = {
+            **(result.get("audit") or {}),
+            "context_pack_slug": context_pack_slug,
+            "context_pack_version": context_pack_version,
+            "context_pack_hash": context_pack_hash,
+        }
 
         if action_type not in ALLOWED_ACTIONS:
             result["status"] = "UnsupportedIntent"
@@ -173,7 +200,7 @@ class IntentResolutionEngine:
             patch_object = {
                 key: value
                 for key, value in inferred_fields.items()
-                if key in {"title", "category", "format", "intent", "duration", "tags", "summary", "body"}
+                if key in {"title", "category", "format", "intent", "duration", "scenes", "tags", "summary", "body"}
             }
             if not patch_object:
                 result["status"] = "ValidationError"

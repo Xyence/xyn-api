@@ -7,7 +7,88 @@ from typing import Any, Dict, List, Tuple
 VIDEO_RENDER_STATUSES = {"not_started", "queued", "running", "succeeded", "failed", "canceled"}
 
 
-def default_video_spec(title: str = "", summary: str = "") -> Dict[str, Any]:
+def _scene_on_screen(value: str) -> str:
+    words = [word for word in str(value or "").strip().split() if word]
+    return " ".join(words[:12]).strip()
+
+
+def _scene_voiceover(value: str, *, fallback: str) -> str:
+    text = str(value or "").strip()
+    return text or fallback
+
+
+def normalize_video_scene(item: Dict[str, Any], *, index: int) -> Dict[str, Any]:
+    scene_id = str(item.get("id") or f"s{index}").strip() or f"s{index}"
+    title = str(item.get("title") or item.get("name") or f"Scene {index}").strip() or f"Scene {index}"
+    voiceover = _scene_voiceover(
+        item.get("voiceover") or item.get("narration"),
+        fallback=f"{title}.",
+    )
+    on_screen = _scene_on_screen(item.get("on_screen") or item.get("on_screen_text") or title)
+    if not on_screen:
+        on_screen = f"Scene {index}"
+    return {
+        "id": scene_id,
+        "title": title,
+        "voiceover": voiceover,
+        "on_screen": on_screen,
+    }
+
+
+def deterministic_scene_scaffold(
+    *,
+    title: str,
+    topic: str,
+    audience: str = "",
+    description: str = "",
+    scene_count: int = 5,
+) -> List[Dict[str, Any]]:
+    resolved_title = str(title or "Explainer Video").strip() or "Explainer Video"
+    resolved_topic = str(topic or resolved_title).strip() or resolved_title
+    resolved_audience = str(audience or "").strip()
+    resolved_description = str(description or "").strip()
+    count = max(3, min(int(scene_count or 5), 7))
+    plans = [
+        ("Hook / Premise", "What this is about"),
+        ("Setup / Context", "The setup"),
+        ("Key Moments / Main Points", "Key points"),
+        ("Outcome / Takeaways", "What it means"),
+        ("Close / Next Step", "Closing thought"),
+    ]
+    if count <= 3:
+        plans = [
+            ("Hook / Premise", "What this is about"),
+            ("Core", "Core ideas"),
+            ("Takeaway / Close", "Closing thought"),
+        ]
+    scenes: List[Dict[str, Any]] = []
+    for idx in range(count):
+        plan = plans[idx] if idx < len(plans) else (f"Detail {idx - len(plans) + 1}", "Additional detail")
+        intro = f"This explainer introduces {resolved_topic.lower()}."
+        if idx == 0:
+            voice = intro
+        elif idx == count - 1:
+            voice = f"This closes with the key takeaway from {resolved_title.lower()}."
+        else:
+            detail = resolved_description or f"It focuses on practical context for {resolved_topic.lower()}."
+            voice = detail
+        if resolved_audience and idx in {0, 1}:
+            voice = f"{voice} It is tailored for {resolved_audience}."
+        scenes.append(
+            normalize_video_scene(
+                {
+                    "id": f"s{idx + 1}",
+                    "title": plan[0],
+                    "voiceover": voice,
+                    "on_screen": plan[1],
+                },
+                index=idx + 1,
+            )
+        )
+    return scenes
+
+
+def default_video_spec(title: str = "", summary: str = "", *, scenes: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     return {
         "version": 1,
@@ -33,7 +114,7 @@ def default_video_spec(title: str = "", summary: str = "") -> Dict[str, Any]:
             "notes": "",
             "proposals": [],
         },
-        "scenes": [],
+        "scenes": list(scenes or []),
         "generation": {
             "provider": None,
             "status": "not_started",
@@ -43,7 +124,7 @@ def default_video_spec(title: str = "", summary: str = "") -> Dict[str, Any]:
     }
 
 
-def validate_video_spec(spec: Dict[str, Any]) -> List[str]:
+def validate_video_spec(spec: Dict[str, Any], *, require_scenes: bool = False) -> List[str]:
     errors: List[str] = []
     if not isinstance(spec, dict):
         return ["video_spec_json must be an object"]
@@ -77,6 +158,22 @@ def validate_video_spec(spec: Dict[str, Any]) -> List[str]:
     scenes = spec.get("scenes", [])
     if not isinstance(scenes, list):
         errors.append("scenes must be a list")
+    elif require_scenes and len(scenes) < 3:
+        errors.append("scenes must include at least 3 items for explainer_video")
+    elif scenes:
+        for idx, scene in enumerate(scenes, start=1):
+            if not isinstance(scene, dict):
+                errors.append(f"scenes[{idx - 1}] must be an object")
+                continue
+            normalized = normalize_video_scene(scene, index=idx)
+            if not normalized.get("id"):
+                errors.append(f"scenes[{idx - 1}].id is required")
+            if not normalized.get("title"):
+                errors.append(f"scenes[{idx - 1}].title is required")
+            if not normalized.get("voiceover"):
+                errors.append(f"scenes[{idx - 1}].voiceover is required")
+            if not normalized.get("on_screen"):
+                errors.append(f"scenes[{idx - 1}].on_screen is required")
     generation = spec.get("generation", {})
     if not isinstance(generation, dict):
         errors.append("generation must be an object")
@@ -153,4 +250,3 @@ def export_package_payload(article_payload: Dict[str, Any], latest_render_payloa
 
 def export_package_text(article_payload: Dict[str, Any], latest_render_payload: Dict[str, Any] | None = None) -> str:
     return json.dumps(export_package_payload(article_payload, latest_render_payload), indent=2, sort_keys=True)
-

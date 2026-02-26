@@ -39,6 +39,10 @@ class DraftIntakeContract:
 
         if not str(merged.get("category") or "").strip():
             category_match = re.search(r"\bcategory\b\s*(?:is|:)\s*([a-z0-9_-]+)", prompt, flags=re.IGNORECASE)
+            if not category_match:
+                category_match = re.search(r"\b(?:in|into|for|under)\s+(?:the\s+)?([a-z0-9_-]+)\s+category\b", prompt, flags=re.IGNORECASE)
+            if not category_match:
+                category_match = re.search(r"\b([a-z0-9_-]+)\s+category\b", prompt, flags=re.IGNORECASE)
             if category_match:
                 merged["category"] = str(category_match.group(1)).strip().lower()
 
@@ -76,8 +80,6 @@ class DraftIntakeContract:
 
     def required_fields(self, values: Mapping[str, Any]) -> List[str]:
         required = list(self.required_fields_base)
-        if self.normalize_format(values.get("format")) == "explainer_video":
-            required.append("intent")
         return required
 
     def missing_fields(self, values: Mapping[str, Any]) -> List[str]:

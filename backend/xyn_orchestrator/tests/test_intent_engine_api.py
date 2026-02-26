@@ -7,6 +7,7 @@ from django.test import TestCase
 
 from xyn_orchestrator.intent_engine.contracts import DraftIntakeContractRegistry
 from xyn_orchestrator.intent_engine.engine import IntentResolutionEngine, ResolutionContext
+from xyn_orchestrator.intent_engine.proposal_provider import IntentContextPackMissingError
 from xyn_orchestrator.models import Artifact, LedgerEvent, RoleBinding, UserIdentity, Workspace
 
 
@@ -39,13 +40,13 @@ class IntentEngineApiTests(TestCase):
     def tearDown(self):
         os.environ.pop("XYN_INTENT_ENGINE_V1", None)
 
-    def test_contract_requires_intent_for_explainer_video(self):
+    def test_contract_no_longer_requires_intent_for_explainer_video(self):
         registry = DraftIntakeContractRegistry(category_options_provider=lambda: [{"slug": "web", "name": "Web"}])
         contract = registry.get("ArticleDraft")
         self.assertIsNotNone(contract)
         assert contract is not None
         merged = contract.merge_defaults({"title": "x", "category": "web", "format": "explainer_video"})
-        self.assertIn("intent", contract.missing_fields(merged))
+        self.assertNotIn("intent", contract.missing_fields(merged))
 
     def test_contract_infers_explicit_fields_from_message(self):
         registry = DraftIntakeContractRegistry(category_options_provider=lambda: [{"slug": "demo", "name": "Demo"}])
@@ -60,6 +61,17 @@ class IntentEngineApiTests(TestCase):
         self.assertEqual(inferred.get("title"), "What I Did On My Summer Vacation")
         self.assertEqual(inferred.get("category"), "demo")
         self.assertTrue(str(inferred.get("intent") or "").lower().startswith("create an explainer video"))
+
+    def test_contract_infers_category_from_natural_phrase(self):
+        registry = DraftIntakeContractRegistry(category_options_provider=lambda: [{"slug": "demo", "name": "Demo"}])
+        contract = registry.get("ArticleDraft")
+        self.assertIsNotNone(contract)
+        assert contract is not None
+        inferred = contract.infer_fields(
+            message='Create an explainer video about Xyn governance ledger for telecom engineers. The title is "What I Did On My Summer Vacation". Create it in the demo category.',
+            inferred_fields={},
+        )
+        self.assertEqual(inferred.get("category"), "demo")
 
     def test_engine_rejects_unknown_action_type(self):
         registry = DraftIntakeContractRegistry(category_options_provider=lambda: [{"slug": "web", "name": "Web"}])
@@ -86,6 +98,9 @@ class IntentEngineApiTests(TestCase):
                 "inferred_fields": {"title": "Draft title"},
                 "confidence": 0.93,
                 "_model": "fake",
+                "_context_pack_slug": "xyn-console-default",
+                "_context_pack_version": "1.0.0",
+                "_context_pack_hash": "abc123",
             },
         ):
             response = self.client.post(
@@ -97,6 +112,7 @@ class IntentEngineApiTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["status"], "MissingFields")
         self.assertTrue(any(item["field"] == "category" for item in payload.get("missing_fields", [])))
+        self.assertEqual((payload.get("audit") or {}).get("context_pack_slug"), "xyn-console-default")
 
     def test_resolve_heuristic_create_fallback_for_low_confidence(self):
         with patch(
@@ -146,6 +162,21 @@ class IntentEngineApiTests(TestCase):
         self.assertEqual(payload["status"], "DraftReady")
         self.assertEqual((payload.get("draft_payload") or {}).get("category"), "demo")
         self.assertEqual((payload.get("draft_payload") or {}).get("title"), "What I Did On My Summer Vacation")
+
+    def test_resolve_returns_explicit_error_when_console_context_pack_missing(self):
+        with patch(
+            "xyn_orchestrator.intent_engine.proposal_provider.LlmIntentProposalProvider.propose",
+            side_effect=IntentContextPackMissingError("xyn-console-default"),
+        ):
+            response = self.client.post(
+                "/xyn/api/xyn/intent/resolve",
+                data=json.dumps({"message": "create an explainer video"}),
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        payload = response.json()
+        self.assertEqual(payload.get("status"), "UnsupportedIntent")
+        self.assertIn("context pack missing", str(payload.get("summary") or "").lower())
 
     def test_apply_patch_rejects_unauthorized_fields(self):
         create_response = self.client.post(
@@ -270,3 +301,13 @@ class IntentEngineApiTests(TestCase):
         created = Artifact.objects.get(id=apply_response.json().get("artifact_id"))
         self.assertEqual(created.format, "video_explainer")
         self.assertEqual((created.video_spec_json or {}).get("intent"), "Explain Xyn governance quickly")
+        scenes = (created.video_spec_json or {}).get("scenes") if isinstance(created.video_spec_json, dict) else []
+        self.assertTrue(isinstance(scenes, list) and len(scenes) >= 3)
+        latest = created.revisions.order_by("-revision_number").first()
+        content = latest.content_json if latest and isinstance(latest.content_json, dict) else {}
+        self.assertTrue(str(content.get("summary") or "").strip())
+        self.assertTrue(str(content.get("body_markdown") or "").strip())
+        serialized_scenes = json.dumps(scenes).lower()
+        self.assertNotIn("/app/artifacts", serialized_scenes)
+        self.assertNotIn("validation", serialized_scenes)
+        self.assertNotIn("content_hash", serialized_scenes)

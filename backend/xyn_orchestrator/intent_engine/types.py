@@ -48,6 +48,7 @@ PATCHABLE_FIELDS = {
     "format",
     "intent",
     "duration",
+    "scenes",
     "tags",
     "summary",
     "body",
