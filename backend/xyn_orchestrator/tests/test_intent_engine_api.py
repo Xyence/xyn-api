@@ -84,6 +84,29 @@ class IntentEngineApiTests(TestCase):
         self.assertEqual(payload["status"], "MissingFields")
         self.assertTrue(any(item["field"] == "category" for item in payload.get("missing_fields", [])))
 
+    def test_resolve_heuristic_create_fallback_for_low_confidence(self):
+        with patch(
+            "xyn_orchestrator.intent_engine.proposal_provider.LlmIntentProposalProvider.propose",
+            return_value={
+                "action_type": "ValidateDraft",
+                "artifact_type": "ArticleDraft",
+                "inferred_fields": {},
+                "confidence": 0.01,
+                "_model": "fake",
+            },
+        ):
+            response = self.client.post(
+                "/xyn/api/xyn/intent/resolve",
+                data=json.dumps({"message": "Create an explainer video about governance ledger for telecom engineers."}),
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        payload = response.json()
+        self.assertEqual(payload["status"], "MissingFields")
+        self.assertEqual(payload["action_type"], "CreateDraft")
+        self.assertEqual(payload["artifact_type"], "ArticleDraft")
+        self.assertNotEqual(payload["summary"], "Intent is ambiguous; provide clearer draft instructions.")
+
     def test_apply_patch_rejects_unauthorized_fields(self):
         create_response = self.client.post(
             "/xyn/api/xyn/intent/apply",

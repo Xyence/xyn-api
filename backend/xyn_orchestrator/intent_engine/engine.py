@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import re
 from typing import Any, Dict, List, Optional
 
 from xyn_orchestrator.models import Artifact
@@ -38,6 +39,52 @@ class IntentResolutionEngine:
             },
         }
 
+    @staticmethod
+    def _heuristic_proposal(*, message: str, has_context: bool) -> Optional[Dict[str, Any]]:
+        prompt = str(message or "").strip().lower()
+        if not prompt:
+            return None
+
+        if any(token in prompt for token in ["show options", "what categories", "what formats", "available categories", "available formats"]):
+            field = "category" if "categor" in prompt else "format" if "format" in prompt else "category"
+            return {
+                "action_type": "ShowOptions",
+                "artifact_type": "ArticleDraft",
+                "inferred_fields": {"field": field},
+                "confidence": 0.56,
+                "_model": "heuristic",
+            }
+
+        if has_context and re.search(r"\b(add|set|update|rewrite|change|edit|patch)\b", prompt):
+            return {
+                "action_type": "ProposePatch",
+                "artifact_type": "ArticleDraft",
+                "inferred_fields": {},
+                "confidence": 0.56,
+                "_model": "heuristic",
+            }
+
+        create_verbs = re.search(r"\b(create|make|start|new|draft|write|build)\b", prompt)
+        artifact_tokens = re.search(r"\b(article|guide|tour|explainer|video)\b", prompt)
+        if create_verbs and artifact_tokens:
+            inferred_fields: Dict[str, Any] = {}
+            if "explainer" in prompt or "video" in prompt:
+                inferred_fields["format"] = "explainer_video"
+            elif "guide" in prompt:
+                inferred_fields["format"] = "guide"
+            elif "tour" in prompt:
+                inferred_fields["format"] = "tour"
+            else:
+                inferred_fields["format"] = "article"
+            return {
+                "action_type": "CreateDraft",
+                "artifact_type": "ArticleDraft",
+                "inferred_fields": inferred_fields,
+                "confidence": 0.56,
+                "_model": "heuristic",
+            }
+        return None
+
     def resolve(self, *, message: str, context: ResolutionContext) -> tuple[ResolutionResult, Dict[str, Any]]:
         request_id = str(uuid.uuid4())
         artifact_type_hint = "ArticleDraft"
@@ -52,6 +99,15 @@ class IntentResolutionEngine:
         artifact_type = proposal.get("artifact_type")
         confidence = float(proposal.get("confidence") or 0.0)
         llm_model = str(proposal.get("_model") or "")
+
+        if confidence < 0.55:
+            heuristic = self._heuristic_proposal(message=message, has_context=has_context)
+            if heuristic:
+                proposal = heuristic
+                action_type = str(proposal.get("action_type") or "").strip()
+                artifact_type = proposal.get("artifact_type")
+                confidence = float(proposal.get("confidence") or confidence)
+                llm_model = str(proposal.get("_model") or llm_model)
 
         result = self._base_result(
             action_type=action_type or "ValidateDraft",
