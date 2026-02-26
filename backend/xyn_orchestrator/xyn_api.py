@@ -5285,17 +5285,12 @@ def _can_view_generic_artifact(identity: UserIdentity, artifact: Artifact) -> bo
     return bool(artifact.author_id and str(artifact.author_id) == str(identity.id))
 
 
-def _intent_scene(scene_id: str, title: str, *, route: str = "", body: str = "", outcome: str = "", highlights: Optional[List[str]] = None) -> Dict[str, Any]:
+def _intent_scene(scene_id: str, title: str, *, body: str = "", outcome: str = "") -> Dict[str, Any]:
     return {
         "id": scene_id,
         "title": title,
-        "duration_hint": "12-20s",
         "voiceover": outcome or body or title,
         "on_screen": body or title,
-        "ui_route": route or "",
-        "highlights": highlights or [],
-        "assets": [],
-        "notes": "",
     }
 
 
@@ -5303,7 +5298,6 @@ def _compose_intent_text(title: str, scenes: List[Dict[str, Any]]) -> str:
     lines: List[str] = [f"# {title}", ""]
     for idx, scene in enumerate(scenes, start=1):
         lines.append(f"{idx}. {scene.get('title') or f'Scene {idx}'}")
-        lines.append(f"   Route: {scene.get('ui_route') or 'n/a'}")
         lines.append(f"   Voiceover: {scene.get('voiceover') or ''}")
         lines.append(f"   On-screen: {scene.get('on_screen') or ''}")
         lines.append("")
@@ -5320,10 +5314,8 @@ def _generate_intent_script_for_tour(artifact: Artifact, *, audience: str, tone:
         scene = _intent_scene(
             f"s{idx}",
             str(step.get("title") or f"Step {idx}"),
-            route=str(step.get("route") or ""),
             body=str(step.get("body_md") or ""),
             outcome=f"Guide the viewer through {str(step.get('title') or '').strip().lower() or 'the current step'} with clear expected outcome.",
-            highlights=[str(step.get("type") or "callout"), str((step.get("anchor") or {}).get("test_id") or "")],
         )
         scenes.append(scene)
     if not scenes:
@@ -5331,7 +5323,6 @@ def _generate_intent_script_for_tour(artifact: Artifact, *, audience: str, tone:
             _intent_scene(
                 "s1",
                 artifact.title,
-                route=str((spec.get("entry") or {}).get("route") or ""),
                 outcome="Introduce the tour objective and expected result.",
             )
         )
@@ -5343,8 +5334,97 @@ def _generate_intent_script_for_tour(artifact: Artifact, *, audience: str, tone:
             "length_target": length_target,
             "dependencies": ["xyn-ui", "workflow_runner"],
         },
+        "duration_hint": "60-90s",
     }
     return script_json, _compose_intent_text(f"{artifact.title} Intent Script", scenes)
+
+
+def _article_content_payload_for_intent_script(artifact: Artifact) -> Dict[str, Any]:
+    latest = _latest_artifact_revision(artifact)
+    content = latest.content_json if latest and isinstance(latest.content_json, dict) else {}
+    return {
+        "title": str(content.get("title") or artifact.title or "").strip(),
+        "summary": str(content.get("summary") or artifact.summary or "").strip(),
+        "body": str(content.get("body_markdown") or "").strip(),
+        "tags": [str(tag).strip() for tag in (content.get("tags") or artifact.tags or []) if str(tag).strip()],
+    }
+
+
+def _article_intent_script_validation_error(payload: Dict[str, Any]) -> Optional[str]:
+    summary = str(payload.get("summary") or "").strip()
+    body = str(payload.get("body") or "").strip()
+    if summary:
+        return None
+    if len(body) >= 80:
+        return None
+    return "Add a summary or body to generate an intent script."
+
+
+def _sentence_chunks(value: str, *, limit: int = 3) -> List[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    chunks = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+    if chunks:
+        return chunks[:limit]
+    return [text[:320]]
+
+
+def _generate_intent_script_for_article_content(payload: Dict[str, Any], *, audience: str, tone: str, length_target: str) -> Tuple[Dict[str, Any], str]:
+    title = str(payload.get("title") or "Article").strip() or "Article"
+    summary = str(payload.get("summary") or "").strip()
+    body = str(payload.get("body") or "").strip()
+    tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
+    tag_text = ", ".join(str(tag).strip() for tag in tags if str(tag).strip())
+
+    summary_chunks = _sentence_chunks(summary, limit=2)
+    body_chunks = _sentence_chunks(body, limit=6)
+    primary = summary_chunks[0] if summary_chunks else (body_chunks[0] if body_chunks else title)
+    detail = body_chunks[1] if len(body_chunks) > 1 else (summary_chunks[1] if len(summary_chunks) > 1 else primary)
+    outcome = body_chunks[2] if len(body_chunks) > 2 else detail
+
+    scenes: List[Dict[str, Any]] = [
+        _intent_scene(
+            "s1",
+            "Core message",
+            body=primary[:240],
+            outcome=f"{title}: {primary[:280]}",
+        ),
+        _intent_scene(
+            "s2",
+            "Key details",
+            body=detail[:240],
+            outcome=detail[:280] if detail else primary[:280],
+        ),
+        _intent_scene(
+            "s3",
+            "Practical takeaway",
+            body=outcome[:240],
+            outcome=outcome[:280] if outcome else detail[:280],
+        ),
+    ]
+    if tag_text:
+        scenes.append(
+            _intent_scene(
+                "s4",
+                "Topic focus",
+                body=f"Topics: {tag_text[:220]}",
+                outcome=f"Reinforce the article focus areas: {tag_text[:240]}",
+            )
+        )
+
+    script_json = {
+        "title": f"{title} Intent Script",
+        "scenes": scenes,
+        "duration_hint": "60-90s",
+        "metadata": {
+            "audience": audience,
+            "tone": tone,
+            "length_target": length_target,
+            "dependencies": [],
+        },
+    }
+    return script_json, _compose_intent_text(f"{title} Intent Script", scenes)
 
 
 def _generate_intent_script_for_artifact(artifact: Artifact, *, audience: str, tone: str, length_target: str) -> Tuple[Dict[str, Any], str]:
@@ -5354,24 +5434,20 @@ def _generate_intent_script_for_artifact(artifact: Artifact, *, audience: str, t
         _intent_scene(
             "s1",
             f"{artifact.title} overview",
-            route=f"/app/artifacts/{artifact.id}",
             outcome=(
                 f"This is a {artifact.type.slug} artifact in {artifact.artifact_state} state, "
                 f"with validation {artifact.validation_status or 'unknown'}."
             ),
-            highlights=[artifact.type.slug, artifact.artifact_state, artifact.validation_status or "unknown"],
         )
     )
     scenes.append(
         _intent_scene(
             "s2",
             "Provenance and trust signals",
-            route=f"/app/artifacts/{artifact.id}",
             outcome=(
                 f"Show owner, schema version, and content hash {str(artifact.content_hash or '')[:16]} "
                 "to explain traceability."
             ),
-            highlights=[str(artifact.schema_version or ""), str(artifact.content_hash or "")[:16]],
         )
     )
     if artifact.type.slug == "article":
@@ -5382,9 +5458,7 @@ def _generate_intent_script_for_artifact(artifact: Artifact, *, audience: str, t
             _intent_scene(
                 "s3",
                 "Content narrative",
-                route=f"/app/artifacts/{artifact.id}",
                 outcome=narrative[:480] or "Describe the article narrative and intended audience outcome.",
-                highlights=["article", artifact.format or "standard"],
             )
         )
     elif artifact.type.slug == "workflow":
@@ -5393,9 +5467,7 @@ def _generate_intent_script_for_artifact(artifact: Artifact, *, audience: str, t
             _intent_scene(
                 "s3",
                 "Workflow path",
-                route=f"/app/artifacts/workflows?workflow={artifact.id}",
                 outcome=f"Walk through {len(spec.get('steps') or [])} deterministic workflow steps.",
-                highlights=[artifact.workflow_profile or "workflow"],
             )
         )
     elif artifact.type.slug == "blueprint" and isinstance(source, Blueprint):
@@ -5403,13 +5475,13 @@ def _generate_intent_script_for_artifact(artifact: Artifact, *, audience: str, t
             _intent_scene(
                 "s3",
                 "Blueprint intent",
-                route=f"/app/blueprints/{source.id}",
                 outcome=(source.description or source.spec_text or "").strip()[:480] or "Explain blueprint intent and expected deployment outcome.",
-                highlights=[source.namespace, source.name],
             )
         )
     script_json = {
+        "title": f"{artifact.title} Intent Script",
         "scenes": scenes,
+        "duration_hint": "60-90s",
         "metadata": {
             "audience": audience,
             "tone": tone,
@@ -9612,7 +9684,27 @@ def intent_script_generate(request: HttpRequest) -> JsonResponse:
             return JsonResponse({"error": "forbidden"}, status=403)
         linked_artifact = artifact
         title = f"{artifact.title} Intent Script"
-        script_json, script_text = _generate_intent_script_for_artifact(artifact, audience=audience, tone=tone, length_target=length_target)
+        if artifact.type.slug == "article":
+            content_payload = _article_content_payload_for_intent_script(artifact)
+            validation_error = _article_intent_script_validation_error(content_payload)
+            if validation_error:
+                return JsonResponse(
+                    {
+                        "status": "MissingFields",
+                        "message": validation_error,
+                        "missing_fields": [
+                            {"field": "summary", "reason": "Add summary text or article body", "options_available": False},
+                            {"field": "body", "reason": "Add summary text or article body", "options_available": False},
+                        ],
+                    },
+                    status=400,
+                )
+            script_json, script_text = _generate_intent_script_for_article_content(
+                content_payload, audience=audience, tone=tone, length_target=length_target
+            )
+            title = str(script_json.get("title") or title)
+        else:
+            script_json, script_text = _generate_intent_script_for_artifact(artifact, audience=audience, tone=tone, length_target=length_target)
     else:
         title = str(payload.get("title") or "Manual Intent Script").strip() or "Manual Intent Script"
         script_json = {

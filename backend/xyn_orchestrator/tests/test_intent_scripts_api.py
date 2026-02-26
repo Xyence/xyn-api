@@ -61,6 +61,27 @@ class IntentScriptsApiTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content.decode())
         return response.json()["artifact_id"]
 
+    def _create_article_artifact(self, *, title: str, category: str = "web", summary: str = "", body: str = "") -> str:
+        response = self.client.post(
+            "/xyn/api/xyn/intent/apply",
+            data=json.dumps(
+                {
+                    "action_type": "CreateDraft",
+                    "artifact_type": "ArticleDraft",
+                    "payload": {
+                        "title": title,
+                        "category": category,
+                        "format": "article",
+                        "summary": summary,
+                        "body": body,
+                    },
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        return response.json()["artifact_id"]
+
     def test_generate_intent_script_from_tour(self):
         workflow_id = self._create_workflow()
         response = self.client.post(
@@ -120,3 +141,61 @@ class IntentScriptsApiTests(TestCase):
         listing = self.client.get("/xyn/api/intent-scripts", {"scope_type": "artifact", "scope_ref_id": artifact_id})
         self.assertEqual(listing.status_code, 200, listing.content.decode())
         self.assertTrue(any(item["intent_script_id"] == script_id for item in listing.json().get("items", [])))
+
+    def test_generate_intent_script_from_article_uses_content_only(self):
+        body = (
+            "What I did on my summer vacation included documenting lessons from field deployments. "
+            "I focused on governance ledger workflows and how teams review changes clearly. "
+            "The article explains practical steps and outcomes for telecom engineering teams."
+        )
+        artifact_id = self._create_article_artifact(
+            title="What I Did On My Summer Vacation",
+            summary="A practical account of governance ledger lessons.",
+            body=body,
+        )
+
+        response = self.client.post(
+            "/xyn/api/intent-scripts/generate",
+            data=json.dumps(
+                {
+                    "scope_type": "artifact",
+                    "scope_ref_id": artifact_id,
+                    "audience": "developer",
+                    "length_target": "short",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        item = response.json()["item"]
+        serialized = json.dumps(item.get("script_json") or {}).lower()
+        script_text = str(item.get("script_text") or "").lower()
+        self.assertNotIn("/app/artifacts", serialized)
+        self.assertNotIn("ui_route", serialized)
+        self.assertNotIn("/app/artifacts", script_text)
+        self.assertNotIn("route:", script_text)
+        self.assertNotIn("provisional", script_text)
+        self.assertNotIn("content hash", script_text)
+        self.assertNotIn("schema", script_text)
+        self.assertNotIn("validation", script_text)
+        self.assertNotIn("owner", script_text)
+        self.assertIn("summer vacation", script_text)
+
+    def test_generate_intent_script_from_article_requires_summary_or_body(self):
+        artifact_id = self._create_article_artifact(title="Empty Article", summary="", body="")
+        response = self.client.post(
+            "/xyn/api/intent-scripts/generate",
+            data=json.dumps(
+                {
+                    "scope_type": "artifact",
+                    "scope_ref_id": artifact_id,
+                    "audience": "developer",
+                    "length_target": "short",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400, response.content.decode())
+        payload = response.json()
+        self.assertEqual(payload.get("status"), "MissingFields")
+        self.assertIn("Add a summary or body", str(payload.get("message") or ""))
