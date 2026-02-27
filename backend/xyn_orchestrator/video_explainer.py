@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
@@ -48,32 +49,80 @@ def deterministic_scene_scaffold(
     resolved_audience = str(audience or "").strip()
     resolved_description = str(description or "").strip()
     count = max(3, min(int(scene_count or 5), 7))
+    topic_lower = resolved_topic.lower()
+    if "salamander" in topic_lower:
+        biology_scenes = [
+            {
+                "title": "Meet the salamanders",
+                "voiceover": (
+                    "Salamanders are amphibians with moist skin and long tails, spanning more than 700 known species. "
+                    "They bridge aquatic and terrestrial ecosystems."
+                ),
+                "on_screen": "Amphibians across diverse habitats",
+            },
+            {
+                "title": "Habitat and life cycle",
+                "voiceover": (
+                    "Most salamanders rely on cool, damp environments such as forests, streams, and wetlands. "
+                    "Many begin life as aquatic larvae before transitioning to land."
+                ),
+                "on_screen": "Forests, streams, wetlands",
+            },
+            {
+                "title": "Regeneration abilities",
+                "voiceover": (
+                    "Some salamanders can regenerate limbs, tail tissue, and even parts of the spinal cord. "
+                    "Researchers study this process to understand tissue repair."
+                ),
+                "on_screen": "Regeneration in action",
+            },
+            {
+                "title": "Role in ecosystems",
+                "voiceover": (
+                    "Salamanders help control insect populations and serve as prey for birds and mammals. "
+                    "Their abundance is often used as an indicator of ecosystem health."
+                ),
+                "on_screen": "Key ecosystem indicators",
+            },
+            {
+                "title": "Conservation takeaway",
+                "voiceover": (
+                    "Habitat loss, pollution, and climate shifts threaten salamander populations. "
+                    "Protecting wetlands and forests helps preserve their biodiversity and ecological value."
+                ),
+                "on_screen": "Protect habitat, protect species",
+            },
+        ]
+        if resolved_audience:
+            biology_scenes[0]["voiceover"] = f"{biology_scenes[0]['voiceover']} This overview is tailored for {resolved_audience}."
+        selected = biology_scenes[:count]
+        return [normalize_video_scene({"id": f"s{idx + 1}", **row}, index=idx + 1) for idx, row in enumerate(selected)]
+
     plans = [
-        ("Hook / Premise", "What this is about"),
-        ("Setup / Context", "The setup"),
-        ("Key Moments / Main Points", "Key points"),
-        ("Outcome / Takeaways", "What it means"),
-        ("Close / Next Step", "Closing thought"),
+        (f"{resolved_topic.title()}: core premise", "Topic overview"),
+        (f"{resolved_topic.title()}: context", "Context"),
+        (f"{resolved_topic.title()}: key points", "Key points"),
+        (f"{resolved_topic.title()}: takeaways", "Takeaways"),
+        (f"{resolved_topic.title()}: closing", "Closing"),
     ]
     if count <= 3:
         plans = [
-            ("Hook / Premise", "What this is about"),
-            ("Core", "Core ideas"),
-            ("Takeaway / Close", "Closing thought"),
+            (f"{resolved_topic.title()}: premise", "Premise"),
+            (f"{resolved_topic.title()}: core points", "Core points"),
+            (f"{resolved_topic.title()}: takeaway", "Takeaway"),
         ]
     scenes: List[Dict[str, Any]] = []
     for idx in range(count):
-        plan = plans[idx] if idx < len(plans) else (f"Detail {idx - len(plans) + 1}", "Additional detail")
-        intro = f"This explainer introduces {resolved_topic.lower()}."
+        plan = plans[idx] if idx < len(plans) else (f"{resolved_topic.title()}: detail {idx - len(plans) + 1}", "Additional detail")
         if idx == 0:
-            voice = intro
+            voice = f"{resolved_topic.title()} is the central focus of this explainer."
         elif idx == count - 1:
-            voice = f"This closes with the key takeaway from {resolved_title.lower()}."
+            voice = f"The closing takeaway is why {resolved_topic.lower()} matters in practice."
         else:
-            detail = resolved_description or f"It focuses on practical context for {resolved_topic.lower()}."
+            detail = resolved_description or f"This section covers practical context and evidence related to {resolved_topic.lower()}."
             voice = detail
         if resolved_audience and idx in {0, 1}:
-            voice = f"{voice} It is tailored for {resolved_audience}."
+            voice = f"{voice} The explanation is tuned for {resolved_audience}."
         scenes.append(
             normalize_video_scene(
                 {
@@ -199,6 +248,18 @@ def sanitize_payload(payload: Any) -> Any:
     return payload
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def _build_export_asset(article_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
     scenes = spec.get("scenes", [])
     return {
@@ -233,7 +294,7 @@ def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_
 
 def export_package_payload(article_payload: Dict[str, Any], latest_render_payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
     spec = article_payload.get("video_spec_json") if isinstance(article_payload.get("video_spec_json"), dict) else {}
-    return {
+    payload = {
         "article_id": article_payload.get("id"),
         "title": article_payload.get("title"),
         "slug": article_payload.get("slug"),
@@ -246,6 +307,7 @@ def export_package_payload(article_payload: Dict[str, Any], latest_render_payloa
         "latest_render": latest_render_payload or {},
         "exported_at": datetime.now(timezone.utc).isoformat(),
     }
+    return _json_safe(payload)
 
 
 def export_package_text(article_payload: Dict[str, Any], latest_render_payload: Dict[str, Any] | None = None) -> str:

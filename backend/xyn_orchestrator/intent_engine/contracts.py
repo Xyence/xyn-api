@@ -34,6 +34,14 @@ class DraftIntakeContract:
             title_match = re.search(r"\btitle\b\s*(?:is|:)\s*[\"']([^\"']+)[\"']", raw_message, flags=re.IGNORECASE)
             if not title_match:
                 title_match = re.search(r"\btitle\b\s*(?:is|:)\s*([^\n.;]+)", raw_message, flags=re.IGNORECASE)
+            if not title_match:
+                title_match = re.search(r"\btitle\s+it(?:\s+as)?\s*[\"']([^\"']+)[\"']", raw_message, flags=re.IGNORECASE)
+            if not title_match:
+                title_match = re.search(r"\btitle\s+it(?:\s+as)?\s*([^\n.;]+)", raw_message, flags=re.IGNORECASE)
+            if not title_match:
+                title_match = re.search(r"\bcall\s+it\s*[\"']([^\"']+)[\"']", raw_message, flags=re.IGNORECASE)
+            if not title_match:
+                title_match = re.search(r"\bcall\s+it\s*([^\n.;]+)", raw_message, flags=re.IGNORECASE)
             if title_match:
                 merged["title"] = str(title_match.group(1)).strip()
 
@@ -71,6 +79,9 @@ class DraftIntakeContract:
         return merged
 
     def normalize_format(self, value: Any) -> str:
+        if self.artifact_type == "ContextPack":
+            raw = str(value or "").strip().lower()
+            return raw if raw in {"json", "yaml", "text"} else "json"
         raw = str(value or "").strip().lower()
         if raw in {"video_explainer", "explainer_video"}:
             return "explainer_video"
@@ -116,7 +127,16 @@ class DraftIntakeContractRegistry:
                     "format": lambda: list(FormatOption),
                     "duration": lambda: list(DurationOption),
                 },
-            )
+            ),
+            "ContextPack": DraftIntakeContract(
+                artifact_type="ContextPack",
+                required_fields_base=["title", "content"],
+                optional_fields=["summary", "tags", "format"],
+                default_values={"format": "json"},
+                option_sources={
+                    "format": lambda: ["json", "yaml", "text"],
+                },
+            ),
         }
 
     def get(self, artifact_type: str) -> Optional[DraftIntakeContract]:

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from django.db import transaction
 
-from xyn_orchestrator.models import Artifact, ArtifactRevision, UserIdentity
+from xyn_orchestrator.models import Artifact, ArtifactRevision, ContextPack, UserIdentity
 from xyn_orchestrator.video_explainer import default_video_spec, normalize_video_scene, validate_video_spec
 
-from .types import PATCHABLE_FIELDS
+from .types import ARTICLE_PATCHABLE_FIELDS, CONTEXT_PACK_PATCHABLE_FIELDS
 
 DURATION_OPTIONS = {"2m", "5m", "8m", "12m"}
 
@@ -63,7 +65,7 @@ def _current_values(artifact: Artifact) -> Dict[str, Any]:
 def validate_patch(*, artifact: Artifact, patch_object: Dict[str, Any], allowed_categories: List[str]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     if not isinstance(patch_object, dict):
         raise PatchValidationError("patch_object must be an object")
-    unknown_fields = [key for key in patch_object.keys() if key not in PATCHABLE_FIELDS]
+    unknown_fields = [key for key in patch_object.keys() if key not in ARTICLE_PATCHABLE_FIELDS]
     if unknown_fields:
         raise PatchValidationError(f"unsupported patch fields: {', '.join(sorted(unknown_fields))}")
 
@@ -114,6 +116,125 @@ def validate_patch(*, artifact: Artifact, patch_object: Dict[str, Any], allowed_
             changes.append({"field": field_name, "from": current.get(field_name), "to": normalized.get(field_name)})
 
     return normalized, changes
+
+
+def _content_hash_for_pack(pack: ContextPack) -> str:
+    return hashlib.sha256(str(pack.content_markdown or "").encode("utf-8")).hexdigest()
+
+
+def _normalize_context_pack_format(pack: ContextPack) -> str:
+    applies = pack.applies_to_json if isinstance(pack.applies_to_json, dict) else {}
+    raw = str(applies.get("content_format") or "").strip().lower()
+    return raw if raw in {"json", "yaml", "text"} else "json"
+
+
+def _validate_context_pack_content(format_name: str, content: str):
+    normalized_format = str(format_name or "").strip().lower()
+    payload = str(content or "")
+    if normalized_format == "json":
+        try:
+            json.loads(payload or "{}")
+        except Exception as exc:
+            raise PatchValidationError(f"invalid json content: {exc}") from exc
+        return
+    if normalized_format == "yaml":
+        try:
+            import yaml  # type: ignore
+
+            yaml.safe_load(payload or "")
+        except Exception as exc:
+            raise PatchValidationError(f"invalid yaml content: {exc}") from exc
+        return
+    if normalized_format != "text":
+        raise PatchValidationError("invalid format")
+
+
+def _context_pack_current_values(pack: ContextPack) -> Dict[str, Any]:
+    applies = pack.applies_to_json if isinstance(pack.applies_to_json, dict) else {}
+    tags = applies.get("tags") if isinstance(applies.get("tags"), list) else []
+    return {
+        "title": str(pack.name or ""),
+        "summary": str(applies.get("summary") or ""),
+        "tags": [str(tag).strip() for tag in tags if str(tag).strip()],
+        "content": str(pack.content_markdown or ""),
+        "format": _normalize_context_pack_format(pack),
+    }
+
+
+def validate_context_pack_patch(*, pack: ContextPack, patch_object: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    if not isinstance(patch_object, dict):
+        raise PatchValidationError("patch_object must be an object")
+    unknown_fields = [key for key in patch_object.keys() if key not in CONTEXT_PACK_PATCHABLE_FIELDS]
+    if unknown_fields:
+        raise PatchValidationError(f"unsupported patch fields: {', '.join(sorted(unknown_fields))}")
+
+    current = _context_pack_current_values(pack)
+    normalized: Dict[str, Any] = {}
+    changes: List[Dict[str, Any]] = []
+
+    for field_name, next_value in patch_object.items():
+        if field_name == "title":
+            value = str(next_value or "").strip()
+            if not value:
+                raise PatchValidationError("title cannot be empty")
+            normalized[field_name] = value
+        elif field_name == "summary":
+            normalized[field_name] = str(next_value or "")
+        elif field_name == "tags":
+            if not isinstance(next_value, list):
+                raise PatchValidationError("tags must be a list")
+            normalized[field_name] = [str(v).strip() for v in next_value if str(v).strip()]
+        elif field_name == "content":
+            normalized[field_name] = str(next_value or "")
+        elif field_name == "format":
+            value = str(next_value or "").strip().lower()
+            if value not in {"json", "yaml", "text"}:
+                raise PatchValidationError("invalid format")
+            normalized[field_name] = value
+
+    effective_format = str(normalized.get("format") or current.get("format") or "json")
+    if "content" in normalized or "format" in normalized:
+        _validate_context_pack_content(effective_format, str(normalized.get("content") or current.get("content") or ""))
+
+    for field_name, value in normalized.items():
+        if current.get(field_name) != value:
+            changes.append({"field": field_name, "from": current.get(field_name), "to": value})
+    return normalized, changes
+
+
+def apply_context_pack_patch(*, pack: ContextPack, actor: UserIdentity, patch_object: Dict[str, Any]) -> Tuple[ContextPack, Dict[str, str], List[Dict[str, Any]]]:
+    normalized, changes = validate_context_pack_patch(pack=pack, patch_object=patch_object)
+    if not changes:
+        return pack, {"before_hash": _content_hash_for_pack(pack), "after_hash": _content_hash_for_pack(pack)}, changes
+
+    before_hash = _content_hash_for_pack(pack)
+    with transaction.atomic():
+        dirty_fields: set[str] = set()
+        applies = dict(pack.applies_to_json or {}) if isinstance(pack.applies_to_json, dict) else {}
+        if "title" in normalized:
+            pack.name = str(normalized["title"])
+            dirty_fields.add("name")
+        if "content" in normalized:
+            pack.content_markdown = str(normalized["content"])
+            dirty_fields.add("content_markdown")
+        if "summary" in normalized:
+            applies["summary"] = str(normalized["summary"])
+            dirty_fields.add("applies_to_json")
+        if "tags" in normalized:
+            applies["tags"] = list(normalized["tags"])
+            dirty_fields.add("applies_to_json")
+        if "format" in normalized:
+            applies["content_format"] = str(normalized["format"])
+            dirty_fields.add("applies_to_json")
+        if "applies_to_json" in dirty_fields:
+            pack.applies_to_json = applies
+        if hasattr(pack, "updated_by_id"):
+            pack.updated_by = actor.user if hasattr(actor, "user") else None
+            dirty_fields.add("updated_by")
+        if dirty_fields:
+            pack.save(update_fields=sorted(dirty_fields | {"updated_at"}))
+    after_hash = _content_hash_for_pack(pack)
+    return pack, {"before_hash": before_hash, "after_hash": after_hash}, changes
 
 
 def apply_patch(*, artifact: Artifact, actor: UserIdentity, patch_object: Dict[str, Any], category_resolver) -> Artifact:

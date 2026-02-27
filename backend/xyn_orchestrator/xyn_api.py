@@ -191,6 +191,7 @@ from .intent_engine import (
     PatchValidationError,
     apply_patch as intent_apply_patch,
 )
+from .intent_engine.patch_service import apply_context_pack_patch as intent_apply_context_pack_patch
 from .intent_engine.patch_service import to_internal_format as intent_to_internal_format
 from .intent_engine.telemetry import increment as intent_telemetry_increment
 
@@ -204,6 +205,7 @@ PREVIEW_ALLOWED_TRANSITIONS: Dict[str, Set[str]] = {
 }
 DOC_ARTIFACT_TYPE_SLUG = "doc_page"
 ARTICLE_ARTIFACT_TYPE_SLUG = "article"
+CONTEXT_PACK_ARTIFACT_TYPE_SLUG = "context_pack"
 WORKFLOW_ARTIFACT_TYPE_SLUG = "workflow"
 ARTICLE_CATEGORIES = {"web", "guide", "core-concepts", "release-note", "internal", "tutorial"}
 GUIDE_ARTICLE_CATEGORIES = {"guide", "core-concepts", "tutorial"}
@@ -234,6 +236,15 @@ WORKSPACE_ROLE_SLUGS = {"reader", "contributor", "publisher", "moderator", "admi
 PURPOSE_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 
 
+def _artifact_state_for_status(status: str) -> str:
+    value = str(status or "").strip().lower()
+    if value == "deprecated":
+        return "deprecated"
+    if value == "published":
+        return "canonical"
+    return "provisional"
+
+
 def _truthy_env(value: Any, *, default: bool) -> bool:
     raw = str(value or "").strip().lower()
     if not raw:
@@ -261,6 +272,7 @@ def _intent_engine() -> IntentResolutionEngine:
     return IntentResolutionEngine(
         proposal_provider=LlmIntentProposalProvider(),
         contracts=_intent_contract_registry(),
+        context_pack_target_lookup=_lookup_context_pack_artifact_for_intent,
     )
 
 
@@ -1491,6 +1503,80 @@ def _minutes_to_seconds(value: str) -> Optional[int]:
     return max(30, int(match.group(1)) * 60)
 
 
+_INSTRUCTIONY_PREFIX_RE = re.compile(
+    r"^\s*(intent\s*:\s*)?(create|write|make|generate|draft)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_instruction_text(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if _INSTRUCTIONY_PREFIX_RE.search(text):
+        return True
+    lowered = text.lower()
+    return "the title is" in lowered or "create it in the" in lowered or "ground it in" in lowered
+
+
+def _extract_explainer_generation_fields(
+    *,
+    title: str,
+    intent: str,
+    summary: str,
+    description: str,
+    audience: str,
+    category: str,
+) -> Dict[str, str]:
+    source = " ".join([str(intent or ""), str(description or ""), str(summary or "")]).strip()
+    lowered_source = source.lower()
+    extracted_topic = ""
+    extracted_grounding = ""
+    extracted_audience = str(audience or "").strip()
+
+    about_match = re.search(r"\babout\s+(.+?)(?:[.;]|$)", source, re.IGNORECASE)
+    if about_match:
+        extracted_topic = re.sub(r"\s+", " ", about_match.group(1)).strip(" \"'")
+
+    if not extracted_audience:
+        audience_match = re.search(r"\bfor\s+(.+?)(?:[.;]|$)", source, re.IGNORECASE)
+        if audience_match:
+            extracted_audience = re.sub(r"\s+", " ", audience_match.group(1)).strip(" \"'")
+
+    grounding_match = re.search(r"\bground(?:ed)?\s+(?:it\s+)?in\s+(.+?)(?:[.;]|$)", source, re.IGNORECASE)
+    if grounding_match:
+        extracted_grounding = re.sub(r"\s+", " ", grounding_match.group(1)).strip(" \"'")
+
+    if not extracted_topic:
+        if _looks_like_instruction_text(source):
+            extracted_topic = str(title or "").strip()
+        else:
+            extracted_topic = source
+    if not extracted_topic:
+        extracted_topic = str(title or "Explainer Video").strip() or "Explainer Video"
+
+    clean_topic = extracted_topic
+    for marker in ["the title is", "create it in the", "category:", "intent:"]:
+        marker_index = clean_topic.lower().find(marker)
+        if marker_index > 0:
+            clean_topic = clean_topic[:marker_index]
+    clean_topic = re.sub(r"\s+", " ", clean_topic).strip(" \"'.")
+    if not clean_topic:
+        clean_topic = str(title or "Explainer Video").strip() or "Explainer Video"
+
+    normalized_category = str(category or "").strip().lower()
+    if not extracted_grounding and "biology" in lowered_source and "salamander" in clean_topic.lower():
+        extracted_grounding = "actual biology"
+
+    return {
+        "title": str(title or "").strip(),
+        "topic": clean_topic,
+        "grounding": str(extracted_grounding or "").strip(),
+        "category": normalized_category,
+        "audience": str(extracted_audience or "").strip(),
+    }
+
+
 def _storyboard_from_scenes(scenes: List[Dict[str, Any]], *, duration_seconds_target: int) -> List[Dict[str, Any]]:
     if not scenes:
         return []
@@ -1537,6 +1623,8 @@ def _generate_explainer_scene_scaffold(
     *,
     title: str,
     topic: str,
+    grounding: str = "",
+    category: str = "",
     audience: str = "",
     description: str = "",
 ) -> Tuple[List[Dict[str, Any]], str]:
@@ -1544,7 +1632,7 @@ def _generate_explainer_scene_scaffold(
     base_topic = str(topic or base_title).strip() or base_title
     base_audience = str(audience or "").strip()
     base_description = str(description or "").strip()
-    default_count = 3 if len(base_description) < 700 else 5 if len(base_description) < 2500 else 6
+    default_count = 5 if len(base_description) < 2500 else 6
     scene_count = max(3, min(default_count, 7))
     plan_rows = deterministic_scene_scaffold(
         title=base_title,
@@ -1565,12 +1653,16 @@ def _generate_explainer_scene_scaffold(
     payload = {
         "title": base_title,
         "topic": base_topic,
+        "grounding": str(grounding or "").strip(),
+        "category": str(category or "").strip(),
         "audience": base_audience,
         "description": base_description,
         "scene_plan": plan,
         "constraints": [
-            "Use only title/topic/audience/description.",
+            "Use only title/topic/grounding/category/audience/description.",
             "Do not mention routes, ids, lifecycle state, validation, hash, owner, schema, lineage, timestamps.",
+            "Do not repeat or summarize the instruction itself.",
+            "Do not use placeholder titles like Hook / Premise or Setup / Context.",
             "Return strict JSON only.",
         ],
         "output_schema": {"scenes": [{"id": "s1", "title": "string", "voiceover": "string", "on_screen": "string"}]},
@@ -1584,7 +1676,16 @@ def _generate_explainer_scene_scaffold(
             resolved_config=resolved,
             messages=[
                 {"role": "system", "content": "Return strict JSON only."},
-                {"role": "developer", "content": "Fill the scene plan in order and keep every line grounded in supplied content."},
+                {
+                    "role": "developer",
+                    "content": (
+                        "You are generating a scene-based explainer video about the provided topic. "
+                        "Do NOT repeat or summarize the instruction. Interpret the topic and produce original content. "
+                        "Do NOT reference the existence of an instruction. Fill the scene plan in order. "
+                        "Every line must be grounded in supplied topic data. "
+                        "For biology topics, include concrete biological details."
+                    ),
+                },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
         )
@@ -1618,6 +1719,9 @@ def _build_explainer_video_spec(
     title: str,
     summary: str,
     intent: str = "",
+    topic: str = "",
+    grounding: str = "",
+    category: str = "",
     duration: str = "",
     audience: str = "",
     description: str = "",
@@ -1629,12 +1733,17 @@ def _build_explainer_video_spec(
     else:
         scenes, quality = _generate_explainer_scene_scaffold(
             title=title,
-            topic=intent or title,
+            topic=topic or intent or title,
+            grounding=grounding,
+            category=category,
             audience=audience,
             description=description or summary,
         )
     spec = default_video_spec(title=title, summary=summary, scenes=scenes)
-    spec["intent"] = str(intent or summary or title).strip()
+    intent_base = str(intent or topic or summary or title).strip()
+    if grounding:
+        intent_base = f"{intent_base}. Grounding: {str(grounding).strip()}".strip(". ")
+    spec["intent"] = intent_base
     if duration:
         spec["duration"] = duration
         seconds = _minutes_to_seconds(duration)
@@ -1661,6 +1770,10 @@ def _derive_explainer_initial_content(
 ) -> Tuple[str, str]:
     normalized_summary = str(summary or "").strip()
     normalized_body = str(body_markdown or "").strip()
+    if _looks_like_instruction_text(normalized_summary):
+        normalized_summary = ""
+    if _looks_like_instruction_text(normalized_body):
+        normalized_body = ""
     if normalized_summary and normalized_body:
         return normalized_summary, normalized_body
     fallback_lines = [str(scene.get("voiceover") or "").strip() for scene in (scenes or []) if str(scene.get("voiceover") or "").strip()]
@@ -1701,6 +1814,25 @@ def _resolve_video_context_pack_for_article(
     allow_clear: bool = True,
 ) -> tuple[Optional[ContextPack], Optional[JsonResponse]]:
     def _default_video_context_pack() -> Optional[ContextPack]:
+        preferred = (
+            ContextPack.objects.filter(
+                name="explainer-video-default",
+                purpose=VIDEO_CONTEXT_PACK_PURPOSE,
+                is_active=True,
+            )
+            .order_by("-updated_at")
+            .first()
+        )
+        if preferred:
+            return preferred
+        if ContextPack.objects.filter(
+            name="explainer-video-default",
+            purpose=VIDEO_CONTEXT_PACK_PURPOSE,
+            is_active=False,
+        ).exists():
+            logging.getLogger(__name__).warning(
+                "explainer-video-default context pack exists but is inactive; skipping auto-bind"
+            )
         return (
             ContextPack.objects.filter(purpose=VIDEO_CONTEXT_PACK_PURPOSE, is_active=True, is_default=True)
             .order_by("-updated_at")
@@ -1751,10 +1883,30 @@ def _video_context_metadata(pack: Optional[ContextPack]) -> Dict[str, Any]:
 
 def _article_video_ai_config(artifact: Artifact) -> Dict[str, Any]:
     raw = artifact.video_ai_config_json if isinstance(artifact.video_ai_config_json, dict) else {}
-    return {
-        "agents": raw.get("agents") if isinstance(raw.get("agents"), dict) else {},
-        "context_packs": raw.get("context_packs") if isinstance(raw.get("context_packs"), dict) else {},
-    }
+    agents = raw.get("agents") if isinstance(raw.get("agents"), dict) else {}
+    raw_context = raw.get("context_packs") if isinstance(raw.get("context_packs"), dict) else {}
+    normalized_context: Dict[str, Dict[str, Any]] = {}
+    for purpose_slug, entry in raw_context.items():
+        if purpose_slug not in EXPLAINER_PURPOSES:
+            continue
+        if isinstance(entry, dict):
+            mode = str(entry.get("mode") or entry.get("override_mode") or "extend").strip().lower()
+            if mode not in {"extend", "replace"}:
+                mode = "extend"
+            refs = entry.get("context_pack_refs")
+            if refs is None:
+                refs = entry.get("refs")
+            if refs is None:
+                refs = entry.get("context_packs")
+            if refs is None:
+                refs = entry.get("packs")
+            refs = refs if isinstance(refs, list) else []
+            normalized_context[purpose_slug] = {"mode": mode, "context_pack_refs": refs}
+            continue
+        # Backward compatibility: legacy list-only overrides imply replace behavior.
+        refs = entry if isinstance(entry, list) else ([entry] if entry else [])
+        normalized_context[purpose_slug] = {"mode": "replace", "context_pack_refs": refs}
+    return {"agents": agents, "context_packs": normalized_context}
 
 
 def _resolve_agent_value(value: Any) -> Optional[AgentDefinition]:
@@ -1823,23 +1975,23 @@ def _resolve_context_pack_ref(ref: Any) -> Optional[ContextPack]:
         for key in ("id", "context_pack_id"):
             value = str(ref.get(key) or "").strip()
             if value:
-                row = ContextPack.objects.filter(id=value, is_active=True).first()
+                row = ContextPack.objects.filter(id=value).order_by("-is_active", "-updated_at").first()
                 if row:
                     return row
         for key in ("slug", "name"):
             value = str(ref.get(key) or "").strip()
             if value:
-                row = ContextPack.objects.filter(name=value, is_active=True).order_by("-updated_at").first()
+                row = ContextPack.objects.filter(name=value).order_by("-is_active", "-updated_at").first()
                 if row:
                     return row
         return None
     raw = str(ref or "").strip()
     if not raw:
         return None
-    by_id = ContextPack.objects.filter(id=raw, is_active=True).first()
+    by_id = ContextPack.objects.filter(id=raw).order_by("-is_active", "-updated_at").first()
     if by_id:
         return by_id
-    return ContextPack.objects.filter(name=raw, is_active=True).order_by("-updated_at").first()
+    return ContextPack.objects.filter(name=raw).order_by("-is_active", "-updated_at").first()
 
 
 def _validate_pack_purpose_for_explainer(pack: ContextPack, purpose_slug: str) -> bool:
@@ -1860,10 +2012,11 @@ def _resolve_context_packs_for_purpose(
     agent: Optional[AgentDefinition],
     *,
     explicit_override: Any = None,
-) -> Tuple[List[ContextPack], str, str, Optional[str]]:
+) -> Tuple[List[ContextPack], str, str, Optional[str], str, List[Dict[str, Any]]]:
     config = _article_video_ai_config(artifact)
     override_present = explicit_override is not None or purpose_slug in config["context_packs"]
     raw_override = explicit_override if explicit_override is not None else config["context_packs"].get(purpose_slug)
+    override_mode = "extend"
 
     def _resolve_many(raw_refs: Any) -> Tuple[List[ContextPack], Optional[str]]:
         rows: List[ContextPack] = []
@@ -1881,31 +2034,55 @@ def _resolve_context_packs_for_purpose(
             rows.append(pack)
         return rows, None
 
-    if override_present:
-        rows, err = _resolve_many(raw_override)
-        if err:
-            return [], "override", "", err
-        resolved = _resolve_context_pack_list(rows)
-        return rows, "override", resolved.get("hash", ""), None
+    def _dedupe(rows: List[ContextPack]) -> List[ContextPack]:
+        deduped: List[ContextPack] = []
+        seen: set[str] = set()
+        for row in rows:
+            key = str(row.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+        return deduped
 
-    purpose_obj = AgentPurpose.objects.filter(slug=purpose_slug).first()
-    purpose_refs = purpose_obj.default_context_pack_refs_json if purpose_obj and isinstance(purpose_obj.default_context_pack_refs_json, list) else []
-    agent_refs = agent.context_pack_refs_json if agent and isinstance(agent.context_pack_refs_json, list) else []
-    combined: List[Any] = []
-    if purpose_refs:
-        combined.extend(purpose_refs)
-    if agent_refs:
-        combined.extend(agent_refs)
-    rows, err = _resolve_many(combined)
-    if err:
-        return [], "fallback", "", err
-    source = "fallback"
-    if purpose_refs:
-        source = "purpose_default"
-    elif agent_refs:
-        source = "agent_default"
-    resolved = _resolve_context_pack_list(rows)
-    return rows, source, resolved.get("hash", ""), None
+    default_rows: List[ContextPack] = []
+    if agent and isinstance(agent.context_pack_refs_json, list):
+        default_rows, default_err = _resolve_many(agent.context_pack_refs_json)
+        if default_err:
+            return [], "agent_default", "", default_err, "extend", []
+
+    if override_present:
+        override_refs = raw_override
+        if isinstance(raw_override, dict):
+            mode_value = str(raw_override.get("mode") or raw_override.get("override_mode") or "extend").strip().lower()
+            if mode_value not in {"extend", "replace"}:
+                return [], "override", "", "context pack override mode must be 'extend' or 'replace'", "extend", []
+            override_mode = mode_value
+            override_refs = raw_override.get("context_pack_refs")
+            if override_refs is None:
+                override_refs = raw_override.get("refs")
+            if override_refs is None:
+                override_refs = raw_override.get("context_packs")
+            if override_refs is None:
+                override_refs = raw_override.get("packs")
+        rows, err = _resolve_many(override_refs)
+        if err:
+            return [], "override", "", err, override_mode, []
+        if override_mode == "replace":
+            merged_rows = _dedupe(rows)
+        else:
+            merged_rows = _dedupe(default_rows + rows)
+        resolved = _resolve_context_pack_list(merged_rows)
+        refs_with_source: List[Dict[str, Any]] = []
+        override_ids = {str(item.id) for item in rows}
+        for ref in resolved.get("refs", []):
+            source = "override" if str(ref.get("id") or "") in override_ids else "agent_default"
+            refs_with_source.append({**ref, "source": source})
+        return merged_rows, "override", resolved.get("hash", ""), None, override_mode, refs_with_source
+
+    resolved = _resolve_context_pack_list(default_rows)
+    refs_with_source = [{**ref, "source": "agent_default"} for ref in resolved.get("refs", [])]
+    return default_rows, "agent_default", resolved.get("hash", ""), None, "extend", refs_with_source
 
 
 def _effective_video_ai_config(artifact: Artifact) -> Dict[str, Any]:
@@ -1916,8 +2093,22 @@ def _effective_video_ai_config(artifact: Artifact) -> Dict[str, Any]:
         pack_source = "fallback"
         pack_hash = ""
         pack_error: Optional[str] = None
+        override_mode = "extend"
+        pack_refs_with_source: List[Dict[str, Any]] = []
         if agent:
-            packs, pack_source, pack_hash, pack_error = _resolve_context_packs_for_purpose(artifact, purpose_slug, agent)
+            packs, pack_source, pack_hash, pack_error, override_mode, pack_refs_with_source = _resolve_context_packs_for_purpose(
+                artifact,
+                purpose_slug,
+                agent,
+            )
+        deprecated_packs = [pack.name for pack in packs if not pack.is_active]
+        warnings: List[str] = []
+        if agent_error:
+            warnings.append(agent_error)
+        if pack_error:
+            warnings.append(pack_error)
+        if deprecated_packs:
+            warnings.append(f"deprecated context packs in use: {', '.join(sorted(set(deprecated_packs)))}")
         effective[purpose_slug] = {
             "purpose_slug": purpose_slug,
             "purpose_name": meta["name"],
@@ -1929,16 +2120,20 @@ def _effective_video_ai_config(artifact: Artifact) -> Dict[str, Any]:
                     "name": agent.name,
                     "model_provider": agent.model_config.provider.slug if agent.model_config_id else None,
                     "model_name": agent.model_config.model_name if agent.model_config_id else None,
+                    "model_config_id": str(agent.model_config_id) if agent.model_config_id else None,
                 }
                 if agent
                 else None
             ),
             "context_packs": [_serialize_video_context_pack(pack) for pack in packs],
             "context_pack_hash": pack_hash,
+            "effective_model_config_id": str(agent.model_config_id) if agent and agent.model_config_id else None,
+            "effective_context_pack_refs": pack_refs_with_source,
+            "context_pack_override_mode": override_mode,
             "source": "override" if agent_source == "override" or pack_source == "override" else (agent_source if agent_source != "fallback" else pack_source),
             "agent_source": agent_source,
             "context_source": pack_source,
-            "warning": agent_error or pack_error,
+            "warning": " | ".join(warnings) if warnings else None,
         }
     return effective
 
@@ -1992,16 +2187,16 @@ def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
         "provider": render.provider,
         "model_name": render.model_name or "",
         "status": render.status,
-        "requested_at": render.requested_at,
-        "started_at": render.started_at,
-        "completed_at": render.completed_at,
+        "requested_at": render.requested_at.isoformat() if render.requested_at else None,
+        "started_at": render.started_at.isoformat() if render.started_at else None,
+        "completed_at": render.completed_at.isoformat() if render.completed_at else None,
         "request_payload_json": sanitize_payload(render.request_payload_json or {}),
         "result_payload_json": sanitize_payload(render.result_payload_json or {}),
         "output_assets": render.output_assets or [],
         "context_pack_id": str(render.context_pack_id) if render.context_pack_id else None,
         "context_pack_name": render.context_pack.name if getattr(render, "context_pack", None) else None,
         "context_pack_version": render.context_pack_version or "",
-        "context_pack_updated_at": render.context_pack_updated_at,
+        "context_pack_updated_at": render.context_pack_updated_at.isoformat() if render.context_pack_updated_at else None,
         "context_pack_hash": render.context_pack_hash or "",
         "spec_snapshot_hash": render.spec_snapshot_hash or "",
         "input_snapshot_hash": render.input_snapshot_hash or "",
@@ -7463,7 +7658,8 @@ def workflow_transition(request: HttpRequest, workflow_id: str) -> JsonResponse:
     if to_status not in allowed:
         return JsonResponse({"error": f"invalid transition: {from_status} -> {to_status}"}, status=400)
     artifact.status = to_status
-    update_fields = ["status", "updated_at"]
+    artifact.artifact_state = _artifact_state_for_status(to_status)
+    update_fields = ["status", "artifact_state", "updated_at"]
     if to_status == "published":
         validation_status, validation_errors = validate_artifact(artifact)
         content_hash = compute_content_hash(artifact)
@@ -7640,6 +7836,14 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
         published_at = timezone.now() if status == "published" else None
         scaffold_quality = "none"
         if article_format == "video_explainer":
+            generation_fields = _extract_explainer_generation_fields(
+                title=title,
+                intent=str(payload.get("intent") or ""),
+                summary=summary,
+                description=str(payload.get("description") or body_markdown or summary),
+                audience=str(payload.get("audience") or ""),
+                category=category.slug,
+            )
             if candidate_video_spec is not None:
                 final_video_spec = candidate_video_spec
                 scaffold_quality = "provided"
@@ -7647,9 +7851,12 @@ def articles_collection(request: HttpRequest) -> JsonResponse:
                 final_video_spec, scaffold_quality = _build_explainer_video_spec(
                     title=title,
                     summary=summary,
-                    intent=str(payload.get("intent") or summary or title),
+                    intent=generation_fields.get("topic") or str(payload.get("intent") or summary or title),
+                    topic=generation_fields.get("topic") or "",
+                    grounding=generation_fields.get("grounding") or "",
+                    category=generation_fields.get("category") or "",
                     duration=str(payload.get("duration") or ""),
-                    audience=str(payload.get("audience") or ""),
+                    audience=generation_fields.get("audience") or "",
                     description=str(payload.get("description") or body_markdown or summary),
                 )
         else:
@@ -8085,6 +8292,67 @@ def _resolve_article_or_404(article_id_or_slug: str) -> Artifact:
     return get_object_or_404(Artifact, id=article_id_or_slug, type__slug=ARTICLE_ARTIFACT_TYPE_SLUG)
 
 
+def _resolve_context_pack_artifact_or_404(pack_id_or_slug: str) -> Artifact:
+    by_id = (
+        Artifact.objects.filter(id=pack_id_or_slug, type__slug=CONTEXT_PACK_ARTIFACT_TYPE_SLUG)
+        .select_related("type", "workspace")
+        .first()
+    )
+    if by_id:
+        return by_id
+    by_slug = (
+        Artifact.objects.filter(slug=pack_id_or_slug, type__slug=CONTEXT_PACK_ARTIFACT_TYPE_SLUG)
+        .select_related("type", "workspace")
+        .first()
+    )
+    if by_slug:
+        return by_slug
+    by_title = (
+        Artifact.objects.filter(title__iexact=pack_id_or_slug, type__slug=CONTEXT_PACK_ARTIFACT_TYPE_SLUG)
+        .select_related("type", "workspace")
+        .order_by("-updated_at")
+        .first()
+    )
+    if by_title:
+        return by_title
+    return get_object_or_404(Artifact, id=pack_id_or_slug, type__slug=CONTEXT_PACK_ARTIFACT_TYPE_SLUG)
+
+
+def _lookup_context_pack_artifact_for_intent(*, message: str, proposal: Dict[str, Any]) -> Optional[Artifact]:
+    inferred = proposal.get("inferred_fields") if isinstance(proposal.get("inferred_fields"), dict) else {}
+    candidates: List[str] = []
+    for key in ("target_id", "target_slug", "slug", "name", "title", "context_pack"):
+        raw = str(inferred.get(key) or proposal.get(key) or "").strip()
+        if raw:
+            candidates.append(raw)
+    quoted = re.findall(r"[\"']([^\"']+)[\"']", str(message or ""))
+    candidates.extend([item.strip() for item in quoted if str(item or "").strip()])
+    phrase_match = re.search(r"context\s*pack\s+([a-zA-Z0-9_.:-]+)", str(message or ""), flags=re.IGNORECASE)
+    if phrase_match:
+        candidates.append(str(phrase_match.group(1) or "").strip())
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for candidate in candidates:
+        normalized = candidate.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(candidate)
+
+    if not deduped:
+        return None
+    for candidate in deduped:
+        row = (
+            Artifact.objects.filter(type__slug=CONTEXT_PACK_ARTIFACT_TYPE_SLUG)
+            .filter(Q(id=candidate) | Q(slug=candidate) | Q(title__iexact=candidate))
+            .order_by("-updated_at")
+            .first()
+        )
+        if row:
+            return row
+    return None
+
+
 @csrf_exempt
 def article_detail(request: HttpRequest, article_id: str) -> JsonResponse:
     identity = _require_authenticated(request)
@@ -8360,7 +8628,7 @@ def _video_generate_text(
     resolved_agent, agent_source, agent_error = _resolve_agent_for_purpose(artifact, purpose_slug, explicit_override=explicit_agent)
     if not resolved_agent:
         raise AiConfigError(agent_error or f"no agent resolved for {purpose_slug}")
-    packs, context_source, context_hash, context_error = _resolve_context_packs_for_purpose(
+    packs, context_source, context_hash, context_error, override_mode, effective_pack_refs = _resolve_context_packs_for_purpose(
         artifact,
         purpose_slug,
         resolved_agent,
@@ -8393,7 +8661,10 @@ def _video_generate_text(
             "agent_source": agent_source,
             "context_source": context_source,
             "context_pack_refs": resolved_context.get("refs", []),
+            "effective_context_pack_refs": effective_pack_refs,
             "context_pack_hash": context_hash,
+            "context_pack_override_mode": override_mode,
+            "effective_model_config_id": str(resolved_agent.model_config_id) if resolved_agent.model_config_id else None,
             "metadata": metadata,
         },
     )
@@ -8408,7 +8679,10 @@ def _video_generate_text(
         "purpose_slug": purpose_slug,
         "context_source": context_source,
         "context_pack_refs": resolved_context.get("refs", []),
+        "effective_context_pack_refs": effective_pack_refs,
         "context_pack_hash": context_hash,
+        "context_pack_override_mode": override_mode,
+        "effective_model_config_id": str(resolved_agent.model_config_id) if resolved_agent.model_config_id else None,
     }
 
 
@@ -8612,10 +8886,26 @@ def article_video_ai_config(request: HttpRequest, article_id: str) -> JsonRespon
             if raw_value is None or raw_value == "" or (isinstance(raw_value, list) and len(raw_value) == 0):
                 next_context.pop(purpose_slug, None)
                 continue
-            refs, err = _normalize_context_pack_override_refs(purpose_slug, raw_value)
+            mode = "extend"
+            refs_input = raw_value
+            if isinstance(raw_value, dict):
+                mode = str(raw_value.get("mode") or raw_value.get("override_mode") or "extend").strip().lower()
+                if mode not in {"extend", "replace"}:
+                    return JsonResponse({"error": f"{purpose_slug}: override mode must be 'extend' or 'replace'"}, status=400)
+                refs_input = raw_value.get("context_pack_refs")
+                if refs_input is None:
+                    refs_input = raw_value.get("refs")
+                if refs_input is None:
+                    refs_input = raw_value.get("context_packs")
+                if refs_input is None:
+                    refs_input = raw_value.get("packs")
+            refs, err = _normalize_context_pack_override_refs(purpose_slug, refs_input)
             if err:
                 return JsonResponse({"error": f"{purpose_slug}: {err}"}, status=400)
-            next_context[purpose_slug] = refs
+            if not refs:
+                next_context.pop(purpose_slug, None)
+                continue
+            next_context[purpose_slug] = {"mode": mode, "context_pack_refs": refs}
 
     persisted = {"agents": next_agents, "context_packs": next_context}
     artifact.video_ai_config_json = persisted if next_agents or next_context else None
@@ -8628,6 +8918,11 @@ def article_video_ai_config(request: HttpRequest, article_id: str) -> JsonRespon
         {
             "agent_overrides": sorted(list(next_agents.keys())),
             "context_pack_overrides": sorted(list(next_context.keys())),
+            "context_pack_override_modes": {
+                slug: str((entry or {}).get("mode") or "extend")
+                for slug, entry in next_context.items()
+                if isinstance(entry, dict)
+            },
         },
     )
     return JsonResponse(
@@ -9457,7 +9752,8 @@ def article_transition(request: HttpRequest, article_id: str) -> JsonResponse:
         return JsonResponse({"error": f"invalid transition {artifact.status} -> {to_status}"}, status=400)
     from_status = artifact.status
     artifact.status = to_status
-    update_fields = ["status", "updated_at"]
+    artifact.artifact_state = _artifact_state_for_status(to_status)
+    update_fields = ["status", "artifact_state", "updated_at"]
     if to_status == "published":
         validation_status, validation_errors = validate_artifact(artifact)
         content_hash = compute_content_hash(artifact)
@@ -10354,6 +10650,46 @@ def _serialize_model_config(config: ModelConfig) -> Dict[str, Any]:
     }
 
 
+def _serialize_agent_default_context_pack_ref(ref: Any) -> Optional[Dict[str, Any]]:
+    pack = _resolve_context_pack_ref(ref)
+    if not pack:
+        return None
+    return {
+        "id": str(pack.id),
+        "slug": pack.name,
+        "name": pack.name,
+        "purpose": pack.purpose,
+        "scope": pack.scope,
+        "version": pack.version,
+        "content_hash": _context_pack_content_hash(pack),
+        "state": "canonical" if pack.is_active else "deprecated",
+        "is_active": bool(pack.is_active),
+    }
+
+
+def _normalize_agent_default_context_pack_refs(raw_refs: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    refs: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for raw_ref in _normalize_pack_refs_input(raw_refs):
+        pack = _resolve_context_pack_ref(raw_ref)
+        if not pack:
+            return [], "context pack ref not found"
+        key = str(pack.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(
+            {
+                "id": str(pack.id),
+                "name": pack.name,
+                "purpose": pack.purpose,
+                "scope": pack.scope,
+                "version": pack.version,
+            }
+        )
+    return refs, None
+
+
 def _model_config_compat_payload(config: ModelConfig) -> Dict[str, Any]:
     base_params = {
         "temperature": config.temperature,
@@ -10376,14 +10712,20 @@ def _model_config_compat_payload(config: ModelConfig) -> Dict[str, Any]:
 
 def _serialize_agent_definition(agent: AgentDefinition) -> Dict[str, Any]:
     purpose_slugs = [item.slug for item in agent.purposes.all().order_by("slug")]
+    default_refs = agent.context_pack_refs_json if isinstance(agent.context_pack_refs_json, list) else []
+    default_context_packs = [item for item in (_serialize_agent_default_context_pack_ref(ref) for ref in default_refs) if item]
     return {
         "id": str(agent.id),
         "slug": agent.slug,
         "name": agent.name,
         "model_config_id": str(agent.model_config_id),
         "model_config": _serialize_model_config(agent.model_config),
+        "override_prompt_text": agent.system_prompt_text or "",
+        "default_context_pack_refs_json": default_refs,
+        "default_context_packs": default_context_packs,
+        # Backward-compatible aliases.
         "system_prompt_text": agent.system_prompt_text or "",
-        "context_pack_refs_json": agent.context_pack_refs_json or [],
+        "context_pack_refs_json": default_refs,
         "is_default": bool(agent.is_default),
         "enabled": agent.enabled,
         "purposes": purpose_slugs,
@@ -10723,11 +11065,21 @@ def ai_agents_collection(request: HttpRequest) -> JsonResponse:
         slug=slug,
         name=name,
         model_config=model_config,
-        system_prompt_text=str(payload.get("system_prompt_text") or ""),
-        context_pack_refs_json=payload.get("context_pack_refs_json") if isinstance(payload.get("context_pack_refs_json"), list) else [],
+        system_prompt_text=str(payload.get("override_prompt_text") or payload.get("system_prompt_text") or ""),
+        context_pack_refs_json=[],
         is_default=bool(payload.get("is_default", False)),
         enabled=bool(payload.get("enabled", True)),
     )
+    raw_default_refs = payload.get("default_context_pack_refs_json")
+    if raw_default_refs is None:
+        raw_default_refs = payload.get("context_pack_refs_json")
+    if raw_default_refs is not None:
+        refs, ref_err = _normalize_agent_default_context_pack_refs(raw_default_refs)
+        if ref_err:
+            agent.delete()
+            return JsonResponse({"error": ref_err}, status=400)
+        agent.context_pack_refs_json = refs
+        agent.save(update_fields=["context_pack_refs_json", "updated_at"])
     if agent.is_default:
         AgentDefinition.objects.exclude(id=agent.id).update(is_default=False)
     purpose_slugs = payload.get("purposes") if isinstance(payload.get("purposes"), list) else []
@@ -10769,10 +11121,16 @@ def ai_agent_detail(request: HttpRequest, agent_id: str) -> JsonResponse:
         if not model_config:
             return JsonResponse({"error": "invalid model_config_id"}, status=400)
         agent.model_config = model_config
-    if "system_prompt_text" in payload:
-        agent.system_prompt_text = str(payload.get("system_prompt_text") or "")
-    if "context_pack_refs_json" in payload and isinstance(payload.get("context_pack_refs_json"), list):
-        agent.context_pack_refs_json = payload.get("context_pack_refs_json")
+    if "override_prompt_text" in payload or "system_prompt_text" in payload:
+        agent.system_prompt_text = str(payload.get("override_prompt_text") or payload.get("system_prompt_text") or "")
+    if "default_context_pack_refs_json" in payload or "context_pack_refs_json" in payload:
+        raw_default_refs = payload.get("default_context_pack_refs_json")
+        if raw_default_refs is None:
+            raw_default_refs = payload.get("context_pack_refs_json")
+        refs, ref_err = _normalize_agent_default_context_pack_refs(raw_default_refs)
+        if ref_err:
+            return JsonResponse({"error": ref_err}, status=400)
+        agent.context_pack_refs_json = refs
     if "enabled" in payload:
         agent.enabled = bool(payload.get("enabled"))
     if "is_default" in payload:
@@ -10866,18 +11224,37 @@ def _intent_apply_create_draft(
         return JsonResponse({"error": str(exc)}, status=400)
     video_spec = None
     scaffold_quality = "none"
+    video_context_pack = None
     if internal_format == "video_explainer":
+        generation_fields = _extract_explainer_generation_fields(
+            title=title,
+            intent=intent_value,
+            summary=summary,
+            description=str(merged.get("description") or body_markdown or summary),
+            audience=str(merged.get("audience") or ""),
+            category=category.slug,
+        )
         video_spec, scaffold_quality = _build_explainer_video_spec(
             title=title,
             summary=summary,
-            intent=intent_value or title,
+            intent=generation_fields.get("topic") or intent_value or title,
+            topic=generation_fields.get("topic") or "",
+            grounding=generation_fields.get("grounding") or "",
+            category=generation_fields.get("category") or "",
             duration=duration_value,
-            audience=str(merged.get("audience") or ""),
+            audience=generation_fields.get("audience") or "",
             description=str(merged.get("description") or body_markdown or summary),
         )
         spec_errors = validate_video_spec(video_spec, require_scenes=True)
         if spec_errors:
             return JsonResponse({"error": "invalid video spec", "details": spec_errors}, status=400)
+        video_context_pack, pack_error = _resolve_video_context_pack_for_article(
+            None,
+            payload.get("video_context_pack_id") if isinstance(payload, dict) else None,
+            allow_clear=False,
+        )
+        if pack_error:
+            return pack_error
         summary, body_markdown = _derive_explainer_initial_content(
             title=title,
             summary=summary,
@@ -10907,6 +11284,7 @@ def _intent_apply_create_draft(
             },
             article_category=category,
             video_spec_json=video_spec,
+            video_context_pack=video_context_pack if internal_format == "video_explainer" else None,
         )
         ArtifactRevision.objects.create(
             artifact=artifact,
@@ -10974,19 +11352,95 @@ def _intent_apply_create_draft(
 def _intent_apply_patch(
     *,
     identity: UserIdentity,
+    artifact_type: str,
     artifact_id: str,
     patch_object: Dict[str, Any],
     request_id: str,
 ) -> JsonResponse:
-    artifact = _resolve_article_or_404(artifact_id)
-    if not _can_edit_article(identity, artifact):
+    if artifact_type == "ArticleDraft":
+        artifact = _resolve_article_or_404(artifact_id)
+        if not _can_edit_article(identity, artifact):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        try:
+            updated = intent_apply_patch(
+                artifact=artifact,
+                actor=identity,
+                patch_object=patch_object,
+                category_resolver=lambda: _intent_category_options(),
+            )
+        except PatchValidationError as exc:
+            intent_telemetry_increment("apply_error")
+            return JsonResponse(
+                {
+                    "status": "ValidationError",
+                    "action_type": "ApplyPatch",
+                    "artifact_type": "ArticleDraft",
+                    "artifact_id": str(artifact.id),
+                    "summary": "Patch failed deterministic validation.",
+                    "validation_errors": [str(exc)],
+                    "audit": {
+                        "request_id": request_id,
+                        "timestamp": timezone.now().isoformat(),
+                        **_intent_context_pack_audit(),
+                    },
+                },
+                status=400,
+            )
+
+        latest = ArtifactRevision.objects.filter(artifact=updated).order_by("-revision_number").first()
+        current_content = dict((latest.content_json if latest else {}) or {})
+        metadata = {
+            "title": updated.title,
+            "category": _article_category(updated),
+            "format": _article_format(updated),
+            "summary_hash": hashlib.sha256(str(current_content.get("summary") or "").encode("utf-8")).hexdigest(),
+            "body_hash": hashlib.sha256(str(current_content.get("body_markdown") or "").encode("utf-8")).hexdigest(),
+        }
+        emit_ledger_event(
+            actor=identity,
+            action="draft.patched",
+            artifact=updated,
+            summary="Patched Article draft via intent engine",
+            metadata=metadata,
+            dedupe_key=f"draft.patched:{updated.id}:{hashlib.sha256(json.dumps(metadata, sort_keys=True).encode('utf-8')).hexdigest()}",
+        )
+        intent_telemetry_increment("apply_success")
+        payload_response = {
+            "status": "DraftReady",
+            "action_type": "ApplyPatch",
+            "artifact_type": "ArticleDraft",
+            "artifact_id": str(updated.id),
+            "summary": "Patch applied successfully.",
+            "next_actions": [{"label": "Open editor", "action": "OpenEditor"}],
+            "audit": {
+                "request_id": request_id,
+                "timestamp": timezone.now().isoformat(),
+                **_intent_context_pack_audit(),
+            },
+        }
+        _audit_intent_event(
+            message="intent.apply",
+            identity=identity,
+            request_id=request_id,
+            artifact_id=str(updated.id),
+            proposal={"patch_object": patch_object},
+            resolution=payload_response,
+        )
+        return JsonResponse(payload_response)
+
+    artifact = _resolve_context_pack_artifact_or_404(artifact_id)
+    if not _can_manage_docs(identity):
         return JsonResponse({"error": "forbidden"}, status=403)
+    if str(artifact.source_ref_type or "") != "ContextPack":
+        return JsonResponse({"error": "context pack target unavailable"}, status=404)
+    pack = ContextPack.objects.filter(id=artifact.source_ref_id).first()
+    if not pack:
+        return JsonResponse({"error": "context pack target unavailable"}, status=404)
     try:
-        updated = intent_apply_patch(
-            artifact=artifact,
+        updated_pack, hash_info, changes = intent_apply_context_pack_patch(
+            pack=pack,
             actor=identity,
             patch_object=patch_object,
-            category_resolver=lambda: _intent_category_options(),
         )
     except PatchValidationError as exc:
         intent_telemetry_increment("apply_error")
@@ -10994,7 +11448,7 @@ def _intent_apply_patch(
             {
                 "status": "ValidationError",
                 "action_type": "ApplyPatch",
-                "artifact_type": "ArticleDraft",
+                "artifact_type": "ContextPack",
                 "artifact_id": str(artifact.id),
                 "summary": "Patch failed deterministic validation.",
                 "validation_errors": [str(exc)],
@@ -11007,30 +11461,42 @@ def _intent_apply_patch(
             status=400,
         )
 
-    latest = ArtifactRevision.objects.filter(artifact=updated).order_by("-revision_number").first()
-    current_content = dict((latest.content_json if latest else {}) or {})
+    artifact.title = updated_pack.name
+    artifact.summary = f"{updated_pack.purpose} · {updated_pack.scope} · v{updated_pack.version}"
+    artifact.scope_json = {
+        "purpose": updated_pack.purpose,
+        "scope": updated_pack.scope,
+        "namespace": updated_pack.namespace,
+        "project_key": updated_pack.project_key,
+    }
+    artifact.save(update_fields=["title", "summary", "scope_json", "updated_at"])
+
     metadata = {
-        "title": updated.title,
-        "category": _article_category(updated),
-        "format": _article_format(updated),
-        "summary_hash": hashlib.sha256(str(current_content.get("summary") or "").encode("utf-8")).hexdigest(),
-        "body_hash": hashlib.sha256(str(current_content.get("body_markdown") or "").encode("utf-8")).hexdigest(),
+        "title": updated_pack.name,
+        "format": (
+            str((updated_pack.applies_to_json or {}).get("content_format") or "json")
+            if isinstance(updated_pack.applies_to_json, dict)
+            else "json"
+        ),
+        "changed_fields": [entry.get("field") for entry in changes if isinstance(entry, dict)],
+        "before_content_hash": hash_info.get("before_hash"),
+        "after_content_hash": hash_info.get("after_hash"),
     }
     emit_ledger_event(
         actor=identity,
-        action="draft.patched",
-        artifact=updated,
-        summary="Patched Article draft via intent engine",
+        action="contextpack.patched",
+        artifact=artifact,
+        summary="Patched Context Pack via intent engine",
         metadata=metadata,
-        dedupe_key=f"draft.patched:{updated.id}:{hashlib.sha256(json.dumps(metadata, sort_keys=True).encode('utf-8')).hexdigest()}",
+        dedupe_key=f"contextpack.patched:{artifact.id}:{hashlib.sha256(json.dumps(metadata, sort_keys=True).encode('utf-8')).hexdigest()}",
     )
     intent_telemetry_increment("apply_success")
     payload_response = {
         "status": "DraftReady",
         "action_type": "ApplyPatch",
-        "artifact_type": "ArticleDraft",
-        "artifact_id": str(updated.id),
-        "summary": "Patch applied successfully.",
+        "artifact_type": "ContextPack",
+        "artifact_id": str(artifact.id),
+        "summary": "Context pack patch applied successfully.",
         "next_actions": [{"label": "Open editor", "action": "OpenEditor"}],
         "audit": {
             "request_id": request_id,
@@ -11042,8 +11508,8 @@ def _intent_apply_patch(
         message="intent.apply",
         identity=identity,
         request_id=request_id,
-        artifact_id=str(updated.id),
-        proposal={"patch_object": patch_object},
+        artifact_id=str(artifact.id),
+        proposal={"patch_object": patch_object, "artifact_type": "ContextPack"},
         resolution=payload_response,
     )
     return JsonResponse(payload_response)
@@ -11068,11 +11534,17 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
     context_artifact_type = str(context_payload.get("artifact_type") or "").strip()
     context_artifact = None
     if context_artifact_id:
-        context_artifact = _resolve_article_or_404(context_artifact_id)
-        if not _can_edit_article(identity, context_artifact):
-            return JsonResponse({"error": "forbidden"}, status=403)
-        if context_artifact_type and context_artifact_type not in {"ArticleDraft", "article"}:
-            return JsonResponse({"error": "unsupported artifact_type context"}, status=400)
+        normalized_context_type = str(context_artifact_type or "").strip().lower()
+        if normalized_context_type in {"contextpack", "context_pack"}:
+            context_artifact = _resolve_context_pack_artifact_or_404(context_artifact_id)
+            if not _can_manage_docs(identity):
+                return JsonResponse({"error": "forbidden"}, status=403)
+        else:
+            context_artifact = _resolve_article_or_404(context_artifact_id)
+            if not _can_edit_article(identity, context_artifact):
+                return JsonResponse({"error": "forbidden"}, status=403)
+            if context_artifact_type and context_artifact_type not in {"ArticleDraft", "article"}:
+                return JsonResponse({"error": "unsupported artifact_type context"}, status=400)
 
     engine = _intent_engine()
     result, proposal = engine.resolve(message=message, context=ResolutionContext(artifact=context_artifact))
@@ -11116,16 +11588,24 @@ def xyn_intent_apply(request: HttpRequest) -> JsonResponse:
 
     if action_type not in {"CreateDraft", "ApplyPatch"}:
         return JsonResponse({"error": "action_type must be CreateDraft or ApplyPatch"}, status=400)
-    if artifact_type != "ArticleDraft":
-        return JsonResponse({"error": "artifact_type must be ArticleDraft"}, status=400)
+    if artifact_type not in {"ArticleDraft", "ContextPack"}:
+        return JsonResponse({"error": "artifact_type must be ArticleDraft or ContextPack"}, status=400)
 
     if action_type == "CreateDraft":
+        if artifact_type != "ArticleDraft":
+            return JsonResponse({"error": "CreateDraft currently supports ArticleDraft only"}, status=400)
         return _intent_apply_create_draft(identity=identity, payload=body_payload, request_id=request_id)
 
     artifact_id = str(payload.get("artifact_id") or "").strip()
     if not artifact_id:
         return JsonResponse({"error": "artifact_id is required for ApplyPatch"}, status=400)
-    return _intent_apply_patch(identity=identity, artifact_id=artifact_id, patch_object=body_payload, request_id=request_id)
+    return _intent_apply_patch(
+        identity=identity,
+        artifact_type=artifact_type,
+        artifact_id=artifact_id,
+        patch_object=body_payload,
+        request_id=request_id,
+    )
 
 
 def xyn_intent_options(request: HttpRequest) -> JsonResponse:
@@ -11138,11 +11618,12 @@ def xyn_intent_options(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "method not allowed"}, status=405)
     artifact_type = str(request.GET.get("artifact_type") or "").strip()
     field_name = str(request.GET.get("field") or "").strip().lower()
-    if artifact_type != "ArticleDraft":
-        return JsonResponse({"error": "artifact_type must be ArticleDraft"}, status=400)
-    if field_name not in {"category", "format", "duration"}:
-        return JsonResponse({"error": "field must be category|format|duration"}, status=400)
-    contract = _intent_contract_registry().get("ArticleDraft")
+    if artifact_type not in {"ArticleDraft", "ContextPack"}:
+        return JsonResponse({"error": "artifact_type must be ArticleDraft or ContextPack"}, status=400)
+    allowed_fields = {"category", "format", "duration"} if artifact_type == "ArticleDraft" else {"format"}
+    if field_name not in allowed_fields:
+        return JsonResponse({"error": f"field must be {'|'.join(sorted(allowed_fields))}"}, status=400)
+    contract = _intent_contract_registry().get(artifact_type)
     options = contract.options_for_field(field_name) if contract else []
     return JsonResponse({"artifact_type": artifact_type, "field": field_name, "options": options})
 

@@ -8,7 +8,8 @@ from django.test import TestCase
 from xyn_orchestrator.intent_engine.contracts import DraftIntakeContractRegistry
 from xyn_orchestrator.intent_engine.engine import IntentResolutionEngine, ResolutionContext
 from xyn_orchestrator.intent_engine.proposal_provider import IntentContextPackMissingError
-from xyn_orchestrator.models import Artifact, LedgerEvent, RoleBinding, UserIdentity, Workspace
+from xyn_orchestrator.artifact_links import ensure_context_pack_artifact
+from xyn_orchestrator.models import Artifact, ArticleCategory, ContextPack, LedgerEvent, RoleBinding, UserIdentity, Workspace
 
 
 class _FakeProvider:
@@ -72,6 +73,29 @@ class IntentEngineApiTests(TestCase):
             inferred_fields={},
         )
         self.assertEqual(inferred.get("category"), "demo")
+
+    def test_contract_infers_title_from_title_it_phrase(self):
+        registry = DraftIntakeContractRegistry(category_options_provider=lambda: [{"slug": "demo", "name": "Demo"}])
+        contract = registry.get("ArticleDraft")
+        self.assertIsNotNone(contract)
+        assert contract is not None
+        inferred = contract.infer_fields(
+            message=(
+                "Create an explainer video about turtles. Make it scientific. "
+                "Title it 'Adult Non-mutant Tai-Chi Turtles' and put it in the demo category."
+            ),
+            inferred_fields={},
+        )
+        self.assertEqual(inferred.get("title"), "Adult Non-mutant Tai-Chi Turtles")
+
+    def test_context_pack_contract_defaults(self):
+        registry = DraftIntakeContractRegistry(category_options_provider=lambda: [{"slug": "demo", "name": "Demo"}])
+        contract = registry.get("ContextPack")
+        self.assertIsNotNone(contract)
+        assert contract is not None
+        merged = contract.merge_defaults({"title": "Pack", "content": "{}"})
+        self.assertEqual(merged.get("format"), "json")
+        self.assertEqual(contract.missing_fields(merged), [])
 
     def test_engine_rejects_unknown_action_type(self):
         registry = DraftIntakeContractRegistry(category_options_provider=lambda: [{"slug": "web", "name": "Web"}])
@@ -212,6 +236,86 @@ class IntentEngineApiTests(TestCase):
         self.assertEqual(patch_response.status_code, 400)
         self.assertEqual(patch_response.json().get("status"), "ValidationError")
 
+    def test_context_pack_apply_patch_validates_and_writes_ledger(self):
+        pack = ContextPack.objects.create(
+            name="xyn-console-default",
+            purpose="any",
+            scope="global",
+            version="1.0.0",
+            is_active=True,
+            content_markdown='{"hello":"world"}',
+            applies_to_json={"content_format": "json"},
+        )
+        artifact = ensure_context_pack_artifact(pack, owner_user=self.user)
+        bad = self.client.post(
+            "/xyn/api/xyn/intent/apply",
+            data=json.dumps(
+                {
+                    "action_type": "ApplyPatch",
+                    "artifact_type": "ContextPack",
+                    "artifact_id": str(artifact.id),
+                    "payload": {"content": "{invalid json}", "format": "json"},
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(bad.status_code, 400, bad.content.decode())
+        self.assertEqual(bad.json().get("status"), "ValidationError")
+
+        ok = self.client.post(
+            "/xyn/api/xyn/intent/apply",
+            data=json.dumps(
+                {
+                    "action_type": "ApplyPatch",
+                    "artifact_type": "ContextPack",
+                    "artifact_id": str(artifact.id),
+                    "payload": {"title": "xyn-console-default", "content": '{"hello":"xyn"}', "format": "json"},
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(ok.status_code, 200, ok.content.decode())
+        artifact.refresh_from_db()
+        pack.refresh_from_db()
+        self.assertEqual(pack.content_markdown, '{"hello":"xyn"}')
+        self.assertTrue(LedgerEvent.objects.filter(artifact=artifact, action="contextpack.patched").exists())
+
+    def test_resolve_context_pack_with_context(self):
+        pack = ContextPack.objects.create(
+            name="xyn-console-default",
+            purpose="any",
+            scope="global",
+            version="1.0.0",
+            is_active=True,
+            content_markdown='{"hello":"world"}',
+            applies_to_json={"content_format": "json"},
+        )
+        artifact = ensure_context_pack_artifact(pack, owner_user=self.user)
+        with patch(
+            "xyn_orchestrator.intent_engine.proposal_provider.LlmIntentProposalProvider.propose",
+            return_value={
+                "action_type": "ProposePatch",
+                "artifact_type": "ContextPack",
+                "inferred_fields": {"content": '{"hello":"patched"}', "format": "json"},
+                "confidence": 0.95,
+                "_model": "fake",
+            },
+        ):
+            response = self.client.post(
+                "/xyn/api/xyn/intent/resolve",
+                data=json.dumps(
+                    {
+                        "message": "Update context pack content",
+                        "context": {"artifact_id": str(artifact.id), "artifact_type": "ContextPack"},
+                    }
+                ),
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        payload = response.json()
+        self.assertEqual(payload.get("status"), "ProposedPatch")
+        self.assertEqual(payload.get("artifact_type"), "ContextPack")
+
     def test_show_options_returns_categories_and_formats(self):
         options = self.client.get("/xyn/api/xyn/intent/options?artifact_type=ArticleDraft&field=format")
         self.assertEqual(options.status_code, 200)
@@ -311,3 +415,59 @@ class IntentEngineApiTests(TestCase):
         self.assertNotIn("/app/artifacts", serialized_scenes)
         self.assertNotIn("validation", serialized_scenes)
         self.assertNotIn("content_hash", serialized_scenes)
+
+    def test_create_explainer_uses_structured_topic_and_auto_binds_default_pack(self):
+        ArticleCategory.objects.get_or_create(slug="demo", defaults={"name": "Demo", "enabled": True})
+        default_pack, _ = ContextPack.objects.get_or_create(
+            name="explainer-video-default",
+            purpose="video_explainer",
+            scope="global",
+            version="1.0.0",
+            namespace="",
+            project_key="",
+            defaults={
+                "is_active": True,
+                "is_default": False,
+                "content_markdown": "Ground scenes in factual biology.",
+            },
+        )
+        if not default_pack.is_active:
+            default_pack.is_active = True
+            default_pack.save(update_fields=["is_active", "updated_at"])
+        response = self.client.post(
+            "/xyn/api/xyn/intent/apply",
+            data=json.dumps(
+                {
+                    "action_type": "CreateDraft",
+                    "artifact_type": "ArticleDraft",
+                    "payload": {
+                        "title": "The Intrigue of Salamanders",
+                        "category": "demo",
+                        "format": "explainer_video",
+                        "intent": (
+                            "Create an explainer video about salamanders. Ground it in actual biology. "
+                            "The title is 'The Intrigue of Salamanders'. Create it in the demo category."
+                        ),
+                    },
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        artifact = Artifact.objects.get(id=response.json().get("artifact_id"))
+        self.assertEqual(str(artifact.video_context_pack_id), str(default_pack.id))
+        latest = artifact.revisions.order_by("-revision_number").first()
+        content = latest.content_json if latest and isinstance(latest.content_json, dict) else {}
+        summary = str(content.get("summary") or "").lower()
+        body = str(content.get("body_markdown") or "").lower()
+        self.assertIn("salamander", summary)
+        self.assertIn("salamander", body)
+        self.assertNotIn("create an explainer video", summary)
+        self.assertNotIn("create an explainer video", body)
+        scenes = (artifact.video_spec_json or {}).get("scenes") if isinstance(artifact.video_spec_json, dict) else []
+        self.assertTrue(isinstance(scenes, list) and len(scenes) >= 3)
+        scene_blob = json.dumps(scenes).lower()
+        self.assertIn("regener", scene_blob)
+        self.assertIn("amphib", scene_blob)
+        self.assertNotIn("hook / premise", scene_blob)
+        self.assertNotIn("setup / context", scene_blob)

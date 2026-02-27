@@ -41,8 +41,8 @@ class ResolutionResult(TypedDict, total=False):
 
 
 ALLOWED_ACTIONS = {"CreateDraft", "ProposePatch", "ShowOptions", "ValidateDraft"}
-ALLOWED_ARTIFACT_TYPES = {"ArticleDraft"}
-PATCHABLE_FIELDS = {
+ALLOWED_ARTIFACT_TYPES = {"ArticleDraft", "ContextPack"}
+ARTICLE_PATCHABLE_FIELDS = {
     "title",
     "category",
     "format",
@@ -53,3 +53,4 @@ PATCHABLE_FIELDS = {
     "summary",
     "body",
 }
+CONTEXT_PACK_PATCHABLE_FIELDS = {"title", "summary", "tags", "content", "format"}
