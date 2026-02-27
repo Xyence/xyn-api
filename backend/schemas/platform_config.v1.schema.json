@@ -89,6 +89,22 @@
         }
       },
       "additionalProperties": true
+    },
+    "video_generation": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "provider": {"type": "string", "enum": ["unknown", "export_package", "json_export", "http", "http_adapter"]},
+        "http": {
+          "type": "object",
+          "properties": {
+            "endpoint_url": {"type": "string"},
+            "timeout_seconds": {"type": "integer", "minimum": 5, "maximum": 600}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
     }
   },
   "required": ["storage", "notifications"],

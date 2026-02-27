@@ -3154,6 +3154,14 @@ def _default_platform_config() -> Dict[str, Any]:
             "enabled": True,
             "channels": [],
         },
+        "video_generation": {
+            "enabled": True,
+            "provider": os.environ.get("XYENCE_VIDEO_PROVIDER", "export_package") or "export_package",
+            "http": {
+                "endpoint_url": "",
+                "timeout_seconds": 90,
+            },
+        },
     }
 
 
@@ -3253,6 +3261,23 @@ def _validate_platform_config_semantics(payload: Dict[str, Any]) -> List[str]:
                 errors.append(f"notifications.channels[{idx}].aws_sns.topic_arn is required when enabled")
             if not str(sns_cfg.get("region") or "").strip():
                 errors.append(f"notifications.channels[{idx}].aws_sns.region is required when enabled")
+
+    video_generation = payload.get("video_generation") if isinstance(payload.get("video_generation"), dict) else {}
+    if video_generation:
+        enabled = bool(video_generation.get("enabled", True))
+        provider = str(video_generation.get("provider") or "").strip().lower()
+        http_cfg = video_generation.get("http") if isinstance(video_generation.get("http"), dict) else {}
+        if enabled and provider in {"http", "http_adapter"}:
+            if not str(http_cfg.get("endpoint_url") or "").strip():
+                errors.append("video_generation.http.endpoint_url is required when provider is http")
+        timeout_seconds = http_cfg.get("timeout_seconds")
+        if timeout_seconds is not None:
+            try:
+                timeout = int(timeout_seconds)
+                if timeout < 5 or timeout > 600:
+                    errors.append("video_generation.http.timeout_seconds must be between 5 and 600")
+            except (TypeError, ValueError):
+                errors.append("video_generation.http.timeout_seconds must be an integer")
     return errors
 
 
@@ -9385,7 +9410,19 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
         if pack_error:
             return pack_error
         request_payload = payload.get("request_payload_json") if isinstance(payload.get("request_payload_json"), dict) else {}
-        provider = str(payload.get("provider") or request_payload.get("provider") or os.environ.get("XYENCE_VIDEO_PROVIDER") or "unknown")
+        platform_config = _load_platform_config()
+        video_generation_cfg = (
+            platform_config.get("video_generation")
+            if isinstance(platform_config.get("video_generation"), dict)
+            else {}
+        )
+        provider = str(
+            payload.get("provider")
+            or request_payload.get("provider")
+            or video_generation_cfg.get("provider")
+            or os.environ.get("XYENCE_VIDEO_PROVIDER")
+            or "unknown"
+        ).strip().lower() or "unknown"
         model_name = str(payload.get("model_name") or request_payload.get("model_name") or request_payload.get("model") or "").strip()
         spec = _video_spec(artifact)
         spec_hash = _normalized_json_hash(spec)
@@ -9393,6 +9430,19 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
         context_hash = str(context_meta.get("hash") or "")
         input_hash = _video_input_snapshot_hash(spec_hash, context_hash, provider, model_name)
         request_payload_with_meta = dict(request_payload)
+        http_cfg = video_generation_cfg.get("http") if isinstance(video_generation_cfg.get("http"), dict) else {}
+        try:
+            http_timeout_seconds = int(http_cfg.get("timeout_seconds") or 90)
+        except (TypeError, ValueError):
+            http_timeout_seconds = 90
+        request_payload_with_meta["video_provider_config"] = {
+            "enabled": bool(video_generation_cfg.get("enabled", True)),
+            "provider": str(video_generation_cfg.get("provider") or provider),
+            "http": {
+                "endpoint_url": str(http_cfg.get("endpoint_url") or "").strip(),
+                "timeout_seconds": http_timeout_seconds,
+            },
+        }
         request_payload_with_meta["input_snapshot"] = {
             "spec_snapshot_hash": spec_hash,
             "context_pack_hash": context_hash,

@@ -4,6 +4,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
+import requests
+
 
 VIDEO_RENDER_STATUSES = {"not_started", "queued", "running", "succeeded", "failed", "canceled"}
 
@@ -272,14 +274,119 @@ def _build_export_asset(article_id: str, spec: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def _normalize_assets(raw_assets: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_assets, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for asset in raw_assets:
+        if not isinstance(asset, dict):
+            continue
+        asset_type = str(asset.get("type") or "").strip() or "video"
+        url = str(asset.get("url") or "").strip()
+        if not url:
+            continue
+        normalized.append(
+            {
+                "type": asset_type,
+                "url": url,
+                "metadata": asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {},
+            }
+        )
+    return normalized
+
+
+def _render_via_http_provider(
+    *,
+    endpoint_url: str,
+    timeout_seconds: int,
+    provider_name: str,
+    spec: Dict[str, Any],
+    request_payload: Dict[str, Any],
+    article_id: str,
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    payload = {
+        "article_id": article_id,
+        "spec": spec,
+        "request": sanitize_payload(request_payload),
+    }
+    response = requests.post(
+        endpoint_url,
+        json=payload,
+        timeout=max(5, min(timeout_seconds, 600)),
+    )
+    response.raise_for_status()
+    body = response.json() if response.content else {}
+    assets = _normalize_assets((body or {}).get("assets"))
+    if not assets:
+        video_url = str((body or {}).get("video_url") or "").strip()
+        if video_url:
+            assets = [{"type": "video", "url": video_url, "metadata": {}}]
+    if not assets:
+        assets = [_build_export_asset(article_id, spec)]
+    result_payload = {
+        "message": "Video render request sent to external provider.",
+        "provider_configured": True,
+        "provider": provider_name,
+        "provider_response": sanitize_payload(body),
+    }
+    return provider_name, assets, result_payload
+
+
 def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_id: str) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
-    provider = str(request_payload.get("provider") or os.environ.get("XYENCE_VIDEO_PROVIDER") or "unknown").strip().lower() or "unknown"
+    provider_cfg = request_payload.get("video_provider_config") if isinstance(request_payload.get("video_provider_config"), dict) else {}
+    provider = str(
+        request_payload.get("provider")
+        or provider_cfg.get("provider")
+        or os.environ.get("XYENCE_VIDEO_PROVIDER")
+        or "unknown"
+    ).strip().lower() or "unknown"
     sanitized_payload = sanitize_payload(request_payload)
     if provider in {"", "unknown", "stub", "none"}:
         assets = [_build_export_asset(article_id, spec)]
         return "unknown", assets, {
             "message": "Video provider is not configured. Generated export package placeholder.",
             "provider_configured": False,
+            "request": sanitized_payload,
+        }
+
+    if provider in {"http", "http_adapter"}:
+        http_cfg = provider_cfg.get("http") if isinstance(provider_cfg.get("http"), dict) else {}
+        endpoint_url = str(http_cfg.get("endpoint_url") or "").strip()
+        try:
+            timeout_seconds = int(http_cfg.get("timeout_seconds") or 90)
+        except (TypeError, ValueError):
+            timeout_seconds = 90
+        if not endpoint_url:
+            assets = [_build_export_asset(article_id, spec)]
+            return provider, assets, {
+                "message": "HTTP video provider selected but endpoint_url is missing. Generated export package placeholder.",
+                "provider_configured": False,
+                "request": sanitized_payload,
+            }
+        try:
+            return _render_via_http_provider(
+                endpoint_url=endpoint_url,
+                timeout_seconds=timeout_seconds,
+                provider_name=provider,
+                spec=spec,
+                request_payload=request_payload,
+                article_id=article_id,
+            )
+        except Exception as exc:
+            assets = [_build_export_asset(article_id, spec)]
+            return provider, assets, {
+                "message": f"HTTP provider request failed: {exc}",
+                "provider_configured": True,
+                "provider": provider,
+                "request": sanitized_payload,
+            }
+
+    if provider in {"export_package", "json_export"}:
+        assets = [_build_export_asset(article_id, spec)]
+        return provider, assets, {
+            "message": "Export package generated.",
+            "provider_configured": True,
+            "provider": provider,
             "request": sanitized_payload,
         }
 
