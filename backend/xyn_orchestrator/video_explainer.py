@@ -334,6 +334,7 @@ def _render_via_http_provider(
 
 def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_id: str) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     provider_cfg = request_payload.get("video_provider_config") if isinstance(request_payload.get("video_provider_config"), dict) else {}
+    rendering_mode = str(provider_cfg.get("rendering_mode") or "").strip().lower()
     provider = str(
         request_payload.get("provider")
         or provider_cfg.get("provider")
@@ -341,15 +342,24 @@ def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_
         or "unknown"
     ).strip().lower() or "unknown"
     sanitized_payload = sanitize_payload(request_payload)
+    if rendering_mode == "export_package_only":
+        assets = [_build_export_asset(article_id, spec)]
+        return "export_package", assets, {
+            "message": "Rendering mode is export_package_only. No external rendering performed.",
+            "provider_configured": True,
+            "rendering_mode": rendering_mode,
+            "request": sanitized_payload,
+        }
     if provider in {"", "unknown", "stub", "none"}:
         assets = [_build_export_asset(article_id, spec)]
         return "unknown", assets, {
             "message": "Video provider is not configured. Generated export package placeholder.",
             "provider_configured": False,
+            "rendering_mode": rendering_mode or "unknown",
             "request": sanitized_payload,
         }
 
-    if provider in {"http", "http_adapter"}:
+    if provider in {"http", "http_adapter"} or rendering_mode in {"render_via_endpoint", "render_via_adapter"}:
         http_cfg = provider_cfg.get("http") if isinstance(provider_cfg.get("http"), dict) else {}
         endpoint_url = str(http_cfg.get("endpoint_url") or "").strip()
         try:
@@ -361,6 +371,7 @@ def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_
             return provider, assets, {
                 "message": "HTTP video provider selected but endpoint_url is missing. Generated export package placeholder.",
                 "provider_configured": False,
+                "rendering_mode": rendering_mode or "render_via_endpoint",
                 "request": sanitized_payload,
             }
         try:
@@ -387,6 +398,7 @@ def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_
             "message": "Export package generated.",
             "provider_configured": True,
             "provider": provider,
+            "rendering_mode": rendering_mode or "export_package_only",
             "request": sanitized_payload,
         }
 

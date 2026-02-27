@@ -105,6 +105,27 @@
         }
       },
       "additionalProperties": true
+    },
+    "video": {
+      "type": "object",
+      "properties": {
+        "rendering_mode": {
+          "type": "string",
+          "enum": [
+            "export_package_only",
+            "render_via_adapter",
+            "render_via_endpoint",
+            "render_via_model_config"
+          ]
+        },
+        "endpoint_url": {"type": ["string", "null"]},
+        "adapter_id": {"type": ["string", "null"]},
+        "adapter_config_id": {"type": ["string", "null"]},
+        "credential_ref": {"type": ["string", "null"]},
+        "timeout_seconds": {"type": "integer", "minimum": 5, "maximum": 600},
+        "retry_count": {"type": "integer", "minimum": 0, "maximum": 10}
+      },
+      "additionalProperties": true
     }
   },
   "required": ["storage", "notifications"],

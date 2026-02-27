@@ -216,6 +216,41 @@ WORKFLOW_PROFILE_TYPES = {"tour"}
 WORKFLOW_SCHEMA_VERSION = 1
 WORKFLOW_DEFAULT_CATEGORY = "xyn_usage"
 VIDEO_CONTEXT_PACK_PURPOSE = "video_explainer"
+VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG = "video_adapter_config"
+VIDEO_RENDER_PACKAGE_ARTIFACT_TYPE_SLUG = "render_package"
+VIDEO_RENDERING_MODES = {
+    "export_package_only",
+    "render_via_adapter",
+    "render_via_endpoint",
+    "render_via_model_config",
+}
+VIDEO_RENDER_ADAPTERS: List[Dict[str, Any]] = [
+    {
+        "id": "google_veo",
+        "name": "Google Veo",
+        "description": "Google Veo adapter (stub contract in core).",
+        "config_schema_version": 1,
+    },
+    {
+        "id": "runway",
+        "name": "Runway",
+        "description": "Runway adapter (stub contract in core).",
+        "config_schema_version": 1,
+    },
+    {
+        "id": "openai_video",
+        "name": "OpenAI Video",
+        "description": "OpenAI video adapter placeholder.",
+        "config_schema_version": 1,
+    },
+    {
+        "id": "http_generic_renderer",
+        "name": "HTTP Generic Renderer",
+        "description": "Generic HTTP renderer adapter using configured endpoint.",
+        "config_schema_version": 1,
+    },
+]
+VIDEO_RENDER_DIRECT_MODEL = str(os.environ.get("VIDEO_RENDER_DIRECT_MODEL") or "").strip() in {"1", "true", "yes", "on"}
 EXPLAINER_PURPOSES: Dict[str, Dict[str, str]] = {
     "explainer_script": {"name": "Script", "description": "Generate explainer narration scripts."},
     "explainer_storyboard": {"name": "Storyboard", "description": "Generate storyboard scene structures."},
@@ -1214,6 +1249,36 @@ def _ensure_workflow_artifact_type() -> ArtifactType:
     return artifact_type
 
 
+def _ensure_video_adapter_config_artifact_type() -> ArtifactType:
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug=VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG,
+        defaults={
+            "name": "Video Adapter Config",
+            "description": "Governed configuration for video renderer adapters",
+            "icon": "Settings2",
+            "schema_json": {
+                "rendering_mode": sorted(VIDEO_RENDERING_MODES),
+                "adapter_ids": [entry["id"] for entry in VIDEO_RENDER_ADAPTERS],
+                "state": sorted(choice[0] for choice in Artifact.ARTIFACT_STATE_CHOICES),
+            },
+        },
+    )
+    return artifact_type
+
+
+def _ensure_render_package_artifact_type() -> ArtifactType:
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug=VIDEO_RENDER_PACKAGE_ARTIFACT_TYPE_SLUG,
+        defaults={
+            "name": "Render Package",
+            "description": "Versioned render package snapshot produced from explainer artifacts",
+            "icon": "Package",
+            "schema_json": {"version": 1, "fields": ["scenes", "storyboard", "narration", "visual_prompts", "metadata"]},
+        },
+    )
+    return artifact_type
+
+
 def _normalize_doc_route_bindings(raw: Any) -> list[str]:
     values: list[str] = []
     if not isinstance(raw, list):
@@ -2180,7 +2245,92 @@ def _video_input_snapshot_hash(spec_hash: str, context_hash: str, provider: str,
     return _normalized_json_hash(payload)
 
 
+def _create_render_package_artifact(
+    *,
+    article: Artifact,
+    identity: UserIdentity,
+    spec: Dict[str, Any],
+    render_mode: str,
+    provider_name: str,
+    input_snapshot_hash: str,
+    spec_snapshot_hash: str,
+) -> Artifact:
+    render_package_type = _ensure_render_package_artifact_type()
+    title = f"{article.title} Render Package"
+    slug = _normalize_artifact_slug(
+        "",
+        fallback_title=f"{article.slug or slugify(article.title) or 'article'}-render-package-{timezone.now().strftime('%Y%m%d%H%M%S')}",
+    )
+    render_package = Artifact.objects.create(
+        workspace=article.workspace,
+        type=render_package_type,
+        artifact_state="immutable",
+        title=title,
+        slug=slug,
+        summary=f"Render package for {article.title}",
+        schema_version="render_package.v1",
+        status="published",
+        version=1,
+        visibility="private",
+        author=identity,
+        custodian=identity,
+        parent_artifact=article,
+        lineage_root=article.lineage_root or article,
+        source_ref_type="RenderPackage",
+        source_ref_id="",
+        scope_json={"article_id": str(article.id), "rendering_mode": render_mode, "provider": provider_name},
+        provenance_json={"source_system": "xyn", "source_model": "Artifact", "source_id": str(article.id)},
+    )
+    ArtifactRevision.objects.create(
+        artifact=render_package,
+        revision_number=1,
+        content_json={
+            "render_package_id": str(render_package.id),
+            "source_article_artifact_id": str(article.id),
+            "source_lineage_root_id": str(article.lineage_root_id or article.id),
+            "rendering_mode": render_mode,
+            "provider": provider_name,
+            "spec_snapshot_hash": spec_snapshot_hash,
+            "input_snapshot_hash": input_snapshot_hash,
+            "video_spec_json": spec,
+            "scenes": spec.get("scenes") if isinstance(spec.get("scenes"), list) else [],
+            "storyboard": ((spec.get("storyboard") or {}).get("draft") if isinstance(spec.get("storyboard"), dict) else []) or [],
+            "narration": ((spec.get("narration") or {}).get("draft") if isinstance(spec.get("narration"), dict) else "") or "",
+            "visual_prompts": ((spec.get("visual_prompts") or {}).get("draft") if isinstance(spec.get("visual_prompts"), dict) else {}) or {},
+            "metadata": {
+                "title": spec.get("title") or article.title,
+                "intent": spec.get("intent") or "",
+                "audience": spec.get("audience") or "",
+                "tone": spec.get("tone") or "",
+                "duration_seconds_target": spec.get("duration_seconds_target"),
+            },
+        },
+        created_by=identity,
+    )
+    render_package.content_hash = compute_content_hash(render_package)
+    render_package.validation_status = "pass"
+    render_package.validation_errors_json = []
+    render_package.save(update_fields=["content_hash", "validation_status", "validation_errors_json", "updated_at"])
+    emit_ledger_event(
+        actor=identity,
+        action="artifact.create",
+        artifact=render_package,
+        summary="Created Render Package artifact",
+        metadata={
+            "source_article_artifact_id": str(article.id),
+            "rendering_mode": render_mode,
+            "provider": provider_name,
+            "spec_snapshot_hash": spec_snapshot_hash,
+            "input_snapshot_hash": input_snapshot_hash,
+        },
+        dedupe_key=make_dedupe_key("artifact.create", str(render_package.id)),
+    )
+    return render_package
+
+
 def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
+    request_payload = render.request_payload_json if isinstance(render.request_payload_json, dict) else {}
+    input_snapshot = request_payload.get("input_snapshot") if isinstance(request_payload.get("input_snapshot"), dict) else {}
     return {
         "id": str(render.id),
         "article_id": str(render.article_id),
@@ -2190,7 +2340,7 @@ def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
         "requested_at": render.requested_at.isoformat() if render.requested_at else None,
         "started_at": render.started_at.isoformat() if render.started_at else None,
         "completed_at": render.completed_at.isoformat() if render.completed_at else None,
-        "request_payload_json": sanitize_payload(render.request_payload_json or {}),
+        "request_payload_json": sanitize_payload(request_payload),
         "result_payload_json": sanitize_payload(render.result_payload_json or {}),
         "output_assets": render.output_assets or [],
         "context_pack_id": str(render.context_pack_id) if render.context_pack_id else None,
@@ -2200,6 +2350,7 @@ def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
         "context_pack_hash": render.context_pack_hash or "",
         "spec_snapshot_hash": render.spec_snapshot_hash or "",
         "input_snapshot_hash": render.input_snapshot_hash or "",
+        "render_package_artifact_id": str(input_snapshot.get("render_package_artifact_id") or "").strip() or None,
         "error_message": render.error_message or "",
         "error_details_json": sanitize_payload(render.error_details_json or {}),
     }
@@ -3154,15 +3305,61 @@ def _default_platform_config() -> Dict[str, Any]:
             "enabled": True,
             "channels": [],
         },
-        "video_generation": {
+        "video": {
+            "rendering_mode": "export_package_only",
+            "endpoint_url": "",
+            "adapter_id": "http_generic_renderer",
+            "adapter_config_id": None,
+            "credential_ref": "",
+            "timeout_seconds": 90,
+            "retry_count": 0,
+        },
+        "video_generation": {  # legacy shape retained for migration compatibility
             "enabled": True,
-            "provider": os.environ.get("XYENCE_VIDEO_PROVIDER", "export_package") or "export_package",
-            "http": {
-                "endpoint_url": "",
-                "timeout_seconds": 90,
-            },
+            "provider": "export_package",
+            "http": {"endpoint_url": "", "timeout_seconds": 90},
         },
     }
+
+
+def _migrate_video_generation_to_video(payload: Dict[str, Any]) -> Dict[str, Any]:
+    migrated = dict(payload or {})
+    if not isinstance(migrated.get("video"), dict):
+        migrated["video"] = {}
+    video = dict(migrated.get("video") or {})
+    legacy = migrated.get("video_generation") if isinstance(migrated.get("video_generation"), dict) else {}
+
+    mode = str(video.get("rendering_mode") or "").strip()
+    if not mode:
+        legacy_provider = str(legacy.get("provider") or "").strip().lower()
+        if legacy_provider in {"http", "http_adapter"}:
+            mode = "render_via_adapter"
+        elif legacy_provider in {"http_endpoint", "http_url"}:
+            mode = "render_via_endpoint"
+        elif legacy_provider in {"export_package", "json_export"}:
+            mode = "export_package_only"
+        elif legacy_provider in {"unknown", "none", ""}:
+            mode = "export_package_only"
+        else:
+            mode = "export_package_only"
+    if mode == "render_via_adapter" and not str(video.get("adapter_id") or "").strip():
+        video["adapter_id"] = "http_generic_renderer"
+    if "endpoint_url" not in video:
+        http_cfg = legacy.get("http") if isinstance(legacy.get("http"), dict) else {}
+        video["endpoint_url"] = str(http_cfg.get("endpoint_url") or "").strip()
+    if "timeout_seconds" not in video:
+        http_cfg = legacy.get("http") if isinstance(legacy.get("http"), dict) else {}
+        try:
+            video["timeout_seconds"] = int(http_cfg.get("timeout_seconds") or 90)
+        except (TypeError, ValueError):
+            video["timeout_seconds"] = 90
+    if "retry_count" not in video:
+        video["retry_count"] = 0
+    video.setdefault("adapter_config_id", None)
+    video.setdefault("credential_ref", "")
+    video["rendering_mode"] = mode
+    migrated["video"] = video
+    return migrated
 
 
 def _load_platform_config() -> Dict[str, Any]:
@@ -3172,7 +3369,32 @@ def _load_platform_config() -> Dict[str, Any]:
     cfg = latest.config_json or {}
     merged = _default_platform_config()
     merged.update(cfg)
-    return merged
+    return _migrate_video_generation_to_video(merged)
+
+
+def _video_rendering_config(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    cfg = _migrate_video_generation_to_video(payload or _default_platform_config())
+    video = cfg.get("video") if isinstance(cfg.get("video"), dict) else {}
+    mode = str(video.get("rendering_mode") or "export_package_only").strip()
+    if mode not in VIDEO_RENDERING_MODES:
+        mode = "export_package_only"
+    try:
+        timeout_seconds = int(video.get("timeout_seconds") or 90)
+    except (TypeError, ValueError):
+        timeout_seconds = 90
+    try:
+        retry_count = int(video.get("retry_count") or 0)
+    except (TypeError, ValueError):
+        retry_count = 0
+    return {
+        "rendering_mode": mode,
+        "endpoint_url": str(video.get("endpoint_url") or "").strip(),
+        "adapter_id": str(video.get("adapter_id") or "").strip(),
+        "adapter_config_id": str(video.get("adapter_config_id") or "").strip(),
+        "credential_ref": str(video.get("credential_ref") or "").strip(),
+        "timeout_seconds": max(5, min(timeout_seconds, 600)),
+        "retry_count": max(0, min(retry_count, 10)),
+    }
 
 
 def _platform_config_version() -> int:
@@ -3262,22 +3484,48 @@ def _validate_platform_config_semantics(payload: Dict[str, Any]) -> List[str]:
             if not str(sns_cfg.get("region") or "").strip():
                 errors.append(f"notifications.channels[{idx}].aws_sns.region is required when enabled")
 
-    video_generation = payload.get("video_generation") if isinstance(payload.get("video_generation"), dict) else {}
-    if video_generation:
-        enabled = bool(video_generation.get("enabled", True))
-        provider = str(video_generation.get("provider") or "").strip().lower()
-        http_cfg = video_generation.get("http") if isinstance(video_generation.get("http"), dict) else {}
-        if enabled and provider in {"http", "http_adapter"}:
-            if not str(http_cfg.get("endpoint_url") or "").strip():
-                errors.append("video_generation.http.endpoint_url is required when provider is http")
-        timeout_seconds = http_cfg.get("timeout_seconds")
+    video = payload.get("video") if isinstance(payload.get("video"), dict) else {}
+    if video:
+        mode = str(video.get("rendering_mode") or "").strip()
+        if mode and mode not in VIDEO_RENDERING_MODES:
+            errors.append("video.rendering_mode is invalid")
+        if mode == "render_via_model_config" and not VIDEO_RENDER_DIRECT_MODEL:
+            errors.append("video.rendering_mode render_via_model_config is disabled by feature flag")
+        if mode == "render_via_endpoint" and not str(video.get("endpoint_url") or "").strip():
+            errors.append("video.endpoint_url is required when rendering_mode is render_via_endpoint")
+        if mode == "render_via_adapter":
+            adapter_id = str(video.get("adapter_id") or "").strip()
+            if not adapter_id:
+                errors.append("video.adapter_id is required when rendering_mode is render_via_adapter")
+            elif adapter_id not in {entry["id"] for entry in VIDEO_RENDER_ADAPTERS}:
+                errors.append("video.adapter_id is not a registered adapter")
+        timeout_seconds = video.get("timeout_seconds")
         if timeout_seconds is not None:
             try:
                 timeout = int(timeout_seconds)
                 if timeout < 5 or timeout > 600:
-                    errors.append("video_generation.http.timeout_seconds must be between 5 and 600")
+                    errors.append("video.timeout_seconds must be between 5 and 600")
             except (TypeError, ValueError):
-                errors.append("video_generation.http.timeout_seconds must be an integer")
+                errors.append("video.timeout_seconds must be an integer")
+        retry_count = video.get("retry_count")
+        if retry_count is not None:
+            try:
+                retries = int(retry_count)
+                if retries < 0 or retries > 10:
+                    errors.append("video.retry_count must be between 0 and 10")
+            except (TypeError, ValueError):
+                errors.append("video.retry_count must be an integer")
+
+        adapter_config_id = str(video.get("adapter_config_id") or "").strip()
+        if mode == "render_via_adapter" and adapter_config_id:
+            adapter_artifact = Artifact.objects.filter(
+                id=adapter_config_id,
+                type__slug=VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG,
+            ).select_related("type").first()
+            if not adapter_artifact:
+                errors.append("video.adapter_config_id does not reference a video adapter config artifact")
+            elif adapter_artifact.artifact_state != "canonical":
+                errors.append("video.adapter_config_id must reference a canonical adapter config")
     return errors
 
 
@@ -3787,6 +4035,7 @@ def platform_config_collection(request: HttpRequest) -> JsonResponse:
         if not _is_platform_admin(identity):
             return JsonResponse({"error": "forbidden"}, status=403)
         payload = _parse_json(request)
+        payload = _migrate_video_generation_to_video(payload)
         errors = _validate_schema_payload(payload, "platform_config.v1.schema.json")
         errors.extend(_validate_platform_config_semantics(payload))
         if errors:
@@ -3799,6 +4048,234 @@ def platform_config_collection(request: HttpRequest) -> JsonResponse:
         )
         return JsonResponse({"version": int(document.version), "config": document.config_json})
     return JsonResponse({"error": "method not allowed"}, status=405)
+
+
+def _video_adapter_content_from_artifact(artifact: Artifact) -> Dict[str, Any]:
+    latest = _latest_artifact_revision(artifact)
+    content = latest.content_json if latest and isinstance(latest.content_json, dict) else {}
+    return content if isinstance(content, dict) else {}
+
+
+def _serialize_video_adapter_config_artifact(artifact: Artifact) -> Dict[str, Any]:
+    content = _video_adapter_content_from_artifact(artifact)
+    adapter_id = str(content.get("adapter_id") or artifact.scope_json.get("adapter_id") or "").strip() if isinstance(artifact.scope_json, dict) else str(content.get("adapter_id") or "").strip()
+    return {
+        "artifact_id": str(artifact.id),
+        "title": artifact.title,
+        "slug": artifact.slug,
+        "artifact_state": artifact.artifact_state,
+        "version": int(artifact.version or 1),
+        "content_hash": artifact.content_hash or "",
+        "updated_at": artifact.updated_at.isoformat() if artifact.updated_at else "",
+        "adapter_id": adapter_id,
+        "config_json": content,
+    }
+
+
+def _validate_video_adapter_config_content(content: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+    adapter_id = str(content.get("adapter_id") or "").strip()
+    if not adapter_id:
+        errors.append("adapter_id is required")
+    elif adapter_id not in {entry["id"] for entry in VIDEO_RENDER_ADAPTERS}:
+        errors.append("adapter_id is not recognized")
+    if "render_caps" in content and not isinstance(content.get("render_caps"), dict):
+        errors.append("render_caps must be an object")
+    if "defaults" in content and not isinstance(content.get("defaults"), dict):
+        errors.append("defaults must be an object")
+    if "provider_model_id" in content and not isinstance(content.get("provider_model_id"), str):
+        errors.append("provider_model_id must be a string")
+    if "credential_ref" in content and not isinstance(content.get("credential_ref"), str):
+        errors.append("credential_ref must be a string")
+    if "model_config_id" in content and content.get("model_config_id") not in {None, ""}:
+        model_config_id = str(content.get("model_config_id") or "").strip()
+        if model_config_id:
+            if not ModelConfig.objects.filter(id=model_config_id, enabled=True).exists():
+                errors.append("model_config_id does not reference an enabled model config")
+    return errors
+
+
+@csrf_exempt
+@login_required
+def video_adapters_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    return JsonResponse(
+        {
+            "adapters": VIDEO_RENDER_ADAPTERS,
+            "feature_flags": {"render_via_model_config": VIDEO_RENDER_DIRECT_MODEL},
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def video_adapter_configs_collection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    _ensure_video_adapter_config_artifact_type()
+    if request.method == "GET":
+        adapter_id = str(request.GET.get("adapter_id") or "").strip()
+        state = str(request.GET.get("state") or "canonical").strip().lower()
+        qs = Artifact.objects.filter(type__slug=VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG).order_by("-updated_at")
+        if state:
+            qs = qs.filter(artifact_state=state)
+        items = list(qs[:200])
+        payload: List[Dict[str, Any]] = []
+        for artifact in items:
+            serialized = _serialize_video_adapter_config_artifact(artifact)
+            if adapter_id and serialized.get("adapter_id") != adapter_id:
+                continue
+            payload.append(serialized)
+        return JsonResponse({"configs": payload})
+
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    payload = _parse_json(request)
+    title = str(payload.get("title") or "").strip() or "Video Adapter Config"
+    adapter_id = str(payload.get("adapter_id") or "").strip()
+    if not adapter_id:
+        return JsonResponse({"error": "adapter_id is required"}, status=400)
+    config_json = payload.get("config_json") if isinstance(payload.get("config_json"), dict) else {
+        "adapter_id": adapter_id,
+        "provider_model_id": "",
+        "credential_ref": "",
+        "model_config_id": None,
+        "render_caps": {"max_duration_s": 12, "max_resolution": "1920x1080", "fps_options": [24, 30]},
+        "defaults": {"fps": 24, "resolution": "1280x720", "aspect_ratio": "16:9"},
+    }
+    config_json["adapter_id"] = adapter_id
+    validation_errors = _validate_video_adapter_config_content(config_json)
+    if validation_errors:
+        return JsonResponse({"error": "invalid adapter config", "details": validation_errors}, status=400)
+
+    identity_user = request.user if request.user.is_authenticated else None
+    slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=title)
+    with transaction.atomic():
+        artifact = Artifact.objects.create(
+            workspace=_default_workspace(),
+            type=ArtifactType.objects.get(slug=VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG),
+            artifact_state="provisional",
+            title=title,
+            slug=slug,
+            schema_version="video_adapter_config.v1",
+            status="draft",
+            version=1,
+            visibility="team",
+            author=identity,
+            custodian=identity,
+            source_ref_type="VideoAdapterConfig",
+            source_ref_id="",
+            scope_json={"adapter_id": adapter_id},
+            provenance_json={"source_system": "xyn", "created_via": "platform_settings"},
+        )
+        artifact.lineage_root = artifact
+        artifact.save(update_fields=["lineage_root", "updated_at"])
+        ArtifactRevision.objects.create(
+            artifact=artifact,
+            revision_number=1,
+            content_json=config_json,
+            created_by=identity,
+        )
+        artifact.content_hash = compute_content_hash(artifact)
+        artifact.validation_status, validation = ("pass", [])
+        artifact.validation_errors_json = validation
+        artifact.save(update_fields=["content_hash", "validation_status", "validation_errors_json", "updated_at"])
+        emit_ledger_event(
+            actor=identity,
+            action="artifact.create",
+            artifact=artifact,
+            summary="Created video adapter config artifact",
+            metadata={"title": artifact.title, "adapter_id": adapter_id, "initial_artifact_state": artifact.artifact_state},
+            dedupe_key=make_dedupe_key("artifact.create", str(artifact.id)),
+        )
+    return JsonResponse({"config": _serialize_video_adapter_config_artifact(artifact)})
+
+
+@csrf_exempt
+@login_required
+def video_adapter_config_detail(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    artifact = get_object_or_404(
+        Artifact.objects.select_related("type"),
+        id=artifact_id,
+        type__slug=VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG,
+    )
+    if request.method == "GET":
+        return JsonResponse({"config": _serialize_video_adapter_config_artifact(artifact)})
+    if request.method != "PATCH":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    payload = _parse_json(request)
+    old_artifact = Artifact.objects.get(id=artifact.id)
+    old_content = _video_adapter_content_from_artifact(artifact)
+    content = dict(old_content)
+    if "title" in payload:
+        artifact.title = str(payload.get("title") or "").strip() or artifact.title
+    if "artifact_state" in payload:
+        next_state = str(payload.get("artifact_state") or "").strip().lower()
+        if next_state not in {choice[0] for choice in Artifact.ARTIFACT_STATE_CHOICES}:
+            return JsonResponse({"error": "invalid artifact_state"}, status=400)
+        artifact.artifact_state = next_state
+    if "config_json" in payload:
+        if not isinstance(payload.get("config_json"), dict):
+            return JsonResponse({"error": "config_json must be an object"}, status=400)
+        content = dict(payload.get("config_json") or {})
+    if "adapter_id" in payload:
+        content["adapter_id"] = str(payload.get("adapter_id") or "").strip()
+    if "slug" in payload:
+        artifact.slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=artifact.title)
+
+    validation_errors = _validate_video_adapter_config_content(content)
+    if validation_errors:
+        return JsonResponse({"error": "invalid adapter config", "details": validation_errors}, status=400)
+
+    with transaction.atomic():
+        artifact.scope_json = {**(artifact.scope_json or {}), "adapter_id": str(content.get("adapter_id") or "").strip()}
+        artifact.save(update_fields=["title", "artifact_state", "slug", "scope_json", "updated_at"])
+        if content != old_content:
+            next_revision = _next_artifact_revision_number(artifact)
+            ArtifactRevision.objects.create(
+                artifact=artifact,
+                revision_number=next_revision,
+                content_json=content,
+                created_by=identity,
+            )
+            artifact.version = next_revision
+        artifact.content_hash = compute_content_hash(artifact)
+        artifact.validation_status = "pass"
+        artifact.validation_errors_json = []
+        artifact.save(update_fields=["version", "content_hash", "validation_status", "validation_errors_json", "updated_at"])
+
+        new_artifact = Artifact.objects.get(id=artifact.id)
+        diff_payload = compute_artifact_diff(old_artifact, new_artifact)
+        if content != old_content:
+            diff_payload["changed_fields"] = sorted(set((diff_payload.get("changed_fields") or []) + ["config_json"]))
+            diff_payload["config_changed"] = True
+        if diff_payload.get("changed_fields"):
+            emit_ledger_event(
+                actor=identity,
+                action="artifact.update",
+                artifact=new_artifact,
+                summary=f"Updated video adapter config artifact: {', '.join(diff_payload['changed_fields'][:3])}",
+                metadata=diff_payload,
+                dedupe_key=make_dedupe_key("artifact.update", str(new_artifact.id), diff_payload=diff_payload),
+            )
+    return JsonResponse({"config": _serialize_video_adapter_config_artifact(artifact)})
 
 
 def _report_payload_from_request(request: HttpRequest) -> Dict[str, Any]:
@@ -9411,18 +9888,18 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
             return pack_error
         request_payload = payload.get("request_payload_json") if isinstance(payload.get("request_payload_json"), dict) else {}
         platform_config = _load_platform_config()
-        video_generation_cfg = (
-            platform_config.get("video_generation")
-            if isinstance(platform_config.get("video_generation"), dict)
-            else {}
-        )
-        provider = str(
-            payload.get("provider")
-            or request_payload.get("provider")
-            or video_generation_cfg.get("provider")
-            or os.environ.get("XYENCE_VIDEO_PROVIDER")
-            or "unknown"
-        ).strip().lower() or "unknown"
+        rendering_cfg = _video_rendering_config(platform_config)
+        render_mode = str(rendering_cfg.get("rendering_mode") or "export_package_only")
+        provider = str(payload.get("provider") or request_payload.get("provider") or "").strip().lower()
+        if not provider:
+            if render_mode == "render_via_adapter":
+                provider = str(rendering_cfg.get("adapter_id") or "unknown").strip().lower() or "unknown"
+            elif render_mode == "render_via_endpoint":
+                provider = "http"
+            elif render_mode == "render_via_model_config":
+                provider = "model_config"
+            else:
+                provider = "export_package"
         model_name = str(payload.get("model_name") or request_payload.get("model_name") or request_payload.get("model") or "").strip()
         spec = _video_spec(artifact)
         spec_hash = _normalized_json_hash(spec)
@@ -9430,25 +9907,47 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
         context_hash = str(context_meta.get("hash") or "")
         input_hash = _video_input_snapshot_hash(spec_hash, context_hash, provider, model_name)
         request_payload_with_meta = dict(request_payload)
-        http_cfg = video_generation_cfg.get("http") if isinstance(video_generation_cfg.get("http"), dict) else {}
-        try:
-            http_timeout_seconds = int(http_cfg.get("timeout_seconds") or 90)
-        except (TypeError, ValueError):
-            http_timeout_seconds = 90
+        adapter_config_payload: Dict[str, Any] = {}
+        adapter_config_id = str(rendering_cfg.get("adapter_config_id") or "").strip()
+        if adapter_config_id:
+            adapter_artifact = Artifact.objects.filter(
+                id=adapter_config_id,
+                type__slug=VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG,
+            ).first()
+            if adapter_artifact:
+                adapter_config_payload = _video_adapter_content_from_artifact(adapter_artifact)
+        endpoint_url = str(rendering_cfg.get("endpoint_url") or "").strip()
+        if not endpoint_url and isinstance(adapter_config_payload, dict):
+            endpoint_url = str(adapter_config_payload.get("endpoint_url") or "").strip()
         request_payload_with_meta["video_provider_config"] = {
-            "enabled": bool(video_generation_cfg.get("enabled", True)),
-            "provider": str(video_generation_cfg.get("provider") or provider),
+            "rendering_mode": render_mode,
+            "provider": provider,
+            "adapter_id": str(rendering_cfg.get("adapter_id") or ""),
+            "adapter_config_id": adapter_config_id or None,
+            "adapter_config": adapter_config_payload,
+            "credential_ref": str(rendering_cfg.get("credential_ref") or ""),
             "http": {
-                "endpoint_url": str(http_cfg.get("endpoint_url") or "").strip(),
-                "timeout_seconds": http_timeout_seconds,
+                "endpoint_url": endpoint_url,
+                "timeout_seconds": int(rendering_cfg.get("timeout_seconds") or 90),
+                "retry_count": int(rendering_cfg.get("retry_count") or 0),
             },
         }
+        render_package = _create_render_package_artifact(
+            article=artifact,
+            identity=identity,
+            spec=spec,
+            render_mode=render_mode,
+            provider_name=provider,
+            input_snapshot_hash=input_hash,
+            spec_snapshot_hash=spec_hash,
+        )
         request_payload_with_meta["input_snapshot"] = {
             "spec_snapshot_hash": spec_hash,
             "context_pack_hash": context_hash,
             "provider": provider,
             "model_name": model_name,
             "input_snapshot_hash": input_hash,
+            "render_package_artifact_id": str(render_package.id),
         }
         if context_meta:
             request_payload_with_meta["context_pack"] = context_meta
@@ -9494,6 +9993,7 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
             identity,
             {
                 "render_id": str(render_record.id),
+                "render_package_artifact_id": str(render_package.id),
                 "provider": provider,
                 "model_name": model_name,
                 "spec_snapshot_hash": spec_hash,
