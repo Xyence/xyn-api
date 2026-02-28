@@ -10072,6 +10072,8 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
         rendering_cfg = _video_rendering_config(platform_config)
         render_mode = str(rendering_cfg.get("rendering_mode") or "export_package_only")
         provider = str(payload.get("provider") or request_payload.get("provider") or "").strip().lower()
+        if provider in {"unknown", "stub", "none"}:
+            provider = ""
         if not provider:
             if render_mode == "render_via_adapter":
                 provider = str(rendering_cfg.get("adapter_id") or "unknown").strip().lower() or "unknown"
