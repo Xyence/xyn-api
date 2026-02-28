@@ -88,6 +88,9 @@ from .models import (
     ArtifactExternalRef,
     ArtifactReaction,
     ArtifactComment,
+    ArtifactPackage,
+    ArtifactInstallReceipt,
+    ArtifactBindingValue,
     PublishBinding,
     VideoRender,
     WorkflowRun,
@@ -117,6 +120,13 @@ from .models import (
     PlatformConfigDocument,
     Report,
     ReportAttachment,
+)
+from .artifact_packages import (
+    ArtifactPackageValidationError,
+    export_artifact_package,
+    import_package_blob,
+    install_package,
+    validate_package_install,
 )
 from .module_registry import maybe_sync_modules_from_registry
 from .deployments import (
@@ -6330,8 +6340,13 @@ def _serialize_unified_artifact(artifact: Artifact, source_record: Any = None) -
         "artifact_state": artifact.artifact_state,
         "title": artifact.title,
         "summary": artifact.summary or "",
+        "status": artifact.status,
+        "package_version": artifact.package_version or "",
         "schema_version": artifact.schema_version or "",
         "content_hash": artifact.content_hash or "",
+        "dependencies": artifact.dependencies if isinstance(artifact.dependencies, list) else [],
+        "bindings": artifact.bindings if isinstance(artifact.bindings, list) else [],
+        "content_ref": artifact.content_ref if isinstance(artifact.content_ref, dict) else {},
         "validation_status": artifact.validation_status or "unknown",
         "validation_errors": artifact.validation_errors_json or [],
         "owner": _artifact_owner_payload(artifact),
@@ -7152,6 +7167,232 @@ def artifact_activity(request: HttpRequest, artifact_id: str) -> JsonResponse:
     total = qs.count()
     rows = list(qs.order_by("-created_at")[offset : offset + limit])
     return JsonResponse({"events": [_serialize_ledger_event(row) for row in rows], "count": total, "limit": limit, "offset": offset})
+
+
+def _serialize_artifact_binding_value(row: ArtifactBindingValue) -> Dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "type": row.binding_type,
+        "value": row.value,
+        "description": row.description or "",
+        "secret_ref_id": str(row.secret_ref_id) if row.secret_ref_id else None,
+        "updated_at": row.updated_at,
+    }
+
+
+def _serialize_artifact_package(package: ArtifactPackage) -> Dict[str, Any]:
+    manifest = package.manifest if isinstance(package.manifest, dict) else {}
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), list) else []
+    return {
+        "id": str(package.id),
+        "name": package.name,
+        "version": package.version,
+        "package_hash": package.package_hash or "",
+        "created_at": package.created_at,
+        "artifact_count": len(artifacts),
+        "manifest": manifest,
+    }
+
+
+def _serialize_artifact_install_receipt(receipt: ArtifactInstallReceipt) -> Dict[str, Any]:
+    return {
+        "id": str(receipt.id),
+        "package_name": receipt.package_name,
+        "package_version": receipt.package_version,
+        "package_hash": receipt.package_hash or "",
+        "installed_at": receipt.installed_at,
+        "installed_by": str(receipt.installed_by_id) if receipt.installed_by_id else None,
+        "install_mode": receipt.install_mode,
+        "resolved_bindings": receipt.resolved_bindings if isinstance(receipt.resolved_bindings, dict) else {},
+        "operations": receipt.operations if isinstance(receipt.operations, list) else [],
+        "status": receipt.status,
+        "error_summary": receipt.error_summary or "",
+        "artifact_changes": receipt.artifact_changes if isinstance(receipt.artifact_changes, list) else [],
+    }
+
+
+@csrf_exempt
+@login_required
+def artifact_bindings_collection(request: HttpRequest) -> JsonResponse:
+    if request.method not in {"GET", "POST"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "GET":
+        rows = ArtifactBindingValue.objects.select_related("secret_ref").order_by("name")
+        return JsonResponse({"bindings": [_serialize_artifact_binding_value(row) for row in rows]})
+
+    payload = _parse_json(request)
+    name = str(payload.get("name") or "").strip().upper()
+    binding_type = str(payload.get("type") or "string").strip().lower()
+    if not name:
+        return JsonResponse({"error": "name is required"}, status=400)
+    valid_types = {choice[0] for choice in ArtifactBindingValue.TYPE_CHOICES}
+    if binding_type not in valid_types:
+        return JsonResponse({"error": "invalid type"}, status=400)
+    description = str(payload.get("description") or "").strip()
+    value = payload.get("value")
+    secret_ref_id = str(payload.get("secret_ref_id") or "").strip()
+
+    row, _ = ArtifactBindingValue.objects.get_or_create(
+        name=name,
+        defaults={
+            "binding_type": binding_type,
+            "description": description,
+            "value": value,
+            "updated_by": request.user if request.user.is_authenticated else None,
+        },
+    )
+    row.binding_type = binding_type
+    row.description = description
+    row.value = value
+    row.updated_by = request.user if request.user.is_authenticated else None
+    if secret_ref_id:
+        row.secret_ref_id = secret_ref_id
+    row.save()
+    return JsonResponse({"binding": _serialize_artifact_binding_value(row)})
+
+
+@csrf_exempt
+@login_required
+def artifact_binding_detail(request: HttpRequest, binding_id: str) -> JsonResponse:
+    if request.method not in {"PATCH", "DELETE", "GET"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    row = get_object_or_404(ArtifactBindingValue.objects.select_related("secret_ref"), id=binding_id)
+    if request.method == "GET":
+        return JsonResponse({"binding": _serialize_artifact_binding_value(row)})
+    if request.method == "DELETE":
+        row.delete()
+        return JsonResponse({"status": "deleted"})
+
+    payload = _parse_json(request)
+    if "description" in payload:
+        row.description = str(payload.get("description") or "").strip()
+    if "type" in payload:
+        binding_type = str(payload.get("type") or "").strip().lower()
+        valid_types = {choice[0] for choice in ArtifactBindingValue.TYPE_CHOICES}
+        if binding_type not in valid_types:
+            return JsonResponse({"error": "invalid type"}, status=400)
+        row.binding_type = binding_type
+    if "value" in payload:
+        row.value = payload.get("value")
+    if "secret_ref_id" in payload:
+        secret_ref_id = str(payload.get("secret_ref_id") or "").strip()
+        row.secret_ref_id = secret_ref_id or None
+    row.updated_by = request.user if request.user.is_authenticated else None
+    row.save()
+    return JsonResponse({"binding": _serialize_artifact_binding_value(row)})
+
+
+@csrf_exempt
+@login_required
+def artifact_packages_collection(request: HttpRequest) -> JsonResponse:
+    if request.method not in {"GET", "POST"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    if request.method == "GET":
+        rows = ArtifactPackage.objects.order_by("-created_at")[:200]
+        return JsonResponse({"packages": [_serialize_artifact_package(row) for row in rows]})
+
+    if not request.FILES or "file" not in request.FILES:
+        return JsonResponse({"error": "file upload required (multipart field: file)"}, status=400)
+    upload = request.FILES["file"]
+    try:
+        package = import_package_blob(blob=upload.read(), created_by=request.user if request.user.is_authenticated else None)
+    except ArtifactPackageValidationError as exc:
+        return JsonResponse({"error": "invalid package", "details": exc.errors}, status=400)
+    return JsonResponse({"package": _serialize_artifact_package(package)})
+
+
+@csrf_exempt
+@login_required
+def artifact_package_detail(request: HttpRequest, package_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    package = get_object_or_404(ArtifactPackage, id=package_id)
+    return JsonResponse({"package": _serialize_artifact_package(package)})
+
+
+@csrf_exempt
+@login_required
+def artifact_package_validate(request: HttpRequest, package_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    package = get_object_or_404(ArtifactPackage, id=package_id)
+    payload = _parse_json(request)
+    overrides = payload.get("binding_overrides") if isinstance(payload.get("binding_overrides"), dict) else {}
+    try:
+        result = validate_package_install(package, binding_overrides=overrides)
+    except ArtifactPackageValidationError as exc:
+        return JsonResponse({"valid": False, "errors": exc.errors}, status=400)
+    return JsonResponse(result)
+
+
+@csrf_exempt
+@login_required
+def artifact_package_install(request: HttpRequest, package_id: str) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    package = get_object_or_404(ArtifactPackage, id=package_id)
+    payload = _parse_json(request)
+    overrides = payload.get("binding_overrides") if isinstance(payload.get("binding_overrides"), dict) else {}
+    receipt = install_package(
+        package,
+        binding_overrides=overrides,
+        installed_by=request.user if request.user.is_authenticated else None,
+    )
+    status = 200 if receipt.status == "success" else 400
+    return JsonResponse({"receipt": _serialize_artifact_install_receipt(receipt)}, status=status)
+
+
+@csrf_exempt
+@login_required
+def artifact_install_receipts_collection(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact_id = str(request.GET.get("artifact_id") or "").strip()
+    rows = list(ArtifactInstallReceipt.objects.order_by("-installed_at")[:500])
+    if artifact_id:
+        filtered: List[ArtifactInstallReceipt] = []
+        for row in rows:
+            changes = row.artifact_changes if isinstance(row.artifact_changes, list) else []
+            if any(str(change.get("artifact_id") or "") == artifact_id for change in changes if isinstance(change, dict)):
+                filtered.append(row)
+        rows = filtered
+    return JsonResponse({"receipts": [_serialize_artifact_install_receipt(row) for row in rows[:200]]})
+
+
+@csrf_exempt
+@login_required
+def artifact_export_package(request: HttpRequest, artifact_id: str) -> HttpResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    payload = _parse_json(request)
+    package_name = str(payload.get("package_name") or f"{artifact.type.slug}-{artifact.slug}").strip().lower()
+    package_version = str(payload.get("package_version") or "0.1.0").strip()
+    try:
+        blob = export_artifact_package(root_artifact=artifact, package_name=package_name, package_version=package_version)
+    except ArtifactPackageValidationError as exc:
+        return JsonResponse({"error": "invalid export request", "details": exc.errors}, status=400)
+    response = HttpResponse(blob, content_type="application/zip")
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", package_name) or "artifact-package"
+    response["Content-Disposition"] = f'attachment; filename=\"{safe_name}-{package_version}.zip\"'
+    return response
 
 
 @csrf_exempt

@@ -897,6 +897,9 @@ class Artifact(models.Model):
         ("ratified", "Ratified"),
         ("published", "Published"),
         ("deprecated", "Deprecated"),
+        ("active", "Active"),
+        ("inactive", "Inactive"),
+        ("error", "Error"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -951,6 +954,10 @@ class Artifact(models.Model):
     )
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="draft")
     version = models.PositiveIntegerField(default=1)
+    package_version = models.CharField(max_length=40, blank=True, default="")
+    content_ref = models.JSONField(null=True, blank=True)
+    dependencies = models.JSONField(default=list, blank=True)
+    bindings = models.JSONField(default=list, blank=True)
     lineage_json = models.JSONField(null=True, blank=True)
     author = models.ForeignKey(UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifacts_authored")
     custodian = models.ForeignKey(UserIdentity, null=True, blank=True, on_delete=models.SET_NULL, related_name="artifacts_custodied")
@@ -2132,6 +2139,94 @@ class PlatformConfigDocument(models.Model):
 
     def __str__(self) -> str:
         return f"Platform config v{self.version}"
+
+
+class ArtifactPackage(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=240)
+    version = models.CharField(max_length=40)
+    manifest = models.JSONField(default=dict, blank=True)
+    file_blob_ref = models.CharField(max_length=600, blank=True, default="")
+    package_hash = models.CharField(max_length=128, blank=True, default="")
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="artifact_packages_created"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        unique_together = ("name", "version", "package_hash")
+
+    def __str__(self) -> str:
+        return f"{self.name}@{self.version}"
+
+
+class ArtifactInstallReceipt(models.Model):
+    STATUS_CHOICES = [
+        ("success", "Success"),
+        ("failed", "Failed"),
+        ("partial", "Partial"),
+    ]
+    MODE_CHOICES = [
+        ("install", "Install"),
+        ("upgrade", "Upgrade"),
+        ("reinstall", "Reinstall"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    package = models.ForeignKey(
+        "ArtifactPackage", null=True, blank=True, on_delete=models.SET_NULL, related_name="install_receipts"
+    )
+    package_name = models.CharField(max_length=240)
+    package_version = models.CharField(max_length=40)
+    package_hash = models.CharField(max_length=128, blank=True, default="")
+    installed_at = models.DateTimeField(default=timezone.now)
+    installed_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="artifact_install_receipts"
+    )
+    install_mode = models.CharField(max_length=20, choices=MODE_CHOICES, default="install")
+    resolved_bindings = models.JSONField(default=dict, blank=True)
+    operations = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="success")
+    error_summary = models.TextField(blank=True, default="")
+    artifact_changes = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-installed_at"]
+
+    def __str__(self) -> str:
+        return f"{self.package_name}@{self.package_version}:{self.status}"
+
+
+class ArtifactBindingValue(models.Model):
+    TYPE_CHOICES = [
+        ("string", "String"),
+        ("secret_ref", "Secret Ref"),
+        ("model_ref", "Model Ref"),
+        ("url", "URL"),
+        ("json", "JSON"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=160, unique=True)
+    binding_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default="string")
+    value = models.JSONField(null=True, blank=True)
+    description = models.TextField(blank=True, default="")
+    secret_ref = models.ForeignKey(
+        "SecretRef", null=True, blank=True, on_delete=models.SET_NULL, related_name="artifact_bindings"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="artifact_binding_values_updated"
+    )
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
 
 
 class ModelProvider(models.Model):
