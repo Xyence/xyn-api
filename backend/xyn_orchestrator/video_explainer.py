@@ -1,10 +1,13 @@
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+from .notifications.registry import resolve_secret_ref_value
 
 
 VIDEO_RENDER_STATUSES = {"not_started", "queued", "running", "succeeded", "failed", "canceled"}
@@ -332,6 +335,234 @@ def _render_via_http_provider(
     return provider_name, assets, result_payload
 
 
+def _extract_google_api_key(secret_value: str) -> str:
+    value = str(secret_value or "").strip()
+    if not value:
+        return ""
+    if value.startswith("AIza"):
+        return value
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    for key in ("api_key", "apiKey", "key"):
+        candidate = str(parsed.get(key) or "").strip()
+        if candidate.startswith("AIza"):
+            return candidate
+    return ""
+
+
+def _build_google_veo_prompt(spec: Dict[str, Any]) -> str:
+    title = str(spec.get("title") or "").strip()
+    intent = str(spec.get("intent") or "").strip()
+    audience = str(spec.get("audience") or "").strip()
+    tone = str(spec.get("tone") or "").strip()
+    script_text = str(((spec.get("script") or {}).get("draft")) or "").strip() if isinstance(spec.get("script"), dict) else ""
+    scenes = spec.get("scenes") if isinstance(spec.get("scenes"), list) else []
+    scene_lines: List[str] = []
+    for item in scenes[:8]:
+        if not isinstance(item, dict):
+            continue
+        scene = normalize_video_scene(item, index=len(scene_lines) + 1)
+        scene_lines.append(f"{scene['title']}: {scene['voiceover']} (On screen: {scene['on_screen']})")
+    parts = [
+        f"Create a short explainer video.",
+        f"Title: {title}" if title else "",
+        f"Intent: {intent}" if intent else "",
+        f"Audience: {audience}" if audience else "",
+        f"Tone: {tone}" if tone else "",
+        f"Narration script: {script_text}" if script_text else "",
+        "Scenes:\n" + "\n".join(f"- {line}" for line in scene_lines) if scene_lines else "",
+        "Output should be coherent, cinematic, and aligned with this storyboard.",
+    ]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _normalize_google_operations_url(base_url: str, operation_name: str) -> str:
+    op = str(operation_name or "").strip()
+    if not op:
+        return ""
+    if op.startswith("http://") or op.startswith("https://"):
+        return op
+    base = str(base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+    return f"{base}/{op.lstrip('/')}"
+
+
+def _extract_video_urls(payload: Any) -> List[str]:
+    urls: List[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_l = str(key).lower()
+            if isinstance(value, str):
+                candidate = value.strip()
+                if (key_l.endswith("uri") or "video" in key_l or key_l.endswith("url")) and (
+                    candidate.startswith("http://")
+                    or candidate.startswith("https://")
+                    or candidate.startswith("gs://")
+                ):
+                    urls.append(candidate)
+            else:
+                urls.extend(_extract_video_urls(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            urls.extend(_extract_video_urls(item))
+    return urls
+
+
+def _google_veo_request_variants(model_id: str, prompt: str, base_url: str) -> List[Tuple[str, Dict[str, Any]]]:
+    model = str(model_id or "").strip() or "veo-3.1-generate-preview"
+    base = str(base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+    if "/models/" in base and ":" in base:
+        generate_url = base
+    else:
+        generate_url = f"{base}/models/{model}:generateVideos"
+    predict_url = f"{base}/models/{model}:predictLongRunning"
+    return [
+        (
+            generate_url,
+            {
+                "prompt": {"text": prompt},
+            },
+        ),
+        (
+            predict_url,
+            {
+                "instances": [{"prompt": prompt}],
+                "parameters": {},
+            },
+        ),
+    ]
+
+
+def _render_via_google_veo(
+    *,
+    provider_name: str,
+    spec: Dict[str, Any],
+    request_payload: Dict[str, Any],
+    article_id: str,
+    provider_cfg: Dict[str, Any],
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    adapter_cfg = provider_cfg.get("adapter_config") if isinstance(provider_cfg.get("adapter_config"), dict) else {}
+    model_id = str(
+        adapter_cfg.get("provider_model_id")
+        or request_payload.get("model_name")
+        or provider_cfg.get("provider_model_id")
+        or "veo-3.1-generate-preview"
+    ).strip()
+    credential_ref = str(adapter_cfg.get("credential_ref") or provider_cfg.get("credential_ref") or "").strip()
+    resolved_secret = resolve_secret_ref_value(credential_ref) if credential_ref else None
+    api_key = _extract_google_api_key(resolved_secret or "")
+    endpoint_url = str(
+        adapter_cfg.get("endpoint_url")
+        or ((provider_cfg.get("http") or {}).get("endpoint_url") if isinstance(provider_cfg.get("http"), dict) else "")
+        or "https://generativelanguage.googleapis.com/v1beta"
+    ).strip()
+    timeout_seconds = 180
+    http_cfg = provider_cfg.get("http") if isinstance(provider_cfg.get("http"), dict) else {}
+    try:
+        timeout_seconds = int(http_cfg.get("timeout_seconds") or 180)
+    except (TypeError, ValueError):
+        timeout_seconds = 180
+    timeout_seconds = max(30, min(timeout_seconds, 900))
+    if not api_key:
+        assets = [_build_export_asset(article_id, spec)]
+        return provider_name, assets, {
+            "message": "Google Veo adapter requires credential_ref resolving to an API key.",
+            "provider_configured": False,
+            "provider": provider_name,
+            "credential_ref": credential_ref or None,
+        }
+
+    prompt = _build_google_veo_prompt(spec)
+    operation_name = ""
+    submit_errors: List[str] = []
+    response_body: Dict[str, Any] = {}
+    active_url = ""
+    for candidate_url, body in _google_veo_request_variants(model_id, prompt, endpoint_url):
+        active_url = candidate_url
+        try:
+            response = requests.post(
+                candidate_url,
+                params={"key": api_key},
+                json=body,
+                timeout=max(10, min(timeout_seconds, 120)),
+            )
+            if response.status_code == 404:
+                submit_errors.append(f"{candidate_url} -> 404")
+                continue
+            response.raise_for_status()
+            response_body = response.json() if response.content else {}
+            operation_name = str(response_body.get("name") or "").strip()
+            if operation_name:
+                break
+            if isinstance(response_body.get("operation"), dict):
+                operation_name = str(response_body.get("operation", {}).get("name") or "").strip()
+                if operation_name:
+                    break
+            submit_errors.append(f"{candidate_url} -> missing operation name")
+        except Exception as exc:
+            submit_errors.append(f"{candidate_url} -> {exc}")
+    if not operation_name:
+        assets = [_build_export_asset(article_id, spec)]
+        return provider_name, assets, {
+            "message": f"Google Veo submit failed: {'; '.join(submit_errors) or 'no operation id returned'}",
+            "provider_configured": True,
+            "provider": provider_name,
+            "provider_response": sanitize_payload(response_body),
+        }
+
+    operation_url = _normalize_google_operations_url(endpoint_url, operation_name)
+    deadline = time.time() + timeout_seconds
+    final_operation: Dict[str, Any] = {}
+    while time.time() < deadline:
+        poll = requests.get(operation_url, params={"key": api_key}, timeout=20)
+        poll.raise_for_status()
+        body = poll.json() if poll.content else {}
+        final_operation = body if isinstance(body, dict) else {}
+        if final_operation.get("done") is True:
+            break
+        time.sleep(3)
+    done = bool(final_operation.get("done"))
+    if not done:
+        assets = [_build_export_asset(article_id, spec)]
+        return provider_name, assets, {
+            "message": "Google Veo operation timed out before completion.",
+            "provider_configured": True,
+            "provider": provider_name,
+            "operation_name": operation_name,
+            "operation_url": operation_url,
+            "provider_response": sanitize_payload(final_operation),
+        }
+    if final_operation.get("error"):
+        assets = [_build_export_asset(article_id, spec)]
+        return provider_name, assets, {
+            "message": f"Google Veo operation failed: {sanitize_payload(final_operation.get('error'))}",
+            "provider_configured": True,
+            "provider": provider_name,
+            "operation_name": operation_name,
+            "provider_response": sanitize_payload(final_operation),
+        }
+
+    urls = _extract_video_urls(final_operation.get("response") or final_operation)
+    unique_urls: List[str] = []
+    for url in urls:
+        if url not in unique_urls:
+            unique_urls.append(url)
+    assets: List[Dict[str, Any]] = [{"type": "video", "url": url, "metadata": {"provider": "google_veo"}} for url in unique_urls]
+    if not assets:
+        assets = [_build_export_asset(article_id, spec)]
+    return provider_name, assets, {
+        "message": "Google Veo operation completed.",
+        "provider_configured": True,
+        "provider": provider_name,
+        "operation_name": operation_name,
+        "operation_url": operation_url,
+        "provider_response": sanitize_payload(final_operation),
+    }
+
+
 def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_id: str) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     provider_cfg = request_payload.get("video_provider_config") if isinstance(request_payload.get("video_provider_config"), dict) else {}
     rendering_mode = str(provider_cfg.get("rendering_mode") or "").strip().lower()
@@ -358,6 +589,25 @@ def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_
             "rendering_mode": rendering_mode or "unknown",
             "request": sanitized_payload,
         }
+
+    adapter_id = str(provider_cfg.get("adapter_id") or "").strip().lower()
+    if rendering_mode == "render_via_adapter" and adapter_id == "google_veo":
+        try:
+            return _render_via_google_veo(
+                provider_name=provider if provider not in {"http", "http_adapter"} else "google_veo",
+                spec=spec,
+                request_payload=request_payload,
+                article_id=article_id,
+                provider_cfg=provider_cfg,
+            )
+        except Exception as exc:
+            assets = [_build_export_asset(article_id, spec)]
+            return "google_veo", assets, {
+                "message": f"Google Veo adapter request failed: {exc}",
+                "provider_configured": True,
+                "provider": "google_veo",
+                "request": sanitized_payload,
+            }
 
     if provider in {"http", "http_adapter"} or rendering_mode in {"render_via_endpoint", "render_via_adapter"}:
         http_cfg = provider_cfg.get("http") if isinstance(provider_cfg.get("http"), dict) else {}

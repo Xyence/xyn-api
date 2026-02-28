@@ -20,6 +20,7 @@ from xyn_orchestrator.models import (
     Workspace,
 )
 from xyn_orchestrator import xyn_api
+from xyn_orchestrator import video_explainer
 
 
 class GovernedArticlesApiTests(TestCase):
@@ -539,6 +540,78 @@ class GovernedArticlesApiTests(TestCase):
         self.assertEqual(render.get("context_pack_hash"), render_b.get("context_pack_hash"))
         self.assertTrue(bool(render_b.get("spec_snapshot_hash")))
         self.assertNotEqual(render.get("input_snapshot_hash"), render_b.get("input_snapshot_hash"))
+
+    def test_google_veo_adapter_render_returns_video_asset(self):
+        spec = video_explainer.default_video_spec(
+            title="Salamanders",
+            summary="A biology explainer",
+            scenes=[
+                {"id": "s1", "title": "Intro", "voiceover": "Salamanders are amphibians.", "on_screen": "Salamanders"},
+                {"id": "s2", "title": "Regeneration", "voiceover": "They can regrow limbs.", "on_screen": "Regeneration"},
+                {"id": "s3", "title": "Habitat", "voiceover": "They prefer moist habitats.", "on_screen": "Habitat"},
+            ],
+        )
+        request_payload = {
+            "video_provider_config": {
+                "rendering_mode": "render_via_adapter",
+                "provider": "google_veo",
+                "adapter_id": "google_veo",
+                "adapter_config": {
+                    "adapter_id": "google_veo",
+                    "provider_model_id": "veo-3.1-generate-preview",
+                    "credential_ref": "secret_ref:test",
+                },
+                "http": {"endpoint_url": "https://generativelanguage.googleapis.com/v1beta", "timeout_seconds": 30},
+            }
+        }
+
+        class _FakeResponse:
+            def __init__(self, status_code=200, payload=None):
+                self.status_code = status_code
+                self._payload = payload or {}
+                self.content = b"{}"
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise Exception(f"http {self.status_code}")
+
+            def json(self):
+                return self._payload
+
+        with patch("xyn_orchestrator.video_explainer.resolve_secret_ref_value", return_value="AIza_test_key"):
+            with patch(
+                "xyn_orchestrator.video_explainer.requests.post",
+                return_value=_FakeResponse(payload={"name": "operations/op-123"}),
+            ) as post_mock:
+                with patch(
+                    "xyn_orchestrator.video_explainer.requests.get",
+                    return_value=_FakeResponse(
+                        payload={"done": True, "response": {"generatedVideos": [{"video": {"uri": "https://cdn.example/video.mp4"}}]}}
+                    ),
+                ):
+                    provider, assets, result = video_explainer.render_video(spec, request_payload, "article-1")
+
+        self.assertEqual(provider, "google_veo")
+        self.assertTrue(any(str(asset.get("type")) == "video" for asset in assets))
+        self.assertTrue(any(str(asset.get("url") or "").startswith("https://cdn.example") for asset in assets))
+        self.assertTrue(result.get("provider_configured"))
+        post_mock.assert_called()
+
+    def test_google_veo_adapter_render_fails_without_credential(self):
+        spec = video_explainer.default_video_spec(title="No Cred", summary="No cred")
+        request_payload = {
+            "video_provider_config": {
+                "rendering_mode": "render_via_adapter",
+                "provider": "google_veo",
+                "adapter_id": "google_veo",
+                "adapter_config": {"adapter_id": "google_veo", "provider_model_id": "veo-3.1-generate-preview"},
+            }
+        }
+        with patch("xyn_orchestrator.video_explainer.resolve_secret_ref_value", return_value=None):
+            provider, assets, result = video_explainer.render_video(spec, request_payload, "article-2")
+        self.assertEqual(provider, "google_veo")
+        self.assertIn("requires credential_ref", str(result.get("message") or ""))
+        self.assertTrue(any(str(asset.get("type")) == "export_package" for asset in assets))
 
     def test_video_ai_config_get_returns_effective_resolution(self):
         self._set_identity(self.admin_identity)

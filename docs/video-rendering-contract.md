@@ -35,3 +35,19 @@ Seeded config included:
 - slug: `google-veo-prod`
 - adapter: `google_veo`
 - provider model: `veo-3.1`
+
+## Direct Google Veo Adapter
+
+When `render_via_adapter` is selected and `adapter_id=google_veo`, Xyn calls Google directly:
+
+1. Submit generation request to `https://generativelanguage.googleapis.com/v1beta/models/{provider_model_id}:generateVideos` (fallback `:predictLongRunning`).
+2. Poll returned operation until `done=true`.
+3. Extract video URIs from operation response and store as render assets.
+
+Credential expectations:
+
+- `credential_ref` resolves to a secret containing either:
+  - a raw Google API key (`AIza...`), or
+  - JSON with `api_key` / `apiKey` / `key`.
+
+If no video URI is returned, render is marked failed and export package remains as fallback artifact.

@@ -228,7 +228,7 @@ VIDEO_RENDER_ADAPTERS: List[Dict[str, Any]] = [
     {
         "id": "google_veo",
         "name": "Google Veo",
-        "description": "Google Veo adapter (stub contract in core).",
+        "description": "Direct Google Veo adapter (API key + operation polling).",
         "config_schema_version": 1,
     },
     {
@@ -4120,6 +4120,7 @@ def _run_video_adapter_connection_test(adapter_id: str, config: Dict[str, Any]) 
         add_check("credential_ref", "warning", "No credential_ref configured")
 
     if adapter_id == "google_veo":
+        api_key = ""
         if resolved_secret:
             parsed_json: Optional[Dict[str, Any]] = None
             try:
@@ -4128,6 +4129,14 @@ def _run_video_adapter_connection_test(adapter_id: str, config: Dict[str, Any]) 
                     parsed_json = maybe_json
             except Exception:
                 parsed_json = None
+            if str(resolved_secret).strip().startswith("AIza"):
+                api_key = str(resolved_secret).strip()
+            elif parsed_json:
+                for candidate in ("api_key", "apiKey", "key"):
+                    value = str(parsed_json.get(candidate) or "").strip()
+                    if value.startswith("AIza"):
+                        api_key = value
+                        break
             if parsed_json:
                 required_keys = {"client_email", "private_key", "project_id"}
                 missing = sorted(key for key in required_keys if not str(parsed_json.get(key) or "").strip())
@@ -4144,6 +4153,13 @@ def _run_video_adapter_connection_test(adapter_id: str, config: Dict[str, Any]) 
                 add_check("google_service_account", "warning", "Credential secret is not JSON; treated as opaque token/key")
         else:
             add_check("google_service_account", "fail", "Google Veo adapter requires a resolvable credential_ref")
+
+        if api_key:
+            add_check("google_api_key", "pass", "Credential includes a Google API key")
+        elif resolved_secret:
+            add_check("google_api_key", "warning", "No API key detected in resolved secret; runtime uses API key mode")
+        else:
+            add_check("google_api_key", "fail", "No resolved credential available")
 
         try:
             response = requests.get("https://aiplatform.googleapis.com/$discovery/rest?version=v1", timeout=8)
@@ -4163,6 +4179,31 @@ def _run_video_adapter_connection_test(adapter_id: str, config: Dict[str, Any]) 
                 )
         except Exception as exc:
             add_check("google_endpoint_reachability", "fail", f"Could not reach Google AI Platform endpoint: {exc.__class__.__name__}")
+
+        model_lookup_id = model_id or "veo-3.1-generate-preview"
+        if api_key:
+            try:
+                model_resp = requests.get(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model_lookup_id}",
+                    params={"key": api_key},
+                    timeout=8,
+                )
+                if model_resp.status_code == 200:
+                    add_check("google_model_lookup", "pass", f"Model endpoint reachable for '{model_lookup_id}'")
+                elif model_resp.status_code == 404:
+                    add_check(
+                        "google_model_lookup",
+                        "warning",
+                        f"Model '{model_lookup_id}' not found at direct lookup endpoint. Check provider_model_id naming.",
+                    )
+                else:
+                    add_check(
+                        "google_model_lookup",
+                        "warning",
+                        f"Model lookup returned HTTP {model_resp.status_code}",
+                    )
+            except Exception as exc:
+                add_check("google_model_lookup", "warning", f"Model lookup failed: {exc.__class__.__name__}")
     elif adapter_id == "http_generic_renderer":
         endpoint = str(config.get("endpoint_url") or "").strip()
         if not endpoint:
@@ -10099,6 +10140,8 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
             ).first()
             if adapter_artifact:
                 adapter_config_payload = _video_adapter_content_from_artifact(adapter_artifact)
+        if not model_name and isinstance(adapter_config_payload, dict):
+            model_name = str(adapter_config_payload.get("provider_model_id") or "").strip()
         endpoint_url = str(rendering_cfg.get("endpoint_url") or "").strip()
         if not endpoint_url and isinstance(adapter_config_payload, dict):
             endpoint_url = str(adapter_config_payload.get("endpoint_url") or "").strip()
