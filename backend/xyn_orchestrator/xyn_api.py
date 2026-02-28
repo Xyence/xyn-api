@@ -10525,6 +10525,19 @@ def internal_video_render_error(request: HttpRequest, render_id: str) -> JsonRes
 
 
 @csrf_exempt
+def internal_secret_resolve(request: HttpRequest) -> JsonResponse:
+    if auth_error := _require_internal_token(request):
+        return auth_error
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    ref_text = str(request.GET.get("ref") or "").strip()
+    if not ref_text:
+        return JsonResponse({"error": "ref is required"}, status=400)
+    value = resolve_secret_ref_value(ref_text)
+    return JsonResponse({"ref": ref_text, "resolved": bool(value), "value": value or None})
+
+
+@csrf_exempt
 def article_transition(request: HttpRequest, article_id: str) -> JsonResponse:
     if request.method != "POST":
         return JsonResponse({"error": "method not allowed"}, status=405)

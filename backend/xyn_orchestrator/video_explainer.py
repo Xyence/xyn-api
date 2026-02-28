@@ -7,8 +7,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from .notifications.registry import resolve_secret_ref_value
-
 
 VIDEO_RENDER_STATUSES = {"not_started", "queued", "running", "succeeded", "failed", "canceled"}
 
@@ -354,6 +352,29 @@ def _extract_google_api_key(secret_value: str) -> str:
     return ""
 
 
+def _resolve_secret_ref_value_lazy(ref_text: str) -> Optional[str]:
+    value = str(ref_text or "").strip()
+    if not value:
+        return None
+    internal_base_url = str(os.environ.get("XYENCE_INTERNAL_BASE_URL") or "").strip().rstrip("/")
+    internal_token = str(os.environ.get("XYENCE_INTERNAL_TOKEN") or "").strip()
+    if not internal_base_url or not internal_token:
+        return None
+    try:
+        response = requests.get(
+            f"{internal_base_url}/xyn/internal/secrets/resolve",
+            headers={"X-Internal-Token": internal_token},
+            params={"ref": value},
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json() if response.content else {}
+    except Exception:
+        return None
+    resolved_value = str((payload or {}).get("value") or "").strip()
+    return resolved_value or None
+
+
 def _build_google_veo_prompt(spec: Dict[str, Any]) -> str:
     title = str(spec.get("title") or "").strip()
     intent = str(spec.get("intent") or "").strip()
@@ -452,7 +473,7 @@ def _render_via_google_veo(
         or "veo-3.1-generate-preview"
     ).strip()
     credential_ref = str(adapter_cfg.get("credential_ref") or provider_cfg.get("credential_ref") or "").strip()
-    resolved_secret = resolve_secret_ref_value(credential_ref) if credential_ref else None
+    resolved_secret = _resolve_secret_ref_value_lazy(credential_ref) if credential_ref else None
     api_key = _extract_google_api_key(resolved_secret or "")
     endpoint_url = str(
         adapter_cfg.get("endpoint_url")
