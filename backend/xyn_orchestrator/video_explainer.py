@@ -439,23 +439,20 @@ def _extract_video_urls(payload: Any) -> List[str]:
 def _google_veo_request_variants(model_id: str, prompt: str, base_url: str) -> List[Tuple[str, Dict[str, Any]]]:
     model = str(model_id or "").strip() or "veo-3.1-generate-preview"
     base = str(base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
-    if "/models/" in base and ":" in base:
-        generate_url = base
-    else:
-        generate_url = f"{base}/models/{model}:generateVideos"
     predict_url = f"{base}/models/{model}:predictLongRunning"
+    generate_url = f"{base}/models/{model}:generateVideos"
     return [
-        (
-            generate_url,
-            {
-                "prompt": {"text": prompt},
-            },
-        ),
         (
             predict_url,
             {
                 "instances": [{"prompt": prompt}],
                 "parameters": {},
+            },
+        ),
+        (
+            generate_url,
+            {
+                "prompt": {"text": prompt},
             },
         ),
     ]
@@ -507,28 +504,47 @@ def _render_via_google_veo(
     active_url = ""
     for candidate_url, body in _google_veo_request_variants(model_id, prompt, endpoint_url):
         active_url = candidate_url
-        try:
-            response = requests.post(
-                candidate_url,
-                params={"key": api_key},
-                json=body,
-                timeout=max(10, min(timeout_seconds, 120)),
-            )
-            if response.status_code == 404:
-                submit_errors.append(f"{candidate_url} -> 404")
-                continue
-            response.raise_for_status()
-            response_body = response.json() if response.content else {}
-            operation_name = str(response_body.get("name") or "").strip()
-            if operation_name:
-                break
-            if isinstance(response_body.get("operation"), dict):
-                operation_name = str(response_body.get("operation", {}).get("name") or "").strip()
+        attempts = 0
+        while attempts < 3 and not operation_name:
+            attempts += 1
+            try:
+                response = requests.post(
+                    candidate_url,
+                    params={"key": api_key},
+                    json=body,
+                    timeout=max(10, min(timeout_seconds, 120)),
+                )
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    wait_seconds = 5
+                    try:
+                        wait_seconds = int(retry_after) if retry_after else 5
+                    except (TypeError, ValueError):
+                        wait_seconds = 5
+                    if attempts < 3:
+                        time.sleep(max(2, min(wait_seconds, 30)))
+                        continue
+                    submit_errors.append(f"{candidate_url} -> 429 Too Many Requests")
+                    break
+                if response.status_code == 404:
+                    submit_errors.append(f"{candidate_url} -> 404 Not Found")
+                    break
+                response.raise_for_status()
+                response_body = response.json() if response.content else {}
+                operation_name = str(response_body.get("name") or "").strip()
                 if operation_name:
                     break
-            submit_errors.append(f"{candidate_url} -> missing operation name")
-        except Exception as exc:
-            submit_errors.append(f"{candidate_url} -> {exc}")
+                if isinstance(response_body.get("operation"), dict):
+                    operation_name = str(response_body.get("operation", {}).get("name") or "").strip()
+                    if operation_name:
+                        break
+                submit_errors.append(f"{candidate_url} -> missing operation name")
+                break
+            except Exception as exc:
+                if attempts >= 3:
+                    submit_errors.append(f"{candidate_url} -> {exc}")
+                else:
+                    time.sleep(3)
     if not operation_name:
         assets = [_build_export_asset(article_id, spec)]
         return provider_name, assets, {
