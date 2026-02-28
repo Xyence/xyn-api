@@ -4159,11 +4159,12 @@ def video_adapter_configs_collection(request: HttpRequest) -> JsonResponse:
     if validation_errors:
         return JsonResponse({"error": "invalid adapter config", "details": validation_errors}, status=400)
 
-    identity_user = request.user if request.user.is_authenticated else None
-    slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=title)
+    workspace = _default_workspace()
+    normalized_slug = _normalize_artifact_slug(str(payload.get("slug") or ""), fallback_title=title)
+    slug = _next_available_artifact_slug(str(workspace.id), normalized_slug)
     with transaction.atomic():
         artifact = Artifact.objects.create(
-            workspace=_default_workspace(),
+            workspace=workspace,
             type=ArtifactType.objects.get(slug=VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG),
             artifact_state="provisional",
             title=title,
@@ -5999,6 +6000,18 @@ def _artifact_slug_exists(workspace_id: str, slug: str, *, exclude_artifact_id: 
     if exclude_artifact_id:
         qs = qs.exclude(id=exclude_artifact_id)
     return qs.exists()
+
+
+def _next_available_artifact_slug(workspace_id: str, base_slug: str, *, exclude_artifact_id: Optional[str] = None) -> str:
+    normalized = _normalize_artifact_slug(base_slug)
+    if not normalized:
+        normalized = f"artifact-{uuid.uuid4().hex[:8]}"
+    candidate = normalized
+    suffix = 2
+    while _artifact_slug_exists(workspace_id, candidate, exclude_artifact_id=exclude_artifact_id):
+        candidate = f"{normalized}-{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _latest_artifact_revision(artifact: Artifact) -> Optional[ArtifactRevision]:
