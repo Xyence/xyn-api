@@ -4087,6 +4087,28 @@ def _validate_video_adapter_config_content(content: Dict[str, Any]) -> List[str]
         errors.append("provider_model_id must be a string")
     if "credential_ref" in content and not isinstance(content.get("credential_ref"), str):
         errors.append("credential_ref must be a string")
+    if adapter_id == "google_veo":
+        credential_ref = str(content.get("credential_ref") or "").strip()
+        if not credential_ref:
+            errors.append("credential_ref is required for google_veo")
+        else:
+            resolved_secret = resolve_secret_ref_value(credential_ref)
+            if not resolved_secret:
+                errors.append("credential_ref for google_veo could not be resolved")
+            else:
+                resolved_text = str(resolved_secret).strip()
+                parsed_key = ""
+                if resolved_text.startswith("AIza"):
+                    parsed_key = resolved_text
+                else:
+                    try:
+                        maybe_json = json.loads(resolved_text)
+                    except Exception:
+                        maybe_json = None
+                    if isinstance(maybe_json, dict):
+                        parsed_key = str(maybe_json.get("api_key") or maybe_json.get("apiKey") or maybe_json.get("key") or "").strip()
+                if not parsed_key.startswith("AIza"):
+                    errors.append("google_veo credential_ref must resolve to an API key (AIza...) or JSON containing api_key/apiKey/key")
     if "model_config_id" in content and content.get("model_config_id") not in {None, ""}:
         model_config_id = str(content.get("model_config_id") or "").strip()
         if model_config_id:
