@@ -241,6 +241,10 @@ def sanitize_payload(payload: Any) -> Any:
         result: Dict[str, Any] = {}
         for key, value in payload.items():
             lower = str(key).lower()
+            # credential_ref is an identifier, not a secret value. Keep it intact so workers can resolve it later.
+            if lower in {"credential_ref", "secret_ref", "model_config_id", "adapter_config_id"}:
+                result[key] = sanitize_payload(value)
+                continue
             if any(token in lower for token in ("key", "token", "secret", "password", "credential")):
                 result[key] = "***"
             else:
