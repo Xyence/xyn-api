@@ -586,6 +586,26 @@ def _render_via_google_veo(
             "provider_response": sanitize_payload(final_operation),
         }
 
+    generate_response = (
+        (final_operation.get("response") or {}).get("generateVideoResponse")
+        if isinstance(final_operation.get("response"), dict)
+        else None
+    )
+    if isinstance(generate_response, dict):
+        filtered_count = int(generate_response.get("raiMediaFilteredCount") or 0)
+        if filtered_count > 0:
+            reasons = generate_response.get("raiMediaFilteredReasons") if isinstance(generate_response.get("raiMediaFilteredReasons"), list) else []
+            reason_text = "; ".join(str(reason).strip() for reason in reasons if str(reason).strip())
+            assets = [_build_export_asset(article_id, spec)]
+            return provider_name, assets, {
+                "message": f"Google Veo output was policy-filtered{': ' + reason_text if reason_text else ''}",
+                "provider_configured": True,
+                "provider": provider_name,
+                "operation_name": operation_name,
+                "operation_url": operation_url,
+                "provider_response": sanitize_payload(final_operation),
+            }
+
     urls = _extract_video_urls(final_operation.get("response") or final_operation)
     unique_urls: List[str] = []
     for url in urls:
