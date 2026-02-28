@@ -137,7 +137,7 @@ from .oidc import (
 )
 from .secret_stores import SecretStoreError, normalize_secret_logical_name, write_secret_value
 from .storage.registry import StorageProviderRegistry
-from .notifications.registry import NotifierRegistry
+from .notifications.registry import NotifierRegistry, resolve_secret_ref_value
 from .ai_runtime import (
     AiConfigError,
     AiInvokeError,
@@ -4095,6 +4095,105 @@ def _validate_video_adapter_config_content(content: Dict[str, Any]) -> List[str]
     return errors
 
 
+def _run_video_adapter_connection_test(adapter_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+
+    def add_check(name: str, status: str, message: str, details: Optional[Dict[str, Any]] = None) -> None:
+        entry: Dict[str, Any] = {"name": name, "status": status, "message": message}
+        if details:
+            entry["details"] = details
+        checks.append(entry)
+
+    model_id = str(config.get("provider_model_id") or "").strip()
+    if model_id:
+        add_check("model_id", "pass", f"Provider model configured: {model_id}")
+    else:
+        add_check("model_id", "warning", "provider_model_id is empty")
+
+    credential_ref = str(config.get("credential_ref") or "").strip()
+    resolved_secret = resolve_secret_ref_value(credential_ref) if credential_ref else None
+    if credential_ref and resolved_secret:
+        add_check("credential_ref", "pass", "Credential ref resolves to a secret value")
+    elif credential_ref:
+        add_check("credential_ref", "fail", f"Credential ref '{credential_ref}' could not be resolved")
+    else:
+        add_check("credential_ref", "warning", "No credential_ref configured")
+
+    if adapter_id == "google_veo":
+        if resolved_secret:
+            parsed_json: Optional[Dict[str, Any]] = None
+            try:
+                maybe_json = json.loads(str(resolved_secret))
+                if isinstance(maybe_json, dict):
+                    parsed_json = maybe_json
+            except Exception:
+                parsed_json = None
+            if parsed_json:
+                required_keys = {"client_email", "private_key", "project_id"}
+                missing = sorted(key for key in required_keys if not str(parsed_json.get(key) or "").strip())
+                if missing:
+                    add_check(
+                        "google_service_account",
+                        "fail",
+                        "Resolved secret looks like JSON but is missing required service account fields",
+                        {"missing_keys": missing},
+                    )
+                else:
+                    add_check("google_service_account", "pass", "Service account JSON fields are present")
+            else:
+                add_check("google_service_account", "warning", "Credential secret is not JSON; treated as opaque token/key")
+        else:
+            add_check("google_service_account", "fail", "Google Veo adapter requires a resolvable credential_ref")
+
+        try:
+            response = requests.get("https://aiplatform.googleapis.com/$discovery/rest?version=v1", timeout=8)
+            if response.status_code < 500:
+                add_check(
+                    "google_endpoint_reachability",
+                    "pass",
+                    "Google AI Platform endpoint is reachable from this runtime",
+                    {"status_code": response.status_code},
+                )
+            else:
+                add_check(
+                    "google_endpoint_reachability",
+                    "fail",
+                    "Google AI Platform endpoint returned server error",
+                    {"status_code": response.status_code},
+                )
+        except Exception as exc:
+            add_check("google_endpoint_reachability", "fail", f"Could not reach Google AI Platform endpoint: {exc.__class__.__name__}")
+    elif adapter_id == "http_generic_renderer":
+        endpoint = str(config.get("endpoint_url") or "").strip()
+        if not endpoint:
+            add_check("endpoint_url", "fail", "endpoint_url is required for http_generic_renderer")
+        else:
+            try:
+                response = requests.get(endpoint, timeout=6)
+                if response.status_code < 500:
+                    add_check("endpoint_reachability", "pass", "Endpoint is reachable", {"status_code": response.status_code})
+                else:
+                    add_check(
+                        "endpoint_reachability",
+                        "fail",
+                        "Endpoint responded with server error",
+                        {"status_code": response.status_code},
+                    )
+            except Exception as exc:
+                add_check("endpoint_reachability", "fail", f"Could not reach endpoint: {exc.__class__.__name__}")
+    else:
+        add_check("adapter_runtime", "warning", f"No adapter-specific connectivity checks implemented for '{adapter_id}' yet")
+
+    ok = all(entry.get("status") != "fail" for entry in checks)
+    return {
+        "ok": ok,
+        "adapter_id": adapter_id,
+        "provider_model_id": model_id or None,
+        "checked_at": timezone.now().isoformat(),
+        "checks": checks,
+    }
+
+
 @csrf_exempt
 @login_required
 def video_adapters_collection(request: HttpRequest) -> JsonResponse:
@@ -4111,6 +4210,49 @@ def video_adapters_collection(request: HttpRequest) -> JsonResponse:
             "feature_flags": {"render_via_model_config": VIDEO_RENDER_DIRECT_MODEL},
         }
     )
+
+
+@csrf_exempt
+@login_required
+def video_adapter_test_connection(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    payload = _parse_json(request)
+    adapter_id = str(payload.get("adapter_id") or "").strip()
+    adapter_config_id = str(payload.get("adapter_config_id") or "").strip()
+    config_json = payload.get("config_json") if isinstance(payload.get("config_json"), dict) else None
+    if not adapter_id:
+        return JsonResponse({"error": "adapter_id is required"}, status=400)
+    if adapter_id not in {entry["id"] for entry in VIDEO_RENDER_ADAPTERS}:
+        return JsonResponse({"error": "adapter_id is not registered"}, status=400)
+
+    config: Dict[str, Any] = dict(config_json or {})
+    artifact: Optional[Artifact] = None
+    if adapter_config_id:
+        artifact = Artifact.objects.filter(
+            id=adapter_config_id,
+            type__slug=VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG,
+        ).first()
+        if not artifact:
+            return JsonResponse({"error": "adapter_config_id not found"}, status=404)
+        config = _video_adapter_content_from_artifact(artifact)
+    config["adapter_id"] = adapter_id
+    validation_errors = _validate_video_adapter_config_content(config)
+    if validation_errors:
+        return JsonResponse({"error": "invalid adapter config", "details": validation_errors}, status=400)
+
+    result = _run_video_adapter_connection_test(adapter_id, config)
+    result["adapter_config_id"] = adapter_config_id or None
+    if artifact:
+        result["adapter_config_slug"] = artifact.slug
+        result["adapter_config_version"] = int(artifact.version or 1)
+    return JsonResponse(result)
 
 
 @csrf_exempt
