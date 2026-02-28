@@ -9402,21 +9402,47 @@ def _process_video_render(video_render: VideoRender) -> VideoRender:
     video_render.save(update_fields=["status", "started_at", "error_message", "error_details_json", "request_payload_json", "updated_at"])
 
     provider, assets, raw_result = render_video(spec, request_payload, str(article.id))
+    provider_cfg = request_payload.get("video_provider_config") if isinstance(request_payload.get("video_provider_config"), dict) else {}
+    render_mode = str(provider_cfg.get("rendering_mode") or "").strip().lower()
+    provider_configured = bool(raw_result.get("provider_configured")) if isinstance(raw_result, dict) else False
+    has_video_asset = any(str((asset or {}).get("type") or "").strip().lower() == "video" for asset in (assets or []))
+    requires_external_output = render_mode in {"render_via_adapter", "render_via_endpoint", "render_via_model_config"}
     finished_at = timezone.now()
     video_render.provider = provider or "unknown"
-    video_render.status = "succeeded"
+    if requires_external_output and (not provider_configured or not has_video_asset):
+        video_render.status = "failed"
+        message = str((raw_result or {}).get("message") or "Render did not produce a video asset")
+        video_render.error_message = message
+        video_render.error_details_json = {
+            "rendering_mode": render_mode,
+            "provider_configured": provider_configured,
+            "has_video_asset": has_video_asset,
+        }
+    else:
+        video_render.status = "succeeded"
+        video_render.error_message = ""
+        video_render.error_details_json = {}
     video_render.completed_at = finished_at
     video_render.result_payload_json = sanitize_payload(raw_result)
     video_render.output_assets = sanitize_payload(assets)
     video_render.save(
-        update_fields=["provider", "status", "completed_at", "result_payload_json", "output_assets", "updated_at"]
+        update_fields=[
+            "provider",
+            "status",
+            "completed_at",
+            "result_payload_json",
+            "output_assets",
+            "error_message",
+            "error_details_json",
+            "updated_at",
+        ]
     )
 
     spec["generation"] = {
         **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
         "provider": video_render.provider,
         "model_name": video_render.model_name or "",
-        "status": "succeeded",
+        "status": "failed" if video_render.status == "failed" else "succeeded",
         "last_render_id": str(video_render.id),
         "spec_snapshot_hash": video_render.spec_snapshot_hash or "",
         "input_snapshot_hash": video_render.input_snapshot_hash or "",
@@ -10358,13 +10384,30 @@ def internal_video_render_complete(request: HttpRequest, render_id: str) -> Json
     record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
     payload = _parse_json(request)
     record.provider = str(payload.get("provider") or record.provider or "unknown")
-    record.status = "succeeded"
+    result_payload = sanitize_payload(payload.get("result_payload_json") if isinstance(payload.get("result_payload_json"), dict) else {})
+    output_assets = sanitize_payload(payload.get("output_assets") if isinstance(payload.get("output_assets"), list) else [])
+    request_payload = record.request_payload_json if isinstance(record.request_payload_json, dict) else {}
+    provider_cfg = request_payload.get("video_provider_config") if isinstance(request_payload.get("video_provider_config"), dict) else {}
+    render_mode = str(provider_cfg.get("rendering_mode") or "").strip().lower()
+    provider_configured = bool(result_payload.get("provider_configured")) if isinstance(result_payload, dict) else False
+    has_video_asset = any(str((asset or {}).get("type") or "").strip().lower() == "video" for asset in output_assets)
+    requires_external_output = render_mode in {"render_via_adapter", "render_via_endpoint", "render_via_model_config"}
+    if requires_external_output and (not provider_configured or not has_video_asset):
+        record.status = "failed"
+        record.error_message = str(result_payload.get("message") or "Render did not produce a video asset")
+        record.error_details_json = {
+            "rendering_mode": render_mode,
+            "provider_configured": provider_configured,
+            "has_video_asset": has_video_asset,
+        }
+    else:
+        record.status = "succeeded"
+        record.error_message = ""
+        record.error_details_json = {}
     record.started_at = record.started_at or timezone.now()
     record.completed_at = timezone.now()
-    record.result_payload_json = sanitize_payload(payload.get("result_payload_json") if isinstance(payload.get("result_payload_json"), dict) else {})
-    record.output_assets = sanitize_payload(payload.get("output_assets") if isinstance(payload.get("output_assets"), list) else [])
-    record.error_message = ""
-    record.error_details_json = {}
+    record.result_payload_json = result_payload
+    record.output_assets = output_assets
     record.save(
         update_fields=[
             "provider",
@@ -10384,7 +10427,7 @@ def internal_video_render_complete(request: HttpRequest, render_id: str) -> Json
         **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
         "provider": record.provider,
         "model_name": record.model_name or "",
-        "status": "succeeded",
+        "status": "failed" if record.status == "failed" else "succeeded",
         "last_render_id": str(record.id),
         "spec_snapshot_hash": record.spec_snapshot_hash or "",
         "input_snapshot_hash": record.input_snapshot_hash or "",
