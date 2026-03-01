@@ -17031,7 +17031,8 @@ def _normalize_surface_path(value: str) -> str:
 
 
 def _manifest_roots() -> List[Path]:
-    default_root = str(Path(__file__).resolve().parents[3])
+    resolved = Path(__file__).resolve()
+    default_root = str(resolved.parents[2] if len(resolved.parents) > 2 else resolved.parent)
     raw = os.getenv("XYN_KERNEL_MANIFEST_ROOTS", default_root).strip()
     roots: List[Path] = []
     for token in raw.split(os.pathsep):
