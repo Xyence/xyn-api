@@ -7169,6 +7169,219 @@ def artifact_activity(request: HttpRequest, artifact_id: str) -> JsonResponse:
     return JsonResponse({"events": [_serialize_ledger_event(row) for row in rows], "count": total, "limit": limit, "offset": offset})
 
 
+def _latest_artifact_content_json(artifact: Artifact) -> Dict[str, Any]:
+    latest = ArtifactRevision.objects.filter(artifact=artifact).order_by("-revision_number").first()
+    if latest and isinstance(latest.content_json, dict):
+        return dict(latest.content_json)
+    return {}
+
+
+def _artifact_raw_payload(artifact: Artifact) -> Dict[str, Any]:
+    content = _latest_artifact_content_json(artifact)
+    return {
+        "artifact": {
+            "id": str(artifact.id),
+            "type": artifact.type.slug if artifact.type_id else "",
+            "slug": artifact.slug or "",
+            "title": artifact.title or "",
+            "artifact_state": artifact.artifact_state or "",
+            "status": artifact.status or "",
+            "version": artifact.version,
+            "schema_version": artifact.schema_version or "",
+        },
+        "content": content,
+    }
+
+
+def _artifact_raw_file_map(artifact: Artifact) -> Dict[str, bytes]:
+    payload = _artifact_raw_payload(artifact)
+    artifact_json = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    content_json = json.dumps(payload.get("content") or {}, ensure_ascii=False, indent=2).encode("utf-8")
+    return {
+        "artifact.json": artifact_json,
+        "payload/payload.json": content_json,
+    }
+
+
+def _raw_path_to_key(raw_path: str) -> str:
+    normalized = str(raw_path or "").strip().replace("\\", "/")
+    normalized = normalized.lstrip("/")
+    return normalized
+
+
+def _artifact_raw_entries(file_map: Dict[str, bytes], directory: str) -> List[Dict[str, Any]]:
+    directory = f"/{_raw_path_to_key(directory)}".rstrip("/")
+    if directory == "":
+        directory = "/"
+    prefix = "" if directory == "/" else f"{directory.lstrip('/')}/"
+    entries: Dict[str, Dict[str, Any]] = {}
+    for key, blob in file_map.items():
+        if prefix and not key.startswith(prefix):
+            continue
+        remainder = key[len(prefix):] if prefix else key
+        if not remainder:
+            continue
+        head = remainder.split("/", 1)[0]
+        child_path = f"/{head}" if directory == "/" else f"{directory}/{head}"
+        if "/" in remainder:
+            entries[head] = {"name": head, "path": child_path, "kind": "dir"}
+        elif head not in entries:
+            entries[head] = {
+                "name": head,
+                "path": child_path,
+                "kind": "file",
+                "size_bytes": len(blob),
+                "mime_guess": "application/json",
+            }
+    return sorted(entries.values(), key=lambda row: (row["kind"] != "dir", str(row["name"]).lower()))
+
+
+@csrf_exempt
+@login_required
+def artifact_raw_metadata(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    return JsonResponse(
+        {
+            "artifact": {
+                "id": str(artifact.id),
+                "type": artifact.type.slug if artifact.type_id else "",
+                "slug": artifact.slug or "",
+                "version": str(artifact.package_version or artifact.version or "0"),
+                "title": artifact.title or "",
+                "artifact_state": artifact.artifact_state or "",
+                "status": artifact.status or "",
+            },
+            "artifact_hash": artifact.content_hash or "",
+            "content_ref": artifact.content_ref if isinstance(artifact.content_ref, dict) else {},
+            "dependencies": artifact.dependencies if isinstance(artifact.dependencies, list) else [],
+            "bindings": artifact.bindings if isinstance(artifact.bindings, list) else [],
+            "files_root": {"name": "/", "path": "/", "kind": "dir"},
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def artifact_raw_artifact_json(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    return JsonResponse(_artifact_raw_payload(artifact))
+
+
+@csrf_exempt
+@login_required
+def artifact_raw_files(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = get_object_or_404(Artifact, id=artifact_id)
+    directory = str(request.GET.get("path") or "/")
+    file_map = _artifact_raw_file_map(artifact)
+    return JsonResponse({"path": directory, "entries": _artifact_raw_entries(file_map, directory)})
+
+
+@csrf_exempt
+@login_required
+def artifact_raw_file(request: HttpRequest, artifact_id: str) -> HttpResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = get_object_or_404(Artifact, id=artifact_id)
+    raw_path = str(request.GET.get("path") or "").strip()
+    if not raw_path:
+        return JsonResponse({"error": "path is required"}, status=400)
+    key = _raw_path_to_key(raw_path)
+    blob = _artifact_raw_file_map(artifact).get(key)
+    if blob is None:
+        return JsonResponse({"error": "file not found"}, status=404)
+    if str(request.GET.get("download") or "").strip() in {"1", "true", "yes"}:
+        filename = Path(key).name or "artifact-file"
+        response = HttpResponse(blob, content_type="application/octet-stream")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+    return JsonResponse(
+        {
+            "path": f"/{key}",
+            "kind": "file",
+            "size_bytes": len(blob),
+            "mime_guess": "application/json",
+            "inline": True,
+            "content": blob.decode("utf-8", errors="replace"),
+            "download_url": f"/xyn/api/artifacts/{artifact_id}/raw/file?path={quote('/' + key)}&download=1",
+        }
+    )
+
+
+@csrf_exempt
+@login_required
+def artifact_package_raw_manifest(request: HttpRequest, package_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    package = get_object_or_404(ArtifactPackage, id=package_id)
+    return JsonResponse({"manifest": package.manifest if isinstance(package.manifest, dict) else {}})
+
+
+@csrf_exempt
+@login_required
+def artifact_package_raw_tree(request: HttpRequest, package_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    package = get_object_or_404(ArtifactPackage, id=package_id)
+    manifest = package.manifest if isinstance(package.manifest, dict) else {}
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), list) else []
+    entries = [{"name": "manifest.json", "path": "/manifest.json", "kind": "file", "mime_guess": "application/json"}]
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get("slug") or item.get("artifact_id") or "").strip()
+        if not slug:
+            continue
+        entries.append({"name": f"{slug}.json", "path": f"/{slug}.json", "kind": "file", "mime_guess": "application/json"})
+    return JsonResponse({"path": "/", "entries": entries})
+
+
+@csrf_exempt
+@login_required
+def artifact_package_raw_file(request: HttpRequest, package_id: str) -> HttpResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    package = get_object_or_404(ArtifactPackage, id=package_id)
+    path_value = str(request.GET.get("path") or "").strip()
+    if not path_value:
+        return JsonResponse({"error": "path is required"}, status=400)
+    key = _raw_path_to_key(path_value)
+    manifest = package.manifest if isinstance(package.manifest, dict) else {}
+    if key == "manifest.json":
+        payload = json.dumps(manifest, ensure_ascii=False, indent=2)
+        return JsonResponse(
+            {
+                "path": "/manifest.json",
+                "kind": "file",
+                "inline": True,
+                "mime_guess": "application/json",
+                "size_bytes": len(payload.encode("utf-8")),
+                "content": payload,
+                "download_url": f"/xyn/api/artifacts/packages/{package_id}/raw/file?path=/manifest.json&download=1",
+            }
+        )
+    return JsonResponse({"error": "file not found"}, status=404)
+
+
 def _serialize_artifact_binding_value(row: ArtifactBindingValue) -> Dict[str, Any]:
     return {
         "id": str(row.id),
