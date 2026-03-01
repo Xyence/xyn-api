@@ -1,7 +1,10 @@
 import base64
+import io
 import json
 import logging
+import mimetypes
 import os
+import posixpath
 import re
 import html
 import secrets
@@ -9,8 +12,9 @@ import time
 import uuid
 import hashlib
 import fnmatch
+import zipfile
 from functools import wraps
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit, quote
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit, quote, unquote
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Set, Tuple
 
@@ -82,6 +86,8 @@ from .models import (
     ArtifactType,
     ArticleCategory,
     Artifact,
+    ArtifactSurface,
+    ArtifactRuntimeRole,
     ArtifactRevision,
     ArtifactEvent,
     ArtifactLink,
@@ -205,6 +211,9 @@ from .intent_engine.patch_service import apply_context_pack_patch as intent_appl
 from .intent_engine.patch_service import to_internal_format as intent_to_internal_format
 from .intent_engine.telemetry import increment as intent_telemetry_increment
 
+ARTIFACT_DEBUG_PERMISSION = "artifact_debug_view"
+RAW_INLINE_MAX_BYTES = 512 * 1024
+
 PLATFORM_ROLE_IDS = {"platform_owner", "platform_admin", "platform_architect", "platform_operator", "app_user"}
 PREVIEW_SESSION_KEY = "xyn.preview.v1"
 PREVIEW_TTL_SECONDS = 60 * 60
@@ -261,6 +270,48 @@ VIDEO_RENDER_ADAPTERS: List[Dict[str, Any]] = [
     },
 ]
 VIDEO_RENDER_DIRECT_MODEL = str(os.environ.get("VIDEO_RENDER_DIRECT_MODEL") or "").strip() in {"1", "true", "yes", "on"}
+ARTIFACT_SURFACE_RENDERER_TYPES = {
+    "ui_component_ref",
+    "generic_editor",
+    "generic_dashboard",
+    "workflow_visualizer",
+    "article_editor",
+}
+ARTIFACT_SURFACE_NAV_VISIBILITY = {"hidden", "contextual", "always"}
+ARTIFACT_SURFACE_KINDS = {"config", "editor", "dashboard", "visualizer", "docs"}
+ARTIFACT_RUNTIME_ROLE_KINDS = {"route_provider", "job", "event_handler", "integration", "auth", "data_model"}
+UI_COMPONENT_REGISTRY: List[Dict[str, Any]] = [
+    {
+        "key": "articles.index",
+        "description": "Articles index/list surface",
+        "version": "1.0.0",
+        "entrypoint": "app.pages.ArtifactsArticlesPage",
+    },
+    {
+        "key": "articles.draft_editor",
+        "description": "Article draft editor surface",
+        "version": "1.0.0",
+        "entrypoint": "app.pages.ArtifactDetailPage",
+    },
+    {
+        "key": "workflows.index",
+        "description": "Workflows index/list surface",
+        "version": "1.0.0",
+        "entrypoint": "app.pages.ArtifactsWorkflowsPage",
+    },
+    {
+        "key": "workflows.editor",
+        "description": "Workflow editor surface",
+        "version": "1.0.0",
+        "entrypoint": "app.pages.ArtifactDetailPage",
+    },
+    {
+        "key": "workflows.visualizer",
+        "description": "Workflow visualizer surface",
+        "version": "1.0.0",
+        "entrypoint": "app.pages.ArtifactDetailPage",
+    },
+]
 EXPLAINER_PURPOSES: Dict[str, Dict[str, str]] = {
     "explainer_script": {"name": "Script", "description": "Generate explainer narration scripts."},
     "explainer_storyboard": {"name": "Storyboard", "description": "Generate storyboard scene structures."},
@@ -1185,6 +1236,37 @@ def _has_platform_role(identity: UserIdentity, roles: List[str]) -> bool:
 
 def _is_platform_architect(identity: UserIdentity) -> bool:
     return _has_platform_role(identity, ["platform_architect", "platform_admin"])
+
+
+def _has_effective_permission(identity: UserIdentity, permission_key: str) -> bool:
+    key = str(permission_key or "").strip()
+    if not key:
+        return False
+    if _is_platform_admin(identity) or _is_platform_architect(identity):
+        return True
+    try:
+        payload = access_compute_effective_permissions(str(identity.id))
+    except Exception:
+        return False
+    for row in payload.get("effective") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("permissionKey") or "").strip() != key:
+            continue
+        if str(row.get("effect") or "allow").strip().lower() != "allow":
+            continue
+        return True
+    return False
+
+
+def _require_artifact_debug_view(request: HttpRequest) -> Optional[JsonResponse]:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _has_effective_permission(identity, ARTIFACT_DEBUG_PERMISSION):
+        return JsonResponse({"error": "forbidden", "required_permission": ARTIFACT_DEBUG_PERMISSION}, status=403)
+    request.user_identity = identity  # type: ignore[attr-defined]
+    return None
 
 
 def _can_manage_docs(identity: UserIdentity) -> bool:
@@ -2341,18 +2423,44 @@ def _create_render_package_artifact(
 def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
     request_payload = render.request_payload_json if isinstance(render.request_payload_json, dict) else {}
     input_snapshot = request_payload.get("input_snapshot") if isinstance(request_payload.get("input_snapshot"), dict) else {}
+    user_message = str((render.result_payload_json or {}).get("user_message") or "").strip()
+    user_actions = (render.result_payload_json or {}).get("user_actions") if isinstance(render.result_payload_json, dict) else []
+    if not isinstance(user_actions, list):
+        user_actions = []
+    serialized_assets: List[Dict[str, Any]] = []
+    for index, asset in enumerate(render.output_assets or []):
+        if not isinstance(asset, dict):
+            continue
+        serialized_asset = dict(asset)
+        asset_type = str(serialized_asset.get("type") or "").strip().lower()
+        asset_url = str(serialized_asset.get("url") or "").strip()
+        if asset_type == "video" and asset_url:
+            serialized_asset["source_url"] = asset_url
+            serialized_asset["url"] = f"/xyn/api/video-renders/{render.id}/assets/{index}/download"
+        serialized_assets.append(serialized_asset)
+
     return {
         "id": str(render.id),
         "article_id": str(render.article_id),
         "provider": render.provider,
         "model_name": render.model_name or "",
         "status": render.status,
+        "outcome": render.outcome or ("success" if render.status == "succeeded" else "failed"),
         "requested_at": render.requested_at.isoformat() if render.requested_at else None,
         "started_at": render.started_at.isoformat() if render.started_at else None,
         "completed_at": render.completed_at.isoformat() if render.completed_at else None,
         "request_payload_json": sanitize_payload(request_payload),
         "result_payload_json": sanitize_payload(render.result_payload_json or {}),
-        "output_assets": render.output_assets or [],
+        "output_assets": serialized_assets,
+        "provider_operation_name": render.provider_operation_name or "",
+        "provider_operation_id": render.provider_operation_id or "",
+        "provider_filtered_count": render.provider_filtered_count,
+        "provider_filtered_reasons": render.provider_filtered_reasons or [],
+        "provider_error_code": render.provider_error_code or "",
+        "provider_error_message": render.provider_error_message or "",
+        "provider_response_excerpt": sanitize_payload(render.provider_response_excerpt or {}),
+        "last_provider_status_at": render.last_provider_status_at.isoformat() if render.last_provider_status_at else None,
+        "export_package_generated": bool(render.export_package_generated),
         "context_pack_id": str(render.context_pack_id) if render.context_pack_id else None,
         "context_pack_name": render.context_pack.name if getattr(render, "context_pack", None) else None,
         "context_pack_version": render.context_pack_version or "",
@@ -2363,7 +2471,50 @@ def _serialize_video_render(render: VideoRender) -> Dict[str, Any]:
         "render_package_artifact_id": str(input_snapshot.get("render_package_artifact_id") or "").strip() or None,
         "error_message": render.error_message or "",
         "error_details_json": sanitize_payload(render.error_details_json or {}),
+        "user_message": user_message or (render.error_message or ""),
+        "user_actions": [str(action) for action in user_actions if str(action).strip()],
     }
+
+
+def _extract_render_credential_ref(record: VideoRender) -> str:
+    payload = record.request_payload_json if isinstance(record.request_payload_json, dict) else {}
+    provider_cfg = payload.get("video_provider_config") if isinstance(payload.get("video_provider_config"), dict) else {}
+    adapter_cfg = provider_cfg.get("adapter_config") if isinstance(provider_cfg.get("adapter_config"), dict) else {}
+    for candidate in (
+        adapter_cfg.get("credential_ref"),
+        provider_cfg.get("credential_ref"),
+    ):
+        ref_text = str(candidate or "").strip()
+        if ref_text:
+            return ref_text
+    return ""
+
+
+def _append_api_key_to_google_asset_url(asset_url: str, api_key: str) -> str:
+    parts = urlsplit(asset_url)
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
+    filtered_pairs = [(k, v) for (k, v) in query_pairs if str(k).lower() != "key"]
+    filtered_pairs.append(("key", api_key))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(filtered_pairs), parts.fragment))
+
+
+def _resolve_video_asset_fetch_url(record: VideoRender, source_url: str) -> Tuple[Optional[str], Optional[str]]:
+    url_text = str(source_url or "").strip()
+    if not url_text:
+        return None, "asset url is empty"
+    parts = urlsplit(url_text)
+    if parts.scheme not in {"http", "https"}:
+        return None, "asset url must be absolute http(s)"
+    host = (parts.netloc or "").lower()
+    if "generativelanguage.googleapis.com" in host and "/files/" in (parts.path or ""):
+        credential_ref = _extract_render_credential_ref(record)
+        if not credential_ref:
+            return None, "video asset requires credential_ref"
+        secret_value = str(resolve_secret_ref_value(credential_ref) or "").strip()
+        if not secret_value:
+            return None, "video asset credential could not be resolved"
+        return _append_api_key_to_google_asset_url(url_text, secret_value), None
+    return url_text, None
 
 
 def _convert_article_html_to_markdown(value: str) -> str:
@@ -5814,6 +5965,14 @@ def api_me(request: HttpRequest) -> JsonResponse:
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
     roles = _get_roles(identity)
+    permissions_payload = access_compute_effective_permissions(str(identity.id))
+    permissions = sorted(
+        {
+            str(row.get("permissionKey") or "").strip()
+            for row in (permissions_payload.get("effective") or [])
+            if isinstance(row, dict) and str(row.get("effect") or "allow").strip().lower() == "allow"
+        }
+    )
     memberships = WorkspaceMembership.objects.filter(user_identity=identity).select_related("workspace").order_by("workspace__name")
     return JsonResponse(
         {
@@ -5824,6 +5983,7 @@ def api_me(request: HttpRequest) -> JsonResponse:
                 "display_name": identity.display_name,
             },
             "roles": roles,
+            "permissions": permissions,
             "actor_roles": list(getattr(request, "actor_roles", []) or roles),
             "preview": _serialize_preview_status(identity, request),
             "workspaces": [
@@ -6332,6 +6492,40 @@ def _serialize_draft_session_source(session: BlueprintDraftSession) -> Dict[str,
     }
 
 
+def _serialize_artifact_surface(surface: ArtifactSurface) -> Dict[str, Any]:
+    return {
+        "id": str(surface.id),
+        "artifact_id": str(surface.artifact_id),
+        "key": surface.key,
+        "title": surface.title,
+        "description": surface.description or "",
+        "surface_kind": surface.surface_kind,
+        "route": surface.route,
+        "nav_visibility": surface.nav_visibility,
+        "nav_label": surface.nav_label or "",
+        "nav_icon": surface.nav_icon or "",
+        "nav_group": surface.nav_group or "",
+        "renderer": surface.renderer if isinstance(surface.renderer, dict) else {},
+        "context": surface.context if isinstance(surface.context, dict) else {},
+        "permissions": surface.permissions if isinstance(surface.permissions, dict) else {},
+        "sort_order": int(surface.sort_order or 0),
+        "created_at": surface.created_at,
+        "updated_at": surface.updated_at,
+    }
+
+
+def _serialize_artifact_runtime_role(role: ArtifactRuntimeRole) -> Dict[str, Any]:
+    return {
+        "id": str(role.id),
+        "artifact_id": str(role.artifact_id),
+        "role_kind": role.role_kind,
+        "spec": role.spec if isinstance(role.spec, dict) else {},
+        "enabled": bool(role.enabled),
+        "created_at": role.created_at,
+        "updated_at": role.updated_at,
+    }
+
+
 def _serialize_unified_artifact(artifact: Artifact, source_record: Any = None) -> Dict[str, Any]:
     payload = {
         "id": str(artifact.id),
@@ -6358,6 +6552,8 @@ def _serialize_unified_artifact(artifact: Artifact, source_record: Any = None) -
         "parent_artifact_id": str(artifact.parent_artifact_id) if artifact.parent_artifact_id else None,
         "lineage_root_id": str(artifact.lineage_root_id) if artifact.lineage_root_id else None,
         "tags": artifact.tags_json or [],
+        "surfaces": [_serialize_artifact_surface(surface) for surface in artifact.surfaces.order_by("sort_order", "key")[:50]],
+        "runtime_roles": [_serialize_artifact_runtime_role(role) for role in artifact.runtime_roles.order_by("role_kind", "id")[:50]],
         "created_at": artifact.created_at,
         "updated_at": artifact.updated_at,
     }
@@ -6996,7 +7192,7 @@ def artifacts_collection(request: HttpRequest) -> JsonResponse:
     except (TypeError, ValueError):
         offset = 0
 
-    qs = Artifact.objects.select_related("type", "author", "parent_artifact", "lineage_root").all()
+    qs = Artifact.objects.select_related("type", "author", "parent_artifact", "lineage_root").prefetch_related("surfaces", "runtime_roles").all()
     if artifact_type:
         qs = qs.filter(type__slug=artifact_type)
     if artifact_state:
@@ -7039,7 +7235,7 @@ def artifact_detail(request: HttpRequest, artifact_id: str) -> JsonResponse:
         return JsonResponse({"error": "method not allowed"}, status=405)
 
     artifact = get_object_or_404(
-        Artifact.objects.select_related("type", "author", "parent_artifact", "lineage_root"),
+        Artifact.objects.select_related("type", "author", "parent_artifact", "lineage_root").prefetch_related("surfaces", "runtime_roles"),
         id=artifact_id,
     )
     identity = _identity_from_user(request.user)
@@ -7136,6 +7332,148 @@ def artifact_detail(request: HttpRequest, artifact_id: str) -> JsonResponse:
     return JsonResponse(_serialize_unified_artifact(artifact, source))
 
 
+def _normalize_surface_path(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    without_query = raw.split("?", 1)[0].split("#", 1)[0].strip()
+    if not without_query.startswith("/"):
+        without_query = f"/{without_query}"
+    return without_query
+
+
+def _surface_route_match(route_pattern: str, path: str) -> Optional[Dict[str, str]]:
+    pattern = _normalize_surface_path(route_pattern)
+    candidate = _normalize_surface_path(path)
+    if not pattern or not candidate:
+        return None
+    pattern_parts = [part for part in pattern.split("/") if part]
+    candidate_parts = [part for part in candidate.split("/") if part]
+    if len(pattern_parts) != len(candidate_parts):
+        return None
+    params: Dict[str, str] = {}
+    for pattern_part, candidate_part in zip(pattern_parts, candidate_parts):
+        if pattern_part.startswith(":"):
+            key = pattern_part[1:].strip()
+            if not key:
+                return None
+            params[key] = unquote(candidate_part)
+            continue
+        if pattern_part != candidate_part:
+            return None
+    return params
+
+
+@csrf_exempt
+@login_required
+def artifact_surfaces_collection(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    surfaces = ArtifactSurface.objects.filter(artifact=artifact).order_by("sort_order", "key")
+    return JsonResponse({"artifact_id": str(artifact.id), "surfaces": [_serialize_artifact_surface(row) for row in surfaces]})
+
+
+@csrf_exempt
+@login_required
+def artifact_runtime_roles_collection(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    roles = ArtifactRuntimeRole.objects.filter(artifact=artifact).order_by("role_kind", "id")
+    return JsonResponse({"artifact_id": str(artifact.id), "runtime_roles": [_serialize_artifact_runtime_role(row) for row in roles]})
+
+
+@csrf_exempt
+@login_required
+def artifact_surfaces_nav(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    identity = _identity_from_user(request.user)
+    surfaces = (
+        ArtifactSurface.objects.select_related("artifact", "artifact__type")
+        .filter(nav_visibility="always")
+        .order_by("nav_group", "sort_order", "title")
+    )
+    dedupe: set[Tuple[str, str, str]] = set()
+    rows: List[Dict[str, Any]] = []
+    for surface in surfaces:
+        artifact = surface.artifact
+        if not _can_view_generic_artifact(identity, artifact):
+            continue
+        dedupe_key = (
+            str(surface.nav_group or "").strip().lower(),
+            str(surface.nav_label or surface.title or "").strip().lower(),
+            str(surface.route or "").strip().lower(),
+        )
+        if dedupe_key in dedupe:
+            continue
+        dedupe.add(dedupe_key)
+        rows.append(_serialize_artifact_surface(surface))
+    return JsonResponse({"surfaces": rows})
+
+
+@csrf_exempt
+@login_required
+def artifact_surface_resolve(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    path = _normalize_surface_path(request.GET.get("path") or "")
+    if not path:
+        return JsonResponse({"error": "path is required"}, status=400)
+    identity = _identity_from_user(request.user)
+    matches: List[Dict[str, Any]] = []
+    surfaces = ArtifactSurface.objects.select_related("artifact", "artifact__type").all()
+    for surface in surfaces:
+        params = _surface_route_match(surface.route, path)
+        if params is None:
+            continue
+        if not _can_view_generic_artifact(identity, surface.artifact):
+            continue
+        matches.append(
+            {
+                "surface": _serialize_artifact_surface(surface),
+                "artifact": _serialize_unified_artifact(surface.artifact),
+                "params": params,
+            }
+        )
+    if not matches:
+        return JsonResponse({"error": "surface not found"}, status=404)
+    matches.sort(
+        key=lambda row: (
+            0 if row["surface"].get("nav_visibility") == "always" else 1,
+            int(row["surface"].get("sort_order") or 0),
+            row["surface"].get("key") or "",
+        )
+    )
+    return JsonResponse(matches[0])
+
+
+@csrf_exempt
+@login_required
+def artifact_surface_registries(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    renderer_registry = [
+        {"type": "ui_component_ref", "description": "Render through registered UI component key"},
+        {"type": "generic_editor", "description": "Built-in schema-driven editor"},
+        {"type": "generic_dashboard", "description": "Built-in query/widget dashboard"},
+        {"type": "workflow_visualizer", "description": "Built-in workflow visualizer"},
+        {"type": "article_editor", "description": "Temporary article editor adapter"},
+    ]
+    return JsonResponse({"ui_components": UI_COMPONENT_REGISTRY, "renderers": renderer_registry})
+
+
 @csrf_exempt
 @login_required
 def artifact_activity(request: HttpRequest, artifact_id: str) -> JsonResponse:
@@ -7167,6 +7505,337 @@ def artifact_activity(request: HttpRequest, artifact_id: str) -> JsonResponse:
     total = qs.count()
     rows = list(qs.order_by("-created_at")[offset : offset + limit])
     return JsonResponse({"events": [_serialize_ledger_event(row) for row in rows], "count": total, "limit": limit, "offset": offset})
+
+
+def _latest_artifact_content_json(artifact: Artifact) -> Dict[str, Any]:
+    latest = ArtifactRevision.objects.filter(artifact=artifact).order_by("-revision_number").first()
+    if latest and isinstance(latest.content_json, dict):
+        return latest.content_json
+    return {}
+
+
+def _artifact_raw_file_map(artifact: Artifact) -> Dict[str, bytes]:
+    content = _latest_artifact_content_json(artifact)
+    surfaces = [
+        {
+            "id": str(surface.id),
+            "key": surface.key,
+            "title": surface.title,
+            "description": surface.description or "",
+            "surface_kind": surface.surface_kind,
+            "route": surface.route,
+            "nav_visibility": surface.nav_visibility,
+            "nav_label": surface.nav_label or "",
+            "nav_icon": surface.nav_icon or "",
+            "nav_group": surface.nav_group or "",
+            "renderer": surface.renderer if isinstance(surface.renderer, dict) else {},
+            "context": surface.context if isinstance(surface.context, dict) else {},
+            "permissions": surface.permissions if isinstance(surface.permissions, dict) else {},
+            "sort_order": int(surface.sort_order or 0),
+        }
+        for surface in artifact.surfaces.order_by("sort_order", "key")
+    ]
+    runtime_roles = [
+        {
+            "id": str(role.id),
+            "role_kind": role.role_kind,
+            "spec": role.spec if isinstance(role.spec, dict) else {},
+            "enabled": bool(role.enabled),
+        }
+        for role in artifact.runtime_roles.order_by("role_kind", "id")
+    ]
+    artifact_payload = {
+        "artifact": {
+            "id": str(artifact.id),
+            "type": artifact.type.slug if artifact.type_id else "",
+            "slug": artifact.slug,
+            "version": str(artifact.package_version or "0.0.0"),
+            "title": artifact.title,
+            "artifact_state": artifact.artifact_state,
+            "status": artifact.status,
+            "schema_version": artifact.schema_version,
+            "dependencies": artifact.dependencies if isinstance(artifact.dependencies, list) else [],
+            "bindings": artifact.bindings if isinstance(artifact.bindings, list) else [],
+        },
+        "content": content.get("content") if isinstance(content.get("content"), dict) else content,
+        "metadata": {
+            "content_ref": artifact.content_ref if isinstance(artifact.content_ref, dict) else {},
+            "content_hash": artifact.content_hash or "",
+        },
+    }
+    raw_artifact = json.dumps(artifact_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    raw_payload = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    raw_surfaces = json.dumps(surfaces, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    raw_runtime_roles = json.dumps(runtime_roles, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return {
+        "artifact.json": raw_artifact,
+        "payload/payload.json": raw_payload,
+        "surfaces.json": raw_surfaces,
+        "runtime_roles.json": raw_runtime_roles,
+    }
+
+
+def _sanitize_raw_path(path_value: str, *, allow_root: bool = True) -> Optional[str]:
+    raw = str(path_value or "").strip().replace("\\", "/")
+    if not raw:
+        raw = "/"
+    if ".." in Path(raw).parts:
+        return None
+    normalized = posixpath.normpath(raw)
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    if not allow_root and normalized == "/":
+        return None
+    if normalized in {"", "."}:
+        return "/"
+    return normalized
+
+
+def _list_virtual_entries(
+    file_map: Dict[str, bytes],
+    directory_path: str,
+    *,
+    checksums: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    checksums = checksums if isinstance(checksums, dict) else {}
+    directory = _sanitize_raw_path(directory_path or "/")
+    if directory is None:
+        return []
+    base = directory.lstrip("/")
+    prefix = f"{base}/" if base else ""
+    entries: Dict[str, Dict[str, Any]] = {}
+    for file_path, blob in file_map.items():
+        normalized_file = str(file_path or "").strip().lstrip("/")
+        if not normalized_file:
+            continue
+        if prefix and not normalized_file.startswith(prefix):
+            continue
+        remainder = normalized_file[len(prefix) :] if prefix else normalized_file
+        if not remainder:
+            continue
+        name = remainder.split("/", 1)[0]
+        child_path = f"{directory.rstrip('/')}/{name}" if directory != "/" else f"/{name}"
+        if "/" in remainder:
+            if child_path not in entries:
+                entries[child_path] = {
+                    "name": name,
+                    "path": child_path,
+                    "kind": "dir",
+                    "size_bytes": None,
+                    "mime_guess": None,
+                    "sha256_optional": None,
+                }
+            continue
+        guessed_mime = mimetypes.guess_type(normalized_file)[0] or "application/octet-stream"
+        entries[child_path] = {
+            "name": name,
+            "path": child_path,
+            "kind": "file",
+            "size_bytes": len(blob),
+            "mime_guess": guessed_mime,
+            "sha256_optional": str(checksums.get(normalized_file) or "") or None,
+        }
+    return sorted(entries.values(), key=lambda row: (0 if row.get("kind") == "dir" else 1, str(row.get("name") or "").lower()))
+
+
+def _resolve_virtual_file(file_map: Dict[str, bytes], raw_path: str) -> Tuple[Optional[str], Optional[bytes]]:
+    normalized = _sanitize_raw_path(raw_path, allow_root=False)
+    if not normalized:
+        return None, None
+    internal = normalized.lstrip("/")
+    if not internal or internal.endswith("/"):
+        return None, None
+    blob = file_map.get(internal)
+    if blob is None:
+        return None, None
+    return internal, blob
+
+
+def _raw_text_preview_response(
+    *,
+    internal_path: str,
+    blob: bytes,
+    request: HttpRequest,
+    download_url_base: str,
+) -> HttpResponse:
+    guessed_mime = mimetypes.guess_type(internal_path)[0] or "application/octet-stream"
+    force_download = str(request.GET.get("download") or "").strip().lower() in {"1", "true", "yes"}
+    is_textual = guessed_mime.startswith("text/") or guessed_mime in {
+        "application/json",
+        "application/x-yaml",
+        "text/yaml",
+        "application/xml",
+        "text/xml",
+        "text/markdown",
+    }
+    if force_download or not is_textual or len(blob) > RAW_INLINE_MAX_BYTES:
+        filename = Path(internal_path).name or "artifact-file"
+        response = HttpResponse(blob, content_type=guessed_mime if not force_download else "application/octet-stream")
+        response["Content-Disposition"] = f'attachment; filename="{re.sub(r"[^A-Za-z0-9._-]+", "-", filename)}"'
+        return response
+    try:
+        content = blob.decode("utf-8")
+    except UnicodeDecodeError:
+        content = blob.decode("utf-8", errors="replace")
+    return JsonResponse(
+        {
+            "path": f"/{internal_path}",
+            "kind": "file",
+            "size_bytes": len(blob),
+            "mime_guess": guessed_mime,
+            "inline": True,
+            "content": content,
+            "download_url": f"{download_url_base}?path={quote('/' + internal_path)}&download=1",
+        }
+    )
+
+
+@csrf_exempt
+def artifact_raw_metadata(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if guard := _require_artifact_debug_view(request):
+        return guard
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    return JsonResponse(
+        {
+            "artifact": {
+                "id": str(artifact.id),
+                "type": artifact.type.slug if artifact.type_id else "",
+                "slug": artifact.slug,
+                "version": str(artifact.package_version or "0.0.0"),
+                "title": artifact.title,
+                "artifact_state": artifact.artifact_state,
+                "status": artifact.status,
+            },
+            "artifact_hash": artifact.content_hash or "",
+            "content_ref": artifact.content_ref if isinstance(artifact.content_ref, dict) else {},
+            "dependencies": artifact.dependencies if isinstance(artifact.dependencies, list) else [],
+            "bindings": artifact.bindings if isinstance(artifact.bindings, list) else [],
+            "surfaces": [_serialize_artifact_surface(row) for row in artifact.surfaces.order_by("sort_order", "key")],
+            "runtime_roles": [_serialize_artifact_runtime_role(row) for row in artifact.runtime_roles.order_by("role_kind", "id")],
+            "files_root": {"name": "/", "path": "/", "kind": "dir"},
+        }
+    )
+
+
+@csrf_exempt
+def artifact_raw_artifact_json(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if guard := _require_artifact_debug_view(request):
+        return guard
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    file_map = _artifact_raw_file_map(artifact)
+    payload = json.loads(file_map["artifact.json"].decode("utf-8"))
+    return JsonResponse(payload)
+
+
+@csrf_exempt
+def artifact_raw_files(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if guard := _require_artifact_debug_view(request):
+        return guard
+    artifact = get_object_or_404(Artifact, id=artifact_id)
+    directory = _sanitize_raw_path(str(request.GET.get("path") or "/"))
+    if directory is None:
+        return JsonResponse({"error": "invalid path"}, status=400)
+    file_map = _artifact_raw_file_map(artifact)
+    entries = _list_virtual_entries(file_map, directory)
+    return JsonResponse({"path": directory, "entries": entries})
+
+
+@csrf_exempt
+def artifact_raw_file(request: HttpRequest, artifact_id: str) -> HttpResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if guard := _require_artifact_debug_view(request):
+        return guard
+    artifact = get_object_or_404(Artifact, id=artifact_id)
+    raw_path = str(request.GET.get("path") or "")
+    if not raw_path:
+        return JsonResponse({"error": "path is required"}, status=400)
+    file_map = _artifact_raw_file_map(artifact)
+    internal_path, blob = _resolve_virtual_file(file_map, raw_path)
+    if not internal_path or blob is None:
+        return JsonResponse({"error": "file not found"}, status=404)
+    return _raw_text_preview_response(
+        internal_path=internal_path,
+        blob=blob,
+        request=request,
+        download_url_base=f"/xyn/api/artifacts/{artifact_id}/raw/file",
+    )
+
+
+def _package_file_map(package: ArtifactPackage) -> Dict[str, bytes]:
+    blob_path = Path(str(package.file_blob_ref or "").strip())
+    if not blob_path.exists():
+        raise FileNotFoundError("package blob is missing on disk")
+    file_map: Dict[str, bytes] = {}
+    with zipfile.ZipFile(io.BytesIO(blob_path.read_bytes()), "r") as archive:
+        for name in archive.namelist():
+            normalized = str(name or "").strip().lstrip("/")
+            if not normalized or normalized.endswith("/"):
+                continue
+            if ".." in Path(normalized).parts:
+                continue
+            file_map[normalized] = archive.read(name)
+    return file_map
+
+
+@csrf_exempt
+def artifact_package_raw_manifest(request: HttpRequest, package_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if guard := _require_artifact_debug_view(request):
+        return guard
+    package = get_object_or_404(ArtifactPackage, id=package_id)
+    return JsonResponse({"manifest": package.manifest if isinstance(package.manifest, dict) else {}})
+
+
+@csrf_exempt
+def artifact_package_raw_tree(request: HttpRequest, package_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if guard := _require_artifact_debug_view(request):
+        return guard
+    package = get_object_or_404(ArtifactPackage, id=package_id)
+    directory = _sanitize_raw_path(str(request.GET.get("path") or "/"))
+    if directory is None:
+        return JsonResponse({"error": "invalid path"}, status=400)
+    try:
+        file_map = _package_file_map(package)
+    except FileNotFoundError as exc:
+        return JsonResponse({"error": str(exc)}, status=404)
+    checksums = package.manifest.get("checksums") if isinstance(package.manifest, dict) else {}
+    entries = _list_virtual_entries(file_map, directory, checksums=checksums if isinstance(checksums, dict) else None)
+    return JsonResponse({"path": directory, "entries": entries})
+
+
+@csrf_exempt
+def artifact_package_raw_file(request: HttpRequest, package_id: str) -> HttpResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if guard := _require_artifact_debug_view(request):
+        return guard
+    package = get_object_or_404(ArtifactPackage, id=package_id)
+    raw_path = str(request.GET.get("path") or "")
+    if not raw_path:
+        return JsonResponse({"error": "path is required"}, status=400)
+    try:
+        file_map = _package_file_map(package)
+    except FileNotFoundError as exc:
+        return JsonResponse({"error": str(exc)}, status=404)
+    internal_path, blob = _resolve_virtual_file(file_map, raw_path)
+    if not internal_path or blob is None:
+        return JsonResponse({"error": "file not found"}, status=404)
+    return _raw_text_preview_response(
+        internal_path=internal_path,
+        blob=blob,
+        request=request,
+        download_url_base=f"/xyn/api/artifacts/packages/{package_id}/raw/file",
+    )
 
 
 def _serialize_artifact_binding_value(row: ArtifactBindingValue) -> Dict[str, Any]:
@@ -7873,7 +8542,70 @@ def workspaces_collection(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
-    memberships = WorkspaceMembership.objects.filter(user_identity=identity).select_related("workspace").order_by("workspace__name")
+    if request.method == "POST":
+        if not _is_platform_admin(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        payload = _parse_json(request)
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return JsonResponse({"error": "name is required"}, status=400)
+        description = str(payload.get("description") or "")
+        slug = str(payload.get("slug") or "").strip().lower() or slugify(name)
+        if not slug:
+            return JsonResponse({"error": "slug is required"}, status=400)
+        if Workspace.objects.filter(slug=slug).exists():
+            return JsonResponse({"error": "workspace slug already exists"}, status=400)
+        with transaction.atomic():
+            workspace = Workspace.objects.create(
+                slug=slug,
+                name=name,
+                description=description,
+                status="active",
+            )
+            WorkspaceMembership.objects.create(
+                workspace=workspace,
+                user_identity=identity,
+                role="admin",
+                termination_authority=True,
+            )
+        return JsonResponse(
+            {
+                "workspace": {
+                    "id": str(workspace.id),
+                    "slug": workspace.slug,
+                    "name": workspace.name,
+                    "description": workspace.description,
+                    "status": workspace.status,
+                    "role": "admin",
+                    "termination_authority": True,
+                }
+            },
+            status=201,
+        )
+
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    memberships = WorkspaceMembership.objects.filter(user_identity=identity).select_related("workspace")
+    membership_by_workspace_id = {str(row.workspace_id): row for row in memberships}
+    if _is_platform_admin(identity):
+        workspace_rows = Workspace.objects.all().order_by("name")
+        items = []
+        for workspace in workspace_rows:
+            membership = membership_by_workspace_id.get(str(workspace.id))
+            items.append(
+                {
+                    "id": str(workspace.id),
+                    "slug": workspace.slug,
+                    "name": workspace.name,
+                    "description": workspace.description,
+                    "status": workspace.status or "active",
+                    "role": membership.role if membership else "admin",
+                    "termination_authority": bool(membership.termination_authority) if membership else True,
+                }
+            )
+        return JsonResponse({"workspaces": items})
+
     return JsonResponse(
         {
             "workspaces": [
@@ -7882,11 +8614,84 @@ def workspaces_collection(request: HttpRequest) -> JsonResponse:
                     "slug": m.workspace.slug,
                     "name": m.workspace.name,
                     "description": m.workspace.description,
+                    "status": m.workspace.status or "active",
                     "role": m.role,
                     "termination_authority": m.termination_authority,
                 }
-                for m in memberships
+                for m in memberships.order_by("workspace__name")
             ]
+        }
+    )
+
+
+@csrf_exempt
+def workspace_detail(request: HttpRequest, workspace_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    workspace = get_object_or_404(Workspace, id=workspace_id)
+    membership = _workspace_membership(identity, str(workspace.id))
+    can_manage = _is_platform_admin(identity) or bool(membership and membership.role == "admin")
+    if request.method == "GET":
+        if not membership and not _is_platform_admin(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        return JsonResponse(
+            {
+                "workspace": {
+                    "id": str(workspace.id),
+                    "slug": workspace.slug,
+                    "name": workspace.name,
+                    "description": workspace.description,
+                    "status": workspace.status or "active",
+                    "role": membership.role if membership else "admin",
+                    "termination_authority": bool(membership.termination_authority) if membership else True,
+                }
+            }
+        )
+
+    if request.method not in {"PATCH", "PUT"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not can_manage:
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    update_fields: List[str] = []
+    if "name" in payload:
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return JsonResponse({"error": "name is required"}, status=400)
+        workspace.name = name
+        update_fields.append("name")
+    if "description" in payload:
+        workspace.description = str(payload.get("description") or "")
+        update_fields.append("description")
+    if "status" in payload:
+        status = str(payload.get("status") or "").strip().lower()
+        if status not in {"active", "deprecated"}:
+            return JsonResponse({"error": "invalid status"}, status=400)
+        workspace.status = status
+        update_fields.append("status")
+    if "slug" in payload:
+        slug = str(payload.get("slug") or "").strip().lower()
+        if not slug:
+            return JsonResponse({"error": "slug is required"}, status=400)
+        if Workspace.objects.exclude(id=workspace.id).filter(slug=slug).exists():
+            return JsonResponse({"error": "workspace slug already exists"}, status=400)
+        workspace.slug = slug
+        update_fields.append("slug")
+    if not update_fields:
+        return JsonResponse({"workspace": {"id": str(workspace.id), "slug": workspace.slug, "name": workspace.name, "description": workspace.description, "status": workspace.status}})
+    workspace.save(update_fields=[*update_fields, "updated_at"])
+    return JsonResponse(
+        {
+            "workspace": {
+                "id": str(workspace.id),
+                "slug": workspace.slug,
+                "name": workspace.name,
+                "description": workspace.description,
+                "status": workspace.status or "active",
+                "role": membership.role if membership else "admin",
+                "termination_authority": bool(membership.termination_authority) if membership else True,
+            }
         }
     )
 
@@ -9688,6 +10493,154 @@ def _generate_storyboard_from_script(script_text: str, duration_seconds_target: 
     return storyboard, scenes
 
 
+def _normalize_video_outcome(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"success", "failed", "filtered", "canceled", "timeout"}:
+        return normalized
+    if normalized in {"succeeded", "ok"}:
+        return "success"
+    return "failed"
+
+
+def _status_for_video_outcome(outcome: str) -> str:
+    normalized = _normalize_video_outcome(outcome)
+    if normalized == "success":
+        return "succeeded"
+    if normalized == "filtered":
+        return "filtered"
+    if normalized == "canceled":
+        return "canceled"
+    return "failed"
+
+
+def _operation_id_from_name(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.split("/")[-1]
+
+
+def _apply_video_render_completion(video_render: VideoRender, *, provider: str, raw_result: Dict[str, Any], assets: List[Dict[str, Any]]) -> VideoRender:
+    provider_name = str(provider or video_render.provider or "unknown").strip() or "unknown"
+    result_payload = sanitize_payload(raw_result if isinstance(raw_result, dict) else {})
+    output_assets = sanitize_payload(assets if isinstance(assets, list) else [])
+    request_payload = video_render.request_payload_json if isinstance(video_render.request_payload_json, dict) else {}
+    provider_cfg = request_payload.get("video_provider_config") if isinstance(request_payload.get("video_provider_config"), dict) else {}
+    render_mode = str(provider_cfg.get("rendering_mode") or "").strip().lower()
+    provider_configured = bool(result_payload.get("provider_configured")) if isinstance(result_payload, dict) else False
+    has_video_asset = any(str((asset or {}).get("type") or "").strip().lower() == "video" for asset in output_assets)
+    requested_outcome = _normalize_video_outcome(result_payload.get("outcome"))
+
+    requires_external_output = render_mode in {"render_via_adapter", "render_via_endpoint", "render_via_model_config"}
+    if requires_external_output and requested_outcome == "success" and (not provider_configured or not has_video_asset):
+        requested_outcome = "failed"
+        result_payload["provider_error_code"] = str(result_payload.get("provider_error_code") or "missing_video_asset")
+        result_payload["provider_error_message"] = str(result_payload.get("provider_error_message") or "Render did not produce a video asset.")
+
+    operation_name = str(result_payload.get("operation_name") or "").strip()
+    operation_id = str(result_payload.get("operation_id") or "").strip() or _operation_id_from_name(operation_name)
+    filtered_reasons = result_payload.get("provider_filtered_reasons") if isinstance(result_payload.get("provider_filtered_reasons"), list) else []
+    filtered_count_raw = result_payload.get("provider_filtered_count")
+    try:
+        filtered_count = int(filtered_count_raw) if filtered_count_raw is not None else (len(filtered_reasons) if filtered_reasons else None)
+    except (TypeError, ValueError):
+        filtered_count = len(filtered_reasons) if filtered_reasons else None
+
+    provider_error_code = str(result_payload.get("provider_error_code") or "").strip()
+    provider_error_message = str(result_payload.get("provider_error_message") or "").strip()
+    user_message = str(result_payload.get("user_message") or "").strip()
+    if not user_message:
+        if requested_outcome == "filtered":
+            user_message = "Video blocked by provider policy."
+        elif requested_outcome == "timeout":
+            user_message = "Video render timed out before completion."
+        elif requested_outcome == "failed":
+            user_message = provider_error_message or str(result_payload.get("message") or "Video render failed.")
+        else:
+            user_message = str(result_payload.get("message") or "Video render completed.")
+    user_actions = result_payload.get("user_actions") if isinstance(result_payload.get("user_actions"), list) else []
+    if requested_outcome == "filtered" and not user_actions:
+        user_actions = ["edit_prompt", "neutralize_prompt", "retry"]
+    result_payload["user_message"] = user_message
+    result_payload["user_actions"] = [str(action).strip() for action in user_actions if str(action).strip()]
+
+    video_render.provider = provider_name
+    video_render.outcome = requested_outcome
+    video_render.status = _status_for_video_outcome(requested_outcome)
+    video_render.error_message = "" if requested_outcome == "success" else user_message
+    video_render.error_details_json = (
+        {}
+        if requested_outcome == "success"
+        else {
+            "rendering_mode": render_mode,
+            "provider_configured": provider_configured,
+            "has_video_asset": has_video_asset,
+            "provider_error_code": provider_error_code,
+            "provider_error_message": provider_error_message or user_message,
+        }
+    )
+    video_render.result_payload_json = result_payload
+    video_render.output_assets = output_assets
+    video_render.provider_operation_name = operation_name
+    video_render.provider_operation_id = operation_id
+    video_render.provider_filtered_count = filtered_count if requested_outcome == "filtered" else None
+    video_render.provider_filtered_reasons = (
+        [str(reason).strip() for reason in filtered_reasons if str(reason).strip()]
+        if requested_outcome == "filtered"
+        else []
+    )
+    video_render.provider_error_code = provider_error_code
+    video_render.provider_error_message = provider_error_message
+    provider_response = result_payload.get("provider_response") if isinstance(result_payload.get("provider_response"), dict) else {}
+    video_render.provider_response_excerpt = sanitize_payload(provider_response)
+    video_render.last_provider_status_at = timezone.now()
+    video_render.export_package_generated = any(str((asset or {}).get("type") or "").strip().lower() == "export_package" for asset in output_assets)
+    video_render.completed_at = timezone.now()
+    if not video_render.started_at:
+        video_render.started_at = timezone.now()
+    video_render.save(
+        update_fields=[
+            "provider",
+            "status",
+            "outcome",
+            "started_at",
+            "completed_at",
+            "result_payload_json",
+            "output_assets",
+            "error_message",
+            "error_details_json",
+            "provider_operation_name",
+            "provider_operation_id",
+            "provider_filtered_count",
+            "provider_filtered_reasons",
+            "provider_error_code",
+            "provider_error_message",
+            "provider_response_excerpt",
+            "last_provider_status_at",
+            "export_package_generated",
+            "updated_at",
+        ]
+    )
+    logger.info(
+        "video_render_outcome render_id=%s provider=%s outcome=%s status=%s operation=%s filtered_count=%s",
+        str(video_render.id),
+        provider_name,
+        requested_outcome,
+        video_render.status,
+        operation_name or "-",
+        str(video_render.provider_filtered_count) if video_render.provider_filtered_count is not None else "-",
+    )
+    if requested_outcome == "filtered":
+        logger.warning(
+            "video_render_provider_filtered render_id=%s provider=%s operation=%s reasons=%s",
+            str(video_render.id),
+            provider_name,
+            operation_name or "-",
+            "; ".join(video_render.provider_filtered_reasons or []),
+        )
+    return video_render
+
+
 def _process_video_render(video_render: VideoRender) -> VideoRender:
     now = timezone.now()
     article = video_render.article
@@ -9706,47 +10659,20 @@ def _process_video_render(video_render: VideoRender) -> VideoRender:
     video_render.save(update_fields=["status", "started_at", "error_message", "error_details_json", "request_payload_json", "updated_at"])
 
     provider, assets, raw_result = render_video(spec, request_payload, str(article.id))
-    provider_cfg = request_payload.get("video_provider_config") if isinstance(request_payload.get("video_provider_config"), dict) else {}
-    render_mode = str(provider_cfg.get("rendering_mode") or "").strip().lower()
-    provider_configured = bool(raw_result.get("provider_configured")) if isinstance(raw_result, dict) else False
-    has_video_asset = any(str((asset or {}).get("type") or "").strip().lower() == "video" for asset in (assets or []))
-    requires_external_output = render_mode in {"render_via_adapter", "render_via_endpoint", "render_via_model_config"}
-    finished_at = timezone.now()
-    video_render.provider = provider or "unknown"
-    if requires_external_output and (not provider_configured or not has_video_asset):
-        video_render.status = "failed"
-        message = str((raw_result or {}).get("message") or "Render did not produce a video asset")
-        video_render.error_message = message
-        video_render.error_details_json = {
-            "rendering_mode": render_mode,
-            "provider_configured": provider_configured,
-            "has_video_asset": has_video_asset,
-        }
-    else:
-        video_render.status = "succeeded"
-        video_render.error_message = ""
-        video_render.error_details_json = {}
-    video_render.completed_at = finished_at
-    video_render.result_payload_json = sanitize_payload(raw_result)
-    video_render.output_assets = sanitize_payload(assets)
-    video_render.save(
-        update_fields=[
-            "provider",
-            "status",
-            "completed_at",
-            "result_payload_json",
-            "output_assets",
-            "error_message",
-            "error_details_json",
-            "updated_at",
-        ]
+    video_render = _apply_video_render_completion(
+        video_render,
+        provider=provider,
+        raw_result=raw_result if isinstance(raw_result, dict) else {},
+        assets=assets if isinstance(assets, list) else [],
     )
+    finished_at = video_render.completed_at or timezone.now()
 
     spec["generation"] = {
         **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
         "provider": video_render.provider,
         "model_name": video_render.model_name or "",
-        "status": "failed" if video_render.status == "failed" else "succeeded",
+        "status": "filtered" if video_render.status == "filtered" else ("failed" if video_render.status == "failed" else "succeeded"),
+        "outcome": video_render.outcome or "",
         "last_render_id": str(video_render.id),
         "spec_snapshot_hash": video_render.spec_snapshot_hash or "",
         "input_snapshot_hash": video_render.input_snapshot_hash or "",
@@ -10499,10 +11425,24 @@ def article_video_renders_collection(request: HttpRequest, article_id: str) -> J
                 _process_video_render(render_record)
             except Exception as exc:
                 render_record.status = "failed"
+                render_record.outcome = "failed"
                 render_record.error_message = str(exc)
                 render_record.error_details_json = {"mode": "inline"}
                 render_record.completed_at = timezone.now()
-                render_record.save(update_fields=["status", "error_message", "error_details_json", "completed_at", "updated_at"])
+                render_record.provider_error_code = "inline_exception"
+                render_record.provider_error_message = str(exc)
+                render_record.save(
+                    update_fields=[
+                        "status",
+                        "outcome",
+                        "error_message",
+                        "error_details_json",
+                        "provider_error_code",
+                        "provider_error_message",
+                        "completed_at",
+                        "updated_at",
+                    ]
+                )
         render_record.refresh_from_db()
         return JsonResponse({"render": _serialize_video_render(render_record), "article": _serialize_article_detail(artifact)})
 
@@ -10548,14 +11488,28 @@ def video_render_detail(request: HttpRequest, render_id: str) -> JsonResponse:
                     _process_video_render(retry)
                 except Exception as exc:
                     retry.status = "failed"
+                    retry.outcome = "failed"
                     retry.error_message = str(exc)
                     retry.error_details_json = {"mode": "inline"}
                     retry.completed_at = timezone.now()
-                    retry.save(update_fields=["status", "error_message", "error_details_json", "completed_at", "updated_at"])
+                    retry.provider_error_code = "inline_exception"
+                    retry.provider_error_message = str(exc)
+                    retry.save(
+                        update_fields=[
+                            "status",
+                            "outcome",
+                            "error_message",
+                            "error_details_json",
+                            "provider_error_code",
+                            "provider_error_message",
+                            "completed_at",
+                            "updated_at",
+                        ]
+                    )
             retry.refresh_from_db()
             return JsonResponse({"render": _serialize_video_render(retry)})
         if action == "cancel":
-            if record.status in {"succeeded", "failed", "canceled"}:
+            if record.status in {"succeeded", "failed", "filtered", "canceled"}:
                 return JsonResponse({"render": _serialize_video_render(record)})
             record.status = "canceled"
             record.completed_at = timezone.now()
@@ -10580,7 +11534,7 @@ def video_render_cancel(request: HttpRequest, render_id: str) -> JsonResponse:
     record = get_object_or_404(VideoRender.objects.select_related("article", "context_pack"), id=render_id)
     if not _can_edit_article(identity, record.article):
         return JsonResponse({"error": "forbidden"}, status=403)
-    if record.status not in {"succeeded", "failed", "canceled"}:
+    if record.status not in {"succeeded", "failed", "filtered", "canceled"}:
         record.status = "canceled"
         record.completed_at = timezone.now()
         record.save(update_fields=["status", "completed_at", "updated_at"])
@@ -10621,10 +11575,24 @@ def video_render_retry(request: HttpRequest, render_id: str) -> JsonResponse:
             _process_video_render(retry)
         except Exception as exc:
             retry.status = "failed"
+            retry.outcome = "failed"
             retry.error_message = str(exc)
             retry.error_details_json = {"mode": "inline"}
             retry.completed_at = timezone.now()
-            retry.save(update_fields=["status", "error_message", "error_details_json", "completed_at", "updated_at"])
+            retry.provider_error_code = "inline_exception"
+            retry.provider_error_message = str(exc)
+            retry.save(
+                update_fields=[
+                    "status",
+                    "outcome",
+                    "error_message",
+                    "error_details_json",
+                    "provider_error_code",
+                    "provider_error_message",
+                    "completed_at",
+                    "updated_at",
+                ]
+            )
     retry.refresh_from_db()
     return JsonResponse({"render": _serialize_video_render(retry)})
 
@@ -10644,6 +11612,48 @@ def article_video_export_package(request: HttpRequest, article_id: str) -> HttpR
     package_text = export_package_text(article_payload, _serialize_video_render(latest_render) if latest_render else None)
     response = HttpResponse(package_text, content_type="application/json; charset=utf-8")
     response["Content-Disposition"] = f'attachment; filename="article-{_artifact_slug(artifact) or artifact.id}-video-package.json"'
+    return response
+
+
+@csrf_exempt
+def video_render_asset_download(request: HttpRequest, render_id: str, asset_index: int) -> HttpResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    if not _can_view_article(identity, record.article):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if asset_index < 0:
+        return JsonResponse({"error": "invalid asset index"}, status=400)
+    assets = record.output_assets if isinstance(record.output_assets, list) else []
+    if asset_index >= len(assets):
+        return JsonResponse({"error": "asset not found"}, status=404)
+    asset = assets[asset_index] if isinstance(assets[asset_index], dict) else {}
+    source_url = str(asset.get("url") or "").strip()
+    fetch_url, fetch_error = _resolve_video_asset_fetch_url(record, source_url)
+    if not fetch_url:
+        return JsonResponse({"error": fetch_error or "asset download url unavailable"}, status=400)
+    try:
+        upstream = requests.get(fetch_url, timeout=120)
+    except requests.RequestException as exc:
+        return JsonResponse({"error": f"asset fetch failed: {exc}"}, status=502)
+    if upstream.status_code >= 400:
+        body_excerpt = (upstream.text or "")[:1000]
+        return JsonResponse(
+            {
+                "error": "asset fetch failed",
+                "upstream_status": upstream.status_code,
+                "upstream_body_excerpt": body_excerpt,
+            },
+            status=502,
+        )
+    content_type = str(upstream.headers.get("Content-Type") or "application/octet-stream")
+    file_name = f"video-render-{record.id}.mp4" if str(asset.get("type") or "").strip().lower() == "video" else f"render-asset-{record.id}"
+    response = HttpResponse(upstream.content, content_type=content_type)
+    response["Content-Disposition"] = f'attachment; filename="{file_name}"'
+    response["Cache-Control"] = "no-store"
     return response
 
 
@@ -10672,12 +11682,12 @@ def internal_video_render_status(request: HttpRequest, render_id: str) -> JsonRe
     record = get_object_or_404(VideoRender, id=render_id)
     payload = _parse_json(request)
     status = str(payload.get("status") or "").strip().lower()
-    if status not in {"queued", "running", "canceled"}:
+    if status not in {"queued", "running", "canceled", "filtered"}:
         return JsonResponse({"error": "invalid status"}, status=400)
     record.status = status
     if status == "running" and not record.started_at:
         record.started_at = timezone.now()
-    if status == "canceled":
+    if status in {"canceled", "filtered"}:
         record.completed_at = timezone.now()
     record.save(update_fields=["status", "started_at", "completed_at", "updated_at"])
     return JsonResponse({"render": _serialize_video_render(record)})
@@ -10691,43 +11701,14 @@ def internal_video_render_complete(request: HttpRequest, render_id: str) -> Json
         return JsonResponse({"error": "method not allowed"}, status=405)
     record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
     payload = _parse_json(request)
-    record.provider = str(payload.get("provider") or record.provider or "unknown")
-    result_payload = sanitize_payload(payload.get("result_payload_json") if isinstance(payload.get("result_payload_json"), dict) else {})
-    output_assets = sanitize_payload(payload.get("output_assets") if isinstance(payload.get("output_assets"), list) else [])
-    request_payload = record.request_payload_json if isinstance(record.request_payload_json, dict) else {}
-    provider_cfg = request_payload.get("video_provider_config") if isinstance(request_payload.get("video_provider_config"), dict) else {}
-    render_mode = str(provider_cfg.get("rendering_mode") or "").strip().lower()
-    provider_configured = bool(result_payload.get("provider_configured")) if isinstance(result_payload, dict) else False
-    has_video_asset = any(str((asset or {}).get("type") or "").strip().lower() == "video" for asset in output_assets)
-    requires_external_output = render_mode in {"render_via_adapter", "render_via_endpoint", "render_via_model_config"}
-    if requires_external_output and (not provider_configured or not has_video_asset):
-        record.status = "failed"
-        record.error_message = str(result_payload.get("message") or "Render did not produce a video asset")
-        record.error_details_json = {
-            "rendering_mode": render_mode,
-            "provider_configured": provider_configured,
-            "has_video_asset": has_video_asset,
-        }
-    else:
-        record.status = "succeeded"
-        record.error_message = ""
-        record.error_details_json = {}
-    record.started_at = record.started_at or timezone.now()
-    record.completed_at = timezone.now()
-    record.result_payload_json = result_payload
-    record.output_assets = output_assets
-    record.save(
-        update_fields=[
-            "provider",
-            "status",
-            "started_at",
-            "completed_at",
-            "result_payload_json",
-            "output_assets",
-            "error_message",
-            "error_details_json",
-            "updated_at",
-        ]
+    provider = str(payload.get("provider") or record.provider or "unknown")
+    result_payload = payload.get("result_payload_json") if isinstance(payload.get("result_payload_json"), dict) else {}
+    output_assets = payload.get("output_assets") if isinstance(payload.get("output_assets"), list) else []
+    record = _apply_video_render_completion(
+        record,
+        provider=provider,
+        raw_result=result_payload,
+        assets=output_assets,
     )
     article = record.article
     spec = _video_spec(article)
@@ -10735,7 +11716,8 @@ def internal_video_render_complete(request: HttpRequest, render_id: str) -> Json
         **(spec.get("generation") if isinstance(spec.get("generation"), dict) else {}),
         "provider": record.provider,
         "model_name": record.model_name or "",
-        "status": "failed" if record.status == "failed" else "succeeded",
+        "status": "filtered" if record.status == "filtered" else ("failed" if record.status == "failed" else "succeeded"),
+        "outcome": record.outcome or "",
         "last_render_id": str(record.id),
         "spec_snapshot_hash": record.spec_snapshot_hash or "",
         "input_snapshot_hash": record.input_snapshot_hash or "",
@@ -10760,12 +11742,13 @@ def internal_video_render_error(request: HttpRequest, render_id: str) -> JsonRes
     record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
     payload = _parse_json(request)
     record.status = "failed"
+    record.outcome = "failed"
     record.started_at = record.started_at or timezone.now()
     record.completed_at = timezone.now()
     record.error_message = str(payload.get("error") or "render failed")
     details = payload.get("error_details_json") if isinstance(payload.get("error_details_json"), dict) else {}
     record.error_details_json = sanitize_payload(details)
-    record.save(update_fields=["status", "started_at", "completed_at", "error_message", "error_details_json", "updated_at"])
+    record.save(update_fields=["status", "outcome", "started_at", "completed_at", "error_message", "error_details_json", "updated_at"])
     article = record.article
     spec = _video_spec(article)
     spec["generation"] = {
@@ -10773,6 +11756,7 @@ def internal_video_render_error(request: HttpRequest, render_id: str) -> JsonRes
         "provider": record.provider,
         "model_name": record.model_name or "",
         "status": "failed",
+        "outcome": "failed",
         "last_render_id": str(record.id),
         "spec_snapshot_hash": record.spec_snapshot_hash or "",
         "input_snapshot_hash": record.input_snapshot_hash or "",
