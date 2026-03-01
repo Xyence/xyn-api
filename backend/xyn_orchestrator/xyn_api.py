@@ -10,7 +10,7 @@ import uuid
 import hashlib
 import fnmatch
 from functools import wraps
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit, quote
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit, quote, unquote
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Set, Tuple
 
@@ -91,6 +91,8 @@ from .models import (
     ArtifactPackage,
     ArtifactInstallReceipt,
     ArtifactBindingValue,
+    ArtifactSurface,
+    ArtifactRuntimeRole,
     PublishBinding,
     VideoRender,
     WorkflowRun,
@@ -16799,4 +16801,318 @@ def blueprint_dev_tasks(request: HttpRequest, blueprint_id: str) -> JsonResponse
         for task in tasks
     ]
     return JsonResponse({"dev_tasks": data})
+
+
+@csrf_exempt
+def workspace_detail(request: HttpRequest, workspace_id: str) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    workspace = get_object_or_404(Workspace, id=workspace_id)
+    membership = _workspace_membership(identity, str(workspace.id))
+    can_manage = _is_platform_admin(identity) or bool(membership and membership.role == "admin")
+    if request.method == "GET":
+        if not membership and not _is_platform_admin(identity):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        return JsonResponse(
+            {
+                "workspace": {
+                    "id": str(workspace.id),
+                    "slug": workspace.slug,
+                    "name": workspace.name,
+                    "description": workspace.description,
+                    "status": workspace.status or "active",
+                    "role": membership.role if membership else "admin",
+                    "termination_authority": bool(membership.termination_authority) if membership else True,
+                }
+            }
+        )
+    if request.method not in {"PATCH", "PUT"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not can_manage:
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    update_fields: List[str] = []
+    if "name" in payload:
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return JsonResponse({"error": "name is required"}, status=400)
+        workspace.name = name
+        update_fields.append("name")
+    if "description" in payload:
+        workspace.description = str(payload.get("description") or "")
+        update_fields.append("description")
+    if "status" in payload:
+        status = str(payload.get("status") or "").strip().lower()
+        if status not in {"active", "deprecated"}:
+            return JsonResponse({"error": "invalid status"}, status=400)
+        workspace.status = status
+        update_fields.append("status")
+    if "slug" in payload:
+        slug = str(payload.get("slug") or "").strip().lower()
+        if not slug:
+            return JsonResponse({"error": "slug is required"}, status=400)
+        if Workspace.objects.exclude(id=workspace.id).filter(slug=slug).exists():
+            return JsonResponse({"error": "workspace slug already exists"}, status=400)
+        workspace.slug = slug
+        update_fields.append("slug")
+    if not update_fields:
+        return JsonResponse(
+            {
+                "workspace": {
+                    "id": str(workspace.id),
+                    "slug": workspace.slug,
+                    "name": workspace.name,
+                    "description": workspace.description,
+                    "status": workspace.status,
+                    "role": membership.role if membership else "admin",
+                    "termination_authority": bool(membership.termination_authority) if membership else True,
+                }
+            }
+        )
+    workspace.save(update_fields=[*update_fields, "updated_at"])
+    return JsonResponse(
+        {
+            "workspace": {
+                "id": str(workspace.id),
+                "slug": workspace.slug,
+                "name": workspace.name,
+                "description": workspace.description,
+                "status": workspace.status or "active",
+                "role": membership.role if membership else "admin",
+                "termination_authority": bool(membership.termination_authority) if membership else True,
+            }
+        }
+    )
+
+
+UI_COMPONENT_REGISTRY: List[Dict[str, str]] = [
+    {"key": "articles.draft_editor", "description": "Article draft editor"},
+    {"key": "articles.explainer_editor", "description": "Explainer video editor"},
+    {"key": "workflows.editor", "description": "Workflow editor"},
+]
+
+
+def _serialize_artifact_surface(surface: ArtifactSurface) -> Dict[str, Any]:
+    return {
+        "id": str(surface.id),
+        "artifact_id": str(surface.artifact_id),
+        "key": surface.key,
+        "title": surface.title,
+        "description": surface.description or "",
+        "surface_kind": surface.surface_kind,
+        "route": surface.route,
+        "nav_visibility": surface.nav_visibility,
+        "nav_label": surface.nav_label,
+        "nav_icon": surface.nav_icon,
+        "nav_group": surface.nav_group,
+        "renderer": surface.renderer_json or {},
+        "context": surface.context_json or {},
+        "permissions": surface.permissions_json or {},
+        "sort_order": int(surface.sort_order or 0),
+        "created_at": surface.created_at,
+        "updated_at": surface.updated_at,
+    }
+
+
+def _serialize_artifact_runtime_role(role: ArtifactRuntimeRole) -> Dict[str, Any]:
+    return {
+        "id": str(role.id),
+        "artifact_id": str(role.artifact_id),
+        "role_kind": role.role_kind,
+        "spec": role.spec_json or {},
+        "enabled": bool(role.enabled),
+        "created_at": role.created_at,
+        "updated_at": role.updated_at,
+    }
+
+
+def _normalize_surface_path(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    without_query = raw.split("?", 1)[0].split("#", 1)[0].strip()
+    if not without_query.startswith("/"):
+        without_query = f"/{without_query}"
+    return without_query
+
+
+def _surface_route_match(route_pattern: str, path: str) -> Optional[Dict[str, str]]:
+    pattern = _normalize_surface_path(route_pattern)
+    candidate = _normalize_surface_path(path)
+    if not pattern or not candidate:
+        return None
+    pattern_parts = [part for part in pattern.split("/") if part]
+    candidate_parts = [part for part in candidate.split("/") if part]
+    if len(pattern_parts) != len(candidate_parts):
+        return None
+    params: Dict[str, str] = {}
+    for pattern_part, candidate_part in zip(pattern_parts, candidate_parts):
+        if pattern_part.startswith(":"):
+            key = pattern_part[1:].strip()
+            if not key:
+                return None
+            params[key] = unquote(candidate_part)
+            continue
+        if pattern_part != candidate_part:
+            return None
+    return params
+
+
+@csrf_exempt
+@login_required
+def artifact_surfaces_collection(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    surfaces = ArtifactSurface.objects.filter(artifact=artifact).order_by("sort_order", "key")
+    return JsonResponse({"artifact_id": str(artifact.id), "surfaces": [_serialize_artifact_surface(row) for row in surfaces]})
+
+
+@csrf_exempt
+@login_required
+def artifact_runtime_roles_collection(request: HttpRequest, artifact_id: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id)
+    roles = ArtifactRuntimeRole.objects.filter(artifact=artifact).order_by("role_kind", "id")
+    return JsonResponse({"artifact_id": str(artifact.id), "runtime_roles": [_serialize_artifact_runtime_role(row) for row in roles]})
+
+
+@csrf_exempt
+@login_required
+def artifact_surfaces_nav(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    identity = _identity_from_user(request.user)
+    surfaces = (
+        ArtifactSurface.objects.select_related("artifact", "artifact__type")
+        .filter(nav_visibility="always")
+        .order_by("nav_group", "sort_order", "title")
+    )
+    dedupe: Set[Tuple[str, str, str]] = set()
+    rows: List[Dict[str, Any]] = []
+    for surface in surfaces:
+        artifact = surface.artifact
+        if not _can_view_generic_artifact(identity, artifact):
+            continue
+        dedupe_key = (
+            str(surface.nav_group or "").strip().lower(),
+            str(surface.nav_label or surface.title or "").strip().lower(),
+            str(surface.route or "").strip().lower(),
+        )
+        if dedupe_key in dedupe:
+            continue
+        dedupe.add(dedupe_key)
+        rows.append(_serialize_artifact_surface(surface))
+    return JsonResponse({"surfaces": rows})
+
+
+@csrf_exempt
+@login_required
+def artifact_surface_resolve(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    path = _normalize_surface_path(request.GET.get("path") or "")
+    if not path:
+        return JsonResponse({"error": "path is required"}, status=400)
+    identity = _identity_from_user(request.user)
+    matches: List[Dict[str, Any]] = []
+    surfaces = ArtifactSurface.objects.select_related("artifact", "artifact__type").all()
+    for surface in surfaces:
+        params = _surface_route_match(surface.route, path)
+        if params is None:
+            continue
+        if not _can_view_generic_artifact(identity, surface.artifact):
+            continue
+        matches.append(
+            {
+                "surface": _serialize_artifact_surface(surface),
+                "artifact": _serialize_unified_artifact(surface.artifact),
+                "params": params,
+            }
+        )
+    if not matches:
+        return JsonResponse({"error": "surface not found"}, status=404)
+    matches.sort(
+        key=lambda row: (
+            0 if row["surface"].get("nav_visibility") == "always" else 1,
+            int(row["surface"].get("sort_order") or 0),
+            row["surface"].get("key") or "",
+        )
+    )
+    return JsonResponse(matches[0])
+
+
+@csrf_exempt
+@login_required
+def artifact_surface_registries(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    renderer_registry = [
+        {"type": "ui_component_ref", "description": "Render through registered UI component key"},
+        {"type": "generic_editor", "description": "Built-in schema-driven editor"},
+        {"type": "generic_dashboard", "description": "Built-in query/widget dashboard"},
+        {"type": "workflow_visualizer", "description": "Built-in workflow visualizer"},
+        {"type": "article_editor", "description": "Temporary article editor adapter"},
+    ]
+    return JsonResponse({"ui_components": UI_COMPONENT_REGISTRY, "renderers": renderer_registry})
+
+
+@csrf_exempt
+def video_render_asset_download(request: HttpRequest, render_id: str, asset_index: int) -> HttpResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    record = get_object_or_404(VideoRender.objects.select_related("article"), id=render_id)
+    if not _can_view_article(identity, record.article):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if asset_index < 0:
+        return JsonResponse({"error": "invalid asset index"}, status=400)
+    assets = record.output_assets if isinstance(record.output_assets, list) else []
+    if asset_index >= len(assets):
+        return JsonResponse({"error": "asset not found"}, status=404)
+    asset = assets[asset_index] if isinstance(assets[asset_index], dict) else {}
+    source_url = str(asset.get("url") or "").strip()
+    fetch_url, fetch_error = _resolve_video_asset_fetch_url(record, source_url)
+    if not fetch_url:
+        return JsonResponse({"error": fetch_error or "asset download url unavailable"}, status=400)
+    try:
+        upstream = requests.get(fetch_url, timeout=120)
+    except requests.RequestException as exc:
+        return JsonResponse({"error": f"asset fetch failed: {exc}"}, status=502)
+    if upstream.status_code >= 400:
+        body_excerpt = (upstream.text or "")[:1000]
+        return JsonResponse(
+            {
+                "error": "asset fetch failed",
+                "upstream_status": upstream.status_code,
+                "upstream_body_excerpt": body_excerpt,
+            },
+            status=502,
+        )
+    content_type = str(upstream.headers.get("Content-Type") or "application/octet-stream")
+    file_name = (
+        f"video-render-{record.id}.mp4"
+        if str(asset.get("type") or "").strip().lower() == "video"
+        else f"render-asset-{record.id}"
+    )
+    response = HttpResponse(upstream.content, content_type=content_type)
+    response["Content-Disposition"] = f'attachment; filename="{file_name}"'
+    response["Cache-Control"] = "no-store"
+    return response
+
+
 logger = logging.getLogger(__name__)
