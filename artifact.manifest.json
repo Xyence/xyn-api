@@ -1,0 +1,17 @@
+{
+  "artifact": {
+    "id": "xyn-api",
+    "name": "xyn-api",
+    "version": "phase1"
+  },
+  "roles": [
+    {
+      "role": "api_router",
+      "mount_path": "/xyn/api",
+      "entrypoint": "xyn_orchestrator.xyn_seed_entrypoint:router",
+      "pythonpath": [
+        "xyn-api/backend"
+      ]
+    }
+  ]
+}

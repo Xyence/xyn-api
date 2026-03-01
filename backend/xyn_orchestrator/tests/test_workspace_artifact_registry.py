@@ -1,5 +1,10 @@
 import json
+import importlib
+import os
+import tempfile
+from pathlib import Path
 
+from django.apps import apps as django_apps
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
@@ -10,8 +15,13 @@ from xyn_orchestrator.models import (
     ArtifactType,
     UserIdentity,
     Workspace,
+    WorkspaceArtifactBinding,
     WorkspaceMembership,
 )
+
+backfill_workspace_artifact_bindings = importlib.import_module(
+    "xyn_orchestrator.migrations.0092_workspace_artifact_bindings"
+).backfill_workspace_artifact_bindings
 
 
 class WorkspaceArtifactRegistryTests(TestCase):
@@ -114,3 +124,218 @@ class WorkspaceArtifactRegistryTests(TestCase):
         )
         self.assertEqual(second.status_code, 400)
         self.assertEqual(second.json().get("error"), "slug already exists in this workspace")
+
+    def test_workspace_artifacts_list_returns_only_bound_artifacts(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        other_workspace = Workspace.objects.create(slug="other-lab", name="Other Lab")
+        WorkspaceMembership.objects.create(workspace=other_workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+
+        included = Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="Included", status="draft")
+        excluded = Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="Excluded", status="draft")
+        Artifact.objects.create(workspace=other_workspace, type=self.article_type, title="Other Workspace", status="draft")
+
+        WorkspaceArtifactBinding.objects.create(workspace=self.workspace, artifact=included, installed_state="installed")
+        WorkspaceArtifactBinding.objects.create(workspace=other_workspace, artifact=excluded, installed_state="installed")
+
+        response = self.client.get(f"/xyn/api/workspaces/{self.workspace.id}/artifacts")
+        self.assertEqual(response.status_code, 200)
+        artifact_ids = {row["artifact_id"] for row in response.json().get("artifacts", [])}
+        self.assertEqual(artifact_ids, {str(included.id)})
+
+    def test_backfill_workspace_artifact_bindings_creates_rows(self):
+        artifact = Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="Needs binding", status="draft")
+        self.assertFalse(WorkspaceArtifactBinding.objects.filter(artifact=artifact).exists())
+
+        backfill_workspace_artifact_bindings(django_apps, None)
+
+        binding = WorkspaceArtifactBinding.objects.filter(artifact=artifact).first()
+        self.assertIsNotNone(binding)
+        self.assertEqual(str(binding.workspace_id), str(self.workspace.id))
+        self.assertEqual(binding.installed_state, "installed")
+
+    def test_internal_workspace_artifacts_requires_token_and_returns_installed_enabled(self):
+        artifact = Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="Installed", status="published")
+        WorkspaceArtifactBinding.objects.create(
+            workspace=self.workspace,
+            artifact=artifact,
+            enabled=True,
+            installed_state="installed",
+        )
+        WorkspaceArtifactBinding.objects.create(
+            workspace=self.workspace,
+            artifact=Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="Disabled", status="published"),
+            enabled=False,
+            installed_state="installed",
+        )
+        WorkspaceArtifactBinding.objects.create(
+            workspace=self.workspace,
+            artifact=Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="Pending", status="published"),
+            enabled=True,
+            installed_state="pending",
+        )
+
+        os.environ["XYENCE_INTERNAL_TOKEN"] = "seed-token"
+        try:
+            denied = self.client.get(f"/xyn/internal/workspaces/{self.workspace.id}/artifacts")
+            self.assertEqual(denied.status_code, 401)
+
+            allowed = self.client.get(
+                f"/xyn/internal/workspaces/{self.workspace.id}/artifacts",
+                HTTP_X_INTERNAL_TOKEN="seed-token",
+            )
+            self.assertEqual(allowed.status_code, 200)
+            rows = allowed.json().get("artifacts", [])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["artifact_id"], str(artifact.id))
+        finally:
+            os.environ.pop("XYENCE_INTERNAL_TOKEN", None)
+
+    def test_nav_surfaces_include_manifest_entries_for_bound_workspace_artifacts(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "hello.manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": {"id": "xyn-hello-app", "name": "Hello App", "version": "phase1c"},
+                        "surfaces": {
+                            "nav": [
+                                {"label": "Hello", "path": "/apps/hello", "order": 900, "group": "build"},
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            artifact = Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="Hello App",
+                slug="xyn-hello-app",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(manifest_path), "slug": "xyn-hello-app"},
+            )
+            WorkspaceArtifactBinding.objects.create(
+                workspace=self.workspace,
+                artifact=artifact,
+                enabled=True,
+                installed_state="installed",
+            )
+            response = self.client.get(f"/xyn/api/artifact-surfaces/nav?workspace_id={self.workspace.id}")
+        self.assertEqual(response.status_code, 200)
+        routes = {row.get("route") for row in response.json().get("surfaces", [])}
+        self.assertIn("/apps/hello", routes)
+
+    def test_nav_surfaces_exclude_disabled_or_uninstalled_bindings(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "hello.manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": {"id": "xyn-hello-app", "name": "Hello App", "version": "phase1c"},
+                        "surfaces": {"nav": [{"label": "Hello", "path": "/apps/hello"}]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            disabled = Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="Hello Disabled",
+                slug="xyn-hello-disabled",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(manifest_path)},
+            )
+            pending = Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="Hello Pending",
+                slug="xyn-hello-pending",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(manifest_path)},
+            )
+            WorkspaceArtifactBinding.objects.create(
+                workspace=self.workspace,
+                artifact=disabled,
+                enabled=False,
+                installed_state="installed",
+            )
+            WorkspaceArtifactBinding.objects.create(
+                workspace=self.workspace,
+                artifact=pending,
+                enabled=True,
+                installed_state="pending",
+            )
+            response = self.client.get(f"/xyn/api/artifact-surfaces/nav?workspace_id={self.workspace.id}")
+        self.assertEqual(response.status_code, 200)
+        routes = {row.get("route") for row in response.json().get("surfaces", [])}
+        self.assertNotIn("/apps/hello", routes)
+
+    def test_nav_surfaces_are_workspace_scoped(self):
+        other_workspace = Workspace.objects.create(slug="other-lab", name="Other Lab")
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        WorkspaceMembership.objects.create(workspace=other_workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ws_a_manifest = Path(tmpdir) / "a.manifest.json"
+            ws_b_manifest = Path(tmpdir) / "b.manifest.json"
+            ws_a_manifest.write_text(
+                json.dumps({"surfaces": {"nav": [{"label": "Hello A", "path": "/apps/hello-a", "order": 10}]}}),
+                encoding="utf-8",
+            )
+            ws_b_manifest.write_text(
+                json.dumps({"surfaces": {"nav": [{"label": "Hello B", "path": "/apps/hello-b", "order": 10}]}}),
+                encoding="utf-8",
+            )
+            artifact_a = Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="Hello A",
+                slug="hello-a",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(ws_a_manifest)},
+            )
+            artifact_b = Artifact.objects.create(
+                workspace=other_workspace,
+                type=module_type,
+                title="Hello B",
+                slug="hello-b",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(ws_b_manifest)},
+            )
+            WorkspaceArtifactBinding.objects.create(
+                workspace=self.workspace,
+                artifact=artifact_a,
+                enabled=True,
+                installed_state="installed",
+            )
+            WorkspaceArtifactBinding.objects.create(
+                workspace=other_workspace,
+                artifact=artifact_b,
+                enabled=True,
+                installed_state="installed",
+            )
+
+            response_a = self.client.get(f"/xyn/api/artifact-surfaces/nav?workspace_id={self.workspace.id}")
+            response_b = self.client.get(f"/xyn/api/artifact-surfaces/nav?workspace_id={other_workspace.id}")
+
+        self.assertEqual(response_a.status_code, 200)
+        self.assertEqual(response_b.status_code, 200)
+        routes_a = {row.get("route") for row in response_a.json().get("surfaces", [])}
+        routes_b = {row.get("route") for row in response_b.json().get("surfaces", [])}
+        self.assertIn("/apps/hello-a", routes_a)
+        self.assertNotIn("/apps/hello-b", routes_a)
+        self.assertIn("/apps/hello-b", routes_b)
+        self.assertNotIn("/apps/hello-a", routes_b)

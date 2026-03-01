@@ -91,6 +91,7 @@ from .models import (
     ArtifactPackage,
     ArtifactInstallReceipt,
     ArtifactBindingValue,
+    WorkspaceArtifactBinding,
     ArtifactSurface,
     ArtifactRuntimeRole,
     PublishBinding,
@@ -6264,6 +6265,30 @@ def _serialize_artifact_summary(artifact: Artifact) -> Dict[str, Any]:
     }
 
 
+def _serialize_workspace_artifact_binding(binding: WorkspaceArtifactBinding) -> Dict[str, Any]:
+    artifact = binding.artifact
+    description = (artifact.summary or "").strip()
+    scope = artifact.scope_json if isinstance(artifact.scope_json, dict) else {}
+    manifest_ref = str(scope.get("manifest_ref") or "").strip()
+    if not description and isinstance(artifact.scope_json, dict):
+        description = str(artifact.scope_json.get("summary") or "").strip()
+    return {
+        "binding_id": str(binding.id),
+        "artifact_id": str(artifact.id),
+        "name": artifact.title,
+        "title": artifact.title,
+        "kind": artifact.type.slug if artifact.type_id else None,
+        "category": artifact.type.slug if artifact.type_id else None,
+        "description": description or None,
+        "enabled": bool(binding.enabled),
+        "installed_state": str(binding.installed_state or "installed"),
+        "version": artifact.version,
+        "slug": _artifact_slug(artifact),
+        "manifest_ref": manifest_ref or None,
+        "updated_at": artifact.updated_at,
+    }
+
+
 def _serialize_comment(comment: ArtifactComment) -> Dict[str, Any]:
     return {
         "id": str(comment.id),
@@ -8163,20 +8188,48 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
                 external_id=str(artifact.id),
                 slug_path=slug,
             )
+            WorkspaceArtifactBinding.objects.get_or_create(
+                workspace=workspace,
+                artifact=artifact,
+                defaults={
+                    "enabled": True,
+                    "installed_state": "installed",
+                    "config_ref": None,
+                },
+            )
             _record_artifact_event(artifact, "artifact_created", identity, {"workspace_id": str(workspace.id)})
         return JsonResponse({"id": str(artifact.id)})
 
     artifact_type = request.GET.get("type") or ""
     status = request.GET.get("status") or ""
-    qs = Artifact.objects.filter(workspace=workspace).select_related("type")
+    qs = WorkspaceArtifactBinding.objects.filter(workspace=workspace).select_related("artifact", "artifact__type")
     if artifact_type:
-        qs = qs.filter(type__slug=artifact_type)
+        qs = qs.filter(artifact__type__slug=artifact_type)
     if status:
-        qs = qs.filter(status=status)
+        qs = qs.filter(artifact__status=status)
     if membership.role == "reader":
-        qs = qs.filter(status="published").filter(visibility__in=["team", "public"])
-    data = [_serialize_artifact_summary(item) for item in qs.order_by("-published_at", "-updated_at")]
+        qs = qs.filter(artifact__status="published").filter(artifact__visibility__in=["team", "public"])
+    data = [_serialize_workspace_artifact_binding(item) for item in qs.order_by("-artifact__updated_at", "-updated_at")]
     return JsonResponse({"artifacts": data})
+
+
+@csrf_exempt
+def internal_workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> JsonResponse:
+    if auth_error := _require_internal_token(request):
+        return auth_error
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    workspace = get_object_or_404(Workspace, id=workspace_id)
+    qs = (
+        WorkspaceArtifactBinding.objects.filter(
+            workspace=workspace,
+            enabled=True,
+            installed_state="installed",
+        )
+        .select_related("artifact", "artifact__type")
+        .order_by("-artifact__updated_at", "-updated_at")
+    )
+    return JsonResponse({"artifacts": [_serialize_workspace_artifact_binding(item) for item in qs]})
 
 
 @csrf_exempt
@@ -16937,6 +16990,106 @@ def _normalize_surface_path(value: str) -> str:
     return without_query
 
 
+def _manifest_roots() -> List[Path]:
+    default_root = str(Path(__file__).resolve().parents[3])
+    raw = os.getenv("XYN_KERNEL_MANIFEST_ROOTS", default_root).strip()
+    roots: List[Path] = []
+    for token in raw.split(os.pathsep):
+        part = token.strip()
+        if not part:
+            continue
+        roots.append(Path(part))
+    return roots
+
+
+def _resolve_manifest_path_for_artifact(artifact: Artifact) -> Optional[Path]:
+    scope = artifact.scope_json if isinstance(artifact.scope_json, dict) else {}
+    manifest_ref = str(scope.get("manifest_ref") or "").strip()
+    if not manifest_ref:
+        return None
+    candidate = Path(manifest_ref)
+    if candidate.is_absolute():
+        return candidate if candidate.exists() else None
+    for root in _manifest_roots():
+        resolved = root / manifest_ref
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def _load_artifact_manifest(artifact: Artifact) -> Dict[str, Any]:
+    manifest_path = _resolve_manifest_path_for_artifact(artifact)
+    if not manifest_path:
+        return {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        logger.warning("failed to load manifest artifact_id=%s path=%s error=%s", artifact.id, manifest_path, exc)
+        return {}
+
+
+def _manifest_nav_surfaces(binding: WorkspaceArtifactBinding) -> List[Dict[str, Any]]:
+    artifact = binding.artifact
+    manifest = _load_artifact_manifest(artifact)
+    surfaces = manifest.get("surfaces") if isinstance(manifest.get("surfaces"), dict) else {}
+    nav_entries = surfaces.get("nav") if isinstance(surfaces.get("nav"), list) else []
+    rows: List[Dict[str, Any]] = []
+
+    for idx, entry in enumerate(nav_entries):
+        if not isinstance(entry, dict):
+            logger.warning("ignored invalid manifest nav entry artifact_id=%s index=%s", artifact.id, idx)
+            continue
+        label = str(entry.get("label") or "").strip()
+        route = _normalize_surface_path(str(entry.get("path") or ""))
+        if not label or not route:
+            logger.warning("ignored manifest nav entry missing label/path artifact_id=%s index=%s", artifact.id, idx)
+            continue
+        order_raw = entry.get("order", 1000)
+        try:
+            sort_order = int(order_raw)
+        except (TypeError, ValueError):
+            sort_order = 1000
+        nav_group = str(entry.get("group") or "build").strip().lower() or "build"
+        nav_icon = str(entry.get("icon") or "").strip() or None
+        description = str(entry.get("description") or "").strip() or None
+        permissions = entry.get("permissions") if isinstance(entry.get("permissions"), dict) else {}
+        rows.append(
+            {
+                "id": f"manifest-nav-{artifact.id}-{idx}",
+                "artifact_id": str(artifact.id),
+                "key": f"manifest-nav-{idx}",
+                "title": label,
+                "description": description,
+                "surface_kind": "docs",
+                "route": route,
+                "nav_visibility": "always",
+                "nav_label": label,
+                "nav_icon": nav_icon,
+                "nav_group": nav_group,
+                "renderer": {"type": "ui_mount"},
+                "context": {"source": "manifest"},
+                "permissions": permissions,
+                "sort_order": sort_order,
+                "created_at": artifact.created_at,
+                "updated_at": artifact.updated_at,
+                "_source_kind": "manifest",
+                "_artifact_title": artifact.title,
+            }
+        )
+    return rows
+
+
+def _resolve_nav_workspace(identity: UserIdentity, requested_workspace_id: str) -> Optional[Workspace]:
+    if requested_workspace_id:
+        membership = WorkspaceMembership.objects.select_related("workspace").filter(
+            workspace_id=requested_workspace_id, user_identity=identity
+        ).first()
+        return membership.workspace if membership else None
+    fallback = WorkspaceMembership.objects.select_related("workspace").filter(user_identity=identity).order_by("workspace__name").first()
+    return fallback.workspace if fallback else None
+
+
 def _surface_route_match(route_pattern: str, path: str) -> Optional[Dict[str, str]]:
     pattern = _normalize_surface_path(route_pattern)
     candidate = _normalize_surface_path(path)
@@ -16990,27 +17143,74 @@ def artifact_surfaces_nav(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "method not allowed"}, status=405)
     if staff_error := _require_staff(request):
         return staff_error
-    identity = _identity_from_user(request.user)
-    surfaces = (
-        ArtifactSurface.objects.select_related("artifact", "artifact__type")
-        .filter(nav_visibility="always")
-        .order_by("nav_group", "sort_order", "title")
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    workspace_id = str(request.GET.get("workspace_id") or "").strip()
+    workspace = _resolve_nav_workspace(identity, workspace_id)
+    if not workspace:
+        if workspace_id:
+            return JsonResponse({"error": "forbidden"}, status=403)
+        return JsonResponse({"surfaces": []})
+
+    bindings = list(
+        WorkspaceArtifactBinding.objects.filter(
+            workspace=workspace,
+            enabled=True,
+            installed_state="installed",
+        ).select_related("artifact", "artifact__type")
     )
-    dedupe: Set[Tuple[str, str, str]] = set()
-    rows: List[Dict[str, Any]] = []
-    for surface in surfaces:
-        artifact = surface.artifact
-        if not _can_view_generic_artifact(identity, artifact):
-            continue
-        dedupe_key = (
-            str(surface.nav_group or "").strip().lower(),
-            str(surface.nav_label or surface.title or "").strip().lower(),
-            str(surface.route or "").strip().lower(),
+    artifacts = [binding.artifact for binding in bindings]
+    artifact_ids = [artifact.id for artifact in artifacts]
+
+    entries: List[Dict[str, Any]] = []
+    if artifact_ids:
+        legacy_rows = (
+            ArtifactSurface.objects.select_related("artifact", "artifact__type")
+            .filter(artifact_id__in=artifact_ids, nav_visibility="always")
+            .order_by("nav_group", "sort_order", "title")
         )
-        if dedupe_key in dedupe:
+        for surface in legacy_rows:
+            if not _can_view_generic_artifact(identity, surface.artifact):
+                continue
+            row = _serialize_artifact_surface(surface)
+            row["_source_kind"] = "legacy"
+            row["_artifact_title"] = surface.artifact.title
+            entries.append(row)
+
+    for binding in bindings:
+        if not _can_view_generic_artifact(identity, binding.artifact):
             continue
-        dedupe.add(dedupe_key)
-        rows.append(_serialize_artifact_surface(surface))
+        entries.extend(_manifest_nav_surfaces(binding))
+
+    entries.sort(
+        key=lambda row: (
+            str(row.get("nav_group") or "build").strip().lower() or "build",
+            int(row.get("sort_order") or 0),
+            str(row.get("nav_label") or row.get("title") or "").strip().lower(),
+        )
+    )
+
+    rows: List[Dict[str, Any]] = []
+    seen_paths: Dict[str, Dict[str, str]] = {}
+    for row in entries:
+        route = _normalize_surface_path(str(row.get("route") or ""))
+        if not route:
+            continue
+        current_artifact_id = str(row.get("artifact_id") or "")
+        if route in seen_paths:
+            previous = seen_paths[route]
+            logger.warning(
+                "duplicate nav path ignored path=%s kept_artifact=%s dropped_artifact=%s",
+                route,
+                previous.get("artifact_id"),
+                current_artifact_id,
+            )
+            continue
+        seen_paths[route] = {"artifact_id": current_artifact_id}
+        row.pop("_source_kind", None)
+        row.pop("_artifact_title", None)
+        rows.append(row)
     return JsonResponse({"surfaces": rows})
 
 
