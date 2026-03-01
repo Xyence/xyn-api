@@ -143,6 +143,45 @@ class WorkspaceArtifactRegistryTests(TestCase):
         artifact_ids = {row["artifact_id"] for row in response.json().get("artifacts", [])}
         self.assertEqual(artifact_ids, {str(included.id)})
 
+    def test_install_workspace_artifact_binding_is_idempotent(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        artifact = Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="Installable", slug="installable", status="published")
+
+        first = self.client.post(
+            f"/xyn/api/workspaces/{self.workspace.id}/artifacts",
+            data=json.dumps({"artifact_id": str(artifact.id), "enabled": True}),
+            content_type="application/json",
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first.json().get("created"))
+        first_binding_id = first.json().get("artifact", {}).get("binding_id")
+        self.assertTrue(first_binding_id)
+
+        second = self.client.post(
+            f"/xyn/api/workspaces/{self.workspace.id}/artifacts",
+            data=json.dumps({"artifact_id": str(artifact.id), "enabled": True}),
+            content_type="application/json",
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(second.json().get("created"))
+        self.assertEqual(second.json().get("artifact", {}).get("binding_id"), first_binding_id)
+        self.assertEqual(
+            WorkspaceArtifactBinding.objects.filter(workspace=self.workspace, artifact=artifact).count(),
+            1,
+        )
+
+    def test_uninstall_workspace_artifact_binding_deletes_binding(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        artifact = Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="Installed", slug="installed", status="published")
+        binding = WorkspaceArtifactBinding.objects.create(workspace=self.workspace, artifact=artifact, enabled=True, installed_state="installed")
+
+        response = self.client.delete(f"/xyn/api/workspaces/{self.workspace.id}/artifacts/{binding.id}")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json().get("deleted"))
+        self.assertFalse(WorkspaceArtifactBinding.objects.filter(id=binding.id).exists())
+
     def test_backfill_workspace_artifact_bindings_creates_rows(self):
         artifact = Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="Needs binding", status="draft")
         self.assertFalse(WorkspaceArtifactBinding.objects.filter(artifact=artifact).exists())

@@ -8137,6 +8137,37 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
         if not _workspace_has_role(identity, workspace_id, "contributor"):
             return JsonResponse({"error": "forbidden"}, status=403)
         payload = _parse_json(request)
+        install_artifact_ref = str(payload.get("artifact_id") or payload.get("slug") or "").strip()
+        if install_artifact_ref:
+            target_artifact: Optional[Artifact] = None
+            try:
+                target_artifact = Artifact.objects.filter(id=install_artifact_ref).select_related("type").first()
+            except Exception:
+                target_artifact = None
+            if not target_artifact:
+                target_artifact = (
+                    Artifact.objects.filter(slug=install_artifact_ref)
+                    .order_by("-updated_at")
+                    .select_related("type")
+                    .first()
+                )
+            if not target_artifact:
+                return JsonResponse({"error": "artifact not found"}, status=404)
+            enabled = bool(payload.get("enabled", True))
+            binding, created = WorkspaceArtifactBinding.objects.get_or_create(
+                workspace=workspace,
+                artifact=target_artifact,
+                defaults={
+                    "enabled": enabled,
+                    "installed_state": "installed",
+                    "config_ref": str(payload.get("config_ref") or "").strip() or None,
+                },
+            )
+            if not created and binding.installed_state != "installed":
+                binding.installed_state = "installed"
+                binding.enabled = enabled
+                binding.save(update_fields=["installed_state", "enabled", "updated_at"])
+            return JsonResponse({"artifact": _serialize_workspace_artifact_binding(binding), "created": created})
         type_slug = str(payload.get("type") or "article").strip().lower()
         artifact_type = ArtifactType.objects.filter(slug=type_slug).first()
         if not artifact_type:
@@ -8240,6 +8271,15 @@ def workspace_artifact_detail(request: HttpRequest, workspace_id: str, artifact_
     membership = _workspace_membership(identity, workspace_id)
     if not membership:
         return JsonResponse({"error": "forbidden"}, status=403)
+    if request.method == "DELETE":
+        if not _workspace_has_role(identity, workspace_id, "contributor"):
+            return JsonResponse({"error": "forbidden"}, status=403)
+        binding = WorkspaceArtifactBinding.objects.filter(workspace_id=workspace_id, id=artifact_id).select_related("artifact", "artifact__type").first()
+        if not binding:
+            return JsonResponse({"error": "binding not found"}, status=404)
+        payload = _serialize_workspace_artifact_binding(binding)
+        binding.delete()
+        return JsonResponse({"deleted": True, "artifact": payload})
     artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id, workspace_id=workspace_id)
     latest = _latest_artifact_revision(artifact)
     if request.method in ("PATCH", "PUT"):
