@@ -7237,7 +7237,6 @@ def _artifact_raw_entries(file_map: Dict[str, bytes], directory: str) -> List[Di
 
 
 @csrf_exempt
-@login_required
 def artifact_raw_metadata(request: HttpRequest, artifact_id: str) -> JsonResponse:
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
@@ -7265,7 +7264,6 @@ def artifact_raw_metadata(request: HttpRequest, artifact_id: str) -> JsonRespons
 
 
 @csrf_exempt
-@login_required
 def artifact_raw_artifact_json(request: HttpRequest, artifact_id: str) -> JsonResponse:
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
@@ -7276,7 +7274,6 @@ def artifact_raw_artifact_json(request: HttpRequest, artifact_id: str) -> JsonRe
 
 
 @csrf_exempt
-@login_required
 def artifact_raw_files(request: HttpRequest, artifact_id: str) -> JsonResponse:
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
@@ -7289,7 +7286,6 @@ def artifact_raw_files(request: HttpRequest, artifact_id: str) -> JsonResponse:
 
 
 @csrf_exempt
-@login_required
 def artifact_raw_file(request: HttpRequest, artifact_id: str) -> HttpResponse:
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
@@ -7322,7 +7318,6 @@ def artifact_raw_file(request: HttpRequest, artifact_id: str) -> HttpResponse:
 
 
 @csrf_exempt
-@login_required
 def artifact_package_raw_manifest(request: HttpRequest, package_id: str) -> JsonResponse:
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
@@ -7333,7 +7328,6 @@ def artifact_package_raw_manifest(request: HttpRequest, package_id: str) -> Json
 
 
 @csrf_exempt
-@login_required
 def artifact_package_raw_tree(request: HttpRequest, package_id: str) -> JsonResponse:
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
@@ -7354,7 +7348,6 @@ def artifact_package_raw_tree(request: HttpRequest, package_id: str) -> JsonResp
 
 
 @csrf_exempt
-@login_required
 def artifact_package_raw_file(request: HttpRequest, package_id: str) -> HttpResponse:
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
