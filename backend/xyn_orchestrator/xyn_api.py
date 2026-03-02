@@ -29,7 +29,7 @@ from django.utils.dateparse import parse_datetime
 from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
-from django.contrib.auth import get_user_model, login
+from django.contrib.auth import authenticate, get_user_model, login
 from jsonschema import Draft202012Validator
 
 from xyence.middleware import _get_or_create_user_from_claims, _verify_oidc_token
@@ -2744,6 +2744,9 @@ WORKSPACE_ROLE_RANK = {
     "admin": 5,
 }
 WORKSPACE_LIFECYCLE_STAGES = {"lead", "prospect", "customer", "churned", "internal"}
+WORKSPACE_AUTH_MODES = {"local", "oidc", "mixed"}
+WORKSPACE_MEMBER_ROLES = {"admin", "member"}
+LOCAL_IDENTITY_ISSUER = "local://xyn"
 
 
 def _workspace_membership(identity: UserIdentity, workspace_id: str) -> Optional[WorkspaceMembership]:
@@ -2787,6 +2790,77 @@ def _workspace_lifecycle_stage_or_default(value: str) -> str:
     return stage
 
 
+def _workspace_auth_mode_or_default(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if not mode:
+        return "local"
+    return mode
+
+
+def _workspace_role_to_member_role(role: str) -> str:
+    return "admin" if str(role or "").strip().lower() == "admin" else "member"
+
+
+def _member_role_to_workspace_role(role: str) -> str:
+    normalized = str(role or "").strip().lower()
+    if normalized == "admin":
+        return "admin"
+    return "reader"
+
+
+def _local_username_for_email(email: str) -> str:
+    normalized = str(email or "").strip().lower()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    return f"local:{digest}"
+
+
+def _ensure_local_identity(email: str) -> UserIdentity:
+    normalized = str(email or "").strip().lower()
+    display_name = normalized.split("@", 1)[0] if "@" in normalized else normalized
+    identity, _ = UserIdentity.objects.get_or_create(
+        issuer=LOCAL_IDENTITY_ISSUER,
+        subject=normalized,
+        defaults={
+            "provider": "local",
+            "provider_id": "local",
+            "email": normalized,
+            "display_name": display_name,
+            "claims_json": {"email": normalized, "provider": "local"},
+        },
+    )
+    if not identity.email:
+        identity.email = normalized
+        identity.save(update_fields=["email", "updated_at"])
+    return identity
+
+
+def _ensure_local_user(email: str, *, password: Optional[str] = None):
+    User = get_user_model()
+    normalized = str(email or "").strip().lower()
+    username = _local_username_for_email(normalized)
+    user, _ = User.objects.get_or_create(
+        username=username,
+        defaults={
+            "email": normalized,
+            "is_staff": False,
+            "is_active": True,
+        },
+    )
+    dirty = False
+    if normalized and user.email != normalized:
+        user.email = normalized
+        dirty = True
+    if password:
+        user.set_password(password)
+        dirty = True
+    if not user.is_active:
+        user.is_active = True
+        dirty = True
+    if dirty:
+        user.save()
+    return user
+
+
 def _serialize_workspace_summary(
     workspace: Workspace,
     *,
@@ -2801,6 +2875,8 @@ def _serialize_workspace_summary(
         "status": workspace.status or "active",
         "kind": str(workspace.kind or "customer"),
         "lifecycle_stage": str(workspace.lifecycle_stage or "prospect"),
+        "auth_mode": str(workspace.auth_mode or "local"),
+        "oidc_config_ref": str(workspace.oidc_config_ref or ""),
         "parent_workspace_id": str(workspace.parent_workspace_id) if workspace.parent_workspace_id else None,
         "org_name": str(workspace.org_name or workspace.name or "").strip(),
         "metadata": workspace.metadata_json if isinstance(workspace.metadata_json, dict) else {},
@@ -5439,6 +5515,9 @@ def auth_login(request: HttpRequest) -> HttpResponse:
     app_id = request.GET.get("appId") or "xyn-ui"
     client = _resolve_app_config(app_id)
     return_to = _sanitize_return_to(request.GET.get("returnTo") or request.GET.get("next") or "", request, client, app_id)
+    local_login_enabled = os.environ.get("XYN_ENABLE_LOCAL_USERS", "true").strip().lower() != "false"
+    login_error = str(request.GET.get("error") or "").strip()
+    login_email = str(request.GET.get("email") or "").strip()
     if client:
         config = _build_oidc_config_payload(client)
         providers = config.get("providers") or []
@@ -5459,6 +5538,9 @@ def auth_login(request: HttpRequest) -> HttpResponse:
             "default_provider_id": config.get("defaultProviderId"),
             "branding": branding,
             "login_title": f"Sign in to {branding.get('display_name') or app_id}",
+            "local_login_enabled": local_login_enabled,
+            "login_error": login_error,
+            "login_email": login_email,
         }
         response = render(request, "xyn_orchestrator/auth_login.html", context)
         # Provider lists are dynamic; avoid stale cached login pages pointing to removed providers.
@@ -5467,6 +5549,52 @@ def auth_login(request: HttpRequest) -> HttpResponse:
         return response
     request.session["post_login_redirect"] = return_to
     return _start_env_fallback_login(request, app_id=app_id, return_to=return_to)
+
+
+@csrf_exempt
+def auth_local_login(request: HttpRequest) -> HttpResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if os.environ.get("XYN_ENABLE_LOCAL_USERS", "true").strip().lower() == "false":
+        return JsonResponse({"error": "local auth disabled"}, status=403)
+    app_id = str(request.POST.get("appId") or "xyn-ui").strip() or "xyn-ui"
+    client = _resolve_app_config(app_id)
+    return_to = _sanitize_return_to(str(request.POST.get("returnTo") or ""), request, client, app_id)
+    email = str(request.POST.get("email") or "").strip().lower()
+    password = str(request.POST.get("password") or "")
+    if not email or not password:
+        login_url = f"/auth/login?appId={quote(app_id, safe='')}&returnTo={quote(return_to, safe='')}&error=missing_credentials&email={quote(email, safe='')}"
+        return redirect(login_url)
+
+    User = get_user_model()
+    user = User.objects.filter(email__iexact=email).first()
+    if not user:
+        login_url = f"/auth/login?appId={quote(app_id, safe='')}&returnTo={quote(return_to, safe='')}&error=invalid_credentials&email={quote(email, safe='')}"
+        return redirect(login_url)
+    authenticated = authenticate(request, username=user.username, password=password)
+    if not authenticated:
+        login_url = f"/auth/login?appId={quote(app_id, safe='')}&returnTo={quote(return_to, safe='')}&error=invalid_credentials&email={quote(email, safe='')}"
+        return redirect(login_url)
+
+    identity = UserIdentity.objects.filter(email__iexact=email).order_by("-last_login_at", "-updated_at").first()
+    if not identity:
+        identity = _ensure_local_identity(email)
+    identity.last_login_at = timezone.now()
+    if not identity.display_name:
+        identity.display_name = email.split("@", 1)[0] if "@" in email else email
+        identity.save(update_fields=["display_name", "last_login_at", "updated_at"])
+    else:
+        identity.save(update_fields=["last_login_at", "updated_at"])
+    roles = _get_roles(identity)
+    authenticated.email = email
+    authenticated.is_staff = bool(set(roles).intersection({"platform_owner", "platform_admin", "platform_architect"}))
+    authenticated.is_superuser = False
+    authenticated.is_active = True
+    authenticated.save()
+
+    login(request, authenticated, backend="django.contrib.auth.backends.ModelBackend")
+    request.session["user_identity_id"] = str(identity.id)
+    return redirect(return_to or "/app")
 
 
 @csrf_exempt
@@ -8196,6 +8324,20 @@ def workspaces_collection(request: HttpRequest) -> JsonResponse:
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
     if request.method == "GET":
+        if _is_platform_admin(identity):
+            rows = Workspace.objects.all().order_by("name")
+            return JsonResponse(
+                {
+                    "workspaces": [
+                        _serialize_workspace_summary(
+                            row,
+                            role="admin",
+                            termination_authority=True,
+                        )
+                        for row in rows
+                    ]
+                }
+            )
         memberships = WorkspaceMembership.objects.filter(user_identity=identity).select_related("workspace").order_by("workspace__name")
         return JsonResponse(
             {
@@ -8226,9 +8368,13 @@ def workspaces_collection(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "workspace slug already exists"}, status=400)
     kind = str(payload.get("kind") or "customer").strip().lower() or "customer"
     lifecycle_stage = _workspace_lifecycle_stage_or_default(str(payload.get("lifecycle_stage") or "prospect"))
+    auth_mode = _workspace_auth_mode_or_default(str(payload.get("auth_mode") or "local"))
     if lifecycle_stage not in WORKSPACE_LIFECYCLE_STAGES:
         return JsonResponse({"error": "invalid lifecycle_stage"}, status=400)
+    if auth_mode not in WORKSPACE_AUTH_MODES:
+        return JsonResponse({"error": "invalid auth_mode"}, status=400)
     org_name = str(payload.get("org_name") or name).strip() or name
+    oidc_config_ref = str(payload.get("oidc_config_ref") or "").strip()
     metadata = payload.get("metadata")
     if metadata is not None and not isinstance(metadata, dict):
         return JsonResponse({"error": "metadata must be an object"}, status=400)
@@ -8248,6 +8394,8 @@ def workspaces_collection(request: HttpRequest) -> JsonResponse:
         status="active",
         kind=kind,
         lifecycle_stage=lifecycle_stage,
+        auth_mode=auth_mode,
+        oidc_config_ref=oidc_config_ref,
         parent_workspace=parent_workspace,
         metadata_json=metadata or {},
     )
@@ -8667,22 +8815,67 @@ def workspace_memberships_collection(request: HttpRequest, workspace_id: str) ->
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _workspace_membership(identity, workspace_id) and not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
     if request.method == "POST":
-        if not _workspace_has_role(identity, workspace_id, "admin"):
+        if not _workspace_has_role(identity, workspace_id, "admin") and not _is_platform_admin(identity):
             return JsonResponse({"error": "forbidden"}, status=403)
         payload = _parse_json(request)
-        user_identity_id = str(payload.get("user_identity_id") or "")
-        role = str(payload.get("role") or "").strip().lower()
-        termination_authority = bool(payload.get("termination_authority", False))
-        if role not in WORKSPACE_ROLE_RANK:
-            return JsonResponse({"error": "invalid role"}, status=400)
-        user_identity = get_object_or_404(UserIdentity, id=user_identity_id)
+        requested_role = str(payload.get("role") or "").strip().lower() or "member"
+        if requested_role in WORKSPACE_ROLE_RANK:
+            workspace_role = requested_role
+            member_role = _workspace_role_to_member_role(workspace_role)
+        else:
+            if requested_role not in WORKSPACE_MEMBER_ROLES:
+                return JsonResponse({"error": "invalid role"}, status=400)
+            workspace_role = _member_role_to_workspace_role(requested_role)
+            member_role = requested_role
+
+        created_user = False
+        temp_password: Optional[str] = None
+        invite_link: Optional[str] = None
+
+        user_identity_id = str(payload.get("user_identity_id") or "").strip()
+        if user_identity_id:
+            user_identity = get_object_or_404(UserIdentity, id=user_identity_id)
+        else:
+            email = str(payload.get("email") or "").strip().lower()
+            if not email:
+                return JsonResponse({"error": "email is required"}, status=400)
+            user_identity = UserIdentity.objects.filter(email__iexact=email).order_by("-updated_at").first()
+            if not user_identity:
+                user_identity = _ensure_local_identity(email)
+                temp_password = secrets.token_urlsafe(12)
+                _ensure_local_user(email, password=temp_password)
+                created_user = True
+                invite_link = f"/auth/login?appId=xyn-ui&mode=local&email={quote(email, safe='')}"
+
         membership, _ = WorkspaceMembership.objects.update_or_create(
             workspace=workspace,
             user_identity=user_identity,
-            defaults={"role": role, "termination_authority": termination_authority},
+            defaults={"role": workspace_role, "termination_authority": member_role == "admin"},
         )
-        return JsonResponse({"id": str(membership.id)})
+        response_payload: Dict[str, Any] = {
+            "id": str(membership.id),
+            "member": {
+                "id": str(membership.id),
+                "workspace_id": str(membership.workspace_id),
+                "user_identity_id": str(membership.user_identity_id),
+                "email": membership.user_identity.email,
+                "display_name": membership.user_identity.display_name,
+                "role": _workspace_role_to_member_role(membership.role),
+                "termination_authority": bool(membership.termination_authority),
+                "created_at": membership.created_at,
+            },
+            "created_user": created_user,
+        }
+        if invite_link:
+            response_payload["invite_link"] = invite_link
+        if temp_password:
+            response_payload["temp_password"] = temp_password
+            response_payload["demo_mode"] = True
+        return JsonResponse(response_payload)
+
     members = WorkspaceMembership.objects.filter(workspace=workspace).select_related("user_identity").order_by("user_identity__email")
     return JsonResponse(
         {
@@ -8693,8 +8886,9 @@ def workspace_memberships_collection(request: HttpRequest, workspace_id: str) ->
                     "user_identity_id": str(member.user_identity_id),
                     "email": member.user_identity.email,
                     "display_name": member.user_identity.display_name,
-                    "role": member.role,
-                    "termination_authority": member.termination_authority,
+                    "role": _workspace_role_to_member_role(member.role),
+                    "termination_authority": bool(member.termination_authority),
+                    "created_at": member.created_at,
                 }
                 for member in members
             ]
@@ -8707,20 +8901,39 @@ def workspace_membership_detail(request: HttpRequest, workspace_id: str, members
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
-    if not _workspace_has_role(identity, workspace_id, "admin"):
+    if not _workspace_has_role(identity, workspace_id, "admin") and not _is_platform_admin(identity):
         return JsonResponse({"error": "forbidden"}, status=403)
     membership = get_object_or_404(WorkspaceMembership, id=membership_id, workspace_id=workspace_id)
+    if request.method == "DELETE":
+        membership.delete()
+        return JsonResponse({"status": "deleted"})
     if request.method != "PATCH":
         return JsonResponse({"error": "method not allowed"}, status=405)
     payload = _parse_json(request)
-    role = str(payload.get("role") or membership.role).strip().lower()
-    if role not in WORKSPACE_ROLE_RANK:
+    requested_role = str(payload.get("role") or "").strip().lower() or membership.role
+    if requested_role in WORKSPACE_MEMBER_ROLES:
+        role = _member_role_to_workspace_role(requested_role)
+    elif requested_role in WORKSPACE_ROLE_RANK:
+        role = requested_role
+    else:
         return JsonResponse({"error": "invalid role"}, status=400)
     membership.role = role
     if "termination_authority" in payload:
         membership.termination_authority = bool(payload.get("termination_authority"))
+    elif requested_role in WORKSPACE_MEMBER_ROLES:
+        membership.termination_authority = requested_role == "admin"
     membership.save(update_fields=["role", "termination_authority", "updated_at"])
-    return JsonResponse({"id": str(membership.id)})
+    return JsonResponse({"id": str(membership.id), "role": _workspace_role_to_member_role(membership.role)})
+
+
+@csrf_exempt
+def workspace_members_collection(request: HttpRequest, workspace_id: str) -> JsonResponse:
+    return workspace_memberships_collection(request, workspace_id)
+
+
+@csrf_exempt
+def workspace_member_detail(request: HttpRequest, workspace_id: str, member_id: str) -> JsonResponse:
+    return workspace_membership_detail(request, workspace_id, member_id)
 
 
 def _resolve_article_workspace(identity: UserIdentity, requested_workspace_id: str) -> Optional[Workspace]:
@@ -17255,6 +17468,15 @@ def workspace_detail(request: HttpRequest, workspace_id: str) -> JsonResponse:
             return JsonResponse({"error": "invalid lifecycle_stage"}, status=400)
         workspace.lifecycle_stage = lifecycle_stage
         update_fields.append("lifecycle_stage")
+    if "auth_mode" in payload:
+        auth_mode = _workspace_auth_mode_or_default(str(payload.get("auth_mode") or ""))
+        if auth_mode not in WORKSPACE_AUTH_MODES:
+            return JsonResponse({"error": "invalid auth_mode"}, status=400)
+        workspace.auth_mode = auth_mode
+        update_fields.append("auth_mode")
+    if "oidc_config_ref" in payload:
+        workspace.oidc_config_ref = str(payload.get("oidc_config_ref") or "").strip()
+        update_fields.append("oidc_config_ref")
     if "parent_workspace_id" in payload:
         raw_parent_id = payload.get("parent_workspace_id")
         parent_workspace_id = str(raw_parent_id or "").strip()
@@ -17543,8 +17765,6 @@ def artifact_runtime_roles_collection(request: HttpRequest, artifact_id: str) ->
 def artifact_surfaces_nav(request: HttpRequest) -> JsonResponse:
     if request.method != "GET":
         return JsonResponse({"error": "method not allowed"}, status=405)
-    if staff_error := _require_staff(request):
-        return staff_error
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)

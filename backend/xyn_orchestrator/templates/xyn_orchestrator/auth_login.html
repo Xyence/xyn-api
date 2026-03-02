@@ -81,6 +81,19 @@
         padding: 10px 12px;
         margin-bottom: 12px;
       }
+      .local-form {
+        margin-top: 14px;
+        display: grid;
+        gap: 10px;
+      }
+      .local-form input {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid rgba(16, 32, 58, 0.2);
+        border-radius: 10px;
+        padding: 10px 12px;
+        font: inherit;
+      }
     </style>
   </head>
   <body>
@@ -91,6 +104,10 @@
       </div>
       <h1>{{ login_title }}</h1>
       <p>Continue with your organization identity provider.</p>
+
+      {% if login_error %}
+      <div class="error">Sign-in failed: {{ login_error|escape }}.</div>
+      {% endif %}
 
       {% if providers %}
       <div class="provider-list">
@@ -105,6 +122,18 @@
       </div>
       {% else %}
       <div class="error">No enabled identity providers are configured for {{ app_id }}.</div>
+      {% endif %}
+
+      {% if local_login_enabled %}
+      <form class="local-form" method="post" action="/auth/local-login">
+        {% csrf_token %}
+        <input type="hidden" name="appId" value="{{ app_id }}" />
+        <input type="hidden" name="returnTo" value="{{ return_to }}" />
+        <input type="email" name="email" placeholder="Email" value="{{ login_email|default:'' }}" required />
+        <input type="password" name="password" placeholder="Temporary password" required />
+        <button class="provider-button" type="submit">Sign in with Local User</button>
+      </form>
+      <p class="muted">Demo mode: local users are enabled for workspace membership testing.</p>
       {% endif %}
 
       <p class="muted">App ID: {{ app_id }}</p>

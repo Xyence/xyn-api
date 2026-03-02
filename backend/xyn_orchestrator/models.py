@@ -833,6 +833,8 @@ class Workspace(models.Model):
         on_delete=models.SET_NULL,
         related_name="children",
     )
+    auth_mode = models.CharField(max_length=20, default="local")
+    oidc_config_ref = models.CharField(max_length=255, blank=True, default="")
     metadata_json = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
