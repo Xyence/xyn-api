@@ -264,6 +264,13 @@ class WorkspaceArtifactRegistryTests(TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertIn("manifest slug mismatch", str(response.json().get("error") or ""))
 
+    def test_blueprint_routes_disabled_by_default(self):
+        self._set_identity(self.admin_identity)
+        api_response = self.client.get("/xyn/api/blueprints")
+        web_response = self.client.get("/xyn/blueprints/")
+        self.assertEqual(api_response.status_code, 404)
+        self.assertEqual(web_response.status_code, 404)
+
     def test_install_workspace_artifact_binding_is_idempotent(self):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
         self._set_identity(self.admin_identity)
