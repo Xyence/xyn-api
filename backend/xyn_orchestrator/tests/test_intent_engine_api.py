@@ -484,13 +484,15 @@ class IntentEngineApiTests(TestCase):
 
     def test_deploy_ems_for_customer_creates_child_workspace_and_binding(self):
         module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
-        ems_artifact = Artifact.objects.create(
+        ems_artifact, _ = Artifact.objects.get_or_create(
             workspace=self.workspace,
-            type=module_type,
-            title="EMS-lite",
             slug="ems-lite",
-            status="published",
-            visibility="team",
+            defaults={
+                "type": module_type,
+                "title": "EMS-lite",
+                "status": "published",
+                "visibility": "team",
+            },
         )
         resolve_response = self.client.post(
             "/xyn/api/xyn/intent/resolve",
