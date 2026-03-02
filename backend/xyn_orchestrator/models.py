@@ -835,6 +835,20 @@ class Workspace(models.Model):
     )
     auth_mode = models.CharField(max_length=20, default="local")
     oidc_config_ref = models.CharField(max_length=255, blank=True, default="")
+    oidc_enabled = models.BooleanField(default=False)
+    oidc_issuer_url = models.URLField(blank=True, default="")
+    oidc_client_id = models.CharField(max_length=255, blank=True, default="")
+    oidc_client_secret_ref = models.ForeignKey(
+        SecretRef,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="workspace_oidc_policies",
+    )
+    oidc_scopes = models.CharField(max_length=255, default="openid profile email")
+    oidc_claim_email = models.CharField(max_length=120, default="email")
+    oidc_allow_auto_provision = models.BooleanField(default=False)
+    oidc_allowed_email_domains_json = models.JSONField(default=list, blank=True)
     metadata_json = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

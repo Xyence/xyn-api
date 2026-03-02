@@ -2747,6 +2747,9 @@ WORKSPACE_LIFECYCLE_STAGES = {"lead", "prospect", "customer", "churned", "intern
 WORKSPACE_AUTH_MODES = {"local", "oidc", "mixed"}
 WORKSPACE_MEMBER_ROLES = {"admin", "member"}
 LOCAL_IDENTITY_ISSUER = "local://xyn"
+WORKSPACE_OIDC_STATE_PREFIX = "workspace_oidc_state:"
+WORKSPACE_OIDC_VERIFIER_PREFIX = "workspace_oidc_verifier:"
+WORKSPACE_OIDC_NONCE_PREFIX = "workspace_oidc_nonce:"
 
 
 def _workspace_membership(identity: UserIdentity, workspace_id: str) -> Optional[WorkspaceMembership]:
@@ -2795,6 +2798,58 @@ def _workspace_auth_mode_or_default(value: str) -> str:
     if not mode:
         return "local"
     return mode
+
+
+def _normalize_allowed_domains(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = [part.strip().lower() for part in value.split(",")]
+    elif isinstance(value, list):
+        raw_items = [str(part or "").strip().lower() for part in value]
+    else:
+        raw_items = []
+    return [item for item in raw_items if item]
+
+
+def _workspace_allows_local_auth(workspace: Workspace) -> bool:
+    mode = _workspace_auth_mode_or_default(workspace.auth_mode)
+    return mode in {"local", "mixed"}
+
+
+def _workspace_allows_oidc_auth(workspace: Workspace) -> bool:
+    mode = _workspace_auth_mode_or_default(workspace.auth_mode)
+    return mode in {"oidc", "mixed"} and bool(workspace.oidc_enabled)
+
+
+def _workspace_oidc_client_secret(workspace: Workspace) -> Optional[str]:
+    if not workspace.oidc_client_secret_ref_id:
+        return None
+    ref = SecretRef.objects.filter(id=workspace.oidc_client_secret_ref_id).select_related("store").first()
+    if not ref:
+        return None
+    return resolve_oidc_secret_ref({"type": "aws.secrets_manager", "ref": ref.external_ref})
+
+
+def _serialize_workspace_auth_policy(workspace: Workspace) -> Dict[str, Any]:
+    return {
+        "workspace_id": str(workspace.id),
+        "auth_mode": _workspace_auth_mode_or_default(workspace.auth_mode),
+        "oidc_enabled": bool(workspace.oidc_enabled),
+        "oidc_issuer_url": str(workspace.oidc_issuer_url or ""),
+        "oidc_client_id": str(workspace.oidc_client_id or ""),
+        "oidc_client_secret_ref_id": str(workspace.oidc_client_secret_ref_id) if workspace.oidc_client_secret_ref_id else None,
+        "oidc_scopes": str(workspace.oidc_scopes or "openid profile email"),
+        "oidc_claim_email": str(workspace.oidc_claim_email or "email"),
+        "oidc_allow_auto_provision": bool(workspace.oidc_allow_auto_provision),
+        "oidc_allowed_email_domains": _normalize_allowed_domains(workspace.oidc_allowed_email_domains_json),
+    }
+
+
+def _workspace_sso_status(workspace: Workspace) -> str:
+    if _workspace_allows_oidc_auth(workspace) and str(workspace.oidc_issuer_url or "").startswith("https://") and str(workspace.oidc_client_id or "").strip():
+        return "ready"
+    return "not_configured"
 
 
 def _workspace_role_to_member_role(role: str) -> str:
@@ -2877,6 +2932,18 @@ def _serialize_workspace_summary(
         "lifecycle_stage": str(workspace.lifecycle_stage or "prospect"),
         "auth_mode": str(workspace.auth_mode or "local"),
         "oidc_config_ref": str(workspace.oidc_config_ref or ""),
+        "oidc_enabled": bool(workspace.oidc_enabled),
+        "oidc_issuer_url": str(workspace.oidc_issuer_url or ""),
+        "oidc_client_id": str(workspace.oidc_client_id or ""),
+        "oidc_client_secret_ref_id": str(workspace.oidc_client_secret_ref_id) if workspace.oidc_client_secret_ref_id else None,
+        "oidc_scopes": str(workspace.oidc_scopes or "openid profile email"),
+        "oidc_claim_email": str(workspace.oidc_claim_email or "email"),
+        "oidc_allow_auto_provision": bool(workspace.oidc_allow_auto_provision),
+        "oidc_allowed_email_domains": _normalize_allowed_domains(workspace.oidc_allowed_email_domains_json),
+        "tenant_auth_status": {
+            "sso": "ready" if _workspace_sso_status(workspace) == "ready" else "not_configured",
+            "local_login": "enabled" if _workspace_allows_local_auth(workspace) else "disabled",
+        },
         "parent_workspace_id": str(workspace.parent_workspace_id) if workspace.parent_workspace_id else None,
         "org_name": str(workspace.org_name or workspace.name or "").strip(),
         "metadata": workspace.metadata_json if isinstance(workspace.metadata_json, dict) else {},
@@ -5595,6 +5662,252 @@ def auth_local_login(request: HttpRequest) -> HttpResponse:
     login(request, authenticated, backend="django.contrib.auth.backends.ModelBackend")
     request.session["user_identity_id"] = str(identity.id)
     return redirect(return_to or "/app")
+
+
+def _oidc_token_kid(token: str) -> str:
+    try:
+        header_b64 = token.split(".")[0]
+        header_b64 += "=" * (-len(header_b64) % 4)
+        header = json.loads(base64.urlsafe_b64decode(header_b64.encode("utf-8")).decode("utf-8"))
+        return str(header.get("kid") or "")
+    except Exception:
+        return ""
+
+
+def _decode_workspace_oidc_id_token(
+    *,
+    id_token: str,
+    issuer_url: str,
+    client_id: str,
+    nonce: str,
+    jwks_uri: str,
+) -> Optional[Dict[str, Any]]:
+    try:
+        jwks_response = requests.get(jwks_uri, timeout=10)
+        jwks_response.raise_for_status()
+        jwks = jwks_response.json()
+        key_set = JsonWebKey.import_key_set(jwks)
+        claims = jwt.decode(
+            id_token,
+            key_set,
+            claims_options={
+                "iss": {"value": issuer_url},
+                "exp": {"essential": True},
+            },
+        )
+        claims.validate(leeway=120)
+    except Exception:
+        kid = _oidc_token_kid(id_token)
+        if not kid:
+            return None
+        try:
+            jwks_response = requests.get(jwks_uri, timeout=10)
+            jwks_response.raise_for_status()
+            key_set = JsonWebKey.import_key_set(jwks_response.json())
+            claims = jwt.decode(
+                id_token,
+                key_set,
+                claims_options={
+                    "iss": {"value": issuer_url},
+                    "exp": {"essential": True},
+                },
+            )
+            claims.validate(leeway=120)
+        except Exception:
+            return None
+    if nonce and claims.get("nonce") != nonce:
+        return None
+    aud = claims.get("aud")
+    if isinstance(aud, list):
+        if client_id not in aud:
+            return None
+    elif aud != client_id:
+        return None
+    return dict(claims)
+
+
+@csrf_exempt
+def workspace_auth_login(request: HttpRequest, workspace_id: str) -> HttpResponse:
+    workspace = Workspace.objects.filter(id=workspace_id).first()
+    if not workspace:
+        return JsonResponse({"error": "workspace not found"}, status=404)
+    return_to = str(request.GET.get("returnTo") or f"/w/{workspace_id}/build/artifacts").strip() or f"/w/{workspace_id}/build/artifacts"
+
+    if _workspace_allows_oidc_auth(workspace):
+        issuer_url = str(workspace.oidc_issuer_url or "").strip()
+        client_id = str(workspace.oidc_client_id or "").strip()
+        if not issuer_url or not client_id:
+            return JsonResponse({"error": "workspace oidc policy is not fully configured"}, status=400)
+        discovery_url = f"{issuer_url.rstrip('/')}/.well-known/openid-configuration"
+        try:
+            discovery_response = requests.get(discovery_url, timeout=10)
+            discovery_response.raise_for_status()
+            discovery = discovery_response.json()
+        except Exception as exc:
+            return JsonResponse({"error": f"oidc discovery failed: {exc}"}, status=400)
+        auth_endpoint = str(discovery.get("authorization_endpoint") or "").strip()
+        if not auth_endpoint:
+            return JsonResponse({"error": "authorization endpoint missing in discovery"}, status=400)
+        verifier, challenge = generate_pkce_pair()
+        state = secrets.token_urlsafe(32)
+        nonce = secrets.token_urlsafe(32)
+        request.session[f"{WORKSPACE_OIDC_STATE_PREFIX}{workspace_id}"] = state
+        request.session[f"{WORKSPACE_OIDC_VERIFIER_PREFIX}{workspace_id}"] = verifier
+        request.session[f"{WORKSPACE_OIDC_NONCE_PREFIX}{workspace_id}"] = nonce
+        request.session[f"workspace_oidc_return_to:{workspace_id}"] = return_to
+        callback_uri = request.build_absolute_uri(f"/xyn/api/workspaces/{workspace_id}/auth/callback")
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": callback_uri,
+            "scope": str(workspace.oidc_scopes or "openid profile email"),
+            "state": state,
+            "nonce": nonce,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        return redirect(f"{auth_endpoint}?{urlencode(params)}")
+
+    if _workspace_allows_local_auth(workspace):
+        local_login_url = (
+            f"/auth/login?appId=xyn-ui&returnTo={quote(return_to, safe='')}"
+        )
+        return redirect(local_login_url)
+    return JsonResponse({"error": "workspace authentication is not enabled"}, status=403)
+
+
+@csrf_exempt
+def workspace_auth_callback(request: HttpRequest, workspace_id: str) -> HttpResponse:
+    workspace = Workspace.objects.filter(id=workspace_id).first()
+    if not workspace:
+        return JsonResponse({"error": "workspace not found"}, status=404)
+    if not _workspace_allows_oidc_auth(workspace):
+        return JsonResponse({"error": "workspace oidc is not enabled"}, status=403)
+
+    state = str(request.GET.get("state") or "")
+    code = str(request.GET.get("code") or "")
+    expected_state = str(request.session.get(f"{WORKSPACE_OIDC_STATE_PREFIX}{workspace_id}") or "")
+    verifier = str(request.session.get(f"{WORKSPACE_OIDC_VERIFIER_PREFIX}{workspace_id}") or "")
+    nonce = str(request.session.get(f"{WORKSPACE_OIDC_NONCE_PREFIX}{workspace_id}") or "")
+    if not state or not code or not expected_state or state != expected_state:
+        return JsonResponse({"error": "invalid state"}, status=400)
+    issuer_url = str(workspace.oidc_issuer_url or "").strip()
+    client_id = str(workspace.oidc_client_id or "").strip()
+    discovery_url = f"{issuer_url.rstrip('/')}/.well-known/openid-configuration"
+    try:
+        discovery_response = requests.get(discovery_url, timeout=10)
+        discovery_response.raise_for_status()
+        discovery = discovery_response.json()
+    except Exception as exc:
+        return JsonResponse({"error": f"oidc discovery failed: {exc}"}, status=400)
+    token_endpoint = str(discovery.get("token_endpoint") or "").strip()
+    jwks_uri = str(discovery.get("jwks_uri") or "").strip()
+    if not token_endpoint or not jwks_uri:
+        return JsonResponse({"error": "oidc discovery missing token/jwks endpoints"}, status=400)
+
+    callback_uri = request.build_absolute_uri(f"/xyn/api/workspaces/{workspace_id}/auth/callback")
+    form_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": client_id,
+        "redirect_uri": callback_uri,
+        "code_verifier": verifier,
+    }
+    client_secret = _workspace_oidc_client_secret(workspace)
+    if client_secret:
+        form_data["client_secret"] = client_secret
+    try:
+        token_response = requests.post(token_endpoint, data=form_data, timeout=15)
+        token_response.raise_for_status()
+        token_payload = token_response.json()
+    except Exception as exc:
+        return JsonResponse({"error": f"oidc token exchange failed: {exc}"}, status=400)
+    id_token = str(token_payload.get("id_token") or "")
+    if not id_token:
+        return JsonResponse({"error": "id_token missing"}, status=400)
+    claims = _decode_workspace_oidc_id_token(
+        id_token=id_token,
+        issuer_url=issuer_url,
+        client_id=client_id,
+        nonce=nonce,
+        jwks_uri=jwks_uri,
+    )
+    if not claims:
+        return JsonResponse({"error": "invalid id_token"}, status=401)
+
+    claim_key = str(workspace.oidc_claim_email or "email").strip() or "email"
+    email = str(claims.get(claim_key) or claims.get("email") or "").strip().lower()
+    if not email:
+        return JsonResponse({"error": "email claim missing"}, status=400)
+    allowed_domains = _normalize_allowed_domains(workspace.oidc_allowed_email_domains_json)
+    if allowed_domains:
+        domain = email.split("@")[-1].lower() if "@" in email else ""
+        if domain not in allowed_domains:
+            return JsonResponse({"error": "email domain not allowed"}, status=403)
+
+    identity = UserIdentity.objects.filter(email__iexact=email).order_by("-updated_at").first()
+    if not identity:
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            provider_id=f"workspace:{workspace_id}",
+            issuer=issuer_url,
+            subject=str(claims.get("sub") or email),
+            email=email,
+            display_name=str(claims.get("name") or claims.get("preferred_username") or email),
+            claims_json=claims,
+            last_login_at=timezone.now(),
+        )
+    else:
+        identity.provider = "oidc"
+        identity.provider_id = f"workspace:{workspace_id}"
+        identity.issuer = issuer_url
+        identity.subject = str(claims.get("sub") or identity.subject or email)
+        identity.email = email
+        identity.display_name = str(claims.get("name") or claims.get("preferred_username") or identity.display_name or email)
+        identity.claims_json = claims
+        identity.last_login_at = timezone.now()
+        identity.save(update_fields=["provider", "provider_id", "issuer", "subject", "email", "display_name", "claims_json", "last_login_at", "updated_at"])
+
+    membership = WorkspaceMembership.objects.filter(workspace=workspace, user_identity=identity).first()
+    if not membership and workspace.oidc_allow_auto_provision:
+        membership = WorkspaceMembership.objects.create(
+            workspace=workspace,
+            user_identity=identity,
+            role="reader",
+            termination_authority=False,
+        )
+    if not membership:
+        return HttpResponse(
+            "<h1>Access not granted</h1><p>You authenticated successfully, but your account is not a member of this workspace.</p>",
+            status=403,
+        )
+
+    User = get_user_model()
+    user, _ = User.objects.get_or_create(
+        username=_local_username_for_email(email),
+        defaults={"email": email, "is_active": True, "is_staff": False},
+    )
+    user.email = email
+    user.is_active = True
+    user.save()
+    login(request, user, backend="django.contrib.auth.backends.ModelBackend")
+    request.session["user_identity_id"] = str(identity.id)
+    return_to = str(request.session.get(f"workspace_oidc_return_to:{workspace_id}") or f"/w/{workspace_id}/build/artifacts")
+    request.session.pop(f"{WORKSPACE_OIDC_STATE_PREFIX}{workspace_id}", None)
+    request.session.pop(f"{WORKSPACE_OIDC_VERIFIER_PREFIX}{workspace_id}", None)
+    request.session.pop(f"{WORKSPACE_OIDC_NONCE_PREFIX}{workspace_id}", None)
+    request.session.pop(f"workspace_oidc_return_to:{workspace_id}", None)
+    return redirect(return_to)
+
+
+@csrf_exempt
+def workspace_auth_login_api(request: HttpRequest, workspace_id: str) -> HttpResponse:
+    return workspace_auth_login(request, workspace_id)
+
+
+@csrf_exempt
+def workspace_auth_callback_api(request: HttpRequest, workspace_id: str) -> HttpResponse:
+    return workspace_auth_callback(request, workspace_id)
 
 
 @csrf_exempt
@@ -8368,13 +8681,27 @@ def workspaces_collection(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "workspace slug already exists"}, status=400)
     kind = str(payload.get("kind") or "customer").strip().lower() or "customer"
     lifecycle_stage = _workspace_lifecycle_stage_or_default(str(payload.get("lifecycle_stage") or "prospect"))
-    auth_mode = _workspace_auth_mode_or_default(str(payload.get("auth_mode") or "local"))
+    default_auth_mode = "oidc" if kind == "customer" else "local"
+    auth_mode = _workspace_auth_mode_or_default(str(payload.get("auth_mode") or default_auth_mode))
     if lifecycle_stage not in WORKSPACE_LIFECYCLE_STAGES:
         return JsonResponse({"error": "invalid lifecycle_stage"}, status=400)
     if auth_mode not in WORKSPACE_AUTH_MODES:
         return JsonResponse({"error": "invalid auth_mode"}, status=400)
     org_name = str(payload.get("org_name") or name).strip() or name
     oidc_config_ref = str(payload.get("oidc_config_ref") or "").strip()
+    oidc_enabled = bool(payload.get("oidc_enabled", False))
+    oidc_issuer_url = str(payload.get("oidc_issuer_url") or "").strip()
+    oidc_client_id = str(payload.get("oidc_client_id") or "").strip()
+    oidc_scopes = str(payload.get("oidc_scopes") or "openid profile email").strip() or "openid profile email"
+    oidc_claim_email = str(payload.get("oidc_claim_email") or "email").strip() or "email"
+    oidc_allow_auto_provision = bool(payload.get("oidc_allow_auto_provision", False))
+    oidc_allowed_email_domains = _normalize_allowed_domains(payload.get("oidc_allowed_email_domains"))
+    oidc_client_secret_ref = None
+    oidc_client_secret_ref_id = str(payload.get("oidc_client_secret_ref_id") or "").strip()
+    if oidc_client_secret_ref_id:
+        oidc_client_secret_ref = SecretRef.objects.filter(id=oidc_client_secret_ref_id).first()
+        if not oidc_client_secret_ref:
+            return JsonResponse({"error": "oidc_client_secret_ref not found"}, status=404)
     metadata = payload.get("metadata")
     if metadata is not None and not isinstance(metadata, dict):
         return JsonResponse({"error": "metadata must be an object"}, status=400)
@@ -8396,6 +8723,14 @@ def workspaces_collection(request: HttpRequest) -> JsonResponse:
         lifecycle_stage=lifecycle_stage,
         auth_mode=auth_mode,
         oidc_config_ref=oidc_config_ref,
+        oidc_enabled=oidc_enabled,
+        oidc_issuer_url=oidc_issuer_url,
+        oidc_client_id=oidc_client_id,
+        oidc_client_secret_ref=oidc_client_secret_ref,
+        oidc_scopes=oidc_scopes,
+        oidc_claim_email=oidc_claim_email,
+        oidc_allow_auto_provision=oidc_allow_auto_provision,
+        oidc_allowed_email_domains_json=oidc_allowed_email_domains,
         parent_workspace=parent_workspace,
         metadata_json=metadata or {},
     )
@@ -8924,6 +9259,112 @@ def workspace_membership_detail(request: HttpRequest, workspace_id: str, members
         membership.termination_authority = requested_role == "admin"
     membership.save(update_fields=["role", "termination_authority", "updated_at"])
     return JsonResponse({"id": str(membership.id), "role": _workspace_role_to_member_role(membership.role)})
+
+
+@csrf_exempt
+def workspace_auth_policy_detail(request: HttpRequest, workspace_id: str) -> JsonResponse:
+    workspace = get_object_or_404(Workspace, id=workspace_id)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    membership = _workspace_membership(identity, workspace_id)
+    if not membership and not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    if request.method == "GET":
+        return JsonResponse({"auth_policy": _serialize_workspace_auth_policy(workspace)})
+    if request.method not in {"PATCH", "PUT"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _workspace_has_role(identity, workspace_id, "admin") and not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    payload = _parse_json(request)
+    update_fields: List[str] = []
+
+    if "auth_mode" in payload:
+        auth_mode = _workspace_auth_mode_or_default(str(payload.get("auth_mode") or ""))
+        if auth_mode not in WORKSPACE_AUTH_MODES:
+            return JsonResponse({"error": "invalid auth_mode"}, status=400)
+        workspace.auth_mode = auth_mode
+        update_fields.append("auth_mode")
+    if "oidc_enabled" in payload:
+        workspace.oidc_enabled = bool(payload.get("oidc_enabled"))
+        update_fields.append("oidc_enabled")
+    if "oidc_issuer_url" in payload:
+        issuer_url = str(payload.get("oidc_issuer_url") or "").strip()
+        if issuer_url and not issuer_url.lower().startswith("https://"):
+            return JsonResponse({"error": "oidc_issuer_url must use https"}, status=400)
+        workspace.oidc_issuer_url = issuer_url
+        update_fields.append("oidc_issuer_url")
+    if "oidc_client_id" in payload:
+        workspace.oidc_client_id = str(payload.get("oidc_client_id") or "").strip()
+        update_fields.append("oidc_client_id")
+    if "oidc_client_secret_ref_id" in payload:
+        secret_ref_id = str(payload.get("oidc_client_secret_ref_id") or "").strip()
+        if secret_ref_id:
+            secret_ref = SecretRef.objects.filter(id=secret_ref_id).first()
+            if not secret_ref:
+                return JsonResponse({"error": "oidc_client_secret_ref not found"}, status=404)
+            workspace.oidc_client_secret_ref = secret_ref
+        else:
+            workspace.oidc_client_secret_ref = None
+        update_fields.append("oidc_client_secret_ref")
+    if "oidc_scopes" in payload:
+        scopes = str(payload.get("oidc_scopes") or "").strip() or "openid profile email"
+        workspace.oidc_scopes = scopes
+        update_fields.append("oidc_scopes")
+    if "oidc_claim_email" in payload:
+        claim_email = str(payload.get("oidc_claim_email") or "").strip() or "email"
+        workspace.oidc_claim_email = claim_email
+        update_fields.append("oidc_claim_email")
+    if "oidc_allow_auto_provision" in payload:
+        workspace.oidc_allow_auto_provision = bool(payload.get("oidc_allow_auto_provision"))
+        update_fields.append("oidc_allow_auto_provision")
+    if "oidc_allowed_email_domains" in payload:
+        workspace.oidc_allowed_email_domains_json = _normalize_allowed_domains(payload.get("oidc_allowed_email_domains"))
+        update_fields.append("oidc_allowed_email_domains_json")
+
+    if workspace.oidc_enabled:
+        if not str(workspace.oidc_issuer_url or "").strip():
+            return JsonResponse({"error": "oidc_issuer_url required when oidc enabled"}, status=400)
+        if not str(workspace.oidc_client_id or "").strip():
+            return JsonResponse({"error": "oidc_client_id required when oidc enabled"}, status=400)
+
+    if update_fields:
+        workspace.save(update_fields=[*update_fields, "updated_at"])
+    return JsonResponse({"auth_policy": _serialize_workspace_auth_policy(workspace)})
+
+
+@csrf_exempt
+def workspace_auth_policy_test_discovery(request: HttpRequest, workspace_id: str) -> JsonResponse:
+    workspace = get_object_or_404(Workspace, id=workspace_id)
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if not _workspace_has_role(identity, workspace_id, "admin") and not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    issuer_url = str(workspace.oidc_issuer_url or "").strip()
+    if not issuer_url:
+        return JsonResponse({"error": "oidc_issuer_url not configured"}, status=400)
+    if not issuer_url.lower().startswith("https://"):
+        return JsonResponse({"error": "oidc_issuer_url must use https"}, status=400)
+    discovery_url = f"{issuer_url.rstrip('/')}/.well-known/openid-configuration"
+    try:
+        response = requests.get(discovery_url, timeout=10)
+        response.raise_for_status()
+        doc = response.json()
+    except Exception as exc:
+        return JsonResponse({"ok": False, "error": str(exc), "discovery_url": discovery_url}, status=400)
+    return JsonResponse(
+        {
+            "ok": True,
+            "discovery_url": discovery_url,
+            "issuer": str(doc.get("issuer") or ""),
+            "authorization_endpoint": str(doc.get("authorization_endpoint") or ""),
+            "token_endpoint": str(doc.get("token_endpoint") or ""),
+            "jwks_uri": str(doc.get("jwks_uri") or ""),
+        }
+    )
 
 
 @csrf_exempt
@@ -13321,6 +13762,8 @@ def _intent_apply_deploy_ems_customer(
         description=f"Customer workspace for {customer_name}",
         kind="customer",
         lifecycle_stage="prospect",
+        auth_mode="oidc",
+        oidc_enabled=False,
         parent_workspace=operator_workspace,
         metadata_json=metadata or {},
     )
@@ -13340,6 +13783,7 @@ def _intent_apply_deploy_ems_customer(
 
     open_ems_path = f"/w/{child_workspace.id}/apps/ems"
     open_installed_path = f"/w/{child_workspace.id}/build/artifacts"
+    open_security_path = f"/w/{child_workspace.id}/admin/platform-settings?tab=security"
     response_payload = {
         "status": "DraftReady",
         "action_type": "CreateDraft",
@@ -13349,6 +13793,7 @@ def _intent_apply_deploy_ems_customer(
         "next_actions": [
             {"label": "Open EMS", "action": "OpenPath", "path": open_ems_path},
             {"label": "Open Installed", "action": "OpenPath", "path": open_installed_path},
+            {"label": "Open Auth Settings", "action": "OpenPath", "path": open_security_path},
         ],
         "audit": {
             "request_id": request_id,
@@ -17477,6 +17922,40 @@ def workspace_detail(request: HttpRequest, workspace_id: str) -> JsonResponse:
     if "oidc_config_ref" in payload:
         workspace.oidc_config_ref = str(payload.get("oidc_config_ref") or "").strip()
         update_fields.append("oidc_config_ref")
+    if "oidc_enabled" in payload:
+        workspace.oidc_enabled = bool(payload.get("oidc_enabled"))
+        update_fields.append("oidc_enabled")
+    if "oidc_issuer_url" in payload:
+        issuer_url = str(payload.get("oidc_issuer_url") or "").strip()
+        if issuer_url and not issuer_url.lower().startswith("https://"):
+            return JsonResponse({"error": "oidc_issuer_url must use https"}, status=400)
+        workspace.oidc_issuer_url = issuer_url
+        update_fields.append("oidc_issuer_url")
+    if "oidc_client_id" in payload:
+        workspace.oidc_client_id = str(payload.get("oidc_client_id") or "").strip()
+        update_fields.append("oidc_client_id")
+    if "oidc_client_secret_ref_id" in payload:
+        secret_ref_id = str(payload.get("oidc_client_secret_ref_id") or "").strip()
+        if secret_ref_id:
+            secret_ref = SecretRef.objects.filter(id=secret_ref_id).first()
+            if not secret_ref:
+                return JsonResponse({"error": "oidc_client_secret_ref not found"}, status=404)
+            workspace.oidc_client_secret_ref = secret_ref
+        else:
+            workspace.oidc_client_secret_ref = None
+        update_fields.append("oidc_client_secret_ref")
+    if "oidc_scopes" in payload:
+        workspace.oidc_scopes = str(payload.get("oidc_scopes") or "openid profile email").strip() or "openid profile email"
+        update_fields.append("oidc_scopes")
+    if "oidc_claim_email" in payload:
+        workspace.oidc_claim_email = str(payload.get("oidc_claim_email") or "email").strip() or "email"
+        update_fields.append("oidc_claim_email")
+    if "oidc_allow_auto_provision" in payload:
+        workspace.oidc_allow_auto_provision = bool(payload.get("oidc_allow_auto_provision"))
+        update_fields.append("oidc_allow_auto_provision")
+    if "oidc_allowed_email_domains" in payload:
+        workspace.oidc_allowed_email_domains_json = _normalize_allowed_domains(payload.get("oidc_allowed_email_domains"))
+        update_fields.append("oidc_allowed_email_domains_json")
     if "parent_workspace_id" in payload:
         raw_parent_id = payload.get("parent_workspace_id")
         parent_workspace_id = str(raw_parent_id or "").strip()

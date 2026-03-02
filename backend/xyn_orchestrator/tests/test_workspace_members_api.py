@@ -1,5 +1,6 @@
 import json
 import uuid
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.test import Client, TestCase
@@ -128,3 +129,61 @@ class WorkspaceMembersApiTests(TestCase):
         self.assertEqual(member_response.status_code, 200, member_response.content.decode())
         member_ids = {row["id"] for row in member_response.json().get("workspaces", [])}
         self.assertEqual(member_ids, {str(self.workspace.id)})
+
+    def test_workspace_auth_policy_patch_and_get(self):
+        patch_response = self.client.patch(
+            f"/xyn/api/workspaces/{self.workspace.id}/auth-policy",
+            data=json.dumps(
+                {
+                    "auth_mode": "oidc",
+                    "oidc_enabled": True,
+                    "oidc_issuer_url": "https://issuer.example.com",
+                    "oidc_client_id": "workspace-client-id",
+                    "oidc_scopes": "openid profile email",
+                    "oidc_claim_email": "email",
+                    "oidc_allow_auto_provision": False,
+                    "oidc_allowed_email_domains": ["example.com"],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(patch_response.status_code, 200, patch_response.content.decode())
+        get_response = self.client.get(f"/xyn/api/workspaces/{self.workspace.id}/auth-policy")
+        self.assertEqual(get_response.status_code, 200, get_response.content.decode())
+        policy = get_response.json().get("auth_policy", {})
+        self.assertEqual(policy.get("auth_mode"), "oidc")
+        self.assertTrue(policy.get("oidc_enabled"))
+        self.assertEqual(policy.get("oidc_issuer_url"), "https://issuer.example.com")
+        self.assertEqual(policy.get("oidc_client_id"), "workspace-client-id")
+
+    @mock.patch("xyn_orchestrator.xyn_api.requests.get")
+    def test_workspace_auth_policy_test_discovery(self, mock_get):
+        self.workspace.oidc_issuer_url = "https://issuer.example.com"
+        self.workspace.save(update_fields=["oidc_issuer_url", "updated_at"])
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "issuer": "https://issuer.example.com",
+            "authorization_endpoint": "https://issuer.example.com/oauth2/v1/authorize",
+            "token_endpoint": "https://issuer.example.com/oauth2/v1/token",
+            "jwks_uri": "https://issuer.example.com/oauth2/v1/keys",
+        }
+        mock_get.return_value.raise_for_status.return_value = None
+        response = self.client.post(f"/xyn/api/workspaces/{self.workspace.id}/auth-policy/test-discovery")
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        self.assertTrue(response.json().get("ok"))
+
+    @mock.patch("xyn_orchestrator.xyn_api.requests.get")
+    def test_workspace_oidc_login_redirects_to_authorize_endpoint(self, mock_get):
+        self.workspace.auth_mode = "oidc"
+        self.workspace.oidc_enabled = True
+        self.workspace.oidc_issuer_url = "https://issuer.example.com"
+        self.workspace.oidc_client_id = "workspace-client-id"
+        self.workspace.save(update_fields=["auth_mode", "oidc_enabled", "oidc_issuer_url", "oidc_client_id", "updated_at"])
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.raise_for_status.return_value = None
+        mock_get.return_value.json.return_value = {
+            "authorization_endpoint": "https://issuer.example.com/oauth2/v1/authorize",
+        }
+        response = self.client.get(f"/w/{self.workspace.id}/auth/login")
+        self.assertEqual(response.status_code, 302, response.content.decode())
+        self.assertIn("https://issuer.example.com/oauth2/v1/authorize", response["Location"])
