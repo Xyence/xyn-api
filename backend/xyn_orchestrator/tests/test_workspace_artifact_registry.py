@@ -12,6 +12,7 @@ from xyn_orchestrator.models import (
     Artifact,
     ArtifactComment,
     ArtifactEvent,
+    ArtifactSurface,
     ArtifactType,
     UserIdentity,
     Workspace,
@@ -378,3 +379,40 @@ class WorkspaceArtifactRegistryTests(TestCase):
         self.assertNotIn("/apps/hello-b", routes_a)
         self.assertIn("/apps/hello-b", routes_b)
         self.assertNotIn("/apps/hello-a", routes_b)
+
+    def test_nav_surfaces_include_legacy_surface_rows(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        artifact = Artifact.objects.create(
+            workspace=self.workspace,
+            type=module_type,
+            title="Legacy Surface App",
+            slug="legacy-surface-app",
+            status="published",
+            visibility="team",
+        )
+        WorkspaceArtifactBinding.objects.create(
+            workspace=self.workspace,
+            artifact=artifact,
+            enabled=True,
+            installed_state="installed",
+        )
+        ArtifactSurface.objects.create(
+            artifact=artifact,
+            key="legacy-nav",
+            title="Legacy App",
+            route="/apps/legacy-app",
+            nav_visibility="always",
+            nav_label="Legacy App",
+            nav_group="build",
+            renderer={"type": "ui_mount"},
+            context={},
+            permissions={},
+            sort_order=200,
+        )
+
+        response = self.client.get(f"/xyn/api/artifact-surfaces/nav?workspace_id={self.workspace.id}")
+        self.assertEqual(response.status_code, 200)
+        routes = {row.get("route") for row in response.json().get("surfaces", [])}
+        self.assertIn("/apps/legacy-app", routes)

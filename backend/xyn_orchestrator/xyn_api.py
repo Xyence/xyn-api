@@ -16987,6 +16987,15 @@ UI_COMPONENT_REGISTRY: List[Dict[str, str]] = [
 
 
 def _serialize_artifact_surface(surface: ArtifactSurface) -> Dict[str, Any]:
+    renderer = getattr(surface, "renderer", None)
+    if renderer is None:
+        renderer = getattr(surface, "renderer_json", {}) or {}
+    context = getattr(surface, "context", None)
+    if context is None:
+        context = getattr(surface, "context_json", {}) or {}
+    permissions = getattr(surface, "permissions", None)
+    if permissions is None:
+        permissions = getattr(surface, "permissions_json", {}) or {}
     return {
         "id": str(surface.id),
         "artifact_id": str(surface.artifact_id),
@@ -16999,9 +17008,9 @@ def _serialize_artifact_surface(surface: ArtifactSurface) -> Dict[str, Any]:
         "nav_label": surface.nav_label,
         "nav_icon": surface.nav_icon,
         "nav_group": surface.nav_group,
-        "renderer": surface.renderer_json or {},
-        "context": surface.context_json or {},
-        "permissions": surface.permissions_json or {},
+        "renderer": renderer or {},
+        "context": context or {},
+        "permissions": permissions or {},
         "sort_order": int(surface.sort_order or 0),
         "created_at": surface.created_at,
         "updated_at": surface.updated_at,
