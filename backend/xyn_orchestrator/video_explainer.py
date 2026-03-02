@@ -436,6 +436,64 @@ def _extract_video_urls(payload: Any) -> List[str]:
     return urls
 
 
+def _operation_id_from_name(operation_name: str) -> str:
+    raw = str(operation_name or "").strip()
+    if not raw:
+        return ""
+    return raw.split("/")[-1]
+
+
+def parse_google_lro_result(final_operation: Dict[str, Any]) -> Dict[str, Any]:
+    operation_name = str(final_operation.get("name") or "").strip()
+    if isinstance(final_operation.get("error"), dict):
+        err = final_operation.get("error") or {}
+        return {
+            "kind": "error",
+            "operation_name": operation_name,
+            "provider_error_code": str(err.get("code") or ""),
+            "provider_error_message": str(err.get("message") or "") or "Provider reported an error.",
+            "raw": sanitize_payload(final_operation),
+        }
+
+    response_payload = final_operation.get("response") if isinstance(final_operation.get("response"), dict) else {}
+    generate_response = (
+        response_payload.get("generateVideoResponse")
+        if isinstance(response_payload.get("generateVideoResponse"), dict)
+        else {}
+    )
+    filtered_count = int(generate_response.get("raiMediaFilteredCount") or 0)
+    reasons = generate_response.get("raiMediaFilteredReasons") if isinstance(generate_response.get("raiMediaFilteredReasons"), list) else []
+    cleaned_reasons = [str(reason).strip() for reason in reasons if str(reason).strip()]
+    if filtered_count > 0 or bool(cleaned_reasons):
+        return {
+            "kind": "filtered",
+            "operation_name": operation_name,
+            "filtered_count": filtered_count,
+            "reasons": cleaned_reasons,
+            "raw": sanitize_payload(final_operation),
+        }
+
+    urls = _extract_video_urls(response_payload or final_operation)
+    unique_urls: List[str] = []
+    for url in urls:
+        if url not in unique_urls:
+            unique_urls.append(url)
+    if unique_urls:
+        return {
+            "kind": "success",
+            "operation_name": operation_name,
+            "asset_urls": unique_urls,
+            "raw": sanitize_payload(final_operation),
+        }
+    return {
+        "kind": "error",
+        "operation_name": operation_name,
+        "provider_error_code": "missing_media",
+        "provider_error_message": "Provider operation completed but no media asset URI was returned.",
+        "raw": sanitize_payload(final_operation),
+    }
+
+
 def _google_veo_request_variants(model_id: str, prompt: str, base_url: str) -> List[Tuple[str, Dict[str, Any]]]:
     model = str(model_id or "").strip() or "veo-3.1-generate-preview"
     base = str(base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
@@ -492,9 +550,11 @@ def _render_via_google_veo(
         assets = [_build_export_asset(article_id, spec)]
         return provider_name, assets, {
             "message": "Google Veo adapter requires credential_ref resolving to an API key.",
+            "outcome": "failed",
             "provider_configured": False,
             "provider": provider_name,
             "credential_ref": credential_ref or None,
+            "export_package_generated": True,
         }
 
     prompt = _build_google_veo_prompt(spec)
@@ -549,9 +609,13 @@ def _render_via_google_veo(
         assets = [_build_export_asset(article_id, spec)]
         return provider_name, assets, {
             "message": f"Google Veo submit failed: {'; '.join(submit_errors) or 'no operation id returned'}",
+            "outcome": "failed",
             "provider_configured": True,
             "provider": provider_name,
+            "provider_error_code": "submit_failed",
+            "provider_error_message": "; ".join(submit_errors) or "No operation id returned.",
             "provider_response": sanitize_payload(response_body),
+            "export_package_generated": True,
         }
 
     operation_url = _normalize_google_operations_url(endpoint_url, operation_name)
@@ -570,57 +634,73 @@ def _render_via_google_veo(
         assets = [_build_export_asset(article_id, spec)]
         return provider_name, assets, {
             "message": "Google Veo operation timed out before completion.",
+            "outcome": "timeout",
             "provider_configured": True,
             "provider": provider_name,
             "operation_name": operation_name,
             "operation_url": operation_url,
+            "provider_error_code": "timeout",
+            "provider_error_message": "Provider operation timed out.",
             "provider_response": sanitize_payload(final_operation),
+            "export_package_generated": True,
         }
-    if final_operation.get("error"):
+    parsed = parse_google_lro_result(final_operation)
+    parsed_kind = str(parsed.get("kind") or "error")
+    provider_response = parsed.get("raw") if isinstance(parsed.get("raw"), dict) else sanitize_payload(final_operation)
+    operation_name = str(parsed.get("operation_name") or operation_name or "").strip()
+    operation_id = _operation_id_from_name(operation_name)
+    if parsed_kind == "filtered":
+        reasons = parsed.get("reasons") if isinstance(parsed.get("reasons"), list) else []
+        filtered_count = int(parsed.get("filtered_count") or 0)
+        reason_text = "; ".join(str(reason).strip() for reason in reasons if str(reason).strip())
         assets = [_build_export_asset(article_id, spec)]
         return provider_name, assets, {
-            "message": f"Google Veo operation failed: {sanitize_payload(final_operation.get('error'))}",
+            "message": f"Video blocked by provider policy{': ' + reason_text if reason_text else ''}",
+            "outcome": "filtered",
             "provider_configured": True,
             "provider": provider_name,
             "operation_name": operation_name,
-            "provider_response": sanitize_payload(final_operation),
+            "operation_id": operation_id,
+            "operation_url": operation_url,
+            "provider_filtered_count": filtered_count,
+            "provider_filtered_reasons": reasons,
+            "provider_response": provider_response,
+            "export_package_generated": True,
+            "user_actions": ["edit_prompt", "neutralize_prompt", "retry"],
+            "user_message": "Provider blocked media output due to policy. Edit or neutralize prompt and retry.",
+        }
+    if parsed_kind == "success":
+        urls = parsed.get("asset_urls") if isinstance(parsed.get("asset_urls"), list) else []
+        assets: List[Dict[str, Any]] = [
+            {"type": "video", "url": str(url), "metadata": {"provider": "google_veo"}}
+            for url in urls
+            if str(url).strip()
+        ]
+        return provider_name, assets, {
+            "message": "Google Veo operation completed.",
+            "outcome": "success",
+            "provider_configured": True,
+            "provider": provider_name,
+            "operation_name": operation_name,
+            "operation_id": operation_id,
+            "operation_url": operation_url,
+            "provider_response": provider_response,
+            "export_package_generated": False,
         }
 
-    generate_response = (
-        (final_operation.get("response") or {}).get("generateVideoResponse")
-        if isinstance(final_operation.get("response"), dict)
-        else None
-    )
-    if isinstance(generate_response, dict):
-        filtered_count = int(generate_response.get("raiMediaFilteredCount") or 0)
-        if filtered_count > 0:
-            reasons = generate_response.get("raiMediaFilteredReasons") if isinstance(generate_response.get("raiMediaFilteredReasons"), list) else []
-            reason_text = "; ".join(str(reason).strip() for reason in reasons if str(reason).strip())
-            assets = [_build_export_asset(article_id, spec)]
-            return provider_name, assets, {
-                "message": f"Google Veo output was policy-filtered{': ' + reason_text if reason_text else ''}",
-                "provider_configured": True,
-                "provider": provider_name,
-                "operation_name": operation_name,
-                "operation_url": operation_url,
-                "provider_response": sanitize_payload(final_operation),
-            }
-
-    urls = _extract_video_urls(final_operation.get("response") or final_operation)
-    unique_urls: List[str] = []
-    for url in urls:
-        if url not in unique_urls:
-            unique_urls.append(url)
-    assets: List[Dict[str, Any]] = [{"type": "video", "url": url, "metadata": {"provider": "google_veo"}} for url in unique_urls]
-    if not assets:
-        assets = [_build_export_asset(article_id, spec)]
+    assets = [_build_export_asset(article_id, spec)]
     return provider_name, assets, {
-        "message": "Google Veo operation completed.",
+        "message": f"Google Veo operation failed: {str(parsed.get('provider_error_message') or 'unknown error')}",
+        "outcome": "failed",
         "provider_configured": True,
         "provider": provider_name,
         "operation_name": operation_name,
+        "operation_id": operation_id,
         "operation_url": operation_url,
-        "provider_response": sanitize_payload(final_operation),
+        "provider_error_code": str(parsed.get("provider_error_code") or ""),
+        "provider_error_message": str(parsed.get("provider_error_message") or ""),
+        "provider_response": provider_response,
+        "export_package_generated": True,
     }
 
 
@@ -638,17 +718,23 @@ def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_
         assets = [_build_export_asset(article_id, spec)]
         return "export_package", assets, {
             "message": "Rendering mode is export_package_only. No external rendering performed.",
+            "outcome": "success",
             "provider_configured": True,
             "rendering_mode": rendering_mode,
             "request": sanitized_payload,
+            "export_package_generated": True,
         }
     if provider in {"", "unknown", "stub", "none"}:
         assets = [_build_export_asset(article_id, spec)]
         return "unknown", assets, {
             "message": "Video provider is not configured. Generated export package placeholder.",
+            "outcome": "failed",
             "provider_configured": False,
             "rendering_mode": rendering_mode or "unknown",
             "request": sanitized_payload,
+            "provider_error_code": "provider_not_configured",
+            "provider_error_message": "Video provider is not configured.",
+            "export_package_generated": True,
         }
 
     adapter_id = str(provider_cfg.get("adapter_id") or "").strip().lower()
@@ -665,9 +751,13 @@ def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_
             assets = [_build_export_asset(article_id, spec)]
             return "google_veo", assets, {
                 "message": f"Google Veo adapter request failed: {exc}",
+                "outcome": "failed",
                 "provider_configured": True,
                 "provider": "google_veo",
                 "request": sanitized_payload,
+                "provider_error_code": "adapter_request_failed",
+                "provider_error_message": str(exc),
+                "export_package_generated": True,
             }
 
     if provider in {"http", "http_adapter"} or rendering_mode in {"render_via_endpoint", "render_via_adapter"}:
@@ -681,9 +771,13 @@ def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_
             assets = [_build_export_asset(article_id, spec)]
             return provider, assets, {
                 "message": "HTTP video provider selected but endpoint_url is missing. Generated export package placeholder.",
+                "outcome": "failed",
                 "provider_configured": False,
                 "rendering_mode": rendering_mode or "render_via_endpoint",
                 "request": sanitized_payload,
+                "provider_error_code": "endpoint_missing",
+                "provider_error_message": "HTTP endpoint URL is missing.",
+                "export_package_generated": True,
             }
         try:
             return _render_via_http_provider(
@@ -698,27 +792,37 @@ def render_video(spec: Dict[str, Any], request_payload: Dict[str, Any], article_
             assets = [_build_export_asset(article_id, spec)]
             return provider, assets, {
                 "message": f"HTTP provider request failed: {exc}",
+                "outcome": "failed",
                 "provider_configured": True,
                 "provider": provider,
                 "request": sanitized_payload,
+                "provider_error_code": "http_provider_failed",
+                "provider_error_message": str(exc),
+                "export_package_generated": True,
             }
 
     if provider in {"export_package", "json_export"}:
         assets = [_build_export_asset(article_id, spec)]
         return provider, assets, {
             "message": "Export package generated.",
+            "outcome": "success",
             "provider_configured": True,
             "provider": provider,
             "rendering_mode": rendering_mode or "export_package_only",
             "request": sanitized_payload,
+            "export_package_generated": True,
         }
 
     assets = [_build_export_asset(article_id, spec)]
     return provider, assets, {
         "message": "Provider abstraction in place. Using stub render output until provider adapter is implemented.",
+        "outcome": "failed",
         "provider_configured": True,
         "provider": provider,
         "request": sanitized_payload,
+        "provider_error_code": "provider_not_implemented",
+        "provider_error_message": "Provider adapter not implemented.",
+        "export_package_generated": True,
     }
 
 

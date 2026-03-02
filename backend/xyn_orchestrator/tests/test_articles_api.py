@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -17,6 +18,7 @@ from xyn_orchestrator.models import (
     ModelProvider,
     RoleBinding,
     UserIdentity,
+    VideoRender,
     Workspace,
 )
 from xyn_orchestrator import xyn_api
@@ -578,7 +580,7 @@ class GovernedArticlesApiTests(TestCase):
             def json(self):
                 return self._payload
 
-        with patch("xyn_orchestrator.video_explainer.resolve_secret_ref_value", return_value="AIza_test_key"):
+        with patch("xyn_orchestrator.video_explainer._resolve_secret_ref_value_lazy", return_value="AIza_test_key"):
             with patch(
                 "xyn_orchestrator.video_explainer.requests.post",
                 return_value=_FakeResponse(payload={"name": "operations/op-123"}),
@@ -607,11 +609,65 @@ class GovernedArticlesApiTests(TestCase):
                 "adapter_config": {"adapter_id": "google_veo", "provider_model_id": "veo-3.1-generate-preview"},
             }
         }
-        with patch("xyn_orchestrator.video_explainer.resolve_secret_ref_value", return_value=None):
+        with patch("xyn_orchestrator.video_explainer._resolve_secret_ref_value_lazy", return_value=None):
             provider, assets, result = video_explainer.render_video(spec, request_payload, "article-2")
         self.assertEqual(provider, "google_veo")
         self.assertIn("requires credential_ref", str(result.get("message") or ""))
         self.assertTrue(any(str(asset.get("type")) == "export_package" for asset in assets))
+
+    def test_parse_google_lro_response_filtered(self):
+        fixture_path = Path(__file__).resolve().parent / "fixtures" / "google_filtered_operation.json"
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+        parsed = video_explainer.parse_google_lro_result(payload)
+        self.assertEqual(parsed.get("kind"), "filtered")
+        self.assertEqual(parsed.get("filtered_count"), 1)
+        self.assertIn("real people's names or likenesses", " ".join(parsed.get("reasons") or []))
+
+    def test_process_video_render_sets_filtered_outcome(self):
+        self._set_identity(self.admin_identity)
+        create = self.client.post(
+            "/xyn/api/articles",
+            data=json.dumps(
+                {
+                    "workspace_id": str(self.workspace.id),
+                    "title": "Filtered demo",
+                    "slug": f"filtered-demo-{self.admin_identity.id}",
+                    "category": "demo",
+                    "format": "video_explainer",
+                    "body_markdown": "content",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(create.status_code, 200, create.content.decode())
+        article_id = create.json()["article"]["id"]
+        article = Artifact.objects.get(id=article_id)
+        render = VideoRender.objects.create(
+            article=article,
+            provider="google_veo",
+            status="queued",
+            request_payload_json={
+                "video_provider_config": {"rendering_mode": "render_via_adapter", "provider": "google_veo"},
+            },
+        )
+        mock_result = {
+            "outcome": "filtered",
+            "provider_configured": True,
+            "provider": "google_veo",
+            "operation_name": "models/veo/operations/op-1",
+            "provider_filtered_count": 1,
+            "provider_filtered_reasons": ["Policy blocked media output."],
+            "message": "Video blocked by provider policy",
+            "user_actions": ["edit_prompt", "neutralize_prompt", "retry"],
+        }
+        with patch("xyn_orchestrator.xyn_api.render_video", return_value=("google_veo", [{"type": "export_package", "url": "https://example/export.json"}], mock_result)):
+            xyn_api._process_video_render(render)
+        render.refresh_from_db()
+        self.assertEqual(render.status, "filtered")
+        self.assertEqual(render.outcome, "filtered")
+        self.assertEqual(render.provider_filtered_count, 1)
+        self.assertEqual(render.provider_filtered_reasons, ["Policy blocked media output."])
+        self.assertTrue(render.export_package_generated)
 
     def test_video_ai_config_get_returns_effective_resolution(self):
         self._set_identity(self.admin_identity)

@@ -42,6 +42,14 @@ PERMISSIONS: List[PermissionDefinition] = [
     PermissionDefinition("export_data", "Export Data", "Export governance and operational data.", "audit", ("export",), True),
     PermissionDefinition("manage_workspace_artifacts", "Manage Workspace Artifacts", "Create and update workspace artifacts.", "workspace", ("write",), False),
     PermissionDefinition("view_workspace", "View Workspace", "Read workspace-scoped content.", "workspace", ("read",), False),
+    PermissionDefinition(
+        "artifact_debug_view",
+        "Artifact Debug View",
+        "Inspect raw artifact and package structures in read-only mode.",
+        "workspace",
+        ("read", "debug"),
+        False,
+    ),
 ]
 
 
@@ -66,6 +74,7 @@ ROLE_PERMISSION_MAP: Dict[str, List[Dict[str, Any]]] = {
         {"permissionKey": "export_data", "scope": None, "effect": "allow"},
         {"permissionKey": "manage_workspace_artifacts", "scope": {"scope_kind": "workspace"}, "effect": "allow"},
         {"permissionKey": "view_workspace", "scope": {"scope_kind": "workspace"}, "effect": "allow"},
+        {"permissionKey": "artifact_debug_view", "scope": {"scope_kind": "workspace"}, "effect": "allow"},
     ],
     "platform_architect": [
         {"permissionKey": "view_platform", "scope": None, "effect": "allow"},
@@ -74,6 +83,7 @@ ROLE_PERMISSION_MAP: Dict[str, List[Dict[str, Any]]] = {
         {"permissionKey": "publish_control_plane", "scope": None, "effect": "allow"},
         {"permissionKey": "view_audit_logs", "scope": None, "effect": "allow"},
         {"permissionKey": "view_workspace", "scope": {"scope_kind": "workspace"}, "effect": "allow"},
+        {"permissionKey": "artifact_debug_view", "scope": {"scope_kind": "workspace"}, "effect": "allow"},
     ],
     "platform_operator": [
         {"permissionKey": "view_platform", "scope": None, "effect": "allow"},

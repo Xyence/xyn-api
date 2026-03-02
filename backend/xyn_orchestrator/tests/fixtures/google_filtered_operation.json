@@ -1,0 +1,13 @@
+{
+  "done": true,
+  "name": "models/veo-3.1-generate-preview/operations/op-filtered-123",
+  "response": {
+    "@type": "type.googleapis.com/google.ai.generativelanguage.v1beta.PredictLongRunningResponse",
+    "generateVideoResponse": {
+      "raiMediaFilteredCount": 1,
+      "raiMediaFilteredReasons": [
+        "Sorry, we can't create videos with real people's names or likenesses. Please remove the celebrity reference and try again."
+      ]
+    }
+  }
+}

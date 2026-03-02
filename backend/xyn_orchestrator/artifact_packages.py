@@ -18,6 +18,8 @@ from .models import (
     ArtifactBindingValue,
     ArtifactInstallReceipt,
     ArtifactPackage,
+    ArtifactRuntimeRole,
+    ArtifactSurface,
     ArtifactRevision,
     ArtifactType,
     PlatformConfigDocument,
@@ -40,6 +42,10 @@ ALLOWED_ARTIFACT_TYPES = {
     "blueprint",
     "module",
 }
+ALLOWED_SURFACE_KINDS = {"config", "editor", "dashboard", "visualizer", "docs"}
+ALLOWED_NAV_VISIBILITY = {"hidden", "contextual", "always"}
+ALLOWED_RENDERER_TYPES = {"ui_component_ref", "generic_editor", "generic_dashboard", "workflow_visualizer", "article_editor"}
+ALLOWED_RUNTIME_ROLE_KINDS = {"route_provider", "job", "event_handler", "integration", "auth", "data_model"}
 
 
 class ArtifactPackageError(Exception):
@@ -115,9 +121,77 @@ def _manifest_artifact_ref(item: Dict[str, Any]) -> str:
     return f"{item.get('type')}:{item.get('slug')}@{item.get('version')}"
 
 
-def _artifact_paths(item: Dict[str, Any]) -> Tuple[str, str]:
+def _artifact_paths(item: Dict[str, Any]) -> Tuple[str, str, str, str]:
     base = f"artifacts/{item['type']}/{item['slug']}/{item['version']}"
-    return f"{base}/artifact.json", f"{base}/payload/payload.json"
+    return (
+        f"{base}/artifact.json",
+        f"{base}/payload/payload.json",
+        f"{base}/surfaces.json",
+        f"{base}/runtime_roles.json",
+    )
+
+
+def _validate_surface_defs(item_ref: str, rows: Any) -> List[str]:
+    errors: List[str] = []
+    if rows is None:
+        return errors
+    if not isinstance(rows, list):
+        return [f"{item_ref} surfaces must be an array"]
+    seen_keys: set[str] = set()
+    seen_routes: set[str] = set()
+    for idx, row in enumerate(rows):
+        path = f"{item_ref} surfaces[{idx}]"
+        if not isinstance(row, dict):
+            errors.append(f"{path} must be an object")
+            continue
+        key = str(row.get("key") or "").strip()
+        route = str(row.get("route") or "").strip()
+        title = str(row.get("title") or "").strip()
+        surface_kind = str(row.get("surface_kind") or "").strip().lower()
+        nav_visibility = str(row.get("nav_visibility") or "hidden").strip().lower()
+        renderer = row.get("renderer") if isinstance(row.get("renderer"), dict) else {}
+        renderer_type = str(renderer.get("type") or "").strip().lower()
+        if not key:
+            errors.append(f"{path}.key is required")
+        elif key in seen_keys:
+            errors.append(f"{path}.key must be unique per artifact")
+        else:
+            seen_keys.add(key)
+        if not title:
+            errors.append(f"{path}.title is required")
+        if not route:
+            errors.append(f"{path}.route is required")
+        elif route in seen_routes:
+            errors.append(f"{path}.route must be unique per artifact")
+        else:
+            seen_routes.add(route)
+        if surface_kind not in ALLOWED_SURFACE_KINDS:
+            errors.append(f"{path}.surface_kind is invalid")
+        if nav_visibility not in ALLOWED_NAV_VISIBILITY:
+            errors.append(f"{path}.nav_visibility is invalid")
+        if renderer_type not in ALLOWED_RENDERER_TYPES:
+            errors.append(f"{path}.renderer.type is invalid")
+    return errors
+
+
+def _validate_runtime_role_defs(item_ref: str, rows: Any) -> List[str]:
+    errors: List[str] = []
+    if rows is None:
+        return errors
+    if not isinstance(rows, list):
+        return [f"{item_ref} runtime_roles must be an array"]
+    for idx, row in enumerate(rows):
+        path = f"{item_ref} runtime_roles[{idx}]"
+        if not isinstance(row, dict):
+            errors.append(f"{path} must be an object")
+            continue
+        role_kind = str(row.get("role_kind") or "").strip().lower()
+        spec = row.get("spec")
+        if role_kind not in ALLOWED_RUNTIME_ROLE_KINDS:
+            errors.append(f"{path}.role_kind is invalid")
+        if spec is not None and not isinstance(spec, dict):
+            errors.append(f"{path}.spec must be an object")
+    return errors
 
 
 def _validate_manifest(manifest: Dict[str, Any]) -> List[str]:
@@ -485,6 +559,24 @@ def validate_package_install(
 
     planned_changes: List[Dict[str, Any]] = []
     for item in ordered:
+        artifact_json_path, payload_path, surfaces_path, runtime_roles_path = _artifact_paths(item)
+        item_ref = _manifest_artifact_ref(item)
+        raw_surfaces = _files.get(surfaces_path)
+        if raw_surfaces:
+            try:
+                surfaces_payload = json.loads(raw_surfaces.decode("utf-8"))
+            except Exception:
+                errors.append(f"{item_ref} surfaces.json is not valid JSON")
+                surfaces_payload = None
+            errors.extend(_validate_surface_defs(item_ref, surfaces_payload))
+        raw_runtime_roles = _files.get(runtime_roles_path)
+        if raw_runtime_roles:
+            try:
+                runtime_roles_payload = json.loads(raw_runtime_roles.decode("utf-8"))
+            except Exception:
+                errors.append(f"{item_ref} runtime_roles.json is not valid JSON")
+                runtime_roles_payload = None
+            errors.extend(_validate_runtime_role_defs(item_ref, runtime_roles_payload))
         current = Artifact.objects.filter(type__slug=item["type"], slug=item["slug"]).first()
         if not current:
             action = "install"
@@ -560,11 +652,13 @@ def install_package(
     try:
         with transaction.atomic():
             for item in ordered:
-                artifact_json_path, payload_path = _artifact_paths(item)
+                artifact_json_path, payload_path, surfaces_path, runtime_roles_path = _artifact_paths(item)
                 raw = files.get(artifact_json_path)
                 if raw is None:
                     raise ArtifactPackageInstallError([f"artifact file missing: {artifact_json_path}"])
                 payload_raw = files.get(payload_path, b"{}")
+                surfaces_raw = files.get(surfaces_path, b"[]")
+                runtime_roles_raw = files.get(runtime_roles_path, b"[]")
                 try:
                     artifact_json = json.loads(raw.decode("utf-8"))
                 except Exception:
@@ -573,6 +667,19 @@ def install_package(
                     payload_json = json.loads(payload_raw.decode("utf-8"))
                 except Exception:
                     payload_json = {}
+                try:
+                    surfaces_payload = json.loads(surfaces_raw.decode("utf-8"))
+                except Exception:
+                    raise ArtifactPackageInstallError([f"invalid json in {surfaces_path}"])
+                try:
+                    runtime_roles_payload = json.loads(runtime_roles_raw.decode("utf-8"))
+                except Exception:
+                    raise ArtifactPackageInstallError([f"invalid json in {runtime_roles_path}"])
+                item_ref = _manifest_artifact_ref(item)
+                surface_errors = _validate_surface_defs(item_ref, surfaces_payload)
+                role_errors = _validate_runtime_role_defs(item_ref, runtime_roles_payload)
+                if surface_errors or role_errors:
+                    raise ArtifactPackageInstallError(surface_errors + role_errors)
 
                 item_type = str(item.get("type") or "")
                 item_slug = str(item.get("slug") or "")
@@ -698,6 +805,59 @@ def install_package(
                     user=installed_by,
                 )
 
+                installed_surface_keys: set[str] = set()
+                for row in surfaces_payload if isinstance(surfaces_payload, list) else []:
+                    if not isinstance(row, dict):
+                        continue
+                    route_text = str(row.get("route") or "").strip()
+                    key_text = str(row.get("key") or "").strip()
+                    if not route_text or not key_text:
+                        continue
+                    conflict = (
+                        ArtifactSurface.objects.filter(route=route_text)
+                        .exclude(artifact_id=artifact.id, key=key_text)
+                        .exists()
+                    )
+                    if conflict:
+                        raise ArtifactPackageInstallError([f"surface route collision: {route_text}"])
+                    defaults = {
+                        "title": str(row.get("title") or key_text).strip() or key_text,
+                        "description": str(row.get("description") or "").strip(),
+                        "surface_kind": str(row.get("surface_kind") or "editor").strip().lower(),
+                        "route": route_text,
+                        "nav_visibility": str(row.get("nav_visibility") or "hidden").strip().lower(),
+                        "nav_label": str(row.get("nav_label") or "").strip(),
+                        "nav_icon": str(row.get("nav_icon") or "").strip(),
+                        "nav_group": str(row.get("nav_group") or "").strip(),
+                        "renderer": row.get("renderer") if isinstance(row.get("renderer"), dict) else {},
+                        "context": row.get("context") if isinstance(row.get("context"), dict) else {},
+                        "permissions": row.get("permissions") if isinstance(row.get("permissions"), dict) else {},
+                        "sort_order": int(row.get("sort_order") or 0),
+                    }
+                    ArtifactSurface.objects.update_or_create(
+                        artifact=artifact,
+                        key=key_text,
+                        defaults=defaults,
+                    )
+                    installed_surface_keys.add(key_text)
+
+                if installed_surface_keys:
+                    ArtifactSurface.objects.filter(artifact=artifact).exclude(key__in=list(installed_surface_keys)).delete()
+
+                ArtifactRuntimeRole.objects.filter(artifact=artifact).delete()
+                for row in runtime_roles_payload if isinstance(runtime_roles_payload, list) else []:
+                    if not isinstance(row, dict):
+                        continue
+                    role_kind = str(row.get("role_kind") or "").strip().lower()
+                    if role_kind not in ALLOWED_RUNTIME_ROLE_KINDS:
+                        continue
+                    ArtifactRuntimeRole.objects.create(
+                        artifact=artifact,
+                        role_kind=role_kind,
+                        spec=row.get("spec") if isinstance(row.get("spec"), dict) else {},
+                        enabled=bool(row.get("enabled", True)),
+                    )
+
                 operations.append(
                     {
                         "step": "install_artifact",
@@ -706,6 +866,8 @@ def install_package(
                         "result": "success",
                         "action": action,
                         "hook": hook_result,
+                        "surfaces_registered": len(installed_surface_keys),
+                        "runtime_roles_registered": ArtifactRuntimeRole.objects.filter(artifact=artifact).count(),
                     }
                 )
                 artifact_changes.append(
@@ -796,7 +958,7 @@ def export_artifact_package(*, root_artifact: Artifact, package_name: str, packa
         }
         manifest_artifacts.append(entry)
 
-        artifact_path, payload_path = _artifact_paths(entry)
+        artifact_path, payload_path, surfaces_path, runtime_roles_path = _artifact_paths(entry)
         artifact_payload = {
             "artifact": {
                 "type": entry["type"],
@@ -817,9 +979,43 @@ def export_artifact_package(*, root_artifact: Artifact, package_name: str, packa
         }
         raw_artifact = json.dumps(artifact_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         raw_payload = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        surfaces_payload = [
+            {
+                "key": row.key,
+                "title": row.title,
+                "description": row.description or "",
+                "surface_kind": row.surface_kind,
+                "route": row.route,
+                "nav_visibility": row.nav_visibility,
+                "nav_label": row.nav_label or "",
+                "nav_icon": row.nav_icon or "",
+                "nav_group": row.nav_group or "",
+                "renderer": row.renderer if isinstance(row.renderer, dict) else {},
+                "context": row.context if isinstance(row.context, dict) else {},
+                "permissions": row.permissions if isinstance(row.permissions, dict) else {},
+                "sort_order": int(row.sort_order or 0),
+            }
+            for row in ArtifactSurface.objects.filter(artifact=artifact).order_by("sort_order", "key")
+        ]
+        runtime_roles_payload = [
+            {
+                "role_kind": row.role_kind,
+                "spec": row.spec if isinstance(row.spec, dict) else {},
+                "enabled": bool(row.enabled),
+            }
+            for row in ArtifactRuntimeRole.objects.filter(artifact=artifact).order_by("role_kind", "id")
+        ]
+        raw_surfaces = json.dumps(surfaces_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        raw_runtime_roles = json.dumps(runtime_roles_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         files[artifact_path] = raw_artifact
         files[payload_path] = raw_payload
+        files[surfaces_path] = raw_surfaces
+        files[runtime_roles_path] = raw_runtime_roles
         entry["artifact_hash"] = _sha256_bytes(raw_artifact)
+        entry["surfaces_hash"] = _sha256_bytes(raw_surfaces)
+        entry["runtime_roles_hash"] = _sha256_bytes(raw_runtime_roles)
+        entry["surface_count"] = len(surfaces_payload)
+        entry["runtime_role_count"] = len(runtime_roles_payload)
 
     manifest = {
         "format_version": MANIFEST_FORMAT_VERSION,
@@ -829,7 +1025,7 @@ def export_artifact_package(*, root_artifact: Artifact, package_name: str, packa
         "platform_compatibility": {
             "min_version": "1.0.0",
             "max_version_optional": None,
-            "required_features": ["artifact_packages_v1"],
+            "required_features": ["artifact_packages_v1", "artifact_surfaces_v1_1", "artifact_runtime_roles_v1_1"],
         },
         "artifacts": manifest_artifacts,
         "entrypoints": [{"type": root_artifact.type.slug, "slug": root_artifact.slug}],

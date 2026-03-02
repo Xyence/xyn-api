@@ -813,10 +813,16 @@ class TenantMembership(models.Model):
 
 
 class Workspace(models.Model):
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("deprecated", "Deprecated"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     slug = models.SlugField(max_length=120, unique=True)
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1015,6 +1021,101 @@ class Artifact(models.Model):
         return self.title
 
 
+class WorkspaceArtifactBinding(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey("Workspace", on_delete=models.CASCADE, related_name="artifact_bindings")
+    artifact = models.ForeignKey("Artifact", on_delete=models.CASCADE, related_name="workspace_bindings")
+    enabled = models.BooleanField(default=True)
+    installed_state = models.CharField(max_length=40, default="installed")
+    config_ref = models.CharField(max_length=240, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workspace", "artifact"],
+                name="uniq_workspace_artifact_binding",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.workspace_id}:{self.artifact_id}"
+
+
+class ArtifactSurface(models.Model):
+    SURFACE_KIND_CHOICES = [
+        ("config", "Config"),
+        ("editor", "Editor"),
+        ("dashboard", "Dashboard"),
+        ("visualizer", "Visualizer"),
+        ("docs", "Docs"),
+    ]
+    NAV_VISIBILITY_CHOICES = [
+        ("hidden", "Hidden"),
+        ("contextual", "Contextual"),
+        ("always", "Always"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="surfaces")
+    key = models.CharField(max_length=120)
+    title = models.CharField(max_length=240)
+    description = models.TextField(blank=True, default="")
+    surface_kind = models.CharField(max_length=20, choices=SURFACE_KIND_CHOICES, default="editor")
+    route = models.CharField(max_length=280)
+    nav_visibility = models.CharField(max_length=20, choices=NAV_VISIBILITY_CHOICES, default="hidden")
+    nav_label = models.CharField(max_length=120, blank=True, default="")
+    nav_icon = models.CharField(max_length=120, blank=True, default="")
+    nav_group = models.CharField(max_length=120, blank=True, default="")
+    renderer = models.JSONField(default=dict, blank=True)
+    context = models.JSONField(default=dict, blank=True)
+    permissions = models.JSONField(default=dict, blank=True)
+    sort_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "key"]
+        unique_together = ("artifact", "key")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["route"],
+                condition=~Q(route=""),
+                name="uniq_artifact_surface_route",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.artifact_id}:{self.key}"
+
+
+class ArtifactRuntimeRole(models.Model):
+    ROLE_KIND_CHOICES = [
+        ("route_provider", "Route Provider"),
+        ("job", "Job"),
+        ("event_handler", "Event Handler"),
+        ("integration", "Integration"),
+        ("auth", "Auth"),
+        ("data_model", "Data Model"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="runtime_roles")
+    role_kind = models.CharField(max_length=40, choices=ROLE_KIND_CHOICES)
+    spec = models.JSONField(default=dict, blank=True)
+    enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["role_kind", "id"]
+
+    def __str__(self) -> str:
+        return f"{self.artifact_id}:{self.role_kind}"
+
+
 class ArtifactRevision(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE, related_name="revisions")
@@ -1037,7 +1138,15 @@ class VideoRender(models.Model):
         ("running", "Running"),
         ("succeeded", "Succeeded"),
         ("failed", "Failed"),
+        ("filtered", "Filtered"),
         ("canceled", "Canceled"),
+    ]
+    OUTCOME_CHOICES = [
+        ("success", "Success"),
+        ("failed", "Failed"),
+        ("filtered", "Filtered"),
+        ("canceled", "Canceled"),
+        ("timeout", "Timeout"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -1064,6 +1173,16 @@ class VideoRender(models.Model):
     context_pack_hash = models.CharField(max_length=64, blank=True)
     spec_snapshot_hash = models.CharField(max_length=64, blank=True)
     input_snapshot_hash = models.CharField(max_length=64, blank=True)
+    outcome = models.CharField(max_length=20, choices=OUTCOME_CHOICES, blank=True, default="")
+    provider_operation_name = models.CharField(max_length=255, blank=True)
+    provider_operation_id = models.CharField(max_length=120, blank=True)
+    provider_filtered_count = models.PositiveIntegerField(null=True, blank=True)
+    provider_filtered_reasons = models.JSONField(default=list, blank=True)
+    provider_error_code = models.CharField(max_length=80, blank=True)
+    provider_error_message = models.TextField(blank=True)
+    provider_response_excerpt = models.JSONField(default=dict, blank=True)
+    last_provider_status_at = models.DateTimeField(null=True, blank=True)
+    export_package_generated = models.BooleanField(default=False)
     error_message = models.TextField(blank=True)
     error_details_json = models.JSONField(null=True, blank=True)
 

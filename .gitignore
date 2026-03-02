@@ -20,3 +20,6 @@ dist/
 
 # Workspace
 WORKSPACE.md
+
+# Local cert material (never commit private keys)
+apps/ems-stack/certs/

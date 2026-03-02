@@ -2,6 +2,23 @@
 
 Xyn produces a governed `render_package` artifact from explainer inputs. Platform settings choose how that package is rendered.
 
+## Render Outcomes
+
+Video renders now persist an explicit `outcome` separate from transport status:
+
+- `success`: media asset URI produced.
+- `filtered`: provider policy refused media output (RAI/safety filter).
+- `failed`: technical failure (auth/config/network/provider error).
+- `timeout`: provider operation did not complete in the polling window.
+- `canceled`: canceled by user/operator.
+
+`filtered` is terminal and distinct from `failed`. Xyn stores:
+
+- provider operation name/id
+- filtered count + reasons
+- provider error code/message (if present)
+- redacted provider response excerpt
+
 ## Rendering Modes
 
 - `export_package_only`: no remote render, package remains downloadable.
@@ -50,4 +67,4 @@ Credential expectations:
   - a raw Google API key (`AIza...`), or
   - JSON with `api_key` / `apiKey` / `key`.
 
-If no video URI is returned, render is marked failed and export package remains as fallback artifact.
+If provider returns `raiMediaFilteredCount > 0` or non-empty `raiMediaFilteredReasons`, render is marked `filtered` and Xyn keeps export package output as fallback.
