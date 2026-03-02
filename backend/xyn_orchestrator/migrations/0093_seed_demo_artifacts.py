@@ -29,23 +29,23 @@ def seed_demo_artifacts(apps, schema_editor):
         legacy_hello.save(update_fields=["slug", "scope_json", "updated_at"])
         canonical_hello = legacy_hello
 
-    hello, _ = Artifact.objects.get_or_create(
-        slug="hello-app",
-        defaults={
-            "workspace": workspace,
-            "type": module_type,
-            "title": "Hello App",
-            "status": "published",
-            "visibility": "team",
-            "summary": "Kernel-loaded artifact for Hello App",
-            "scope_json": {
+    hello = Artifact.objects.filter(slug="hello-app").order_by("-updated_at", "-created_at").first()
+    if hello is None:
+        hello = Artifact.objects.create(
+            workspace=workspace,
+            type=module_type,
+            title="Hello App",
+            slug="hello-app",
+            status="published",
+            visibility="team",
+            summary="Kernel-loaded artifact for Hello App",
+            scope_json={
                 "slug": "hello-app",
                 "manifest_ref": "xyn-ui/apps/hello-artifact/artifact.manifest.json",
                 "summary": "Kernel-loaded artifact for Hello App",
             },
-            "provenance_json": {"source_system": "seed-kernel", "source_id": "hello-app"},
-        },
-    )
+            provenance_json={"source_system": "seed-kernel", "source_id": "hello-app"},
+        )
     hello_scope = dict(hello.scope_json or {})
     if str(hello_scope.get("manifest_ref") or "").strip() != "xyn-ui/apps/hello-artifact/artifact.manifest.json":
         hello_scope["manifest_ref"] = "xyn-ui/apps/hello-artifact/artifact.manifest.json"
@@ -55,23 +55,23 @@ def seed_demo_artifacts(apps, schema_editor):
         hello.scope_json = hello_scope
         hello.save(update_fields=["scope_json", "updated_at"])
 
-    Artifact.objects.get_or_create(
-        slug="ems-lite",
-        defaults={
-            "workspace": workspace,
-            "type": module_type,
-            "title": "EMS-lite",
-            "status": "published",
-            "visibility": "team",
-            "summary": "Minimal asset management app artifact for demo workspaces.",
-            "scope_json": {
+    ems = Artifact.objects.filter(slug="ems-lite").order_by("-updated_at", "-created_at").first()
+    if ems is None:
+        Artifact.objects.create(
+            workspace=workspace,
+            type=module_type,
+            title="EMS-lite",
+            slug="ems-lite",
+            status="published",
+            visibility="team",
+            summary="Minimal asset management app artifact for demo workspaces.",
+            scope_json={
                 "slug": "ems-lite",
                 "manifest_ref": "artifacts/ems-lite/artifact.manifest.json",
                 "summary": "Minimal asset management app artifact for demo workspaces.",
             },
-            "provenance_json": {"source_system": "seed-kernel", "source_id": "ems-lite"},
-        },
-    )
+            provenance_json={"source_system": "seed-kernel", "source_id": "ems-lite"},
+        )
 
 
 def noop(apps, schema_editor):
