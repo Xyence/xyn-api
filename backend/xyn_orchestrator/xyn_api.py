@@ -2743,6 +2743,7 @@ WORKSPACE_ROLE_RANK = {
     "moderator": 4,
     "admin": 5,
 }
+WORKSPACE_LIFECYCLE_STAGES = {"lead", "prospect", "customer", "churned", "internal"}
 
 
 def _workspace_membership(identity: UserIdentity, workspace_id: str) -> Optional[WorkspaceMembership]:
@@ -2761,6 +2762,51 @@ def _workspace_has_termination_authority(identity: UserIdentity, workspace_id: s
     if not membership:
         return False
     return bool(membership.termination_authority or membership.role == "admin")
+
+
+def _workspace_is_descendant(candidate_parent: Workspace, target_workspace: Workspace) -> bool:
+    visited: Set[str] = set()
+    current: Optional[Workspace] = candidate_parent
+    while current is not None:
+        current_id = str(current.id)
+        if current_id in visited:
+            return False
+        visited.add(current_id)
+        if current.id == target_workspace.id:
+            return True
+        if not current.parent_workspace_id:
+            return False
+        current = Workspace.objects.filter(id=current.parent_workspace_id).only("id", "parent_workspace_id").first()
+    return False
+
+
+def _workspace_lifecycle_stage_or_default(value: str) -> str:
+    stage = str(value or "").strip().lower()
+    if not stage:
+        return "prospect"
+    return stage
+
+
+def _serialize_workspace_summary(
+    workspace: Workspace,
+    *,
+    role: Optional[str] = None,
+    termination_authority: Optional[bool] = None,
+) -> Dict[str, Any]:
+    return {
+        "id": str(workspace.id),
+        "slug": workspace.slug,
+        "name": workspace.name,
+        "description": workspace.description,
+        "status": workspace.status or "active",
+        "kind": str(workspace.kind or "customer"),
+        "lifecycle_stage": str(workspace.lifecycle_stage or "prospect"),
+        "parent_workspace_id": str(workspace.parent_workspace_id) if workspace.parent_workspace_id else None,
+        "org_name": str(workspace.org_name or workspace.name or "").strip(),
+        "metadata": workspace.metadata_json if isinstance(workspace.metadata_json, dict) else {},
+        "role": role or "admin",
+        "termination_authority": bool(termination_authority) if termination_authority is not None else True,
+    }
 
 
 def _next_artifact_revision_number(artifact: Artifact) -> int:
@@ -5834,6 +5880,10 @@ def api_me(request: HttpRequest) -> JsonResponse:
                     "id": str(m.workspace_id),
                     "slug": m.workspace.slug,
                     "name": m.workspace.name,
+                    "org_name": str(m.workspace.org_name or m.workspace.name or "").strip(),
+                    "kind": str(m.workspace.kind or "customer"),
+                    "lifecycle_stage": str(m.workspace.lifecycle_stage or "prospect"),
+                    "parent_workspace_id": str(m.workspace.parent_workspace_id) if m.workspace.parent_workspace_id else None,
                     "role": m.role,
                     "termination_authority": m.termination_authority,
                 }
@@ -8145,22 +8195,68 @@ def workspaces_collection(request: HttpRequest) -> JsonResponse:
     identity = _require_authenticated(request)
     if not identity:
         return JsonResponse({"error": "not authenticated"}, status=401)
-    memberships = WorkspaceMembership.objects.filter(user_identity=identity).select_related("workspace").order_by("workspace__name")
-    return JsonResponse(
-        {
-            "workspaces": [
-                {
-                    "id": str(m.workspace_id),
-                    "slug": m.workspace.slug,
-                    "name": m.workspace.name,
-                    "description": m.workspace.description,
-                    "role": m.role,
-                    "termination_authority": m.termination_authority,
-                }
-                for m in memberships
-            ]
-        }
+    if request.method == "GET":
+        memberships = WorkspaceMembership.objects.filter(user_identity=identity).select_related("workspace").order_by("workspace__name")
+        return JsonResponse(
+            {
+                "workspaces": [
+                    _serialize_workspace_summary(
+                        m.workspace,
+                        role=m.role,
+                        termination_authority=bool(m.termination_authority),
+                    )
+                    for m in memberships
+                ]
+            }
+        )
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _is_platform_admin(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    payload = _parse_json(request)
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return JsonResponse({"error": "name is required"}, status=400)
+    slug = str(payload.get("slug") or "").strip().lower()
+    if not slug:
+        slug = slugify(name)[:120]
+    if not slug:
+        return JsonResponse({"error": "slug is required"}, status=400)
+    if Workspace.objects.filter(slug=slug).exists():
+        return JsonResponse({"error": "workspace slug already exists"}, status=400)
+    kind = str(payload.get("kind") or "customer").strip().lower() or "customer"
+    lifecycle_stage = _workspace_lifecycle_stage_or_default(str(payload.get("lifecycle_stage") or "prospect"))
+    if lifecycle_stage not in WORKSPACE_LIFECYCLE_STAGES:
+        return JsonResponse({"error": "invalid lifecycle_stage"}, status=400)
+    org_name = str(payload.get("org_name") or name).strip() or name
+    metadata = payload.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return JsonResponse({"error": "metadata must be an object"}, status=400)
+    parent_workspace = None
+    parent_workspace_id = str(payload.get("parent_workspace_id") or "").strip()
+    if parent_workspace_id:
+        parent_workspace = Workspace.objects.filter(id=parent_workspace_id).first()
+        if not parent_workspace:
+            return JsonResponse({"error": "parent workspace not found"}, status=404)
+        if not _is_platform_admin(identity) and not _workspace_has_role(identity, parent_workspace_id, "admin"):
+            return JsonResponse({"error": "forbidden"}, status=403)
+    workspace = Workspace.objects.create(
+        slug=slug,
+        name=name,
+        org_name=org_name,
+        description=str(payload.get("description") or ""),
+        status="active",
+        kind=kind,
+        lifecycle_stage=lifecycle_stage,
+        parent_workspace=parent_workspace,
+        metadata_json=metadata or {},
     )
+    WorkspaceMembership.objects.get_or_create(
+        workspace=workspace,
+        user_identity=identity,
+        defaults={"role": "admin", "termination_authority": True},
+    )
+    return JsonResponse({"workspace": _serialize_workspace_summary(workspace, role="admin", termination_authority=True)})
 
 
 @csrf_exempt
@@ -12942,6 +13038,121 @@ def _intent_apply_patch(
     return JsonResponse(payload_response)
 
 
+def _match_deploy_ems_customer_command(message: str) -> Optional[str]:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    match = re.search(r"deploy\s+ems(?:-lite)?\s+for\s+customer\s+(.+)$", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    customer_name = str(match.group(1) or "").strip().strip("\"'")
+    return customer_name or None
+
+
+def _resolve_workspace_for_identity(identity: UserIdentity, workspace_id: str) -> Optional[Workspace]:
+    requested = str(workspace_id or "").strip()
+    if requested:
+        membership = WorkspaceMembership.objects.select_related("workspace").filter(
+            user_identity=identity,
+            workspace_id=requested,
+        ).first()
+        if membership:
+            return membership.workspace
+        if _is_platform_admin(identity):
+            return Workspace.objects.filter(id=requested).first()
+        return None
+    fallback = WorkspaceMembership.objects.select_related("workspace").filter(user_identity=identity).order_by("workspace__name").first()
+    return fallback.workspace if fallback else None
+
+
+def _build_workspace_slug_from_name(name: str) -> str:
+    base = slugify(name)[:96] or "workspace"
+    return base
+
+
+def _next_workspace_slug(base_slug: str) -> str:
+    base = str(base_slug or "").strip().lower() or "workspace"
+    candidate = base[:120]
+    if not Workspace.objects.filter(slug=candidate).exists():
+        return candidate
+    for idx in range(2, 2000):
+        suffix = f"-{idx}"
+        next_candidate = f"{base[: max(1, 120 - len(suffix))]}{suffix}"
+        if not Workspace.objects.filter(slug=next_candidate).exists():
+            return next_candidate
+    return f"{base[:110]}-{uuid.uuid4().hex[:8]}"
+
+
+def _intent_apply_deploy_ems_customer(
+    *,
+    identity: UserIdentity,
+    payload: Dict[str, Any],
+    request_id: str,
+) -> JsonResponse:
+    customer_name = str(payload.get("customer_name") or "").strip()
+    if not customer_name:
+        return JsonResponse({"error": "customer_name is required"}, status=400)
+    operator_workspace_id = str(payload.get("operator_workspace_id") or "").strip()
+    operator_workspace = _resolve_workspace_for_identity(identity, operator_workspace_id)
+    if not operator_workspace:
+        return JsonResponse({"error": "operator workspace not found or forbidden"}, status=403)
+
+    metadata = payload.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return JsonResponse({"error": "metadata must be an object"}, status=400)
+    next_slug = _next_workspace_slug(_build_workspace_slug_from_name(customer_name))
+    child_workspace = Workspace.objects.create(
+        slug=next_slug,
+        name=customer_name,
+        org_name=customer_name,
+        description=f"Customer workspace for {customer_name}",
+        kind="customer",
+        lifecycle_stage="prospect",
+        parent_workspace=operator_workspace,
+        metadata_json=metadata or {},
+    )
+    WorkspaceMembership.objects.get_or_create(
+        workspace=child_workspace,
+        user_identity=identity,
+        defaults={"role": "admin", "termination_authority": True},
+    )
+
+    ems_artifact = Artifact.objects.filter(slug="ems-lite").order_by("-updated_at", "-created_at").first()
+    if ems_artifact:
+        WorkspaceArtifactBinding.objects.get_or_create(
+            workspace=child_workspace,
+            artifact=ems_artifact,
+            defaults={"enabled": True, "installed_state": "installed"},
+        )
+
+    open_ems_path = f"/w/{child_workspace.id}/apps/ems"
+    open_installed_path = f"/w/{child_workspace.id}/build/artifacts"
+    response_payload = {
+        "status": "DraftReady",
+        "action_type": "CreateDraft",
+        "artifact_type": "Workspace",
+        "artifact_id": None,
+        "summary": f'Provisioned EMS-lite workspace for "{customer_name}".',
+        "next_actions": [
+            {"label": "Open EMS", "action": "OpenPath", "path": open_ems_path},
+            {"label": "Open Installed", "action": "OpenPath", "path": open_installed_path},
+        ],
+        "audit": {
+            "request_id": request_id,
+            "timestamp": timezone.now().isoformat(),
+        },
+    }
+    _audit_intent_event(
+        message="intent.apply.deploy_ems_customer",
+        identity=identity,
+        request_id=request_id,
+        artifact_id=None,
+        proposal={"operation": "deploy_ems_customer", "customer_name": customer_name},
+        resolution=response_payload,
+    )
+    return JsonResponse(response_payload)
+
+
 @csrf_exempt
 def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
     if not _intent_engine_enabled():
@@ -12957,8 +13168,39 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "message is required"}, status=400)
 
     context_payload = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    context_workspace_id = str(context_payload.get("workspace_id") or "").strip()
     context_artifact_id = str(context_payload.get("artifact_id") or "").strip()
     context_artifact_type = str(context_payload.get("artifact_type") or "").strip()
+
+    customer_name = _match_deploy_ems_customer_command(message)
+    if customer_name:
+        operator_workspace = _resolve_workspace_for_identity(identity, context_workspace_id)
+        if not operator_workspace:
+            return JsonResponse({"error": "workspace context is required for deploy EMS customer flow"}, status=400)
+        return JsonResponse(
+            {
+                "status": "DraftReady",
+                "action_type": "CreateDraft",
+                "artifact_type": "Workspace",
+                "artifact_id": None,
+                "summary": f'Will create customer workspace "{customer_name}" under "{operator_workspace.name}" and install EMS-lite.',
+                "draft_payload": {
+                    "__operation": "deploy_ems_customer",
+                    "customer_name": customer_name,
+                    "operator_workspace_id": str(operator_workspace.id),
+                    "kind": "customer",
+                    "lifecycle_stage": "prospect",
+                },
+                "next_actions": [
+                    {"label": "Create workspace + install EMS-lite", "action": "CreateDraft"},
+                ],
+                "audit": {
+                    "request_id": str(uuid.uuid4()),
+                    "timestamp": timezone.now().isoformat(),
+                },
+            }
+        )
+
     context_artifact = None
     if context_artifact_id:
         normalized_context_type = str(context_artifact_type or "").strip().lower()
@@ -13015,11 +13257,18 @@ def xyn_intent_apply(request: HttpRequest) -> JsonResponse:
 
     if action_type not in {"CreateDraft", "ApplyPatch"}:
         return JsonResponse({"error": "action_type must be CreateDraft or ApplyPatch"}, status=400)
-    if artifact_type not in {"ArticleDraft", "ContextPack"}:
-        return JsonResponse({"error": "artifact_type must be ArticleDraft or ContextPack"}, status=400)
+    if action_type == "CreateDraft":
+        if artifact_type not in {"ArticleDraft", "Workspace"}:
+            return JsonResponse({"error": "artifact_type must be ArticleDraft or Workspace"}, status=400)
+    else:
+        if artifact_type not in {"ArticleDraft", "ContextPack"}:
+            return JsonResponse({"error": "artifact_type must be ArticleDraft or ContextPack"}, status=400)
 
     if action_type == "CreateDraft":
         if artifact_type != "ArticleDraft":
+            operation = str(body_payload.get("__operation") or "").strip().lower()
+            if operation == "deploy_ems_customer":
+                return _intent_apply_deploy_ems_customer(identity=identity, payload=body_payload, request_id=request_id)
             return JsonResponse({"error": "CreateDraft currently supports ArticleDraft only"}, status=400)
         return _intent_apply_create_draft(identity=identity, payload=body_payload, request_id=request_id)
 
@@ -16964,19 +17213,7 @@ def workspace_detail(request: HttpRequest, workspace_id: str) -> JsonResponse:
     if request.method == "GET":
         if not membership and not _is_platform_admin(identity):
             return JsonResponse({"error": "forbidden"}, status=403)
-        return JsonResponse(
-            {
-                "workspace": {
-                    "id": str(workspace.id),
-                    "slug": workspace.slug,
-                    "name": workspace.name,
-                    "description": workspace.description,
-                    "status": workspace.status or "active",
-                    "role": membership.role if membership else "admin",
-                    "termination_authority": bool(membership.termination_authority) if membership else True,
-                }
-            }
-        )
+        return JsonResponse({"workspace": _serialize_workspace_summary(workspace, role=membership.role if membership else "admin", termination_authority=bool(membership.termination_authority) if membership else True)})
     if request.method not in {"PATCH", "PUT"}:
         return JsonResponse({"error": "method not allowed"}, status=405)
     if not can_manage:
@@ -17006,34 +17243,44 @@ def workspace_detail(request: HttpRequest, workspace_id: str) -> JsonResponse:
             return JsonResponse({"error": "workspace slug already exists"}, status=400)
         workspace.slug = slug
         update_fields.append("slug")
+    if "org_name" in payload:
+        workspace.org_name = str(payload.get("org_name") or "").strip() or workspace.name
+        update_fields.append("org_name")
+    if "kind" in payload:
+        workspace.kind = str(payload.get("kind") or "").strip().lower() or "customer"
+        update_fields.append("kind")
+    if "lifecycle_stage" in payload:
+        lifecycle_stage = _workspace_lifecycle_stage_or_default(str(payload.get("lifecycle_stage") or ""))
+        if lifecycle_stage not in WORKSPACE_LIFECYCLE_STAGES:
+            return JsonResponse({"error": "invalid lifecycle_stage"}, status=400)
+        workspace.lifecycle_stage = lifecycle_stage
+        update_fields.append("lifecycle_stage")
+    if "parent_workspace_id" in payload:
+        raw_parent_id = payload.get("parent_workspace_id")
+        parent_workspace_id = str(raw_parent_id or "").strip()
+        if not parent_workspace_id:
+            workspace.parent_workspace = None
+            update_fields.append("parent_workspace")
+        else:
+            if parent_workspace_id == str(workspace.id):
+                return JsonResponse({"error": "parent_workspace_id cannot equal workspace id"}, status=400)
+            parent_workspace = Workspace.objects.filter(id=parent_workspace_id).first()
+            if not parent_workspace:
+                return JsonResponse({"error": "parent workspace not found"}, status=404)
+            if _workspace_is_descendant(parent_workspace, workspace):
+                return JsonResponse({"error": "parent_workspace_id creates a cycle"}, status=400)
+            workspace.parent_workspace = parent_workspace
+            update_fields.append("parent_workspace")
+    if "metadata" in payload:
+        metadata = payload.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            return JsonResponse({"error": "metadata must be an object"}, status=400)
+        workspace.metadata_json = metadata or {}
+        update_fields.append("metadata_json")
     if not update_fields:
-        return JsonResponse(
-            {
-                "workspace": {
-                    "id": str(workspace.id),
-                    "slug": workspace.slug,
-                    "name": workspace.name,
-                    "description": workspace.description,
-                    "status": workspace.status,
-                    "role": membership.role if membership else "admin",
-                    "termination_authority": bool(membership.termination_authority) if membership else True,
-                }
-            }
-        )
+        return JsonResponse({"workspace": _serialize_workspace_summary(workspace, role=membership.role if membership else "admin", termination_authority=bool(membership.termination_authority) if membership else True)})
     workspace.save(update_fields=[*update_fields, "updated_at"])
-    return JsonResponse(
-        {
-            "workspace": {
-                "id": str(workspace.id),
-                "slug": workspace.slug,
-                "name": workspace.name,
-                "description": workspace.description,
-                "status": workspace.status or "active",
-                "role": membership.role if membership else "admin",
-                "termination_authority": bool(membership.termination_authority) if membership else True,
-            }
-        }
-    )
+    return JsonResponse({"workspace": _serialize_workspace_summary(workspace, role=membership.role if membership else "admin", termination_authority=bool(membership.termination_authority) if membership else True)})
 
 
 UI_COMPONENT_REGISTRY: List[Dict[str, str]] = [

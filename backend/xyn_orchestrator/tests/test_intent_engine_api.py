@@ -9,7 +9,17 @@ from xyn_orchestrator.intent_engine.contracts import DraftIntakeContractRegistry
 from xyn_orchestrator.intent_engine.engine import IntentResolutionEngine, ResolutionContext
 from xyn_orchestrator.intent_engine.proposal_provider import IntentContextPackMissingError
 from xyn_orchestrator.artifact_links import ensure_context_pack_artifact
-from xyn_orchestrator.models import Artifact, ArticleCategory, ContextPack, LedgerEvent, RoleBinding, UserIdentity, Workspace
+from xyn_orchestrator.models import (
+    Artifact,
+    ArtifactType,
+    ArticleCategory,
+    ContextPack,
+    LedgerEvent,
+    RoleBinding,
+    UserIdentity,
+    Workspace,
+    WorkspaceArtifactBinding,
+)
 
 
 class _FakeProvider:
@@ -471,3 +481,56 @@ class IntentEngineApiTests(TestCase):
         self.assertIn("amphib", scene_blob)
         self.assertNotIn("hook / premise", scene_blob)
         self.assertNotIn("setup / context", scene_blob)
+
+    def test_deploy_ems_for_customer_creates_child_workspace_and_binding(self):
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        ems_artifact = Artifact.objects.create(
+            workspace=self.workspace,
+            type=module_type,
+            title="EMS-lite",
+            slug="ems-lite",
+            status="published",
+            visibility="team",
+        )
+        resolve_response = self.client.post(
+            "/xyn/api/xyn/intent/resolve",
+            data=json.dumps(
+                {
+                    "message": "deploy EMS for customer Acme Grid",
+                    "context": {"workspace_id": str(self.workspace.id)},
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(resolve_response.status_code, 200, resolve_response.content.decode())
+        resolve_payload = resolve_response.json()
+        self.assertEqual(resolve_payload.get("status"), "DraftReady")
+        self.assertEqual(resolve_payload.get("artifact_type"), "Workspace")
+        draft_payload = resolve_payload.get("draft_payload") or {}
+        self.assertEqual(draft_payload.get("__operation"), "deploy_ems_customer")
+
+        apply_response = self.client.post(
+            "/xyn/api/xyn/intent/apply",
+            data=json.dumps(
+                {
+                    "action_type": "CreateDraft",
+                    "artifact_type": "Workspace",
+                    "payload": draft_payload,
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(apply_response.status_code, 200, apply_response.content.decode())
+        apply_payload = apply_response.json()
+        self.assertEqual(apply_payload.get("status"), "DraftReady")
+        open_ems = next((item for item in apply_payload.get("next_actions", []) if item.get("action") == "OpenPath"), None)
+        self.assertIsNotNone(open_ems)
+        open_path = str((open_ems or {}).get("path") or "")
+        self.assertIn("/apps/ems", open_path)
+        child_workspace = Workspace.objects.exclude(id=self.workspace.id).order_by("-created_at").first()
+        self.assertIsNotNone(child_workspace)
+        assert child_workspace is not None
+        self.assertEqual(child_workspace.parent_workspace_id, self.workspace.id)
+        self.assertEqual(child_workspace.lifecycle_stage, "prospect")
+        self.assertEqual(child_workspace.kind, "customer")
+        self.assertTrue(WorkspaceArtifactBinding.objects.filter(workspace=child_workspace, artifact=ems_artifact).exists())
