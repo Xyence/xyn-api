@@ -43,6 +43,7 @@ services:
       - backend_static:/app/staticfiles
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/ubuntu/src/xyn-contracts:/xyn-contracts:ro
+      - /home/ubuntu/src/artifacts:/home/ubuntu/src/artifacts:ro
       - /home/ubuntu/central-xyence-io-9d049e62e994.json:/secrets/gcp-speech.json:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"

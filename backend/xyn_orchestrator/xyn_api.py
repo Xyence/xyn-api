@@ -6279,7 +6279,6 @@ def _serialize_workspace_artifact_binding(binding: WorkspaceArtifactBinding) -> 
         "name": artifact.title,
         "title": artifact.title,
         "kind": artifact.type.slug if artifact.type_id else None,
-        "category": artifact.type.slug if artifact.type_id else None,
         "description": description or None,
         "enabled": bool(binding.enabled),
         "installed_state": str(binding.installed_state or "installed"),
@@ -7078,6 +7077,10 @@ def artifacts_catalog_collection(request: HttpRequest) -> JsonResponse:
 
     rows: List[Dict[str, Any]] = []
     for artifact in qs.order_by("-updated_at", "-created_at")[:500]:
+        try:
+            manifest_summary = _manifest_summary_for_artifact(artifact)
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=500)
         rows.append(
             {
                 "id": str(artifact.id),
@@ -7087,7 +7090,7 @@ def artifacts_catalog_collection(request: HttpRequest) -> JsonResponse:
                 "description": (artifact.summary or "").strip() or None,
                 "version": artifact.version,
                 "updated_at": artifact.updated_at,
-                "manifest_summary": _manifest_summary_for_artifact(artifact),
+                "manifest_summary": manifest_summary,
             }
         )
     return JsonResponse({"artifacts": rows})
@@ -8173,7 +8176,7 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
         if not _workspace_has_role(identity, workspace_id, "contributor"):
             return JsonResponse({"error": "forbidden"}, status=403)
         payload = _parse_json(request)
-        install_artifact_ref = str(payload.get("artifact_id") or payload.get("slug") or "").strip()
+        install_artifact_ref = str(payload.get("artifact_id") or "").strip()
         if install_artifact_ref:
             target_artifact: Optional[Artifact] = None
             try:
@@ -8203,7 +8206,11 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
                 binding.installed_state = "installed"
                 binding.enabled = enabled
                 binding.save(update_fields=["installed_state", "enabled", "updated_at"])
-            return JsonResponse({"artifact": _serialize_workspace_artifact_binding(binding), "created": created})
+            try:
+                payload = _serialize_workspace_artifact_binding(binding)
+            except ValueError as exc:
+                return JsonResponse({"error": str(exc)}, status=500)
+            return JsonResponse({"artifact": payload, "created": created})
         type_slug = str(payload.get("type") or "article").strip().lower()
         artifact_type = ArtifactType.objects.filter(slug=type_slug).first()
         if not artifact_type:
@@ -8276,7 +8283,12 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
         qs = qs.filter(artifact__status=status)
     if membership.role == "reader":
         qs = qs.filter(artifact__status="published").filter(artifact__visibility__in=["team", "public"])
-    data = [_serialize_workspace_artifact_binding(item) for item in qs.order_by("-artifact__updated_at", "-updated_at")]
+    data: List[Dict[str, Any]] = []
+    for item in qs.order_by("-artifact__updated_at", "-updated_at"):
+        try:
+            data.append(_serialize_workspace_artifact_binding(item))
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=500)
     return JsonResponse({"artifacts": data})
 
 
@@ -8296,7 +8308,13 @@ def internal_workspace_artifacts_collection(request: HttpRequest, workspace_id: 
         .select_related("artifact", "artifact__type")
         .order_by("-artifact__updated_at", "-updated_at")
     )
-    return JsonResponse({"artifacts": [_serialize_workspace_artifact_binding(item) for item in qs]})
+    payload: List[Dict[str, Any]] = []
+    for item in qs:
+        try:
+            payload.append(_serialize_workspace_artifact_binding(item))
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=500)
+    return JsonResponse({"artifacts": payload})
 
 
 @csrf_exempt
@@ -8313,7 +8331,10 @@ def workspace_artifact_detail(request: HttpRequest, workspace_id: str, artifact_
         binding = WorkspaceArtifactBinding.objects.filter(workspace_id=workspace_id, id=artifact_id).select_related("artifact", "artifact__type").first()
         if not binding:
             return JsonResponse({"error": "binding not found"}, status=404)
-        payload = _serialize_workspace_artifact_binding(binding)
+        try:
+            payload = _serialize_workspace_artifact_binding(binding)
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=500)
         binding.delete()
         return JsonResponse({"deleted": True, "artifact": payload})
     artifact = get_object_or_404(Artifact.objects.select_related("type"), id=artifact_id, workspace_id=workspace_id)
@@ -17109,10 +17130,20 @@ def _load_artifact_manifest(artifact: Artifact) -> Dict[str, Any]:
         return {}
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
+        if not isinstance(payload, dict):
+            return {}
+        manifest_artifact = payload.get("artifact") if isinstance(payload.get("artifact"), dict) else {}
+        manifest_slug = str(manifest_artifact.get("id") or "").strip()
+        expected_slug = str(_artifact_slug(artifact) or "").strip()
+        if manifest_slug and expected_slug and manifest_slug != expected_slug:
+            raise ValueError(
+                f"manifest slug mismatch artifact_id={artifact.id} slug={expected_slug} "
+                f"manifest.artifact.id={manifest_slug} file={manifest_path}"
+            )
+        return payload
     except Exception as exc:
         logger.warning("failed to load manifest artifact_id=%s path=%s error=%s", artifact.id, manifest_path, exc)
-        return {}
+        raise ValueError(str(exc)) from exc
 
 
 def _manifest_surface_entries(manifest: Dict[str, Any], surface_key: str) -> List[Dict[str, Any]]:
@@ -17162,6 +17193,7 @@ def _manifest_summary_for_artifact(artifact: Artifact) -> Dict[str, Any]:
         "surfaces": {
             "nav": _manifest_surface_entries(manifest, "nav"),
             "manage": _manifest_surface_entries(manifest, "manage"),
+            "docs": _manifest_surface_entries(manifest, "docs"),
         },
     }
 
@@ -17304,7 +17336,10 @@ def artifact_surfaces_nav(request: HttpRequest) -> JsonResponse:
     for binding in bindings:
         if not _can_view_generic_artifact(identity, binding.artifact):
             continue
-        entries.extend(_manifest_nav_surfaces(binding))
+        try:
+            entries.extend(_manifest_nav_surfaces(binding))
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=500)
 
     entries.sort(
         key=lambda row: (

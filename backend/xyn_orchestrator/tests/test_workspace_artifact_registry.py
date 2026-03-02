@@ -195,6 +195,75 @@ class WorkspaceArtifactRegistryTests(TestCase):
         rows = response.json().get("artifacts", [])
         self.assertGreaterEqual(len(rows), 3)
 
+    def test_catalog_includes_ems_lite_surfaces(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "ems-lite.manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": {"id": "ems-lite", "name": "EMS-lite", "version": "1.0.0"},
+                        "roles": [
+                            {"role": "api_router", "mount_path": "/api/apps/ems"},
+                            {"role": "ui_mount", "mount_path": "/apps/ems"},
+                        ],
+                        "surfaces": {
+                            "nav": [{"label": "EMS", "path": "/apps/ems", "order": 300}],
+                            "manage": [{"label": "Settings", "path": "/apps/ems/manage", "order": 100}],
+                            "docs": [{"label": "Docs", "path": "/apps/ems/docs", "order": 1000}],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="EMS-lite",
+                slug="ems-lite",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(manifest_path), "slug": "ems-lite"},
+            )
+            response = self.client.get("/xyn/api/artifacts/catalog")
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json().get("artifacts", [])
+        ems = next((row for row in rows if row.get("slug") == "ems-lite"), None)
+        self.assertIsNotNone(ems)
+        self.assertEqual(ems.get("manifest_summary", {}).get("surfaces", {}).get("docs", [])[0].get("path"), "/apps/ems/docs")
+
+    def test_catalog_manifest_slug_mismatch_fails_fast(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "mismatch.manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": {"id": "wrong-slug", "name": "Mismatch", "version": "1.0.0"},
+                        "roles": [{"role": "ui_mount", "mount_path": "/apps/mismatch"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="Mismatch",
+                slug="expected-slug",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(manifest_path), "slug": "expected-slug"},
+            )
+            response = self.client.get("/xyn/api/artifacts/catalog")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("manifest slug mismatch", str(response.json().get("error") or ""))
+
     def test_install_workspace_artifact_binding_is_idempotent(self):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
         self._set_identity(self.admin_identity)
@@ -218,6 +287,33 @@ class WorkspaceArtifactRegistryTests(TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertFalse(second.json().get("created"))
         self.assertEqual(second.json().get("artifact", {}).get("binding_id"), first_binding_id)
+        self.assertEqual(
+            WorkspaceArtifactBinding.objects.filter(workspace=self.workspace, artifact=artifact).count(),
+            1,
+        )
+
+    def test_install_workspace_artifact_binding_accepts_slug(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        artifact = Artifact.objects.create(workspace=self.workspace, type=module_type, title="EMS-lite", slug="ems-lite", status="published")
+
+        first = self.client.post(
+            f"/xyn/api/workspaces/{self.workspace.id}/artifacts",
+            data=json.dumps({"artifact_id": "ems-lite", "enabled": True}),
+            content_type="application/json",
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first.json().get("created"))
+        self.assertEqual(first.json().get("artifact", {}).get("artifact_id"), str(artifact.id))
+
+        second = self.client.post(
+            f"/xyn/api/workspaces/{self.workspace.id}/artifacts",
+            data=json.dumps({"artifact_id": "ems-lite", "enabled": True}),
+            content_type="application/json",
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(second.json().get("created"))
         self.assertEqual(
             WorkspaceArtifactBinding.objects.filter(workspace=self.workspace, artifact=artifact).count(),
             1,
@@ -291,7 +387,7 @@ class WorkspaceArtifactRegistryTests(TestCase):
             manifest_path.write_text(
                 json.dumps(
                     {
-                        "artifact": {"id": "xyn-hello-app", "name": "Hello App", "version": "phase1c"},
+                        "artifact": {"id": "hello-app", "name": "Hello App", "version": "phase1c"},
                         "surfaces": {
                             "nav": [
                                 {"label": "Hello", "path": "/apps/hello", "order": 900, "group": "build"},
@@ -305,10 +401,10 @@ class WorkspaceArtifactRegistryTests(TestCase):
                 workspace=self.workspace,
                 type=module_type,
                 title="Hello App",
-                slug="xyn-hello-app",
+                slug="hello-app",
                 status="published",
                 visibility="team",
-                scope_json={"manifest_ref": str(manifest_path), "slug": "xyn-hello-app"},
+                scope_json={"manifest_ref": str(manifest_path), "slug": "hello-app"},
             )
             WorkspaceArtifactBinding.objects.create(
                 workspace=self.workspace,
@@ -330,7 +426,7 @@ class WorkspaceArtifactRegistryTests(TestCase):
             manifest_path.write_text(
                 json.dumps(
                     {
-                        "artifact": {"id": "xyn-hello-app", "name": "Hello App", "version": "phase1c"},
+                        "artifact": {"id": "hello-app", "name": "Hello App", "version": "phase1c"},
                         "surfaces": {"nav": [{"label": "Hello", "path": "/apps/hello"}]},
                     }
                 ),
