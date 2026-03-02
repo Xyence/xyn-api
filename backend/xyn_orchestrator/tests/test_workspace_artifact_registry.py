@@ -144,6 +144,57 @@ class WorkspaceArtifactRegistryTests(TestCase):
         artifact_ids = {row["artifact_id"] for row in response.json().get("artifacts", [])}
         self.assertEqual(artifact_ids, {str(included.id)})
 
+    def test_workspace_artifacts_include_manifest_manage_surfaces(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "manage.manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": {"id": "manage-app", "name": "Manage App", "version": "1.0.0"},
+                        "roles": [{"role": "ui_mount", "mount_path": "/apps/manage"}],
+                        "surfaces": {
+                            "manage": [{"label": "Settings", "path": "/apps/manage/settings", "order": 50}],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            artifact = Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="Manage App",
+                slug="manage-app",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(manifest_path)},
+            )
+            WorkspaceArtifactBinding.objects.create(workspace=self.workspace, artifact=artifact, enabled=True, installed_state="installed")
+
+            response = self.client.get(f"/xyn/api/workspaces/{self.workspace.id}/artifacts")
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json().get("artifacts", [])
+        self.assertEqual(len(rows), 1)
+        manage = rows[0].get("manifest_summary", {}).get("surfaces", {}).get("manage", [])
+        self.assertEqual(manage[0].get("path"), "/apps/manage/settings")
+
+    def test_catalog_returns_global_artifacts(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        Artifact.objects.create(workspace=self.workspace, type=self.article_type, title="A1", slug="a1", status="published")
+        Artifact.objects.create(workspace=self.workspace, type=module_type, title="M1", slug="m1", status="published")
+        Artifact.objects.create(workspace=self.workspace, type=module_type, title="M2", slug="m2", status="published")
+        Artifact.objects.create(workspace=self.workspace, type=module_type, title="M3", slug="m3", status="published")
+
+        response = self.client.get("/xyn/api/artifacts/catalog")
+        self.assertEqual(response.status_code, 200)
+        rows = response.json().get("artifacts", [])
+        self.assertGreaterEqual(len(rows), 3)
+
     def test_install_workspace_artifact_binding_is_idempotent(self):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
         self._set_identity(self.admin_identity)

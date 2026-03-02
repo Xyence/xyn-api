@@ -6272,6 +6272,7 @@ def _serialize_workspace_artifact_binding(binding: WorkspaceArtifactBinding) -> 
     manifest_ref = str(scope.get("manifest_ref") or "").strip()
     if not description and isinstance(artifact.scope_json, dict):
         description = str(artifact.scope_json.get("summary") or "").strip()
+    manifest_summary = _manifest_summary_for_artifact(artifact)
     return {
         "binding_id": str(binding.id),
         "artifact_id": str(artifact.id),
@@ -6285,6 +6286,7 @@ def _serialize_workspace_artifact_binding(binding: WorkspaceArtifactBinding) -> 
         "version": artifact.version,
         "slug": _artifact_slug(artifact),
         "manifest_ref": manifest_ref or None,
+        "manifest_summary": manifest_summary,
         "updated_at": artifact.updated_at,
     }
 
@@ -7055,6 +7057,40 @@ def artifacts_collection(request: HttpRequest) -> JsonResponse:
             source = drafts_by_id.get(artifact.source_ref_id)
         data.append(_serialize_unified_artifact(artifact, source))
     return JsonResponse({"artifacts": data, "count": total, "limit": limit, "offset": offset})
+
+
+@csrf_exempt
+@login_required
+def artifacts_catalog_collection(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+
+    query = str(request.GET.get("query") or request.GET.get("q") or "").strip()
+    kind = str(request.GET.get("kind") or "").strip().lower()
+
+    qs = Artifact.objects.select_related("type").all()
+    if kind:
+        qs = qs.filter(type__slug=kind)
+    if query:
+        qs = qs.filter(models.Q(title__icontains=query) | models.Q(summary__icontains=query) | models.Q(slug__icontains=query))
+
+    rows: List[Dict[str, Any]] = []
+    for artifact in qs.order_by("-updated_at", "-created_at")[:500]:
+        rows.append(
+            {
+                "id": str(artifact.id),
+                "slug": _artifact_slug(artifact),
+                "title": artifact.title,
+                "kind": artifact.type.slug if artifact.type_id else None,
+                "description": (artifact.summary or "").strip() or None,
+                "version": artifact.version,
+                "updated_at": artifact.updated_at,
+                "manifest_summary": _manifest_summary_for_artifact(artifact),
+            }
+        )
+    return JsonResponse({"artifacts": rows})
 
 
 @csrf_exempt
@@ -17079,38 +17115,75 @@ def _load_artifact_manifest(artifact: Artifact) -> Dict[str, Any]:
         return {}
 
 
+def _manifest_surface_entries(manifest: Dict[str, Any], surface_key: str) -> List[Dict[str, Any]]:
+    surfaces = manifest.get("surfaces") if isinstance(manifest.get("surfaces"), dict) else {}
+    raw_rows = surfaces.get(surface_key) if isinstance(surfaces.get(surface_key), list) else []
+    rows: List[Dict[str, Any]] = []
+    for idx, entry in enumerate(raw_rows):
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or "").strip()
+        path = _normalize_surface_path(str(entry.get("path") or ""))
+        if not label or not path:
+            continue
+        try:
+            order = int(entry.get("order", 1000))
+        except (TypeError, ValueError):
+            order = 1000
+        item: Dict[str, Any] = {
+            "label": label,
+            "path": path,
+            "order": order,
+        }
+        icon = str(entry.get("icon") or "").strip()
+        group = str(entry.get("group") or "").strip()
+        if icon:
+            item["icon"] = icon
+        if group:
+            item["group"] = group
+        rows.append(item)
+    rows.sort(key=lambda item: (int(item.get("order") or 1000), str(item.get("label") or "").lower()))
+    return rows
+
+
+def _manifest_summary_for_artifact(artifact: Artifact) -> Dict[str, Any]:
+    manifest = _load_artifact_manifest(artifact)
+    roles_raw = manifest.get("roles") if isinstance(manifest.get("roles"), list) else []
+    roles: List[str] = []
+    for role in roles_raw:
+        if not isinstance(role, dict):
+            continue
+        role_name = str(role.get("role") or "").strip().lower()
+        if role_name:
+            roles.append(role_name)
+    unique_roles = sorted(set(roles))
+    return {
+        "roles": unique_roles,
+        "surfaces": {
+            "nav": _manifest_surface_entries(manifest, "nav"),
+            "manage": _manifest_surface_entries(manifest, "manage"),
+        },
+    }
+
+
 def _manifest_nav_surfaces(binding: WorkspaceArtifactBinding) -> List[Dict[str, Any]]:
     artifact = binding.artifact
-    manifest = _load_artifact_manifest(artifact)
-    surfaces = manifest.get("surfaces") if isinstance(manifest.get("surfaces"), dict) else {}
-    nav_entries = surfaces.get("nav") if isinstance(surfaces.get("nav"), list) else []
+    nav_entries = _manifest_surface_entries(_load_artifact_manifest(artifact), "nav")
     rows: List[Dict[str, Any]] = []
 
     for idx, entry in enumerate(nav_entries):
-        if not isinstance(entry, dict):
-            logger.warning("ignored invalid manifest nav entry artifact_id=%s index=%s", artifact.id, idx)
-            continue
         label = str(entry.get("label") or "").strip()
         route = _normalize_surface_path(str(entry.get("path") or ""))
-        if not label or not route:
-            logger.warning("ignored manifest nav entry missing label/path artifact_id=%s index=%s", artifact.id, idx)
-            continue
-        order_raw = entry.get("order", 1000)
-        try:
-            sort_order = int(order_raw)
-        except (TypeError, ValueError):
-            sort_order = 1000
+        sort_order = int(entry.get("order") or 1000)
         nav_group = str(entry.get("group") or "build").strip().lower() or "build"
         nav_icon = str(entry.get("icon") or "").strip() or None
-        description = str(entry.get("description") or "").strip() or None
-        permissions = entry.get("permissions") if isinstance(entry.get("permissions"), dict) else {}
         rows.append(
             {
                 "id": f"manifest-nav-{artifact.id}-{idx}",
                 "artifact_id": str(artifact.id),
                 "key": f"manifest-nav-{idx}",
                 "title": label,
-                "description": description,
+                "description": None,
                 "surface_kind": "docs",
                 "route": route,
                 "nav_visibility": "always",
@@ -17119,7 +17192,7 @@ def _manifest_nav_surfaces(binding: WorkspaceArtifactBinding) -> List[Dict[str, 
                 "nav_group": nav_group,
                 "renderer": {"type": "ui_mount"},
                 "context": {"source": "manifest"},
-                "permissions": permissions,
+                "permissions": {},
                 "sort_order": sort_order,
                 "created_at": artifact.created_at,
                 "updated_at": artifact.updated_at,
