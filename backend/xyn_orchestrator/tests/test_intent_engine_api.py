@@ -641,3 +641,86 @@ class IntentEngineApiTests(TestCase):
         panel_action = next((row for row in payload.get("next_actions", []) if row.get("action") == "OpenPanel"), None)
         self.assertIsNotNone(panel_action)
         self.assertEqual((panel_action or {}).get("panel_key"), "ems_registrations_time")
+
+    def test_artifact_panel_commands_return_open_panel_actions(self):
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        Artifact.objects.get_or_create(
+            workspace=self.workspace,
+            type=module_type,
+            slug="core.authn-jwt",
+            defaults={
+                "title": "core.authn-jwt",
+                "status": "published",
+                "visibility": "team",
+            },
+        )
+
+        resolve_response = self.client.post(
+            "/xyn/api/xyn/intent/resolve",
+            data=json.dumps({"message": "list core artifacts"}),
+            content_type="application/json",
+        )
+        self.assertEqual(resolve_response.status_code, 200, resolve_response.content.decode())
+        draft_payload = resolve_response.json().get("draft_payload") or {}
+        self.assertEqual(draft_payload.get("__operation"), "open_artifact_panel")
+        self.assertEqual(draft_payload.get("panel_key"), "artifact_list")
+        self.assertEqual((draft_payload.get("params") or {}).get("namespace"), "core")
+
+        apply_response = self.client.post(
+            "/xyn/api/xyn/intent/apply",
+            data=json.dumps(
+                {
+                    "action_type": "CreateDraft",
+                    "artifact_type": "Workspace",
+                    "payload": draft_payload,
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(apply_response.status_code, 200, apply_response.content.decode())
+        panel_action = next((row for row in apply_response.json().get("next_actions", []) if row.get("action") == "OpenPanel"), None)
+        self.assertIsNotNone(panel_action)
+        self.assertEqual((panel_action or {}).get("panel_key"), "artifact_list")
+
+        raw_resolve = self.client.post(
+            "/xyn/api/xyn/intent/resolve",
+            data=json.dumps({"message": "edit artifact core.authn-jwt raw"}),
+            content_type="application/json",
+        )
+        self.assertEqual(raw_resolve.status_code, 200, raw_resolve.content.decode())
+        raw_payload = raw_resolve.json().get("draft_payload") or {}
+        self.assertEqual(raw_payload.get("panel_key"), "artifact_raw_json")
+        self.assertEqual((raw_payload.get("params") or {}).get("slug"), "core.authn-jwt")
+
+    def test_artifact_slug_endpoints_return_full_raw_json_and_files(self):
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        artifact, _ = Artifact.objects.get_or_create(
+            workspace=self.workspace,
+            type=module_type,
+            slug="core.authn-jwt",
+            defaults={
+                "title": "core.authn-jwt",
+                "status": "published",
+                "visibility": "team",
+                "scope_json": {"manifest_ref": "registry/modules/authn-jwt.artifact.manifest.json"},
+            },
+        )
+
+        detail = self.client.get("/xyn/api/artifacts/slug/core.authn-jwt")
+        self.assertEqual(detail.status_code, 200, detail.content.decode())
+        body = detail.json()
+        self.assertEqual((body.get("artifact") or {}).get("id"), str(artifact.id))
+        self.assertIn("manifest_summary", body)
+        self.assertIn("raw_artifact_json", body)
+        self.assertIn("files", body)
+        self.assertTrue(isinstance(body.get("files"), list))
+        self.assertGreaterEqual(len(body.get("files") or []), 1)
+
+        files = self.client.get("/xyn/api/artifacts/slug/core.authn-jwt/files")
+        self.assertEqual(files.status_code, 200, files.content.decode())
+        files_payload = files.json()
+        self.assertEqual(((files_payload.get("artifact") or {}).get("slug")), "core.authn-jwt")
+        first = (files_payload.get("files") or [{}])[0]
+        self.assertIn("path", first)
+        self.assertIn("size_bytes", first)
+        self.assertIn("sha256", first)

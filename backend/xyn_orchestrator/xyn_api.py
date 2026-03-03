@@ -7545,6 +7545,10 @@ def artifacts_collection(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "method not allowed"}, status=405)
 
     artifact_type = str(request.GET.get("type") or "").strip().lower()
+    kind_alias = str(request.GET.get("kind") or "").strip().lower()
+    if not artifact_type and kind_alias:
+        artifact_type = kind_alias
+    namespace = str(request.GET.get("namespace") or "").strip().lower()
     artifact_state = str(request.GET.get("state") or "").strip().lower()
     query = str(request.GET.get("query") or request.GET.get("q") or "").strip()
     owner = str(request.GET.get("owner") or "").strip()
@@ -7561,6 +7565,8 @@ def artifacts_collection(request: HttpRequest) -> JsonResponse:
     qs = Artifact.objects.select_related("type", "author", "parent_artifact", "lineage_root").all()
     if artifact_type:
         qs = qs.filter(type__slug=artifact_type)
+    if namespace:
+        qs = qs.filter(slug__istartswith=f"{namespace}.")
     if artifact_state:
         qs = qs.filter(artifact_state=artifact_state)
     if owner:
@@ -7913,6 +7919,95 @@ def artifact_raw_file(request: HttpRequest, artifact_id: str) -> HttpResponse:
             "inline": True,
             "content": blob.decode("utf-8", errors="replace"),
             "download_url": f"/xyn/api/artifacts/{artifact_id}/raw/file?path={quote('/' + key)}&download=1",
+        }
+    )
+
+
+def _resolve_artifact_by_slug(artifact_slug: str) -> Optional[Artifact]:
+    slug = str(artifact_slug or "").strip()
+    if not slug:
+        return None
+    return (
+        Artifact.objects.select_related("type")
+        .filter(slug=slug)
+        .order_by("-updated_at", "-created_at")
+        .first()
+    )
+
+
+def _artifact_file_metadata_rows(artifact: Artifact) -> List[Dict[str, Any]]:
+    file_map = _artifact_raw_file_map(artifact)
+    rows: List[Dict[str, Any]] = []
+    for key in sorted(file_map.keys()):
+        blob = file_map[key]
+        rows.append(
+            {
+                "path": f"/{key}",
+                "size_bytes": len(blob),
+                "sha256": hashlib.sha256(blob).hexdigest(),
+                "mime_guess": "application/json",
+            }
+        )
+    return rows
+
+
+@csrf_exempt
+@login_required
+def artifact_by_slug_detail(request: HttpRequest, artifact_slug: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = _resolve_artifact_by_slug(artifact_slug)
+    if artifact is None:
+        return JsonResponse({"error": "artifact not found"}, status=404)
+    manifest = _load_artifact_manifest(artifact)
+    manifest_ref = str((artifact.scope_json or {}).get("manifest_ref") or "").strip()
+    payload = {
+        "artifact": {
+            "id": str(artifact.id),
+            "slug": _artifact_slug(artifact),
+            "title": artifact.title or "",
+            "kind": artifact.type.slug if artifact.type_id else "",
+            "version": artifact.version,
+            "artifact_state": artifact.artifact_state or "",
+            "status": artifact.status or "",
+            "updated_at": artifact.updated_at,
+            "manifest_ref": manifest_ref or None,
+        },
+        "manifest": manifest,
+        "manifest_summary": _manifest_summary_for_artifact(artifact),
+        "raw_artifact_json": _artifact_raw_payload(artifact),
+        "files": _artifact_file_metadata_rows(artifact),
+        "surfaces": [
+            _serialize_artifact_surface(row)
+            for row in ArtifactSurface.objects.filter(artifact=artifact).order_by("sort_order", "key")
+        ],
+        "runtime_roles": [
+            _serialize_artifact_runtime_role(row)
+            for row in ArtifactRuntimeRole.objects.filter(artifact=artifact).order_by("role_kind", "id")
+        ],
+    }
+    return JsonResponse(payload)
+
+
+@csrf_exempt
+@login_required
+def artifact_by_slug_files(request: HttpRequest, artifact_slug: str) -> JsonResponse:
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if staff_error := _require_staff(request):
+        return staff_error
+    artifact = _resolve_artifact_by_slug(artifact_slug)
+    if artifact is None:
+        return JsonResponse({"error": "artifact not found"}, status=404)
+    return JsonResponse(
+        {
+            "artifact": {
+                "id": str(artifact.id),
+                "slug": _artifact_slug(artifact),
+            },
+            "files": _artifact_file_metadata_rows(artifact),
         }
     )
 
@@ -13761,6 +13856,27 @@ def _match_ems_panel_command(message: str) -> Optional[Tuple[str, Dict[str, Any]
     return None
 
 
+def _match_artifact_panel_command(message: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    lower = text.lower()
+    list_match = re.search(r"\blist\s+([a-z0-9_.-]+)\s+artifacts\b", lower)
+    if list_match:
+        namespace = str(list_match.group(1) or "").strip().lower()
+        return ("artifact_list", {"namespace": namespace})
+    open_match = re.search(r"\bopen\s+artifact\s+([a-z0-9_.-]+)\b", lower)
+    if open_match:
+        return ("artifact_detail", {"slug": str(open_match.group(1) or "").strip()})
+    raw_match = re.search(r"\bedit\s+artifact\s+([a-z0-9_.-]+)\s+raw\b", lower)
+    if raw_match:
+        return ("artifact_raw_json", {"slug": str(raw_match.group(1) or "").strip()})
+    files_match = re.search(r"\bedit\s+artifact\s+([a-z0-9_.-]+)\s+files\b", lower)
+    if files_match:
+        return ("artifact_files", {"slug": str(files_match.group(1) or "").strip()})
+    return None
+
+
 def _resolve_workspace_for_identity(identity: UserIdentity, workspace_id: str) -> Optional[Workspace]:
     requested = str(workspace_id or "").strip()
     if requested:
@@ -14079,6 +14195,60 @@ def _intent_apply_open_ems_panel(
     return JsonResponse(result_payload)
 
 
+def _intent_apply_open_artifact_panel(
+    *,
+    identity: UserIdentity,
+    payload: Dict[str, Any],
+    request_id: str,
+) -> JsonResponse:
+    panel_key = str(payload.get("panel_key") or "").strip()
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    valid_panel_keys = {"artifact_list", "artifact_detail", "artifact_raw_json", "artifact_files"}
+    if panel_key not in valid_panel_keys:
+        return JsonResponse({"error": "unsupported panel_key"}, status=400)
+
+    slug = str(params.get("slug") or "").strip()
+    if panel_key in {"artifact_detail", "artifact_raw_json", "artifact_files"} and not slug:
+        return JsonResponse({"error": "slug is required"}, status=400)
+    if slug and _resolve_artifact_by_slug(slug) is None:
+        return JsonResponse({"error": "artifact not found"}, status=404)
+
+    result_payload = {
+        "status": "DraftReady",
+        "action_type": "CreateDraft",
+        "artifact_type": "Workspace",
+        "artifact_id": None,
+        "summary": "Artifact panel ready.",
+        "result": {
+            "panel": {
+                "key": panel_key,
+                "params": params,
+            }
+        },
+        "next_actions": [
+            {
+                "label": "Open panel",
+                "action": "OpenPanel",
+                "panel_key": panel_key,
+                "params": params,
+            }
+        ],
+        "audit": {
+            "request_id": request_id,
+            "timestamp": timezone.now().isoformat(),
+        },
+    }
+    _audit_intent_event(
+        message="intent.apply.open_artifact_panel",
+        identity=identity,
+        request_id=request_id,
+        artifact_id=None,
+        proposal={"operation": "open_artifact_panel", "panel_key": panel_key, "params": params},
+        resolution=result_payload,
+    )
+    return JsonResponse(result_payload)
+
+
 @csrf_exempt
 def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
     if not _intent_engine_enabled():
@@ -14149,6 +14319,31 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
                     "panel_key": panel_key,
                     "params": params,
                     "operator_workspace_id": str(operator_workspace.id),
+                },
+                "next_actions": [
+                    {"label": "Open panel", "action": "CreateDraft"},
+                ],
+                "audit": {
+                    "request_id": str(uuid.uuid4()),
+                    "timestamp": timezone.now().isoformat(),
+                },
+            }
+        )
+
+    artifact_panel_request = _match_artifact_panel_command(message)
+    if artifact_panel_request:
+        panel_key, params = artifact_panel_request
+        return JsonResponse(
+            {
+                "status": "DraftReady",
+                "action_type": "CreateDraft",
+                "artifact_type": "Workspace",
+                "artifact_id": None,
+                "summary": "Will open artifact panel.",
+                "draft_payload": {
+                    "__operation": "open_artifact_panel",
+                    "panel_key": panel_key,
+                    "params": params,
                 },
                 "next_actions": [
                     {"label": "Open panel", "action": "CreateDraft"},
@@ -14261,6 +14456,8 @@ def xyn_intent_apply(request: HttpRequest) -> JsonResponse:
                 return _intent_apply_create_ems_instance(identity=identity, payload=body_payload, request_id=request_id)
             if operation == "open_ems_panel":
                 return _intent_apply_open_ems_panel(identity=identity, payload=body_payload, request_id=request_id)
+            if operation == "open_artifact_panel":
+                return _intent_apply_open_artifact_panel(identity=identity, payload=body_payload, request_id=request_id)
             return JsonResponse({"error": "CreateDraft currently supports ArticleDraft only"}, status=400)
         return _intent_apply_create_draft(identity=identity, payload=body_payload, request_id=request_id)
 
