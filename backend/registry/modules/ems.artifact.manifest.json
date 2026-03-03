@@ -1,0 +1,57 @@
+{
+  "artifact": {
+    "id": "ems",
+    "name": "EMS",
+    "version": "1.1.0"
+  },
+  "dependencies": [
+    {
+      "artifact_id": "core.authn-jwt",
+      "optional": true,
+      "reason": "JWT validation capability for secured EMS flows"
+    }
+  ],
+  "roles": [
+    {
+      "role": "api_router",
+      "entrypoint": "xyn_orchestrator.ems_lite_entrypoint:router",
+      "mount_path": "/api/apps/ems",
+      "pythonpath": [
+        "xyn-api/backend"
+      ]
+    },
+    {
+      "role": "ui_mount",
+      "mount_path": "/apps/ems",
+      "static_dir": "xyn-api/apps/ems-artifact/ui-dist"
+    }
+  ],
+  "surfaces": {
+    "nav": [
+      {
+        "label": "EMS",
+        "path": "/apps/ems",
+        "order": 300
+      }
+    ],
+    "manage": [
+      {
+        "label": "Settings",
+        "path": "/apps/ems/manage",
+        "order": 100
+      }
+    ],
+    "docs": [
+      {
+        "label": "Docs",
+        "path": "/apps/ems/docs",
+        "order": 1000
+      },
+      {
+        "label": "Demo Script",
+        "path": "/apps/ems/docs/demo",
+        "order": 1010
+      }
+    ]
+  }
+}

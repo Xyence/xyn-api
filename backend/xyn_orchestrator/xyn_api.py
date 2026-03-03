@@ -18388,6 +18388,9 @@ def _manifest_roots() -> List[Path]:
         if not part:
             continue
         roots.append(Path(part))
+    default_path = Path(default_root)
+    if default_path not in roots:
+        roots.append(default_path)
     return roots
 
 
