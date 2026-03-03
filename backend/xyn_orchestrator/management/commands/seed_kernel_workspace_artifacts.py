@@ -27,6 +27,11 @@ class Command(BaseCommand):
 
         specs = [
             {
+                "slug": "core.workbench",
+                "title": "Workbench",
+                "manifest_ref": "registry/modules/workbench.artifact.manifest.json",
+            },
+            {
                 "slug": "xyn-api",
                 "title": "xyn-api",
                 "manifest_ref": "xyn-api/artifact.manifest.json",

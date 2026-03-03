@@ -1,0 +1,35 @@
+{
+  "artifact": {
+    "id": "core.workbench",
+    "name": "core.workbench",
+    "version": "0.1.0"
+  },
+  "roles": [
+    {
+      "role": "ui_mount",
+      "mount_path": "/apps/workbench",
+      "static_dir": "xyn-api/backend/registry/modules/workbench-ui-dist"
+    }
+  ],
+  "surfaces": {
+    "manage": [
+      {
+        "label": "Workbench",
+        "path": "/app/workbench",
+        "order": 100
+      },
+      {
+        "label": "Legacy Console",
+        "path": "/app/console",
+        "order": 200
+      }
+    ],
+    "docs": [
+      {
+        "label": "Workbench Overview",
+        "path": "/app/workbench",
+        "order": 1000
+      }
+    ]
+  }
+}
