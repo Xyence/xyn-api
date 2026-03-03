@@ -6,7 +6,7 @@ from xyn_orchestrator.models import Artifact, ArtifactType, Workspace, Workspace
 
 
 class Command(BaseCommand):
-    help = "Bind kernel-loadable artifacts (xyn-api, xyn-ui, hello app, ems) into a workspace."
+    help = "Bind kernel-loadable artifacts (workbench, xyn runtime, xyn-api, xyn-ui, hello app, ems) into a workspace."
 
     def add_arguments(self, parser):
         parser.add_argument("--workspace-slug", default="platform-builder")
@@ -32,14 +32,19 @@ class Command(BaseCommand):
                 "manifest_ref": "registry/modules/workbench.artifact.manifest.json",
             },
             {
+                "slug": "core.xyn-runtime",
+                "title": "Xyn Runtime",
+                "manifest_ref": "registry/modules/xyn-runtime.artifact.manifest.json",
+            },
+            {
                 "slug": "xyn-api",
                 "title": "xyn-api",
-                "manifest_ref": "xyn-api/artifact.manifest.json",
+                "manifest_ref": "registry/modules/xyn-api.artifact.manifest.json",
             },
             {
                 "slug": "xyn-ui",
                 "title": "xyn-ui",
-                "manifest_ref": "xyn-ui/artifact.manifest.json",
+                "manifest_ref": "registry/modules/xyn-ui.artifact.manifest.json",
             },
             {
                 "slug": "hello-app",

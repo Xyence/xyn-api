@@ -1,0 +1,87 @@
+{
+  "artifact": {
+    "id": "core.xyn-runtime",
+    "name": "Xyn Runtime",
+    "version": "0.1.0"
+  },
+  "capability": {
+    "visibility": "platform",
+    "category": "platform",
+    "label": "Xyn Runtime",
+    "description": "Meta-artifact that orchestrates xyn-ui + xyn-api runtime deployment.",
+    "order": 5
+  },
+  "dependencies": [
+    {
+      "artifact_id": "xyn-api",
+      "optional": false,
+      "reason": "API runtime"
+    },
+    {
+      "artifact_id": "xyn-ui",
+      "optional": false,
+      "reason": "UI runtime"
+    }
+  ],
+  "roles": [
+    {
+      "role": "api_router",
+      "entrypoint": "xyn_orchestrator.xyn_seed_entrypoint:router",
+      "mount_path": "/xyn/api/runtime",
+      "pythonpath": [
+        "xyn-api/backend"
+      ]
+    }
+  ],
+  "surfaces": {
+    "manage": [
+      {
+        "label": "Runtime Status",
+        "path": "/w/:workspaceId/workbench",
+        "order": 100
+      }
+    ],
+    "docs": [
+      {
+        "label": "Runtime Deployment",
+        "path": "/w/:workspaceId/workbench",
+        "order": 1000
+      }
+    ]
+  },
+  "payload": {
+    "deploy": {
+      "mode": "meta",
+      "entrypoint_artifacts": ["xyn-api", "xyn-ui"],
+      "manifests": {
+        "type": "compose",
+        "ref": "backend/registry/modules/runtime-compose-pull-apply.json"
+      }
+    },
+    "configSchema": {
+      "fqdn": {
+        "type": "string",
+        "required": true
+      },
+      "target_environment": {
+        "type": "string",
+        "enum": ["local", "k8s"],
+        "default": "local"
+      },
+      "image_overrides": {
+        "type": "object",
+        "required": false
+      },
+      "dns_mode": {
+        "type": "string",
+        "enum": ["manual", "route53"],
+        "default": "manual"
+      },
+      "tls_mode": {
+        "type": "string",
+        "enum": ["letsencrypt", "provided"],
+        "default": "letsencrypt"
+      }
+    }
+  }
+}

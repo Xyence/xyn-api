@@ -607,6 +607,86 @@ class IntentEngineApiTests(TestCase):
         )
         self.assertEqual(WorkspaceArtifactBinding.objects.filter(workspace_id=workspace_id, artifact=ems_artifact).count(), 1)
 
+    def test_install_xyn_instance_command_creates_runtime_run_and_is_idempotent(self):
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        Artifact.objects.get_or_create(
+            workspace=self.workspace,
+            slug="xyn-api",
+            defaults={
+                "type": module_type,
+                "title": "xyn-api",
+                "status": "published",
+                "visibility": "team",
+            },
+        )
+        Artifact.objects.get_or_create(
+            workspace=self.workspace,
+            slug="xyn-ui",
+            defaults={
+                "type": module_type,
+                "title": "xyn-ui",
+                "status": "published",
+                "visibility": "team",
+            },
+        )
+        message = "install xyn instance for ACME Co fqdn ems.xyence.io"
+        resolve_response = self.client.post(
+            "/xyn/api/xyn/intent/resolve",
+            data=json.dumps({"message": message, "context": {"workspace_id": str(self.workspace.id)}}),
+            content_type="application/json",
+        )
+        self.assertEqual(resolve_response.status_code, 200, resolve_response.content.decode())
+        draft_payload = resolve_response.json().get("draft_payload") or {}
+        self.assertEqual(draft_payload.get("__operation"), "install_xyn_instance")
+        self.assertEqual(draft_payload.get("fqdn"), "ems.xyence.io")
+
+        first_apply = self.client.post(
+            "/xyn/api/xyn/intent/apply",
+            data=json.dumps(
+                {
+                    "action_type": "CreateDraft",
+                    "artifact_type": "Workspace",
+                    "payload": draft_payload,
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(first_apply.status_code, 200, first_apply.content.decode())
+        first_payload = first_apply.json()
+        self.assertEqual(first_payload.get("status"), "DraftReady")
+        first_result = first_payload.get("result") or {}
+        workspace_id = str((first_result.get("workspace") or {}).get("id") or "")
+        instance_id = str((first_result.get("instance") or {}).get("id") or "")
+        run_id = str((first_result.get("run") or {}).get("id") or "")
+        self.assertTrue(workspace_id)
+        self.assertTrue(instance_id)
+        self.assertTrue(run_id)
+        self.assertIn("https://ems.xyence.io/", str((first_result.get("endpoints") or {}).get("ui_url") or ""))
+
+        panel_action = next((item for item in first_payload.get("next_actions", []) if item.get("action") == "OpenPanel"), None)
+        self.assertIsNotNone(panel_action)
+        self.assertEqual((panel_action or {}).get("panel_key"), "run_detail")
+
+        second_apply = self.client.post(
+            "/xyn/api/xyn/intent/apply",
+            data=json.dumps(
+                {
+                    "action_type": "CreateDraft",
+                    "artifact_type": "Workspace",
+                    "payload": draft_payload,
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(second_apply.status_code, 200, second_apply.content.decode())
+        second_result = second_apply.json().get("result") or {}
+        self.assertEqual(str((second_result.get("workspace") or {}).get("id") or ""), workspace_id)
+        self.assertEqual(str((second_result.get("instance") or {}).get("id") or ""), instance_id)
+        self.assertEqual(
+            WorkspaceAppInstance.objects.filter(workspace_id=workspace_id, app_slug="xyn-runtime", fqdn="ems.xyence.io").count(),
+            1,
+        )
+
     def test_open_ems_panel_command_returns_panel_action(self):
         resolve_response = self.client.post(
             "/xyn/api/xyn/intent/resolve",

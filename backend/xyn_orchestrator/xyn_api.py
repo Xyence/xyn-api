@@ -14223,6 +14223,24 @@ def _match_create_ems_instance_command(message: str) -> Optional[Tuple[str, str]
     return (customer_name, fqdn) if customer_name and fqdn else None
 
 
+def _match_install_xyn_instance_command(message: str) -> Optional[Tuple[str, str]]:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    match = re.search(
+        r"install\s+xyn\s+instance\s+for\s+(.+?)\s+fqdn\s+(?:should\s+be|is|=)?\s*([a-z0-9.-]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    customer_name = str(match.group(1) or "").strip().strip("\"' ,.")
+    fqdn = str(match.group(2) or "").strip().lower().strip(".")
+    if "." not in fqdn:
+        return None
+    return (customer_name, fqdn) if customer_name and fqdn else None
+
+
 def _match_ems_panel_command(message: str) -> Optional[Tuple[str, Dict[str, Any]]]:
     text = str(message or "").strip().lower()
     if not text:
@@ -14321,6 +14339,271 @@ def _find_or_create_customer_workspace(
         metadata_json={},
     )
     return created, True
+
+
+def _ensure_runtime_artifact(
+    *,
+    workspace: Workspace,
+    slug: str,
+    title: str,
+    manifest_ref: str,
+    summary: str,
+) -> Artifact:
+    module_type, _ = ArtifactType.objects.get_or_create(
+        slug="module",
+        defaults={"name": "Module", "description": "Kernel-loadable module artifact."},
+    )
+    artifact = Artifact.objects.filter(slug=slug).order_by("-updated_at", "-created_at").first()
+    if artifact is None:
+        artifact = Artifact.objects.create(
+            workspace=workspace,
+            type=module_type,
+            title=title,
+            slug=slug,
+            status="published",
+            visibility="team",
+            summary=summary,
+            scope_json={"slug": slug, "manifest_ref": manifest_ref, "summary": summary},
+            provenance_json={"source_system": "seed-kernel", "source_id": slug},
+        )
+        return artifact
+    scope = dict(artifact.scope_json or {})
+    scope_changed = False
+    if str(scope.get("slug") or "").strip() != slug:
+        scope["slug"] = slug
+        scope_changed = True
+    if str(scope.get("manifest_ref") or "").strip() != manifest_ref:
+        scope["manifest_ref"] = manifest_ref
+        scope_changed = True
+    update_fields: List[str] = []
+    if str(artifact.title or "").strip() != title:
+        artifact.title = title
+        update_fields.append("title")
+    if str(artifact.summary or "").strip() != summary:
+        artifact.summary = summary
+        update_fields.append("summary")
+    if scope_changed:
+        artifact.scope_json = scope
+        update_fields.append("scope_json")
+    if update_fields:
+        update_fields.append("updated_at")
+        artifact.save(update_fields=update_fields)
+    return artifact
+
+
+def _intent_apply_install_xyn_instance(
+    *,
+    identity: UserIdentity,
+    payload: Dict[str, Any],
+    request_id: str,
+) -> JsonResponse:
+    customer_name = str(payload.get("customer_name") or "").strip()
+    fqdn = str(payload.get("fqdn") or "").strip().lower().strip(".")
+    target_environment = str(payload.get("target_environment") or "local").strip().lower() or "local"
+    dns_mode = str(payload.get("dns_mode") or "manual").strip().lower() or "manual"
+    tls_mode = str(payload.get("tls_mode") or "letsencrypt").strip().lower() or "letsencrypt"
+    image_overrides = payload.get("image_overrides") if isinstance(payload.get("image_overrides"), dict) else {}
+    if target_environment not in {"local", "k8s"}:
+        return JsonResponse({"error": "target_environment must be local or k8s"}, status=400)
+    if dns_mode not in {"manual", "route53"}:
+        return JsonResponse({"error": "dns_mode must be manual or route53"}, status=400)
+    if tls_mode not in {"letsencrypt", "provided"}:
+        return JsonResponse({"error": "tls_mode must be letsencrypt or provided"}, status=400)
+    if not customer_name:
+        return JsonResponse({"error": "customer_name is required"}, status=400)
+    if not fqdn or "." not in fqdn:
+        return JsonResponse({"error": "fqdn is required"}, status=400)
+
+    operator_workspace_id = str(payload.get("operator_workspace_id") or "").strip()
+    operator_workspace = _resolve_workspace_for_identity(identity, operator_workspace_id)
+    if not operator_workspace:
+        return JsonResponse({"error": "operator workspace not found or forbidden"}, status=403)
+
+    workspace, workspace_created = _find_or_create_customer_workspace(
+        operator_workspace=operator_workspace,
+        customer_name=customer_name,
+    )
+    WorkspaceMembership.objects.get_or_create(
+        workspace=workspace,
+        user_identity=identity,
+        defaults={"role": "admin", "termination_authority": True},
+    )
+
+    runtime_artifact = _ensure_runtime_artifact(
+        workspace=operator_workspace,
+        slug="core.xyn-runtime",
+        title="Xyn Runtime",
+        manifest_ref="registry/modules/xyn-runtime.artifact.manifest.json",
+        summary="Meta-artifact orchestrator for self-deploying Xyn runtime.",
+    )
+    xyn_api_artifact = _ensure_runtime_artifact(
+        workspace=operator_workspace,
+        slug="xyn-api",
+        title="xyn-api",
+        manifest_ref="registry/modules/xyn-api.artifact.manifest.json",
+        summary="Deployable Xyn API runtime artifact.",
+    )
+    xyn_ui_artifact = _ensure_runtime_artifact(
+        workspace=operator_workspace,
+        slug="xyn-ui",
+        title="xyn-ui",
+        manifest_ref="registry/modules/xyn-ui.artifact.manifest.json",
+        summary="Deployable Xyn UI runtime artifact.",
+    )
+    binding_created_by_slug: Dict[str, bool] = {}
+    for artifact in [runtime_artifact, xyn_api_artifact, xyn_ui_artifact]:
+        binding, binding_created = WorkspaceArtifactBinding.objects.get_or_create(
+            workspace=workspace,
+            artifact=artifact,
+            defaults={"enabled": True, "installed_state": "installed", "config_ref": None},
+        )
+        binding_created_by_slug[artifact.slug] = binding_created
+        update_fields: List[str] = []
+        if not binding.enabled:
+            binding.enabled = True
+            update_fields.append("enabled")
+        if str(binding.installed_state or "").strip().lower() != "installed":
+            binding.installed_state = "installed"
+            update_fields.append("installed_state")
+        if update_fields:
+            update_fields.append("updated_at")
+            binding.save(update_fields=update_fields)
+
+    deployment_target = "local" if target_environment == "local" else "aws"
+    dns_stub = {
+        "mode": dns_mode,
+        "provider": "local-demo" if dns_mode == "manual" else "route53",
+        "fqdn": fqdn,
+        "desired_record_type": "A",
+        "apply_external_changes": dns_mode == "route53",
+        "status": "pending",
+    }
+    instance, instance_created = WorkspaceAppInstance.objects.get_or_create(
+        workspace=workspace,
+        app_slug="xyn-runtime",
+        fqdn=fqdn,
+        defaults={
+            "artifact": runtime_artifact,
+            "customer_name": customer_name,
+            "deployment_target": deployment_target,
+            "status": "active",
+            "dns_config_json": dns_stub,
+        },
+    )
+    if not instance_created:
+        update_fields: List[str] = []
+        if instance.artifact_id != runtime_artifact.id:
+            instance.artifact = runtime_artifact
+            update_fields.append("artifact")
+        if instance.customer_name != customer_name:
+            instance.customer_name = customer_name
+            update_fields.append("customer_name")
+        if instance.deployment_target != deployment_target:
+            instance.deployment_target = deployment_target
+            update_fields.append("deployment_target")
+        if instance.status != "active":
+            instance.status = "active"
+            update_fields.append("status")
+        if not isinstance(instance.dns_config_json, dict) or instance.dns_config_json != dns_stub:
+            instance.dns_config_json = dns_stub
+            update_fields.append("dns_config_json")
+        if update_fields:
+            update_fields.append("updated_at")
+            instance.save(update_fields=update_fields)
+
+    deployment_plan = {
+        "operation": "install_xyn_instance",
+        "workspace_id": str(workspace.id),
+        "workspace_created": workspace_created,
+        "instance_id": str(instance.id),
+        "fqdn": fqdn,
+        "target_environment": target_environment,
+        "dns_mode": dns_mode,
+        "tls_mode": tls_mode,
+        "image_overrides": image_overrides,
+        "artifacts": {
+            "runtime": {"slug": runtime_artifact.slug, "id": str(runtime_artifact.id)},
+            "xyn_api": {"slug": xyn_api_artifact.slug, "id": str(xyn_api_artifact.id)},
+            "xyn_ui": {"slug": xyn_ui_artifact.slug, "id": str(xyn_ui_artifact.id)},
+        },
+    }
+    run = Run.objects.create(
+        entity_type="module",
+        entity_id=runtime_artifact.id,
+        status="running",
+        summary=f"Install Xyn runtime for {fqdn}",
+        started_at=timezone.now(),
+        metadata_json={"operation": "install_xyn_instance", "plan": deployment_plan, "status": "running"},
+    )
+    run.log_text = (
+        f"Starting Xyn runtime install for {customer_name} ({fqdn})\n"
+        f"Target environment: {target_environment}\n"
+        f"DNS mode: {dns_mode}\n"
+        f"TLS mode: {tls_mode}\n"
+        "Step 1/4: Ensured workspace and membership\n"
+        "Step 2/4: Ensured runtime artifacts and bindings\n"
+        "Step 3/4: Ensured app instance + FQDN configuration\n"
+        "Step 4/4: Runtime deploy plan generated (demo orchestration)\n"
+    )
+    endpoints = {
+        "ui_url": f"https://{fqdn}/",
+        "api_url": f"https://{fqdn}/xyn/api",
+        "workbench_url": f"/w/{workspace.id}/workbench",
+    }
+    run.metadata_json = {
+        "operation": "install_xyn_instance",
+        "plan": deployment_plan,
+        "status": "succeeded",
+        "endpoints": endpoints,
+        "binding_created": binding_created_by_slug,
+    }
+    run.status = "succeeded"
+    run.finished_at = timezone.now()
+    run.save(update_fields=["status", "finished_at", "log_text", "metadata_json", "updated_at"])
+    _write_run_artifact(run, "xyn_runtime_install_plan.json", deployment_plan, "deployment_plan")
+    _write_run_artifact(run, "xyn_runtime_install_endpoints.json", endpoints, "deployment_result")
+    _write_run_summary(run)
+
+    response_payload = {
+        "status": "DraftReady",
+        "action_type": "CreateDraft",
+        "artifact_type": "Workspace",
+        "artifact_id": str(runtime_artifact.id),
+        "summary": f'Installed Xyn runtime instance for "{customer_name}" at {fqdn}.',
+        "result": {
+            "workspace": {"id": str(workspace.id), "created": workspace_created},
+            "runtime": {"slug": runtime_artifact.slug, "installed": True},
+            "instance": {
+                "id": str(instance.id),
+                "created": instance_created,
+                "fqdn": fqdn,
+                "deployment_target": deployment_target,
+            },
+            "run": {
+                "id": str(run.id),
+                "status": run.status,
+                "summary": run.summary,
+            },
+            "endpoints": endpoints,
+        },
+        "next_actions": [
+            {"label": "Open Deployment Run", "action": "OpenPanel", "panel_key": "run_detail", "params": {"run_id": str(run.id)}},
+            {"label": "Open Workbench", "action": "OpenPath", "path": f"/w/{workspace.id}/workbench"},
+        ],
+        "audit": {
+            "request_id": request_id,
+            "timestamp": timezone.now().isoformat(),
+        },
+    }
+    _audit_intent_event(
+        message="intent.apply.install_xyn_instance",
+        identity=identity,
+        request_id=request_id,
+        artifact_id=str(runtime_artifact.id),
+        proposal={"operation": "install_xyn_instance", "customer_name": customer_name, "fqdn": fqdn},
+        resolution=response_payload,
+    )
+    return JsonResponse(response_payload)
 
 
 def _intent_apply_deploy_ems_customer(
@@ -14650,6 +14933,41 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
     context_artifact_id = str(context_payload.get("artifact_id") or "").strip()
     context_artifact_type = str(context_payload.get("artifact_type") or "").strip()
 
+    xyn_instance_request = _match_install_xyn_instance_command(message)
+    if xyn_instance_request:
+        customer_name, fqdn = xyn_instance_request
+        operator_workspace = _resolve_workspace_for_identity(identity, context_workspace_id)
+        if not operator_workspace:
+            return JsonResponse({"error": "workspace context is required for xyn instance install flow"}, status=400)
+        return JsonResponse(
+            {
+                "status": "DraftReady",
+                "action_type": "CreateDraft",
+                "artifact_type": "Workspace",
+                "artifact_id": None,
+                "summary": (
+                    f'Will create/find workspace for "{customer_name}", install xyn runtime artifacts, '
+                    f"and configure deployment for {fqdn}."
+                ),
+                "draft_payload": {
+                    "__operation": "install_xyn_instance",
+                    "customer_name": customer_name,
+                    "fqdn": fqdn,
+                    "operator_workspace_id": str(operator_workspace.id),
+                    "target_environment": "local",
+                    "dns_mode": "manual",
+                    "tls_mode": "letsencrypt",
+                },
+                "next_actions": [
+                    {"label": "Install Xyn Instance", "action": "CreateDraft"},
+                ],
+                "audit": {
+                    "request_id": str(uuid.uuid4()),
+                    "timestamp": timezone.now().isoformat(),
+                },
+            }
+        )
+
     ems_instance_request = _match_create_ems_instance_command(message)
     if ems_instance_request:
         customer_name, fqdn = ems_instance_request
@@ -14836,6 +15154,8 @@ def xyn_intent_apply(request: HttpRequest) -> JsonResponse:
                 return _intent_apply_deploy_ems_customer(identity=identity, payload=body_payload, request_id=request_id)
             if operation == "create_ems_instance":
                 return _intent_apply_create_ems_instance(identity=identity, payload=body_payload, request_id=request_id)
+            if operation == "install_xyn_instance":
+                return _intent_apply_install_xyn_instance(identity=identity, payload=body_payload, request_id=request_id)
             if operation == "open_ems_panel":
                 return _intent_apply_open_ems_panel(identity=identity, payload=body_payload, request_id=request_id)
             if operation == "open_artifact_panel":

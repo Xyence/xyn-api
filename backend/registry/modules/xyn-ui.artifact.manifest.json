@@ -1,37 +1,36 @@
 {
   "artifact": {
-    "id": "xyn-api",
-    "name": "xyn-api",
+    "id": "xyn-ui",
+    "name": "xyn-ui",
     "version": "phase2"
   },
   "capability": {
-    "visibility": "platform",
+    "visibility": "hidden",
     "category": "platform",
-    "label": "Xyn API",
-    "order": 50
+    "label": "Xyn UI",
+    "order": 60
   },
   "roles": [
     {
-      "role": "api_router",
-      "mount_path": "/xyn/api",
-      "entrypoint": "xyn_orchestrator.xyn_seed_entrypoint:router",
-      "pythonpath": [
-        "xyn-api/backend"
-      ]
+      "role": "ui_mount",
+      "scope": "workspace",
+      "mount_path": "/",
+      "static_dir": "xyn-ui/dist",
+      "dev_proxy_url": "http://localhost:5173"
     }
   ],
   "surfaces": {
     "manage": [
       {
-        "label": "API Health",
-        "path": "/xyn/api/health",
+        "label": "Workbench",
+        "path": "/apps/workbench",
         "order": 100
       }
     ],
     "docs": [
       {
-        "label": "API Runtime Contract",
-        "path": "/xyn/api/docs",
+        "label": "UI Runtime Contract",
+        "path": "/w/:workspaceId/workbench",
         "order": 1000
       }
     ]
@@ -39,16 +38,16 @@
   "payload": {
     "deploy": {
       "mode": "container",
-      "service": "xyn-api",
+      "service": "xyn-ui",
       "images": {
-        "xyn_api": {
-          "image": "ghcr.io/xyence/xyn-api",
+        "xyn_ui": {
+          "image": "ghcr.io/xyence/xyn-ui",
           "tag": "latest"
         }
       },
       "manifests": {
         "type": "compose",
-        "ref": "backend/registry/modules/runtime-compose-pull-apply.json"
+        "ref": "backend/registry/modules/runtime-web-static-nginx.json"
       }
     },
     "configSchema": {
