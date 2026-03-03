@@ -6806,7 +6806,7 @@ def _serialize_workspace_artifact_binding(binding: WorkspaceArtifactBinding) -> 
     manifest_ref = str(scope.get("manifest_ref") or "").strip()
     if not description and isinstance(artifact.scope_json, dict):
         description = str(artifact.scope_json.get("summary") or "").strip()
-    manifest_summary = _manifest_summary_for_artifact(artifact)
+    manifest_summary = _manifest_summary_for_artifact(artifact, workspace_id=str(binding.workspace_id))
     return {
         "binding_id": str(binding.id),
         "artifact_id": str(artifact.id),
@@ -7608,6 +7608,7 @@ def artifacts_catalog_collection(request: HttpRequest) -> JsonResponse:
 
     query = str(request.GET.get("query") or request.GET.get("q") or "").strip()
     kind = str(request.GET.get("kind") or "").strip().lower()
+    workspace_id = str(request.GET.get("workspace_id") or "").strip() or None
 
     qs = Artifact.objects.select_related("type").all()
     if kind:
@@ -7618,7 +7619,7 @@ def artifacts_catalog_collection(request: HttpRequest) -> JsonResponse:
     rows: List[Dict[str, Any]] = []
     for artifact in qs.order_by("-updated_at", "-created_at")[:500]:
         try:
-            manifest_summary = _manifest_summary_for_artifact(artifact)
+            manifest_summary = _manifest_summary_for_artifact(artifact, workspace_id=workspace_id)
         except ValueError as exc:
             return JsonResponse({"error": str(exc)}, status=500)
         rows.append(
@@ -7961,6 +7962,7 @@ def artifact_by_slug_detail(request: HttpRequest, artifact_slug: str) -> JsonRes
     artifact = _resolve_artifact_by_slug(artifact_slug)
     if artifact is None:
         return JsonResponse({"error": "artifact not found"}, status=404)
+    workspace_id = str(request.GET.get("workspace_id") or "").strip() or None
     manifest = _load_artifact_manifest(artifact)
     manifest_ref = str((artifact.scope_json or {}).get("manifest_ref") or "").strip()
     payload = {
@@ -7976,7 +7978,7 @@ def artifact_by_slug_detail(request: HttpRequest, artifact_slug: str) -> JsonRes
             "manifest_ref": manifest_ref or None,
         },
         "manifest": manifest,
-        "manifest_summary": _manifest_summary_for_artifact(artifact),
+        "manifest_summary": _manifest_summary_for_artifact(artifact, workspace_id=workspace_id),
         "raw_artifact_json": _artifact_raw_payload(artifact),
         "files": _artifact_file_metadata_rows(artifact),
         "surfaces": [
@@ -18659,7 +18661,37 @@ def _manifest_surface_entries(manifest: Dict[str, Any], surface_key: str) -> Lis
     return rows
 
 
-def _manifest_summary_for_artifact(artifact: Artifact) -> Dict[str, Any]:
+def _article_surface_variant(artifact: Artifact) -> str:
+    fmt = _normalize_article_format(getattr(artifact, "format", None), fallback="standard")
+    return "explainer_video" if fmt == "video_explainer" else "standard"
+
+
+def _article_surface_base_path(artifact: Artifact, workspace_id: Optional[str]) -> str:
+    artifact_slug = _artifact_slug(artifact)
+    variant = _article_surface_variant(artifact)
+    query = urlencode(
+        {
+            "artifact": artifact_slug,
+            "id": str(artifact.id),
+            "artifact_instance_id": str(artifact.id),
+            "draft_id": str(artifact.id),
+            "variant": variant,
+        }
+    )
+    if workspace_id:
+        return f"/w/{workspace_id}/apps/articles/edit?{query}"
+    return f"/apps/articles/edit?{query}"
+
+
+def _article_docs_surface_path(artifact: Artifact, workspace_id: Optional[str]) -> str:
+    variant = _article_surface_variant(artifact)
+    query = urlencode({"variant": variant})
+    if workspace_id:
+        return f"/w/{workspace_id}/apps/articles/docs?{query}"
+    return f"/apps/articles/docs?{query}"
+
+
+def _manifest_summary_for_artifact(artifact: Artifact, workspace_id: Optional[str] = None) -> Dict[str, Any]:
     manifest = _load_artifact_manifest(artifact)
     roles_raw = manifest.get("roles") if isinstance(manifest.get("roles"), list) else []
     roles: List[str] = []
@@ -18670,7 +18702,7 @@ def _manifest_summary_for_artifact(artifact: Artifact) -> Dict[str, Any]:
         if role_name:
             roles.append(role_name)
     unique_roles = sorted(set(roles))
-    return {
+    summary = {
         "roles": unique_roles,
         "surfaces": {
             "nav": _manifest_surface_entries(manifest, "nav"),
@@ -18678,6 +18710,28 @@ def _manifest_summary_for_artifact(artifact: Artifact) -> Dict[str, Any]:
             "docs": _manifest_surface_entries(manifest, "docs"),
         },
     }
+    if artifact.type_id and artifact.type.slug == "article":
+        manage_rows = summary.get("surfaces", {}).get("manage") or []
+        docs_rows = summary.get("surfaces", {}).get("docs") or []
+        if not manage_rows:
+            manage_rows = [
+                {
+                    "label": "Editor",
+                    "path": _article_surface_base_path(artifact, workspace_id),
+                    "order": 100,
+                }
+            ]
+        if not docs_rows:
+            docs_rows = [
+                {
+                    "label": "Article Variant Docs",
+                    "path": _article_docs_surface_path(artifact, workspace_id),
+                    "order": 1000,
+                }
+            ]
+        summary["surfaces"]["manage"] = manage_rows
+        summary["surfaces"]["docs"] = docs_rows
+    return summary
 
 
 def _manifest_nav_surfaces(binding: WorkspaceArtifactBinding) -> List[Dict[str, Any]]:

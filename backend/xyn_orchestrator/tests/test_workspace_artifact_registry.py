@@ -235,6 +235,40 @@ class WorkspaceArtifactRegistryTests(TestCase):
         self.assertIsNotNone(ems)
         self.assertEqual(ems.get("manifest_summary", {}).get("surfaces", {}).get("docs", [])[0].get("path"), "/apps/ems/docs")
 
+    def test_article_artifacts_emit_default_manage_and_docs_surfaces(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        article = Artifact.objects.create(
+            workspace=self.workspace,
+            type=self.article_type,
+            title="Explainer Draft",
+            slug="explainer-draft",
+            status="draft",
+            visibility="team",
+            format="video_explainer",
+            scope_json={},
+        )
+        WorkspaceArtifactBinding.objects.create(workspace=self.workspace, artifact=article, enabled=True, installed_state="installed")
+
+        installed_response = self.client.get(f"/xyn/api/workspaces/{self.workspace.id}/artifacts")
+        self.assertEqual(installed_response.status_code, 200)
+        installed_rows = installed_response.json().get("artifacts", [])
+        self.assertEqual(len(installed_rows), 1)
+        surfaces = installed_rows[0].get("manifest_summary", {}).get("surfaces", {})
+        self.assertGreaterEqual(len(surfaces.get("manage", [])), 1)
+        self.assertGreaterEqual(len(surfaces.get("docs", [])), 1)
+        self.assertIn(f"/w/{self.workspace.id}/apps/articles/edit", surfaces["manage"][0].get("path", ""))
+        self.assertIn("variant=explainer_video", surfaces["manage"][0].get("path", ""))
+
+        catalog_response = self.client.get(f"/xyn/api/artifacts/catalog?workspace_id={self.workspace.id}")
+        self.assertEqual(catalog_response.status_code, 200)
+        catalog_rows = catalog_response.json().get("artifacts", [])
+        match = next((row for row in catalog_rows if row.get("id") == str(article.id)), None)
+        self.assertIsNotNone(match)
+        catalog_manage = match.get("manifest_summary", {}).get("surfaces", {}).get("manage", [])
+        self.assertGreaterEqual(len(catalog_manage), 1)
+        self.assertIn(f"/w/{self.workspace.id}/apps/articles/edit", catalog_manage[0].get("path", ""))
+
     def test_catalog_includes_authn_jwt_roles_and_surfaces(self):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
         self._set_identity(self.admin_identity)
