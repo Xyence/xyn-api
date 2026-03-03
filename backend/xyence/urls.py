@@ -106,6 +106,13 @@ from xyn_orchestrator.provisioning_views import (
     retry_instance_view,
 )
 from xyn_orchestrator.public_views import public_article_detail, public_articles
+from xyn_orchestrator.ems_canvas import (
+    ems_devices_table,
+    ems_registrations_table,
+    ems_device_status_rollup_table,
+    ems_registrations_timeseries_table,
+    ems_dataset_schema,
+)
 from xyn_orchestrator.xyn_api import (
     blueprints_collection,
     blueprint_detail,
@@ -361,6 +368,11 @@ urlpatterns = [
     path("api/v1/reports", reports_collection),
     path("api/v1/reports/<uuid:report_id>", report_detail),
     path("api/v1/platform-config", platform_config_collection),
+    path("api/ems/devices", ems_devices_table),
+    path("api/ems/registrations", ems_registrations_table),
+    path("api/ems/reports/device-status-rollup", ems_device_status_rollup_table),
+    path("api/ems/reports/registrations-timeseries", ems_registrations_timeseries_table),
+    path("api/ems/datasets/<str:dataset>/schema", ems_dataset_schema),
     path("admin/", admin.site.urls),
     path("api/", include("xyn_orchestrator.urls")),
     path("xyn/api/public/menu", public_menu),
