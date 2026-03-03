@@ -2255,6 +2255,46 @@ class ProvisionedInstance(models.Model):
         return f"{self.name} ({self.aws_region})"
 
 
+class WorkspaceAppInstance(models.Model):
+    STATUS_CHOICES = [
+        ("requested", "Requested"),
+        ("active", "Active"),
+        ("error", "Error"),
+    ]
+
+    DEPLOYMENT_TARGET_CHOICES = [
+        ("local", "Local"),
+        ("aws", "AWS"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey("Workspace", on_delete=models.CASCADE, related_name="app_instances")
+    artifact = models.ForeignKey("Artifact", null=True, blank=True, on_delete=models.SET_NULL, related_name="workspace_app_instances")
+    app_slug = models.CharField(max_length=120)
+    customer_name = models.CharField(max_length=255, blank=True)
+    fqdn = models.CharField(max_length=255)
+    deployment_target = models.CharField(max_length=20, choices=DEPLOYMENT_TARGET_CHOICES, default="local")
+    dns_config_json = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="requested")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="workspace_app_instances_created"
+    )
+    updated_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="workspace_app_instances_updated"
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["workspace", "app_slug", "fqdn"], name="uniq_workspace_app_instance_fqdn"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.app_slug}@{self.fqdn}"
+
+
 class AuditLog(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     message = models.TextField()

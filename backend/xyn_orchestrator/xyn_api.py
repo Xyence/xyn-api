@@ -92,6 +92,7 @@ from .models import (
     ArtifactInstallReceipt,
     ArtifactBindingValue,
     WorkspaceArtifactBinding,
+    WorkspaceAppInstance,
     ArtifactSurface,
     ArtifactRuntimeRole,
     PublishBinding,
@@ -13727,6 +13728,24 @@ def _match_deploy_ems_customer_command(message: str) -> Optional[str]:
     return customer_name or None
 
 
+def _match_create_ems_instance_command(message: str) -> Optional[Tuple[str, str]]:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    match = re.search(
+        r"create\s+(?:a\s+)?new\s+instance\s+of\s+ems(?:-lite)?\s+for\s+customer\s+(.+?)\s+fqdn\s+(?:should\s+be|is|=)\s*([a-z0-9.-]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    customer_name = str(match.group(1) or "").strip().strip("\"' ,.")
+    fqdn = str(match.group(2) or "").strip().lower().strip(".")
+    if "." not in fqdn:
+        return None
+    return (customer_name, fqdn) if customer_name and fqdn else None
+
+
 def _resolve_workspace_for_identity(identity: UserIdentity, workspace_id: str) -> Optional[Workspace]:
     requested = str(workspace_id or "").strip()
     if requested:
@@ -13759,6 +13778,36 @@ def _next_workspace_slug(base_slug: str) -> str:
         if not Workspace.objects.filter(slug=next_candidate).exists():
             return next_candidate
     return f"{base[:110]}-{uuid.uuid4().hex[:8]}"
+
+
+def _find_or_create_customer_workspace(
+    *,
+    operator_workspace: Workspace,
+    customer_name: str,
+) -> Tuple[Workspace, bool]:
+    normalized = str(customer_name or "").strip()
+    existing = (
+        Workspace.objects.filter(parent_workspace=operator_workspace)
+        .filter(models.Q(org_name__iexact=normalized) | models.Q(name__iexact=normalized))
+        .order_by("-updated_at", "-created_at")
+        .first()
+    )
+    if existing:
+        return existing, False
+    next_slug = _next_workspace_slug(_build_workspace_slug_from_name(normalized))
+    created = Workspace.objects.create(
+        slug=next_slug,
+        name=normalized,
+        org_name=normalized,
+        description=f"Customer workspace for {normalized}",
+        kind="customer",
+        lifecycle_stage="prospect",
+        auth_mode="oidc",
+        oidc_enabled=False,
+        parent_workspace=operator_workspace,
+        metadata_json={},
+    )
+    return created, True
 
 
 def _intent_apply_deploy_ems_customer(
@@ -13835,6 +13884,134 @@ def _intent_apply_deploy_ems_customer(
     return JsonResponse(response_payload)
 
 
+def _intent_apply_create_ems_instance(
+    *,
+    identity: UserIdentity,
+    payload: Dict[str, Any],
+    request_id: str,
+) -> JsonResponse:
+    customer_name = str(payload.get("customer_name") or "").strip()
+    fqdn = str(payload.get("fqdn") or "").strip().lower().strip(".")
+    if not customer_name:
+        return JsonResponse({"error": "customer_name is required"}, status=400)
+    if not fqdn or "." not in fqdn:
+        return JsonResponse({"error": "fqdn is required"}, status=400)
+
+    operator_workspace_id = str(payload.get("operator_workspace_id") or "").strip()
+    operator_workspace = _resolve_workspace_for_identity(identity, operator_workspace_id)
+    if not operator_workspace:
+        return JsonResponse({"error": "operator workspace not found or forbidden"}, status=403)
+
+    workspace, workspace_created = _find_or_create_customer_workspace(
+        operator_workspace=operator_workspace,
+        customer_name=customer_name,
+    )
+    WorkspaceMembership.objects.get_or_create(
+        workspace=workspace,
+        user_identity=identity,
+        defaults={"role": "admin", "termination_authority": True},
+    )
+
+    ems_artifact = Artifact.objects.filter(slug="ems").order_by("-updated_at", "-created_at").first()
+    binding_created = False
+    if ems_artifact:
+        binding, binding_created = WorkspaceArtifactBinding.objects.get_or_create(
+            workspace=workspace,
+            artifact=ems_artifact,
+            defaults={"enabled": True, "installed_state": "installed"},
+        )
+        needs_update = False
+        if not binding.enabled:
+            binding.enabled = True
+            needs_update = True
+        if str(binding.installed_state or "").strip().lower() != "installed":
+            binding.installed_state = "installed"
+            needs_update = True
+        if needs_update:
+            binding.save(update_fields=["enabled", "installed_state", "updated_at"])
+
+    instance, instance_created = WorkspaceAppInstance.objects.get_or_create(
+        workspace=workspace,
+        app_slug="ems",
+        fqdn=fqdn,
+        defaults={
+            "artifact": ems_artifact,
+            "customer_name": customer_name,
+            "deployment_target": "local",
+            "status": "active",
+            "dns_config_json": {
+                "mode": "stub",
+                "provider": "local-demo",
+                "fqdn": fqdn,
+                "desired_record_type": "A",
+                "apply_external_changes": False,
+            },
+        },
+    )
+    if not instance_created:
+        update_fields: List[str] = []
+        if ems_artifact and instance.artifact_id != ems_artifact.id:
+            instance.artifact = ems_artifact
+            update_fields.append("artifact")
+        if instance.deployment_target != "local":
+            instance.deployment_target = "local"
+            update_fields.append("deployment_target")
+        if instance.customer_name != customer_name:
+            instance.customer_name = customer_name
+            update_fields.append("customer_name")
+        if not isinstance(instance.dns_config_json, dict):
+            instance.dns_config_json = {}
+        desired_dns = {
+            "mode": "stub",
+            "provider": "local-demo",
+            "fqdn": fqdn,
+            "desired_record_type": "A",
+            "apply_external_changes": False,
+        }
+        if instance.dns_config_json != desired_dns:
+            instance.dns_config_json = desired_dns
+            update_fields.append("dns_config_json")
+        if instance.status != "active":
+            instance.status = "active"
+            update_fields.append("status")
+        if update_fields:
+            update_fields.append("updated_at")
+            instance.save(update_fields=update_fields)
+
+    open_path = f"/w/{workspace.id}/apps/ems"
+    response_payload = {
+        "status": "DraftReady",
+        "action_type": "CreateDraft",
+        "artifact_type": "Workspace",
+        "artifact_id": str(ems_artifact.id) if ems_artifact else None,
+        "summary": f'EMS instance ready for "{customer_name}" at {fqdn}.',
+        "result": {
+            "workspace": {"id": str(workspace.id), "created": workspace_created},
+            "app": {"slug": "ems", "installed": bool(ems_artifact), "binding_created": binding_created},
+            "instance": {"id": str(instance.id), "created": instance_created, "fqdn": fqdn, "deployment_target": "local"},
+            "app_url": open_path,
+            "dns": instance.dns_config_json or {},
+        },
+        "next_actions": [
+            {"label": "Open EMS", "action": "OpenPath", "path": open_path},
+            {"label": "Open Installed", "action": "OpenPath", "path": f"/w/{workspace.id}/build/artifacts"},
+        ],
+        "audit": {
+            "request_id": request_id,
+            "timestamp": timezone.now().isoformat(),
+        },
+    }
+    _audit_intent_event(
+        message="intent.apply.create_ems_instance",
+        identity=identity,
+        request_id=request_id,
+        artifact_id=str(ems_artifact.id) if ems_artifact else None,
+        proposal={"operation": "create_ems_instance", "customer_name": customer_name, "fqdn": fqdn},
+        resolution=response_payload,
+    )
+    return JsonResponse(response_payload)
+
+
 @csrf_exempt
 def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
     if not _intent_engine_enabled():
@@ -13853,6 +14030,39 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
     context_workspace_id = str(context_payload.get("workspace_id") or "").strip()
     context_artifact_id = str(context_payload.get("artifact_id") or "").strip()
     context_artifact_type = str(context_payload.get("artifact_type") or "").strip()
+
+    ems_instance_request = _match_create_ems_instance_command(message)
+    if ems_instance_request:
+        customer_name, fqdn = ems_instance_request
+        operator_workspace = _resolve_workspace_for_identity(identity, context_workspace_id)
+        if not operator_workspace:
+            return JsonResponse({"error": "workspace context is required for EMS instance provisioning flow"}, status=400)
+        return JsonResponse(
+            {
+                "status": "DraftReady",
+                "action_type": "CreateDraft",
+                "artifact_type": "Workspace",
+                "artifact_id": None,
+                "summary": (
+                    f'Will create/find workspace for "{customer_name}", install EMS, '
+                    f'and provision local app instance for {fqdn}.'
+                ),
+                "draft_payload": {
+                    "__operation": "create_ems_instance",
+                    "customer_name": customer_name,
+                    "fqdn": fqdn,
+                    "operator_workspace_id": str(operator_workspace.id),
+                    "deployment_target": "local",
+                },
+                "next_actions": [
+                    {"label": "Create EMS Instance", "action": "CreateDraft"},
+                ],
+                "audit": {
+                    "request_id": str(uuid.uuid4()),
+                    "timestamp": timezone.now().isoformat(),
+                },
+            }
+        )
 
     customer_name = _match_deploy_ems_customer_command(message)
     if customer_name:
@@ -13951,6 +14161,8 @@ def xyn_intent_apply(request: HttpRequest) -> JsonResponse:
             operation = str(body_payload.get("__operation") or "").strip().lower()
             if operation == "deploy_ems_customer":
                 return _intent_apply_deploy_ems_customer(identity=identity, payload=body_payload, request_id=request_id)
+            if operation == "create_ems_instance":
+                return _intent_apply_create_ems_instance(identity=identity, payload=body_payload, request_id=request_id)
             return JsonResponse({"error": "CreateDraft currently supports ArticleDraft only"}, status=400)
         return _intent_apply_create_draft(identity=identity, payload=body_payload, request_id=request_id)
 
