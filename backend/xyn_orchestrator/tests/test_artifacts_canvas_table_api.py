@@ -88,3 +88,40 @@ class ArtifactsCanvasTableApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("workspace_id", str(response.json().get("error")))
+
+    def test_structured_canvas_dedupes_duplicate_slugs_and_prefers_installed_for_workspace(self):
+        other_workspace, _ = Workspace.objects.get_or_create(slug="civic-lab", defaults={"name": "Civic Lab"})
+        duplicate_slug = f"hello-app-{uuid.uuid4().hex[:6]}"
+        older = Artifact.objects.create(
+            workspace=self.workspace,
+            type=self.module_type,
+            title="Hello App (Old)",
+            slug=duplicate_slug,
+            status="published",
+            visibility="team",
+        )
+        newer_other = Artifact.objects.create(
+            workspace=other_workspace,
+            type=self.module_type,
+            title="Hello App (Other Workspace)",
+            slug=duplicate_slug,
+            status="published",
+            visibility="team",
+        )
+        Artifact.objects.filter(id=older.id).update(updated_at=timezone.now() - timezone.timedelta(hours=2))
+        Artifact.objects.filter(id=newer_other.id).update(updated_at=timezone.now())
+        WorkspaceArtifactBinding.objects.create(workspace=self.workspace, artifact=older, enabled=True, installed_state="installed")
+
+        response = self.client.get(
+            "/xyn/api/artifacts",
+            {
+                "entity": "artifacts",
+                "workspace_id": str(self.workspace.id),
+                "filters": json.dumps([{"field": "slug", "op": "eq", "value": duplicate_slug}]),
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        rows = ((response.json() or {}).get("dataset") or {}).get("rows") or []
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("slug"), duplicate_slug)
+        self.assertEqual(rows[0].get("installed"), True)

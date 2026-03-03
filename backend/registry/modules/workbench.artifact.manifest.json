@@ -4,6 +4,9 @@
     "name": "core.workbench",
     "version": "0.1.0"
   },
+  "capability": {
+    "visibility": "hidden"
+  },
   "roles": [
     {
       "role": "ui_mount",

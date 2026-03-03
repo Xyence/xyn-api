@@ -4,6 +4,9 @@
     "name": "core.public-site",
     "version": "0.1.0"
   },
+  "capability": {
+    "visibility": "hidden"
+  },
   "roles": [
     {
       "role": "ui_mount",

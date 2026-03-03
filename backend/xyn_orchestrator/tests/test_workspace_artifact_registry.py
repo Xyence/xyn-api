@@ -328,6 +328,61 @@ class WorkspaceArtifactRegistryTests(TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertIn("manifest slug mismatch", str(response.json().get("error") or ""))
 
+    def test_manifest_capability_defaults_hidden_and_honors_explicit_visibility(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hidden_manifest = Path(tmpdir) / "hidden.manifest.json"
+            hidden_manifest.write_text(
+                json.dumps(
+                    {
+                        "artifact": {"id": "core.hidden-artifact", "name": "Hidden", "version": "1.0.0"},
+                        "roles": [{"role": "ui_mount", "mount_path": "/apps/hidden"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            visible_manifest = Path(tmpdir) / "visible.manifest.json"
+            visible_manifest.write_text(
+                json.dumps(
+                    {
+                        "artifact": {"id": "ems", "name": "EMS", "version": "1.0.0"},
+                        "capability": {"visibility": "capabilities", "label": "EMS", "order": 100},
+                        "roles": [{"role": "ui_mount", "mount_path": "/apps/ems"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="Hidden",
+                slug="core.hidden-artifact",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(hidden_manifest), "slug": "core.hidden-artifact"},
+            )
+            Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="EMS",
+                slug="ems",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(visible_manifest), "slug": "ems"},
+            )
+            response = self.client.get("/xyn/api/artifacts/catalog")
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json().get("artifacts", [])
+        hidden = next((row for row in rows if row.get("slug") == "core.hidden-artifact"), None)
+        visible = next((row for row in rows if row.get("slug") == "ems"), None)
+        self.assertIsNotNone(hidden)
+        self.assertIsNotNone(visible)
+        self.assertEqual((hidden.get("capability") or {}).get("visibility"), "hidden")
+        self.assertEqual((visible.get("capability") or {}).get("visibility"), "capabilities")
+
     def test_blueprint_routes_disabled_by_default(self):
         self._set_identity(self.admin_identity)
         api_response = self.client.get("/xyn/api/blueprints")

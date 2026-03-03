@@ -4,6 +4,12 @@
     "name": "EMS",
     "version": "1.1.0"
   },
+  "capability": {
+    "visibility": "capabilities",
+    "category": "application",
+    "label": "EMS",
+    "order": 100
+  },
   "dependencies": [
     {
       "artifact_id": "core.authn-jwt",

@@ -6808,6 +6808,7 @@ def _serialize_workspace_artifact_binding(binding: WorkspaceArtifactBinding) -> 
     if not description and isinstance(artifact.scope_json, dict):
         description = str(artifact.scope_json.get("summary") or "").strip()
     manifest_summary = _manifest_summary_for_artifact(artifact, workspace_id=str(binding.workspace_id))
+    capability = manifest_summary.get("capability") if isinstance(manifest_summary, dict) else {"visibility": "hidden", "order": 1000}
     return {
         "binding_id": str(binding.id),
         "artifact_id": str(artifact.id),
@@ -6821,6 +6822,7 @@ def _serialize_workspace_artifact_binding(binding: WorkspaceArtifactBinding) -> 
         "slug": _artifact_slug(artifact),
         "manifest_ref": manifest_ref or None,
         "manifest_summary": manifest_summary,
+        "capability": capability,
         "updated_at": artifact.updated_at,
     }
 
@@ -7093,6 +7095,43 @@ def _artifact_table_row(artifact: Artifact, *, workspace_id: Optional[str], inst
         "updated_at": _iso_utc(artifact.updated_at),
         "created_at": _iso_utc(artifact.created_at),
     }
+
+
+def _artifact_dataset_identity(artifact: Artifact) -> str:
+    slug = str(_artifact_slug(artifact) or "").strip()
+    return slug or str(artifact.id)
+
+
+def _artifact_dataset_preference(artifact: Artifact, *, installed_ids: Set[str]) -> Tuple[int, dt.datetime, dt.datetime]:
+    updated_at = artifact.updated_at
+    created_at = artifact.created_at
+    if not isinstance(updated_at, dt.datetime):
+        updated_at = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    elif timezone.is_naive(updated_at):
+        updated_at = timezone.make_aware(updated_at, dt.timezone.utc)
+    else:
+        updated_at = updated_at.astimezone(dt.timezone.utc)
+    if not isinstance(created_at, dt.datetime):
+        created_at = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    elif timezone.is_naive(created_at):
+        created_at = timezone.make_aware(created_at, dt.timezone.utc)
+    else:
+        created_at = created_at.astimezone(dt.timezone.utc)
+    return (1 if str(artifact.id) in installed_ids else 0, updated_at, created_at)
+
+
+def _dedupe_artifacts_for_dataset(artifacts: List[Artifact], *, installed_ids: Set[str]) -> List[Artifact]:
+    # Collapse duplicate slugs so canvas primary key (`slug`) stays unique and row selection is deterministic.
+    selected: Dict[str, Artifact] = {}
+    for artifact in artifacts:
+        key = _artifact_dataset_identity(artifact)
+        current = selected.get(key)
+        if current is None:
+            selected[key] = artifact
+            continue
+        if _artifact_dataset_preference(artifact, installed_ids=installed_ids) > _artifact_dataset_preference(current, installed_ids=installed_ids):
+            selected[key] = artifact
+    return list(selected.values())
 
 
 def _coerce_filter_value(field: str, value: Any) -> Any:
@@ -7846,6 +7885,7 @@ def artifacts_collection(request: HttpRequest) -> JsonResponse:
                     installed_state="installed",
                 ).only("artifact_id")
             }
+        artifacts = _dedupe_artifacts_for_dataset(artifacts, installed_ids=installed_ids)
         rows = [_artifact_table_row(artifact, workspace_id=workspace_id, installed_ids=installed_ids) for artifact in artifacts]
         for filter_row in structured_query.get("filters") or []:
             field = str(filter_row.get("field") or "").strip()
@@ -7953,6 +7993,7 @@ def artifacts_catalog_collection(request: HttpRequest) -> JsonResponse:
             manifest_summary = _manifest_summary_for_artifact(artifact, workspace_id=workspace_id)
         except ValueError as exc:
             return JsonResponse({"error": str(exc)}, status=500)
+        capability = manifest_summary.get("capability") if isinstance(manifest_summary, dict) else {"visibility": "hidden", "order": 1000}
         rows.append(
             {
                 "id": str(artifact.id),
@@ -7963,6 +8004,7 @@ def artifacts_catalog_collection(request: HttpRequest) -> JsonResponse:
                 "version": artifact.version,
                 "updated_at": artifact.updated_at,
                 "manifest_summary": manifest_summary,
+                "capability": capability,
             }
         )
     return JsonResponse({"artifacts": rows})
@@ -8310,6 +8352,7 @@ def artifact_by_slug_detail(request: HttpRequest, artifact_slug: str) -> JsonRes
         },
         "manifest": manifest,
         "manifest_summary": _manifest_summary_for_artifact(artifact, workspace_id=workspace_id),
+        "capability": _manifest_capability(manifest),
         "raw_artifact_json": _artifact_raw_payload(artifact),
         "files": _artifact_file_metadata_rows(artifact),
         "surfaces": [
@@ -18943,6 +18986,28 @@ def _resolve_manifest_surface_path(manifest: Dict[str, Any], surface_path: str, 
     return f"{prefix}{normalized}"
 
 
+def _manifest_capability(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    raw = manifest.get("capability") if isinstance(manifest.get("capability"), dict) else {}
+    visibility = str(raw.get("visibility") or "hidden").strip().lower() or "hidden"
+    if visibility not in {"capabilities", "platform", "hidden"}:
+        visibility = "hidden"
+    try:
+        order = int(raw.get("order", 1000))
+    except (TypeError, ValueError):
+        order = 1000
+    payload: Dict[str, Any] = {"visibility": visibility, "order": order}
+    label = str(raw.get("label") or "").strip()
+    if label:
+        payload["label"] = label
+    category = str(raw.get("category") or "").strip().lower()
+    if category in {"application", "integration", "platform", "library"}:
+        payload["category"] = category
+    icon = str(raw.get("icon") or "").strip()
+    if icon:
+        payload["icon"] = icon
+    return payload
+
+
 def _manifest_roots() -> List[Path]:
     resolved = Path(__file__).resolve()
     default_root = str(resolved.parents[1] if len(resolved.parents) > 1 else resolved.parent)
@@ -19071,6 +19136,7 @@ def _manifest_summary_for_artifact(artifact: Artifact, workspace_id: Optional[st
     summary = {
         "roles": unique_roles,
         "ui_mount_scope": _manifest_ui_mount_scope(manifest),
+        "capability": _manifest_capability(manifest),
         "surfaces": {
             "nav": _manifest_surface_entries(manifest, "nav", workspace_id=workspace_id),
             "manage": _manifest_surface_entries(manifest, "manage", workspace_id=workspace_id),
