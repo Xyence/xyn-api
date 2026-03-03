@@ -179,7 +179,8 @@ class WorkspaceArtifactRegistryTests(TestCase):
         rows = response.json().get("artifacts", [])
         self.assertEqual(len(rows), 1)
         manage = rows[0].get("manifest_summary", {}).get("surfaces", {}).get("manage", [])
-        self.assertEqual(manage[0].get("path"), "/apps/manage/settings")
+        self.assertEqual(manage[0].get("path"), f"/w/{self.workspace.id}/apps/manage/settings")
+        self.assertEqual(rows[0].get("manifest_summary", {}).get("ui_mount_scope"), "workspace")
 
     def test_catalog_returns_global_artifacts(self):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
@@ -482,10 +483,10 @@ class WorkspaceArtifactRegistryTests(TestCase):
                 enabled=True,
                 installed_state="installed",
             )
-            response = self.client.get(f"/xyn/api/artifact-surfaces/nav?workspace_id={self.workspace.id}")
+        response = self.client.get(f"/xyn/api/artifact-surfaces/nav?workspace_id={self.workspace.id}")
         self.assertEqual(response.status_code, 200)
         routes = {row.get("route") for row in response.json().get("surfaces", [])}
-        self.assertIn("/apps/hello", routes)
+        self.assertIn(f"/w/{self.workspace.id}/apps/hello", routes)
 
     def test_nav_surfaces_exclude_disabled_or_uninstalled_bindings(self):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
@@ -535,7 +536,7 @@ class WorkspaceArtifactRegistryTests(TestCase):
             response = self.client.get(f"/xyn/api/artifact-surfaces/nav?workspace_id={self.workspace.id}")
         self.assertEqual(response.status_code, 200)
         routes = {row.get("route") for row in response.json().get("surfaces", [])}
-        self.assertNotIn("/apps/hello", routes)
+        self.assertNotIn(f"/w/{self.workspace.id}/apps/hello", routes)
 
     def test_nav_surfaces_are_workspace_scoped(self):
         other_workspace = Workspace.objects.create(slug="other-lab", name="Other Lab")
@@ -592,10 +593,57 @@ class WorkspaceArtifactRegistryTests(TestCase):
         self.assertEqual(response_b.status_code, 200)
         routes_a = {row.get("route") for row in response_a.json().get("surfaces", [])}
         routes_b = {row.get("route") for row in response_b.json().get("surfaces", [])}
-        self.assertIn("/apps/hello-a", routes_a)
-        self.assertNotIn("/apps/hello-b", routes_a)
-        self.assertIn("/apps/hello-b", routes_b)
-        self.assertNotIn("/apps/hello-a", routes_b)
+        self.assertIn(f"/w/{self.workspace.id}/apps/hello-a", routes_a)
+        self.assertNotIn(f"/w/{self.workspace.id}/apps/hello-b", routes_a)
+        self.assertIn(f"/w/{other_workspace.id}/apps/hello-b", routes_b)
+        self.assertNotIn(f"/w/{other_workspace.id}/apps/hello-a", routes_b)
+
+    def test_manifest_ui_mount_scope_global_keeps_absolute_paths(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "public.manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": {"id": "core.public-site", "name": "Public Site", "version": "0.1.0"},
+                        "roles": [{"role": "ui_mount", "mount_path": "/", "scope": "global"}],
+                        "surfaces": {
+                            "nav": [{"label": "Home", "path": "/", "order": 10}],
+                            "docs": [{"label": "Public Site", "path": "/", "order": 1000}],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            artifact = Artifact.objects.create(
+                workspace=self.workspace,
+                type=module_type,
+                title="Public Site",
+                slug="core.public-site",
+                status="published",
+                visibility="team",
+                scope_json={"manifest_ref": str(manifest_path), "slug": "core.public-site"},
+            )
+            WorkspaceArtifactBinding.objects.create(
+                workspace=self.workspace,
+                artifact=artifact,
+                enabled=True,
+                installed_state="installed",
+            )
+            installed = self.client.get(f"/xyn/api/workspaces/{self.workspace.id}/artifacts")
+            nav = self.client.get(f"/xyn/api/artifact-surfaces/nav?workspace_id={self.workspace.id}")
+
+        self.assertEqual(installed.status_code, 200)
+        rows = installed.json().get("artifacts", [])
+        self.assertEqual(len(rows), 1)
+        summary = rows[0].get("manifest_summary", {})
+        self.assertEqual(summary.get("ui_mount_scope"), "global")
+        self.assertEqual(summary.get("surfaces", {}).get("docs", [])[0].get("path"), "/")
+        self.assertEqual(nav.status_code, 200)
+        routes = {row.get("route") for row in nav.json().get("surfaces", [])}
+        self.assertIn("/", routes)
 
     def test_nav_surfaces_include_legacy_surface_rows(self):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")

@@ -7,6 +7,7 @@
   "roles": [
     {
       "role": "ui_mount",
+      "scope": "workspace",
       "mount_path": "/apps/workbench",
       "static_dir": "xyn-api/backend/registry/modules/workbench-ui-dist"
     }

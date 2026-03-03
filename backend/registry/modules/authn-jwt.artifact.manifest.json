@@ -15,6 +15,7 @@
     },
     {
       "role": "ui_mount",
+      "scope": "workspace",
       "mount_path": "/apps/authn-jwt",
       "static_dir": "xyn-api/backend/registry/modules/authn-jwt-ui-dist"
     }

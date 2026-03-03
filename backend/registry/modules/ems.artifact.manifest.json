@@ -22,6 +22,7 @@
     },
     {
       "role": "ui_mount",
+      "scope": "workspace",
       "mount_path": "/apps/ems",
       "static_dir": "xyn-api/apps/ems-artifact/ui-dist"
     }

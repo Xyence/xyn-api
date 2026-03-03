@@ -18908,6 +18908,41 @@ def _normalize_surface_path(value: str) -> str:
     return without_query
 
 
+def _workspace_prefix(workspace_id: Optional[str]) -> str:
+    token = str(workspace_id or "").strip()
+    if not token:
+        return ""
+    return f"/w/{token}"
+
+
+def _manifest_ui_mount_scope(manifest: Dict[str, Any]) -> str:
+    roles = manifest.get("roles") if isinstance(manifest.get("roles"), list) else []
+    for role in roles:
+        if not isinstance(role, dict):
+            continue
+        if str(role.get("role") or "").strip().lower() != "ui_mount":
+            continue
+        scope = str(role.get("scope") or "").strip().lower()
+        if scope in {"global", "workspace"}:
+            return scope
+        return "workspace"
+    return "workspace"
+
+
+def _resolve_manifest_surface_path(manifest: Dict[str, Any], surface_path: str, workspace_id: Optional[str] = None) -> str:
+    normalized = _normalize_surface_path(surface_path)
+    if not normalized:
+        return ""
+    if _manifest_ui_mount_scope(manifest) == "global":
+        return normalized
+    prefix = _workspace_prefix(workspace_id)
+    if not prefix:
+        return normalized
+    if normalized.startswith("/w/"):
+        return normalized
+    return f"{prefix}{normalized}"
+
+
 def _manifest_roots() -> List[Path]:
     resolved = Path(__file__).resolve()
     default_root = str(resolved.parents[1] if len(resolved.parents) > 1 else resolved.parent)
@@ -18961,7 +18996,7 @@ def _load_artifact_manifest(artifact: Artifact) -> Dict[str, Any]:
         raise ValueError(str(exc)) from exc
 
 
-def _manifest_surface_entries(manifest: Dict[str, Any], surface_key: str) -> List[Dict[str, Any]]:
+def _manifest_surface_entries(manifest: Dict[str, Any], surface_key: str, workspace_id: Optional[str] = None) -> List[Dict[str, Any]]:
     surfaces = manifest.get("surfaces") if isinstance(manifest.get("surfaces"), dict) else {}
     raw_rows = surfaces.get(surface_key) if isinstance(surfaces.get(surface_key), list) else []
     rows: List[Dict[str, Any]] = []
@@ -18969,7 +19004,7 @@ def _manifest_surface_entries(manifest: Dict[str, Any], surface_key: str) -> Lis
         if not isinstance(entry, dict):
             continue
         label = str(entry.get("label") or "").strip()
-        path = _normalize_surface_path(str(entry.get("path") or ""))
+        path = _resolve_manifest_surface_path(manifest, str(entry.get("path") or ""), workspace_id=workspace_id)
         if not label or not path:
             continue
         try:
@@ -19035,10 +19070,11 @@ def _manifest_summary_for_artifact(artifact: Artifact, workspace_id: Optional[st
     unique_roles = sorted(set(roles))
     summary = {
         "roles": unique_roles,
+        "ui_mount_scope": _manifest_ui_mount_scope(manifest),
         "surfaces": {
-            "nav": _manifest_surface_entries(manifest, "nav"),
-            "manage": _manifest_surface_entries(manifest, "manage"),
-            "docs": _manifest_surface_entries(manifest, "docs"),
+            "nav": _manifest_surface_entries(manifest, "nav", workspace_id=workspace_id),
+            "manage": _manifest_surface_entries(manifest, "manage", workspace_id=workspace_id),
+            "docs": _manifest_surface_entries(manifest, "docs", workspace_id=workspace_id),
         },
     }
     if artifact.type_id and artifact.type.slug == "article":
@@ -19067,7 +19103,9 @@ def _manifest_summary_for_artifact(artifact: Artifact, workspace_id: Optional[st
 
 def _manifest_nav_surfaces(binding: WorkspaceArtifactBinding) -> List[Dict[str, Any]]:
     artifact = binding.artifact
-    nav_entries = _manifest_surface_entries(_load_artifact_manifest(artifact), "nav")
+    manifest = _load_artifact_manifest(artifact)
+    scope = _manifest_ui_mount_scope(manifest)
+    nav_entries = _manifest_surface_entries(manifest, "nav", workspace_id=str(binding.workspace_id))
     rows: List[Dict[str, Any]] = []
 
     for idx, entry in enumerate(nav_entries):
@@ -19095,6 +19133,7 @@ def _manifest_nav_surfaces(binding: WorkspaceArtifactBinding) -> List[Dict[str, 
                 "sort_order": sort_order,
                 "created_at": artifact.created_at,
                 "updated_at": artifact.updated_at,
+                "ui_mount_scope": scope,
                 "_source_kind": "manifest",
                 "_artifact_title": artifact.title,
             }
@@ -19223,14 +19262,24 @@ def artifact_surfaces_nav(request: HttpRequest) -> JsonResponse:
         current_artifact_id = str(row.get("artifact_id") or "")
         if route in seen_paths:
             previous = seen_paths[route]
-            logger.warning(
-                "duplicate nav path ignored path=%s kept_artifact=%s dropped_artifact=%s",
-                route,
-                previous.get("artifact_id"),
-                current_artifact_id,
-            )
+            previous_scope = str(previous.get("ui_mount_scope") or "").strip().lower()
+            current_scope = str(row.get("ui_mount_scope") or "").strip().lower()
+            if previous_scope == "global" and current_scope == "global":
+                logger.error(
+                    "global nav path collision path=%s kept_artifact=%s dropped_artifact=%s",
+                    route,
+                    previous.get("artifact_id"),
+                    current_artifact_id,
+                )
+            else:
+                logger.warning(
+                    "duplicate nav path ignored path=%s kept_artifact=%s dropped_artifact=%s",
+                    route,
+                    previous.get("artifact_id"),
+                    current_artifact_id,
+                )
             continue
-        seen_paths[route] = {"artifact_id": current_artifact_id}
+        seen_paths[route] = {"artifact_id": current_artifact_id, "ui_mount_scope": str(row.get("ui_mount_scope") or "")}
         row.pop("_source_kind", None)
         row.pop("_artifact_title", None)
         rows.append(row)
