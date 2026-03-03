@@ -2831,6 +2831,48 @@ def _workspace_oidc_client_secret(workspace: Workspace) -> Optional[str]:
     return resolve_oidc_secret_ref({"type": "aws.secrets_manager", "ref": ref.external_ref})
 
 
+def _workspace_member_auth_source(identity: UserIdentity) -> Dict[str, str]:
+    provider = str(identity.provider or "").strip().lower()
+    provider_id = str(identity.provider_id or "").strip()
+    issuer = str(identity.issuer or "").strip()
+    provider_id_lower = provider_id.lower()
+    issuer_lower = issuer.lower()
+    if provider == "local" or provider_id_lower == "local":
+        label = "Local"
+    elif "google" in provider_id_lower or "accounts.google.com" in issuer_lower:
+        label = "Google IdP"
+    elif "aws" in provider_id_lower or "amazonaws" in issuer_lower:
+        label = "Xyn/AWS IdP"
+    elif provider == "oidc":
+        label = "OIDC"
+    elif provider:
+        label = provider.upper()
+    else:
+        label = "Unknown"
+    return {
+        "auth_source": provider_id or provider or "unknown",
+        "auth_source_label": label,
+        "auth_provider": provider,
+        "auth_provider_id": provider_id,
+        "auth_issuer": issuer,
+    }
+
+
+def _serialize_workspace_member(member: WorkspaceMembership) -> Dict[str, Any]:
+    auth_source = _workspace_member_auth_source(member.user_identity)
+    return {
+        "id": str(member.id),
+        "workspace_id": str(member.workspace_id),
+        "user_identity_id": str(member.user_identity_id),
+        "email": member.user_identity.email,
+        "display_name": member.user_identity.display_name,
+        "role": _workspace_role_to_member_role(member.role),
+        "termination_authority": bool(member.termination_authority),
+        "created_at": member.created_at,
+        **auth_source,
+    }
+
+
 def _serialize_workspace_auth_policy(workspace: Workspace) -> Dict[str, Any]:
     return {
         "workspace_id": str(workspace.id),
@@ -9192,16 +9234,7 @@ def workspace_memberships_collection(request: HttpRequest, workspace_id: str) ->
         )
         response_payload: Dict[str, Any] = {
             "id": str(membership.id),
-            "member": {
-                "id": str(membership.id),
-                "workspace_id": str(membership.workspace_id),
-                "user_identity_id": str(membership.user_identity_id),
-                "email": membership.user_identity.email,
-                "display_name": membership.user_identity.display_name,
-                "role": _workspace_role_to_member_role(membership.role),
-                "termination_authority": bool(membership.termination_authority),
-                "created_at": membership.created_at,
-            },
+            "member": _serialize_workspace_member(membership),
             "created_user": created_user,
         }
         if invite_link:
@@ -9215,16 +9248,7 @@ def workspace_memberships_collection(request: HttpRequest, workspace_id: str) ->
     return JsonResponse(
         {
             "memberships": [
-                {
-                    "id": str(member.id),
-                    "workspace_id": str(member.workspace_id),
-                    "user_identity_id": str(member.user_identity_id),
-                    "email": member.user_identity.email,
-                    "display_name": member.user_identity.display_name,
-                    "role": _workspace_role_to_member_role(member.role),
-                    "termination_authority": bool(member.termination_authority),
-                    "created_at": member.created_at,
-                }
+                _serialize_workspace_member(member)
                 for member in members
             ]
         }

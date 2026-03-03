@@ -48,9 +48,32 @@ class WorkspaceMembersApiTests(TestCase):
         self.assertTrue(payload.get("created_user"))
         self.assertTrue(payload.get("temp_password"))
         self.assertEqual(payload["member"]["role"], "member")
+        self.assertEqual(payload["member"]["auth_source_label"], "Local")
         membership = WorkspaceMembership.objects.get(id=payload["id"])
         self.assertEqual(membership.role, "reader")
         self.assertEqual(membership.user_identity.email.lower(), "new-customer@example.com")
+
+    def test_members_list_includes_auth_source_fields(self):
+        identity = UserIdentity.objects.create(
+            provider="oidc",
+            provider_id="google",
+            issuer="https://accounts.google.com",
+            subject="member-google",
+            email="member-google@example.com",
+        )
+        WorkspaceMembership.objects.create(
+            workspace=self.workspace,
+            user_identity=identity,
+            role="reader",
+            termination_authority=False,
+        )
+        response = self.client.get(f"/xyn/api/workspaces/{self.workspace.id}/members")
+        self.assertEqual(response.status_code, 200, response.content.decode())
+        memberships = response.json().get("memberships", [])
+        google_member = next((row for row in memberships if row.get("email") == "member-google@example.com"), None)
+        self.assertIsNotNone(google_member)
+        self.assertEqual(google_member.get("auth_source"), "google")
+        self.assertEqual(google_member.get("auth_source_label"), "Google IdP")
 
     def test_delete_member_removes_membership(self):
         identity = UserIdentity.objects.create(
