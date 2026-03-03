@@ -1,4 +1,5 @@
 import base64
+import datetime as dt
 import json
 import logging
 import os
@@ -6933,6 +6934,288 @@ def _serialize_unified_artifact(artifact: Artifact, source_record: Any = None) -
     return payload
 
 
+ARTIFACTS_DATASET_COLUMNS: List[Dict[str, Any]] = [
+    {"key": "slug", "label": "Slug", "type": "string", "filterable": True, "sortable": True, "searchable": True},
+    {"key": "namespace", "label": "Namespace", "type": "string", "filterable": True, "sortable": True, "searchable": True},
+    {"key": "name", "label": "Name", "type": "string", "filterable": True, "sortable": True, "searchable": True},
+    {"key": "kind", "label": "Kind", "type": "string", "filterable": True, "sortable": True, "enum": ["module", "article", "workflow", "app"]},
+    {"key": "version", "label": "Version", "type": "integer", "filterable": True, "sortable": True},
+    {"key": "roles", "label": "Roles", "type": "string[]", "filterable": True},
+    {"key": "surfaces_count", "label": "Surfaces", "type": "integer", "filterable": False, "sortable": True},
+    {"key": "installed", "label": "Installed", "type": "boolean", "filterable": True, "sortable": True},
+    {"key": "updated_at", "label": "Updated", "type": "datetime", "filterable": True, "sortable": True},
+    {"key": "created_at", "label": "Created", "type": "datetime", "filterable": True, "sortable": True},
+]
+
+ARTIFACTS_DATASET_SCHEMA_BY_KEY: Dict[str, Dict[str, Any]] = {str(col.get("key")): col for col in ARTIFACTS_DATASET_COLUMNS}
+ARTIFACTS_FILTER_OPS = {"eq", "neq", "contains", "in", "gte", "lte", "gt", "lt"}
+
+
+def _iso_utc(dt_value: Any) -> Optional[str]:
+    if not dt_value:
+        return None
+    if not isinstance(dt_value, dt.datetime):
+        return None
+    value = dt_value
+    if timezone.is_naive(value):
+        value = timezone.make_aware(value, dt.timezone.utc)
+    else:
+        value = value.astimezone(dt.timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _artifact_namespace_from_slug(slug: str) -> str:
+    token = str(slug or "").strip()
+    if not token or "." not in token:
+        return ""
+    return token.split(".", 1)[0].strip().lower()
+
+
+def _resolve_relative_time_value(raw_value: Any) -> Optional[timezone.datetime]:
+    token = str(raw_value or "").strip().lower()
+    if not token:
+        return None
+    match = re.match(r"^now-(\d+)([mhd])$", token)
+    if not match:
+        parsed = parse_datetime(token)
+        if not parsed:
+            try:
+                parsed = dt.datetime.fromisoformat(token.replace("z", "+00:00").replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+        if not parsed:
+            return None
+        if timezone.is_naive(parsed):
+            parsed = timezone.make_aware(parsed, dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    amount = max(0, int(match.group(1)))
+    unit = match.group(2)
+    if unit == "m":
+        return timezone.now() - timezone.timedelta(minutes=amount)
+    if unit == "h":
+        return timezone.now() - timezone.timedelta(hours=amount)
+    return timezone.now() - timezone.timedelta(days=amount)
+
+
+def _parse_structured_artifact_query(request: HttpRequest) -> Tuple[Dict[str, Any], Optional[str]]:
+    entity = str(request.GET.get("entity") or "").strip().lower() or "artifacts"
+    if entity != "artifacts":
+        return {}, "unsupported entity"
+    try:
+        limit = max(1, min(500, int(request.GET.get("limit") or 50)))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = max(0, int(request.GET.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+
+    filters_raw = request.GET.get("filters")
+    sort_raw = request.GET.get("sort")
+    if not filters_raw and not sort_raw:
+        query_raw = str(request.GET.get("query") or "").strip()
+        if query_raw.startswith("{"):
+            try:
+                query_payload = json.loads(query_raw)
+            except json.JSONDecodeError:
+                return {}, "invalid query payload"
+            if isinstance(query_payload, dict):
+                filters_raw = json.dumps(query_payload.get("filters") or [])
+                sort_raw = json.dumps(query_payload.get("sort") or [])
+                if "limit" in query_payload:
+                    try:
+                        limit = max(1, min(500, int(query_payload.get("limit") or limit)))
+                    except (TypeError, ValueError):
+                        pass
+                if "offset" in query_payload:
+                    try:
+                        offset = max(0, int(query_payload.get("offset") or offset))
+                    except (TypeError, ValueError):
+                        pass
+
+    try:
+        filters = json.loads(filters_raw) if filters_raw else []
+    except json.JSONDecodeError:
+        return {}, "invalid filters payload"
+    try:
+        sort = json.loads(sort_raw) if sort_raw else []
+    except json.JSONDecodeError:
+        return {}, "invalid sort payload"
+    if not isinstance(filters, list):
+        return {}, "filters must be an array"
+    if not isinstance(sort, list):
+        return {}, "sort must be an array"
+
+    for row in filters:
+        if not isinstance(row, dict):
+            return {}, "invalid filter row"
+        field = str(row.get("field") or "").strip()
+        op = str(row.get("op") or "").strip()
+        if field not in ARTIFACTS_DATASET_SCHEMA_BY_KEY:
+            return {}, f"unknown filter field: {field}"
+        if op not in ARTIFACTS_FILTER_OPS:
+            return {}, f"unsupported filter op: {op}"
+    for row in sort:
+        if not isinstance(row, dict):
+            return {}, "invalid sort row"
+        field = str(row.get("field") or "").strip()
+        direction = str(row.get("dir") or "asc").strip().lower()
+        if field not in ARTIFACTS_DATASET_SCHEMA_BY_KEY:
+            return {}, f"unknown sort field: {field}"
+        if direction not in {"asc", "desc"}:
+            return {}, "sort dir must be asc|desc"
+
+    if not sort:
+        sort = [{"field": "updated_at", "dir": "desc"}]
+    return {"entity": "artifacts", "filters": filters, "sort": sort, "limit": limit, "offset": offset}, None
+
+
+def _artifact_table_row(artifact: Artifact, *, workspace_id: Optional[str], installed_ids: Set[str]) -> Dict[str, Any]:
+    slug = _artifact_slug(artifact)
+    try:
+        manifest_summary = _manifest_summary_for_artifact(artifact, workspace_id=workspace_id)
+    except Exception:
+        manifest_summary = {"roles": [], "surfaces": {"nav": [], "manage": [], "docs": []}}
+    surfaces = manifest_summary.get("surfaces") if isinstance(manifest_summary.get("surfaces"), dict) else {}
+    nav = surfaces.get("nav") if isinstance(surfaces.get("nav"), list) else []
+    manage = surfaces.get("manage") if isinstance(surfaces.get("manage"), list) else []
+    docs = surfaces.get("docs") if isinstance(surfaces.get("docs"), list) else []
+    roles = manifest_summary.get("roles") if isinstance(manifest_summary.get("roles"), list) else []
+    return {
+        "slug": slug,
+        "namespace": _artifact_namespace_from_slug(slug),
+        "name": artifact.title,
+        "kind": artifact.type.slug if artifact.type_id else "",
+        "version": int(artifact.version or 0),
+        "roles": [str(entry) for entry in roles if str(entry or "").strip()],
+        "surfaces_count": len(nav) + len(manage) + len(docs),
+        "installed": str(artifact.id) in installed_ids,
+        "updated_at": _iso_utc(artifact.updated_at),
+        "created_at": _iso_utc(artifact.created_at),
+    }
+
+
+def _coerce_filter_value(field: str, value: Any) -> Any:
+    schema = ARTIFACTS_DATASET_SCHEMA_BY_KEY.get(field) or {}
+    field_type = str(schema.get("type") or "")
+    if field_type == "integer":
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    if field_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        token = str(value or "").strip().lower()
+        if token in {"true", "1", "yes"}:
+            return True
+        if token in {"false", "0", "no"}:
+            return False
+        return None
+    if field_type == "datetime":
+        return _resolve_relative_time_value(value)
+    if field_type == "string[]":
+        if isinstance(value, list):
+            return [str(entry).strip() for entry in value if str(entry).strip()]
+        return str(value or "").strip()
+    return str(value or "").strip()
+
+
+def _row_matches_structured_filter(row: Dict[str, Any], filter_row: Dict[str, Any]) -> bool:
+    field = str(filter_row.get("field") or "").strip()
+    op = str(filter_row.get("op") or "").strip()
+    row_value = row.get(field)
+    normalized = _coerce_filter_value(field, filter_row.get("value"))
+    schema = ARTIFACTS_DATASET_SCHEMA_BY_KEY.get(field) or {}
+    field_type = str(schema.get("type") or "")
+
+    if field_type == "datetime":
+        left = _resolve_relative_time_value(row_value)
+        right = normalized
+        if not left or not right:
+            return False
+        if op == "eq":
+            return left == right
+        if op == "neq":
+            return left != right
+        if op == "gte":
+            return left >= right
+        if op == "lte":
+            return left <= right
+        if op == "gt":
+            return left > right
+        if op == "lt":
+            return left < right
+        return False
+
+    if field_type == "string[]":
+        values = row_value if isinstance(row_value, list) else []
+        lowered_values = [str(entry).strip().lower() for entry in values]
+        if op in {"eq", "contains"}:
+            token = str(normalized or "").strip().lower()
+            return token in lowered_values
+        if op == "in":
+            options = normalized if isinstance(normalized, list) else [normalized]
+            normalized_options = {str(entry).strip().lower() for entry in options if str(entry).strip()}
+            return bool(normalized_options.intersection(set(lowered_values)))
+        if op == "neq":
+            token = str(normalized or "").strip().lower()
+            return token not in lowered_values
+        return False
+
+    left = row_value
+    right = normalized
+    if isinstance(left, str):
+        left_cmp = left.lower()
+    else:
+        left_cmp = left
+    if isinstance(right, str):
+        right_cmp = right.lower()
+    else:
+        right_cmp = right
+    if op == "eq":
+        return left_cmp == right_cmp
+    if op == "neq":
+        return left_cmp != right_cmp
+    if op == "contains":
+        return str(right_cmp or "") in str(left_cmp or "")
+    if op == "in":
+        if not isinstance(right, list):
+            return left_cmp == right_cmp
+        if isinstance(left_cmp, list):
+            left_set = {str(entry).strip().lower() for entry in left_cmp}
+            right_set = {str(entry).strip().lower() for entry in right if str(entry).strip()}
+            return bool(left_set.intersection(right_set))
+        return str(left_cmp) in {str(entry).strip().lower() for entry in right if str(entry).strip()}
+    if op == "gte":
+        return left_cmp is not None and right_cmp is not None and left_cmp >= right_cmp
+    if op == "lte":
+        return left_cmp is not None and right_cmp is not None and left_cmp <= right_cmp
+    if op == "gt":
+        return left_cmp is not None and right_cmp is not None and left_cmp > right_cmp
+    if op == "lt":
+        return left_cmp is not None and right_cmp is not None and left_cmp < right_cmp
+    return False
+
+
+def _row_sort_key(row: Dict[str, Any], field: str) -> Any:
+    value = row.get(field)
+    schema = ARTIFACTS_DATASET_SCHEMA_BY_KEY.get(field) or {}
+    field_type = str(schema.get("type") or "")
+    if field_type == "datetime":
+        parsed = _resolve_relative_time_value(value)
+        return parsed.timestamp() if parsed else 0
+    if field_type == "string[]":
+        if isinstance(value, list):
+            return ",".join(sorted(str(entry).strip().lower() for entry in value))
+        return ""
+    if isinstance(value, str):
+        return value.lower()
+    if value is None:
+        return 0
+    return value
+
+
 def _serialize_ledger_event(event: LedgerEvent) -> Dict[str, Any]:
     artifact = event.artifact
     return {
@@ -7543,6 +7826,54 @@ def artifacts_collection(request: HttpRequest) -> JsonResponse:
         return staff_error
     if request.method == "POST":
         return JsonResponse({"error": "method not allowed"}, status=405)
+    if request.method == "GET" and (
+        str(request.GET.get("entity") or "").strip().lower() == "artifacts"
+        or bool(str(request.GET.get("filters") or "").strip())
+        or bool(str(request.GET.get("sort") or "").strip())
+    ):
+        structured_query, parse_error = _parse_structured_artifact_query(request)
+        if parse_error:
+            return JsonResponse({"error": parse_error}, status=400)
+        workspace_id = str(request.GET.get("workspace_id") or "").strip() or None
+        artifacts = list(Artifact.objects.select_related("type").all())
+        installed_ids: Set[str] = set()
+        if workspace_id:
+            installed_ids = {
+                str(binding.artifact_id)
+                for binding in WorkspaceArtifactBinding.objects.filter(
+                    workspace_id=workspace_id,
+                    enabled=True,
+                    installed_state="installed",
+                ).only("artifact_id")
+            }
+        rows = [_artifact_table_row(artifact, workspace_id=workspace_id, installed_ids=installed_ids) for artifact in artifacts]
+        for filter_row in structured_query.get("filters") or []:
+            field = str(filter_row.get("field") or "").strip()
+            if field == "installed" and not workspace_id:
+                return JsonResponse({"error": "workspace_id is required when filtering installed artifacts"}, status=400)
+            rows = [row for row in rows if _row_matches_structured_filter(row, filter_row)]
+        for sort_row in reversed(structured_query.get("sort") or []):
+            field = str(sort_row.get("field") or "").strip()
+            direction = str(sort_row.get("dir") or "asc").strip().lower()
+            rows.sort(key=lambda row: _row_sort_key(row, field), reverse=direction == "desc")
+        total_count = len(rows)
+        offset = int(structured_query.get("offset") or 0)
+        limit = int(structured_query.get("limit") or 50)
+        paged_rows = rows[offset : offset + limit]
+        return JsonResponse(
+            {
+                "type": "canvas.table",
+                "title": "Artifacts",
+                "dataset": {
+                    "name": "artifacts",
+                    "primary_key": "slug",
+                    "columns": ARTIFACTS_DATASET_COLUMNS,
+                    "rows": paged_rows,
+                    "total_count": total_count,
+                },
+                "query": structured_query,
+            }
+        )
 
     artifact_type = str(request.GET.get("type") or "").strip().lower()
     kind_alias = str(request.GET.get("kind") or "").strip().lower()
