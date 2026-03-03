@@ -8,8 +8,42 @@
     "visibility": "capabilities",
     "category": "application",
     "label": "EMS",
+    "description": "Manage EMS demo assets and operational panels.",
+    "tags": ["ems", "devices", "operations"],
     "order": 100
   },
+  "suggestions": [
+    {
+      "id": "ems-unregistered-devices",
+      "name": "Unregistered Devices",
+      "prompt": "Show unregistered devices",
+      "description": "List devices that still need registration.",
+      "visibility": ["capability", "landing", "palette"],
+      "group": "Devices",
+      "order": 100,
+      "ui": { "badge": "EMS" }
+    },
+    {
+      "id": "ems-registrations-24h",
+      "name": "Registrations (24h)",
+      "prompt": "Show registrations in the past 24 hours",
+      "description": "Review registration activity over the last day.",
+      "visibility": ["capability", "palette"],
+      "group": "Reports",
+      "order": 110,
+      "ui": { "badge": "EMS" }
+    },
+    {
+      "id": "ems-device-statuses",
+      "name": "Device Statuses",
+      "prompt": "Show device statuses",
+      "description": "View current status rollups by device state.",
+      "visibility": ["capability", "landing", "palette"],
+      "group": "Reports",
+      "order": 120,
+      "ui": { "badge": "EMS" }
+    }
+  ],
   "dependencies": [
     {
       "artifact_id": "core.authn-jwt",

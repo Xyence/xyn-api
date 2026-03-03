@@ -6809,6 +6809,7 @@ def _serialize_workspace_artifact_binding(binding: WorkspaceArtifactBinding) -> 
         description = str(artifact.scope_json.get("summary") or "").strip()
     manifest_summary = _manifest_summary_for_artifact(artifact, workspace_id=str(binding.workspace_id))
     capability = manifest_summary.get("capability") if isinstance(manifest_summary, dict) else {"visibility": "hidden", "order": 1000}
+    suggestions = manifest_summary.get("suggestions") if isinstance(manifest_summary, dict) else []
     return {
         "binding_id": str(binding.id),
         "artifact_id": str(artifact.id),
@@ -6823,6 +6824,7 @@ def _serialize_workspace_artifact_binding(binding: WorkspaceArtifactBinding) -> 
         "manifest_ref": manifest_ref or None,
         "manifest_summary": manifest_summary,
         "capability": capability,
+        "suggestions": suggestions if isinstance(suggestions, list) else [],
         "updated_at": artifact.updated_at,
     }
 
@@ -7994,6 +7996,7 @@ def artifacts_catalog_collection(request: HttpRequest) -> JsonResponse:
         except ValueError as exc:
             return JsonResponse({"error": str(exc)}, status=500)
         capability = manifest_summary.get("capability") if isinstance(manifest_summary, dict) else {"visibility": "hidden", "order": 1000}
+        suggestions = manifest_summary.get("suggestions") if isinstance(manifest_summary, dict) else []
         rows.append(
             {
                 "id": str(artifact.id),
@@ -8005,6 +8008,7 @@ def artifacts_catalog_collection(request: HttpRequest) -> JsonResponse:
                 "updated_at": artifact.updated_at,
                 "manifest_summary": manifest_summary,
                 "capability": capability,
+                "suggestions": suggestions if isinstance(suggestions, list) else [],
             }
         )
     return JsonResponse({"artifacts": rows})
@@ -8338,6 +8342,7 @@ def artifact_by_slug_detail(request: HttpRequest, artifact_slug: str) -> JsonRes
     workspace_id = str(request.GET.get("workspace_id") or "").strip() or None
     manifest = _load_artifact_manifest(artifact)
     manifest_ref = str((artifact.scope_json or {}).get("manifest_ref") or "").strip()
+    manifest_summary = _manifest_summary_for_artifact(artifact, workspace_id=workspace_id)
     payload = {
         "artifact": {
             "id": str(artifact.id),
@@ -8351,8 +8356,9 @@ def artifact_by_slug_detail(request: HttpRequest, artifact_slug: str) -> JsonRes
             "manifest_ref": manifest_ref or None,
         },
         "manifest": manifest,
-        "manifest_summary": _manifest_summary_for_artifact(artifact, workspace_id=workspace_id),
+        "manifest_summary": manifest_summary,
         "capability": _manifest_capability(manifest),
+        "suggestions": manifest_summary.get("suggestions") if isinstance(manifest_summary.get("suggestions"), list) else [],
         "raw_artifact_json": _artifact_raw_payload(artifact),
         "files": _artifact_file_metadata_rows(artifact),
         "surfaces": [
@@ -19005,7 +19011,88 @@ def _manifest_capability(manifest: Dict[str, Any]) -> Dict[str, Any]:
     icon = str(raw.get("icon") or "").strip()
     if icon:
         payload["icon"] = icon
+    description = str(raw.get("description") or "").strip()
+    if description:
+        payload["description"] = description
+    tags = raw.get("tags")
+    if isinstance(tags, list):
+        cleaned_tags = [str(entry).strip() for entry in tags if str(entry).strip()]
+        if cleaned_tags:
+            payload["tags"] = cleaned_tags
+    permission_raw = raw.get("permission") if isinstance(raw.get("permission"), dict) else {}
+    permission_resource = str(permission_raw.get("resource") or "").strip()
+    permission_action = str(permission_raw.get("action") or "").strip()
+    if permission_resource and permission_action:
+        payload["permission"] = {"resource": permission_resource, "action": permission_action}
     return payload
+
+
+def _manifest_suggestions(manifest: Dict[str, Any], workspace_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    raw_rows = manifest.get("suggestions") if isinstance(manifest.get("suggestions"), list) else []
+    rows: List[Dict[str, Any]] = []
+    allowed_visibility = {"landing", "capability", "palette", "hidden"}
+    for idx, entry in enumerate(raw_rows):
+        if not isinstance(entry, dict):
+            continue
+        suggestion_id = str(entry.get("id") or "").strip() or f"suggestion-{idx + 1}"
+        prompt = str(entry.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        name = str(entry.get("name") or "").strip() or prompt
+        description = str(entry.get("description") or "").strip()
+        try:
+            order = int(entry.get("order", 1000))
+        except (TypeError, ValueError):
+            order = 1000
+        group = str(entry.get("group") or "").strip()
+        capability_ref = str(entry.get("capability_ref") or "").strip()
+        visibility_raw = entry.get("visibility")
+        visibility_values: List[str] = []
+        if isinstance(visibility_raw, list):
+            visibility_values = [
+                str(item).strip().lower()
+                for item in visibility_raw
+                if str(item).strip().lower() in allowed_visibility
+            ]
+        if not visibility_values:
+            visibility_values = ["capability", "palette"]
+        ui_raw = entry.get("ui") if isinstance(entry.get("ui"), dict) else {}
+        ui_payload: Dict[str, Any] = {}
+        ui_icon = str(ui_raw.get("icon") or "").strip()
+        ui_badge = str(ui_raw.get("badge") or "").strip()
+        if ui_icon:
+            ui_payload["icon"] = ui_icon
+        if ui_badge:
+            ui_payload["badge"] = ui_badge
+        permission_raw = entry.get("permission") if isinstance(entry.get("permission"), dict) else {}
+        permission_resource = str(permission_raw.get("resource") or "").strip()
+        permission_action = str(permission_raw.get("action") or "").strip()
+        suggestion: Dict[str, Any] = {
+            "id": suggestion_id,
+            "name": name,
+            "prompt": prompt,
+            "visibility": visibility_values,
+            "order": order,
+        }
+        if description:
+            suggestion["description"] = description
+        if group:
+            suggestion["group"] = group
+        if capability_ref:
+            suggestion["capability_ref"] = capability_ref
+        if ui_payload:
+            suggestion["ui"] = ui_payload
+        if permission_resource and permission_action:
+            suggestion["permission"] = {"resource": permission_resource, "action": permission_action}
+        rows.append(suggestion)
+    rows.sort(
+        key=lambda row: (
+            int(row.get("order") or 1000),
+            str(row.get("group") or "").lower(),
+            str(row.get("name") or row.get("prompt") or "").lower(),
+        )
+    )
+    return rows
 
 
 def _manifest_roots() -> List[Path]:
@@ -19137,6 +19224,7 @@ def _manifest_summary_for_artifact(artifact: Artifact, workspace_id: Optional[st
         "roles": unique_roles,
         "ui_mount_scope": _manifest_ui_mount_scope(manifest),
         "capability": _manifest_capability(manifest),
+        "suggestions": _manifest_suggestions(manifest, workspace_id=workspace_id),
         "surfaces": {
             "nav": _manifest_surface_entries(manifest, "nav", workspace_id=workspace_id),
             "manage": _manifest_surface_entries(manifest, "manage", workspace_id=workspace_id),

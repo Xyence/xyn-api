@@ -349,6 +349,13 @@ class WorkspaceArtifactRegistryTests(TestCase):
                     {
                         "artifact": {"id": "ems", "name": "EMS", "version": "1.0.0"},
                         "capability": {"visibility": "capabilities", "label": "EMS", "order": 100},
+                        "suggestions": [
+                            {
+                                "id": "ems-unregistered",
+                                "prompt": "Show unregistered devices",
+                                "visibility": ["capability", "landing"],
+                            }
+                        ],
                         "roles": [{"role": "ui_mount", "mount_path": "/apps/ems"}],
                     }
                 ),
@@ -382,6 +389,8 @@ class WorkspaceArtifactRegistryTests(TestCase):
         self.assertIsNotNone(visible)
         self.assertEqual((hidden.get("capability") or {}).get("visibility"), "hidden")
         self.assertEqual((visible.get("capability") or {}).get("visibility"), "capabilities")
+        self.assertEqual(len((visible.get("suggestions") or [])), 1)
+        self.assertEqual(str((visible.get("suggestions") or [])[0].get("prompt") or ""), "Show unregistered devices")
 
     def test_blueprint_routes_disabled_by_default(self):
         self._set_identity(self.admin_identity)

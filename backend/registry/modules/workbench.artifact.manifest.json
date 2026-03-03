@@ -5,8 +5,41 @@
     "version": "0.1.0"
   },
   "capability": {
-    "visibility": "hidden"
+    "visibility": "platform",
+    "category": "platform",
+    "label": "Platform",
+    "description": "Core platform control-plane workflows.",
+    "order": 10
   },
+  "suggestions": [
+    {
+      "id": "platform-list-artifacts",
+      "name": "List Artifacts",
+      "prompt": "List artifacts",
+      "description": "Open the artifacts dataset in the canvas.",
+      "visibility": ["landing", "palette"],
+      "group": "Catalog",
+      "order": 10
+    },
+    {
+      "id": "platform-show-runs",
+      "name": "Show Runs",
+      "prompt": "Show runs",
+      "description": "View recent run activity.",
+      "visibility": ["landing", "palette"],
+      "group": "Operations",
+      "order": 20
+    },
+    {
+      "id": "platform-open-settings",
+      "name": "Open Platform Settings",
+      "prompt": "Open platform settings",
+      "description": "Go to workspace-aware platform settings.",
+      "visibility": ["landing", "palette"],
+      "group": "Admin",
+      "order": 30
+    }
+  ],
   "roles": [
     {
       "role": "ui_mount",
