@@ -1,0 +1,43 @@
+{
+  "artifact": {
+    "id": "core.authn-jwt",
+    "name": "core.authn-jwt",
+    "version": "0.2.0"
+  },
+  "roles": [
+    {
+      "role": "api_router",
+      "entrypoint": "xyn_orchestrator.authn_jwt_entrypoint:router",
+      "mount_path": "/api/apps/authn-jwt",
+      "pythonpath": [
+        "xyn-api/backend"
+      ]
+    },
+    {
+      "role": "ui_mount",
+      "mount_path": "/apps/authn-jwt",
+      "static_dir": "xyn-api/backend/registry/modules/authn-jwt-ui-dist"
+    }
+  ],
+  "surfaces": {
+    "manage": [
+      {
+        "label": "JWT Settings",
+        "path": "/apps/authn-jwt/manage",
+        "order": 100
+      },
+      {
+        "label": "Login Surface",
+        "path": "/apps/authn-jwt/login",
+        "order": 200
+      }
+    ],
+    "docs": [
+      {
+        "label": "JWT Auth Docs",
+        "path": "/apps/authn-jwt/docs",
+        "order": 1000
+      }
+    ]
+  }
+}

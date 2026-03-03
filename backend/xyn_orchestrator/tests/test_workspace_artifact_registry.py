@@ -235,6 +235,35 @@ class WorkspaceArtifactRegistryTests(TestCase):
         self.assertIsNotNone(ems)
         self.assertEqual(ems.get("manifest_summary", {}).get("surfaces", {}).get("docs", [])[0].get("path"), "/apps/ems/docs")
 
+    def test_catalog_includes_authn_jwt_roles_and_surfaces(self):
+        WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
+        self._set_identity(self.admin_identity)
+        module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
+        manifest_path = Path(__file__).resolve().parents[3] / "registry" / "modules" / "authn-jwt.artifact.manifest.json"
+        self.assertTrue(manifest_path.exists())
+        Artifact.objects.create(
+            workspace=self.workspace,
+            type=module_type,
+            title="core.authn-jwt",
+            slug="core.authn-jwt",
+            status="published",
+            visibility="team",
+            scope_json={"manifest_ref": str(manifest_path), "slug": "core.authn-jwt"},
+        )
+
+        response = self.client.get("/xyn/api/artifacts/catalog")
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json().get("artifacts", [])
+        authn = next((row for row in rows if row.get("slug") == "core.authn-jwt"), None)
+        self.assertIsNotNone(authn)
+        roles = authn.get("manifest_summary", {}).get("roles", [])
+        self.assertIn("api_router", roles)
+        self.assertIn("ui_mount", roles)
+        surfaces = authn.get("manifest_summary", {}).get("surfaces", {})
+        self.assertGreaterEqual(len(surfaces.get("manage", [])), 1)
+        self.assertGreaterEqual(len(surfaces.get("docs", [])), 1)
+
     def test_catalog_manifest_slug_mismatch_fails_fast(self):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
         self._set_identity(self.admin_identity)
