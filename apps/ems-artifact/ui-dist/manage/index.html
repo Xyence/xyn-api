@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EMS Settings</title>
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-header">
+        <h1>EMS Settings</h1>
+        <nav>
+          <a href="/apps/ems">Assets</a>
+          <a href="/apps/ems/manage">Settings</a>
+          <a href="/apps/ems/docs">Docs</a>
+          <a href="/apps/ems/docs/demo">Demo Script</a>
+        </nav>
+      </header>
+      <section class="card">
+        <h2>Workspace Context</h2>
+        <p class="muted">Workspace ID: <code id="workspace-id">n/a</code></p>
+        <p class="muted">Environment: <code id="environment-name">demo</code></p>
+      </section>
+      <section class="card">
+        <h2>Option 43 / Netboot Parameters</h2>
+        <p class="muted">Placeholder structure for DHCP option 43 and netboot configuration.</p>
+        <label>Boot server URL <input id="boot-server" placeholder="https://boot.example.com" /></label>
+        <label>Boot file name <input id="boot-file" placeholder="ipxe.efi" /></label>
+        <label>Vendor option 43 payload <input id="option43" placeholder='{"subOptions":[]}' /></label>
+      </section>
+    </main>
+    <script>
+      (function resolveWorkspaceFromPath() {
+        const path = String(window.location.pathname || "");
+        const match = path.match(/^\/w\/([^/]+)\//);
+        const workspaceId = match ? decodeURIComponent(match[1]) : "n/a";
+        const el = document.getElementById("workspace-id");
+        if (el) el.textContent = workspaceId;
+      })();
+    </script>
+  </body>
+</html>

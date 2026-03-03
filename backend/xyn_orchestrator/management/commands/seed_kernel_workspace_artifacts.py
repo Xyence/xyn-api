@@ -6,7 +6,7 @@ from xyn_orchestrator.models import Artifact, ArtifactType, Workspace, Workspace
 
 
 class Command(BaseCommand):
-    help = "Bind kernel-loadable artifacts (xyn-api, xyn-ui, hello app, ems-lite) into a workspace."
+    help = "Bind kernel-loadable artifacts (xyn-api, xyn-ui, hello app, ems) into a workspace."
 
     def add_arguments(self, parser):
         parser.add_argument("--workspace-slug", default="platform-builder")
@@ -42,9 +42,9 @@ class Command(BaseCommand):
                 "manifest_ref": "xyn-ui/apps/hello-artifact/artifact.manifest.json",
             },
             {
-                "slug": "ems-lite",
-                "title": "EMS-lite",
-                "manifest_ref": "artifacts/ems-lite/artifact.manifest.json",
+                "slug": "ems",
+                "title": "EMS",
+                "manifest_ref": "apps/ems-artifact/artifact.manifest.json",
             },
         ]
 
@@ -78,7 +78,6 @@ class Command(BaseCommand):
                     scope["manifest_ref"] = spec["manifest_ref"]
                     artifact.scope_json = scope
                     artifact.save(update_fields=["scope_json", "updated_at"])
-
             _, binding_created = WorkspaceArtifactBinding.objects.get_or_create(
                 workspace=workspace,
                 artifact=artifact,
@@ -90,6 +89,18 @@ class Command(BaseCommand):
             )
             if binding_created:
                 created_bindings += 1
+
+        # Normalize legacy slug so previously installed EMS-lite maps to EMS manifest identity.
+        legacy_ems = Artifact.objects.filter(workspace=workspace, slug="ems-lite").order_by("-updated_at", "-created_at").first()
+        canonical_ems = Artifact.objects.filter(workspace=workspace, slug="ems").order_by("-updated_at", "-created_at").first()
+        if legacy_ems and canonical_ems is None:
+            legacy_ems.slug = "ems"
+            legacy_ems.title = "EMS"
+            scope = dict(legacy_ems.scope_json or {})
+            scope["slug"] = "ems"
+            scope["manifest_ref"] = "apps/ems-artifact/artifact.manifest.json"
+            legacy_ems.scope_json = scope
+            legacy_ems.save(update_fields=["slug", "title", "scope_json", "updated_at"])
 
         self.stdout.write(
             self.style.SUCCESS(

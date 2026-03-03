@@ -1,4 +1,4 @@
-"""EMS-lite artifact API router entrypoint.
+"""EMS artifact API router entrypoint.
 
 Provides a minimal in-memory Assets CRUD for demo use.
 """

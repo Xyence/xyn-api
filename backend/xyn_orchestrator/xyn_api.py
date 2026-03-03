@@ -13797,7 +13797,7 @@ def _intent_apply_deploy_ems_customer(
         defaults={"role": "admin", "termination_authority": True},
     )
 
-    ems_artifact = Artifact.objects.filter(slug="ems-lite").order_by("-updated_at", "-created_at").first()
+    ems_artifact = Artifact.objects.filter(slug="ems").order_by("-updated_at", "-created_at").first()
     if ems_artifact:
         WorkspaceArtifactBinding.objects.get_or_create(
             workspace=child_workspace,
@@ -13813,7 +13813,7 @@ def _intent_apply_deploy_ems_customer(
         "action_type": "CreateDraft",
         "artifact_type": "Workspace",
         "artifact_id": None,
-        "summary": f'Provisioned EMS-lite workspace for "{customer_name}".',
+        "summary": f'Provisioned EMS workspace for "{customer_name}".',
         "next_actions": [
             {"label": "Open EMS", "action": "OpenPath", "path": open_ems_path},
             {"label": "Open Installed", "action": "OpenPath", "path": open_installed_path},
@@ -13865,7 +13865,7 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
                 "action_type": "CreateDraft",
                 "artifact_type": "Workspace",
                 "artifact_id": None,
-                "summary": f'Will create customer workspace "{customer_name}" under "{operator_workspace.name}" and install EMS-lite.',
+                "summary": f'Will create customer workspace "{customer_name}" under "{operator_workspace.name}" and install EMS.',
                 "draft_payload": {
                     "__operation": "deploy_ems_customer",
                     "customer_name": customer_name,
@@ -13874,7 +13874,7 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
                     "lifecycle_stage": "prospect",
                 },
                 "next_actions": [
-                    {"label": "Create workspace + install EMS-lite", "action": "CreateDraft"},
+                    {"label": "Create workspace + install EMS", "action": "CreateDraft"},
                 ],
                 "audit": {
                     "request_id": str(uuid.uuid4()),

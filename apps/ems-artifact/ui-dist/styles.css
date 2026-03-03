@@ -1,0 +1,98 @@
+body {
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  background: #0b1220;
+  color: #e5e7eb;
+}
+
+.page {
+  max-width: 980px;
+  margin: 24px auto;
+  padding: 0 16px 24px;
+}
+
+.page-header {
+  margin-bottom: 16px;
+}
+
+.page-header h1 {
+  margin: 0;
+  font-size: 28px;
+}
+
+.page-header p {
+  margin: 6px 0 0;
+  color: #94a3b8;
+}
+
+nav {
+  margin-top: 10px;
+  display: flex;
+  gap: 12px;
+}
+
+nav a {
+  color: #93c5fd;
+  text-decoration: none;
+}
+
+.card {
+  background: #111827;
+  border: 1px solid #1f2937;
+  border-radius: 10px;
+  padding: 14px;
+  margin-bottom: 14px;
+}
+
+form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+}
+
+input {
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #0f172a;
+  color: #e5e7eb;
+  padding: 8px;
+}
+
+button {
+  border: 1px solid #1d4ed8;
+  border-radius: 8px;
+  background: #1d4ed8;
+  color: #eff6ff;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+}
+
+th,
+td {
+  text-align: left;
+  border-bottom: 1px solid #1f2937;
+  padding: 8px;
+}
+
+.muted {
+  color: #94a3b8;
+}
+
+.error {
+  color: #fecaca;
+  background: #450a0a;
+  padding: 8px;
+  border-radius: 8px;
+}

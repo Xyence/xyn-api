@@ -486,10 +486,10 @@ class IntentEngineApiTests(TestCase):
         module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
         ems_artifact, _ = Artifact.objects.get_or_create(
             workspace=self.workspace,
-            slug="ems-lite",
+            slug="ems",
             defaults={
                 "type": module_type,
-                "title": "EMS-lite",
+                "title": "EMS",
                 "status": "published",
                 "visibility": "team",
             },

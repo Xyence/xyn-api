@@ -195,16 +195,16 @@ class WorkspaceArtifactRegistryTests(TestCase):
         rows = response.json().get("artifacts", [])
         self.assertGreaterEqual(len(rows), 3)
 
-    def test_catalog_includes_ems_lite_surfaces(self):
+    def test_catalog_includes_ems_surfaces(self):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
         self._set_identity(self.admin_identity)
         module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
         with tempfile.TemporaryDirectory() as tmpdir:
-            manifest_path = Path(tmpdir) / "ems-lite.manifest.json"
+            manifest_path = Path(tmpdir) / "ems.manifest.json"
             manifest_path.write_text(
                 json.dumps(
                     {
-                        "artifact": {"id": "ems-lite", "name": "EMS-lite", "version": "1.0.0"},
+                        "artifact": {"id": "ems", "name": "EMS", "version": "1.0.0"},
                         "roles": [
                             {"role": "api_router", "mount_path": "/api/apps/ems"},
                             {"role": "ui_mount", "mount_path": "/apps/ems"},
@@ -221,17 +221,17 @@ class WorkspaceArtifactRegistryTests(TestCase):
             Artifact.objects.create(
                 workspace=self.workspace,
                 type=module_type,
-                title="EMS-lite",
-                slug="ems-lite",
+                title="EMS",
+                slug="ems",
                 status="published",
                 visibility="team",
-                scope_json={"manifest_ref": str(manifest_path), "slug": "ems-lite"},
+                scope_json={"manifest_ref": str(manifest_path), "slug": "ems"},
             )
             response = self.client.get("/xyn/api/artifacts/catalog")
 
         self.assertEqual(response.status_code, 200)
         rows = response.json().get("artifacts", [])
-        ems = next((row for row in rows if row.get("slug") == "ems-lite"), None)
+        ems = next((row for row in rows if row.get("slug") == "ems"), None)
         self.assertIsNotNone(ems)
         self.assertEqual(ems.get("manifest_summary", {}).get("surfaces", {}).get("docs", [])[0].get("path"), "/apps/ems/docs")
 
@@ -332,11 +332,11 @@ class WorkspaceArtifactRegistryTests(TestCase):
         WorkspaceMembership.objects.create(workspace=self.workspace, user_identity=self.admin_identity, role="contributor")
         self._set_identity(self.admin_identity)
         module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
-        artifact = Artifact.objects.create(workspace=self.workspace, type=module_type, title="EMS-lite", slug="ems-lite", status="published")
+        artifact = Artifact.objects.create(workspace=self.workspace, type=module_type, title="EMS", slug="ems", status="published")
 
         first = self.client.post(
             f"/xyn/api/workspaces/{self.workspace.id}/artifacts",
-            data=json.dumps({"artifact_id": "ems-lite", "enabled": True}),
+            data=json.dumps({"artifact_id": "ems", "enabled": True}),
             content_type="application/json",
         )
         self.assertEqual(first.status_code, 200)
@@ -345,7 +345,7 @@ class WorkspaceArtifactRegistryTests(TestCase):
 
         second = self.client.post(
             f"/xyn/api/workspaces/{self.workspace.id}/artifacts",
-            data=json.dumps({"artifact_id": "ems-lite", "enabled": True}),
+            data=json.dumps({"artifact_id": "ems", "enabled": True}),
             content_type="application/json",
         )
         self.assertEqual(second.status_code, 200)

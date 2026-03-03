@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EMS Demo Script</title>
+    <link rel="stylesheet" href="../../styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-header">
+        <h1>EMS Demo Script</h1>
+        <nav>
+          <a href="/apps/ems">Assets</a>
+          <a href="/apps/ems/manage">Settings</a>
+          <a href="/apps/ems/docs">Docs</a>
+        </nav>
+      </header>
+      <section class="card">
+        <h2>1) Provision customer workspace</h2>
+        <ol>
+          <li>Open Console and run: <code>deploy EMS for customer &lt;name&gt;</code>.</li>
+          <li>Open the returned link: <code>/w/&lt;workspaceId&gt;/apps/ems</code>.</li>
+        </ol>
+      </section>
+      <section class="card">
+        <h2>2) Open demo panels</h2>
+        <ol>
+          <li>Catalog: verify EMS appears as installable.</li>
+          <li>Installed: verify EMS is listed in workspace artifacts.</li>
+          <li>Apps nav: click <strong>EMS</strong>.</li>
+          <li>Manage: open <code>/apps/ems/manage</code>.</li>
+        </ol>
+      </section>
+      <section class="card">
+        <h2>3) Expected flow</h2>
+        <ol>
+          <li>Create one or more assets from the EMS page form.</li>
+          <li>Refresh and verify items appear in the assets table.</li>
+          <li>Show settings placeholders on Manage (workspace/environment, option 43/netboot block).</li>
+        </ol>
+      </section>
+    </main>
+  </body>
+</html>
