@@ -13746,6 +13746,21 @@ def _match_create_ems_instance_command(message: str) -> Optional[Tuple[str, str]
     return (customer_name, fqdn) if customer_name and fqdn else None
 
 
+def _match_ems_panel_command(message: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    text = str(message or "").strip().lower()
+    if not text:
+        return None
+    if "show unregistered devices" in text:
+        return ("ems_unregistered_devices", {"state": "unregistered"})
+    if "show device statuses" in text or "show device status" in text:
+        return ("ems_device_statuses", {})
+    match = re.search(r"show\s+registrations\s+in\s+the\s+past\s+(\d+)\s+hours?", text, flags=re.IGNORECASE)
+    if match:
+        hours = max(1, min(168, int(match.group(1))))
+        return ("ems_registrations_time", {"hours": hours})
+    return None
+
+
 def _resolve_workspace_for_identity(identity: UserIdentity, workspace_id: str) -> Optional[Workspace]:
     requested = str(workspace_id or "").strip()
     if requested:
@@ -14012,6 +14027,58 @@ def _intent_apply_create_ems_instance(
     return JsonResponse(response_payload)
 
 
+def _intent_apply_open_ems_panel(
+    *,
+    identity: UserIdentity,
+    payload: Dict[str, Any],
+    request_id: str,
+) -> JsonResponse:
+    panel_key = str(payload.get("panel_key") or "").strip()
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    operator_workspace_id = str(payload.get("operator_workspace_id") or "").strip()
+    workspace = _resolve_workspace_for_identity(identity, operator_workspace_id)
+    if not workspace:
+        return JsonResponse({"error": "workspace not found or forbidden"}, status=403)
+    if panel_key not in {"ems_unregistered_devices", "ems_registrations_time", "ems_device_statuses"}:
+        return JsonResponse({"error": "unsupported panel_key"}, status=400)
+
+    result_payload = {
+        "status": "DraftReady",
+        "action_type": "CreateDraft",
+        "artifact_type": "Workspace",
+        "artifact_id": None,
+        "summary": "EMS panel ready.",
+        "result": {
+            "panel": {
+                "key": panel_key,
+                "params": params,
+                "workspace_id": str(workspace.id),
+            }
+        },
+        "next_actions": [
+            {
+                "label": "Open panel",
+                "action": "OpenPanel",
+                "panel_key": panel_key,
+                "params": params,
+            }
+        ],
+        "audit": {
+            "request_id": request_id,
+            "timestamp": timezone.now().isoformat(),
+        },
+    }
+    _audit_intent_event(
+        message="intent.apply.open_ems_panel",
+        identity=identity,
+        request_id=request_id,
+        artifact_id=None,
+        proposal={"operation": "open_ems_panel", "panel_key": panel_key, "params": params},
+        resolution=result_payload,
+    )
+    return JsonResponse(result_payload)
+
+
 @csrf_exempt
 def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
     if not _intent_engine_enabled():
@@ -14056,6 +14123,35 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
                 },
                 "next_actions": [
                     {"label": "Create EMS Instance", "action": "CreateDraft"},
+                ],
+                "audit": {
+                    "request_id": str(uuid.uuid4()),
+                    "timestamp": timezone.now().isoformat(),
+                },
+            }
+        )
+
+    ems_panel_request = _match_ems_panel_command(message)
+    if ems_panel_request:
+        panel_key, params = ems_panel_request
+        operator_workspace = _resolve_workspace_for_identity(identity, context_workspace_id)
+        if not operator_workspace:
+            return JsonResponse({"error": "workspace context is required for EMS panel flow"}, status=400)
+        return JsonResponse(
+            {
+                "status": "DraftReady",
+                "action_type": "CreateDraft",
+                "artifact_type": "Workspace",
+                "artifact_id": None,
+                "summary": "Will open EMS panel.",
+                "draft_payload": {
+                    "__operation": "open_ems_panel",
+                    "panel_key": panel_key,
+                    "params": params,
+                    "operator_workspace_id": str(operator_workspace.id),
+                },
+                "next_actions": [
+                    {"label": "Open panel", "action": "CreateDraft"},
                 ],
                 "audit": {
                     "request_id": str(uuid.uuid4()),
@@ -14163,6 +14259,8 @@ def xyn_intent_apply(request: HttpRequest) -> JsonResponse:
                 return _intent_apply_deploy_ems_customer(identity=identity, payload=body_payload, request_id=request_id)
             if operation == "create_ems_instance":
                 return _intent_apply_create_ems_instance(identity=identity, payload=body_payload, request_id=request_id)
+            if operation == "open_ems_panel":
+                return _intent_apply_open_ems_panel(identity=identity, payload=body_payload, request_id=request_id)
             return JsonResponse({"error": "CreateDraft currently supports ArticleDraft only"}, status=400)
         return _intent_apply_create_draft(identity=identity, payload=body_payload, request_id=request_id)
 

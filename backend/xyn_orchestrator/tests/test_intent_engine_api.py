@@ -606,3 +606,38 @@ class IntentEngineApiTests(TestCase):
             1,
         )
         self.assertEqual(WorkspaceArtifactBinding.objects.filter(workspace_id=workspace_id, artifact=ems_artifact).count(), 1)
+
+    def test_open_ems_panel_command_returns_panel_action(self):
+        resolve_response = self.client.post(
+            "/xyn/api/xyn/intent/resolve",
+            data=json.dumps(
+                {
+                    "message": "Show registrations in the past 24 hours",
+                    "context": {"workspace_id": str(self.workspace.id)},
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(resolve_response.status_code, 200, resolve_response.content.decode())
+        draft_payload = resolve_response.json().get("draft_payload") or {}
+        self.assertEqual(draft_payload.get("__operation"), "open_ems_panel")
+        self.assertEqual(draft_payload.get("panel_key"), "ems_registrations_time")
+        self.assertEqual((draft_payload.get("params") or {}).get("hours"), 24)
+
+        apply_response = self.client.post(
+            "/xyn/api/xyn/intent/apply",
+            data=json.dumps(
+                {
+                    "action_type": "CreateDraft",
+                    "artifact_type": "Workspace",
+                    "payload": draft_payload,
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(apply_response.status_code, 200, apply_response.content.decode())
+        payload = apply_response.json()
+        self.assertEqual(payload.get("status"), "DraftReady")
+        panel_action = next((row for row in payload.get("next_actions", []) if row.get("action") == "OpenPanel"), None)
+        self.assertIsNotNone(panel_action)
+        self.assertEqual((panel_action or {}).get("panel_key"), "ems_registrations_time")
