@@ -10,6 +10,10 @@ from django.contrib.auth import get_user_model
 from xyn_orchestrator.models import UserIdentity, RoleBinding
 
 
+def _auth_mode() -> str:
+    return os.environ.get("XYN_AUTH_MODE", "simple").strip().lower()
+
+
 class ApiTokenAuthMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
@@ -17,13 +21,13 @@ class ApiTokenAuthMiddleware:
     def __call__(self, request):
         token = _extract_bearer_token(request)
         if token:
-            expected = os.environ.get("XYENCE_UI_BEARER_TOKEN", "").strip()
+            expected = os.environ.get("XYN_UI_BEARER_TOKEN", os.environ.get("XYENCE_UI_BEARER_TOKEN", "")).strip()
             if expected and token == expected:
                 request.user = _get_service_user()
                 request._cached_user = request.user
                 request._dont_enforce_csrf_checks = True
             else:
-                claims = _verify_oidc_token(token)
+                claims = _verify_oidc_token(token) if _auth_mode() == "oidc" else None
                 if claims:
                     user = _get_or_create_user_from_claims(claims)
                     if user:
@@ -93,7 +97,7 @@ def _extract_bearer_token(request) -> str:
 
 def _get_service_user():
     User = get_user_model()
-    username = os.environ.get("XYENCE_UI_BEARER_USER", "xyn-ui").strip() or "xyn-ui"
+    username = os.environ.get("XYN_UI_BEARER_USER", os.environ.get("XYENCE_UI_BEARER_USER", "xyn-ui")).strip() or "xyn-ui"
     user, created = User.objects.get_or_create(
         username=username,
         defaults={"is_staff": True, "is_active": True, "email": ""},
@@ -110,6 +114,8 @@ _JWKS_CLIENT_TS: float = 0.0
 
 
 def _verify_oidc_token(token: str) -> Optional[Dict[str, Any]]:
+    if _auth_mode() != "oidc":
+        return None
     issuer = os.environ.get("OIDC_ISSUER", "https://accounts.google.com").strip()
     audience = os.environ.get("OIDC_CLIENT_ID", "").strip()
     if not audience:

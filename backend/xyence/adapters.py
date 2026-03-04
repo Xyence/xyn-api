@@ -7,8 +7,12 @@ from django.http import HttpResponseForbidden
 from xyn_orchestrator.models import RoleBinding, UserIdentity
 
 
+def _auth_mode() -> str:
+    return os.environ.get("XYN_AUTH_MODE", "simple").strip().lower()
+
+
 def _allowed_domains():
-    raw = os.environ.get("ALLOWED_LOGIN_DOMAINS", "xyence.io")
+    raw = os.environ.get("XYN_OIDC_ALLOWED_DOMAINS", os.environ.get("ALLOWED_LOGIN_DOMAINS", "xyence.io"))
     return {domain.strip().lower() for domain in raw.split(",") if domain.strip()}
 
 
@@ -20,10 +24,14 @@ def _email_domain(email):
 
 class DomainRestrictedSocialAccountAdapter(DefaultSocialAccountAdapter):
     def is_open_for_signup(self, request, sociallogin):
+        if _auth_mode() != "oidc":
+            return False
         email = sociallogin.user.email or sociallogin.account.extra_data.get("email")
         return _email_domain(email) in _allowed_domains()
 
     def pre_social_login(self, request, sociallogin):
+        if _auth_mode() != "oidc":
+            raise ImmediateHttpResponse(HttpResponseForbidden("OIDC auth mode is disabled."))
         email = sociallogin.user.email or sociallogin.account.extra_data.get("email")
         if _email_domain(email) not in _allowed_domains():
             raise ImmediateHttpResponse(

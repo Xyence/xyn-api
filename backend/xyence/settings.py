@@ -1,6 +1,10 @@
 import os
 from pathlib import Path
 
+from .runtime_env import bootstrap_runtime_env
+
+bootstrap_runtime_env()
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-insecure-change-me")
@@ -122,7 +126,9 @@ SESSION_COOKIE_SECURE = True
 SESSION_COOKIE_SAMESITE = "None"
 CSRF_COOKIE_SECURE = True
 CSRF_COOKIE_SAMESITE = "None"
-SESSION_COOKIE_DOMAIN = os.environ.get("SESSION_COOKIE_DOMAIN", ".xyence.io").strip() or None
+_base_domain = os.environ.get("XYN_BASE_DOMAIN", "").strip()
+_default_cookie_domain = f".{_base_domain}" if _base_domain else ".xyence.io"
+SESSION_COOKIE_DOMAIN = os.environ.get("SESSION_COOKIE_DOMAIN", _default_cookie_domain).strip() or None
 CSRF_COOKIE_DOMAIN = os.environ.get("CSRF_COOKIE_DOMAIN", SESSION_COOKIE_DOMAIN or "").strip() or None
 
 STATIC_URL = "/static/"
