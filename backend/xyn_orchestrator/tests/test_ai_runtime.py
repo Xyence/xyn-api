@@ -14,6 +14,21 @@ from xyn_orchestrator.models import AgentDefinition, AgentDefinitionPurpose, Age
 
 
 class AiRuntimeTests(TestCase):
+    def test_bootstrap_uses_canonical_seed_ai_env(self):
+        with patch.dict(
+            os.environ,
+            {
+                "XYN_AI_PROVIDER": "gemini",
+                "XYN_AI_MODEL": "gemini-2.0-flash",
+                "XYN_GEMINI_API_KEY": "gm-test-key",
+            },
+            clear=False,
+        ):
+            ensure_default_ai_seeds()
+            default_assistant = AgentDefinition.objects.get(slug="default-assistant")
+            self.assertEqual(default_assistant.model_config.provider.slug, "google")
+            self.assertEqual(default_assistant.model_config.model_name, "gemini-2.0-flash")
+
     def test_assemble_system_prompt_preamble_only(self):
         self.assertEqual(assemble_system_prompt("", "Purpose preamble"), "Purpose preamble")
 

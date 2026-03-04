@@ -27,7 +27,12 @@ DEFAULT_ASSISTANT_PROMPT = ""
 PROVIDER_ENV_API_KEY = {
     "openai": ["XYN_OPENAI_API_KEY", "OPENAI_API_KEY"],
     "anthropic": ["XYN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
-    "google": ["XYN_GOOGLE_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"],
+    "google": ["XYN_GEMINI_API_KEY", "XYN_GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"],
+}
+PROVIDER_MODEL_DEFAULTS = {
+    "openai": "gpt-5-mini",
+    "google": "gemini-2.0-flash",
+    "anthropic": "claude-3-7-sonnet-latest",
 }
 
 
@@ -218,8 +223,17 @@ def resolve_ai_config(*, purpose_slug: Optional[str] = None, agent_slug: Optiona
             "agent_context_pack_refs_json": agent.context_pack_refs_json or [],
         }
 
-    provider_slug = str(os.environ.get("XYN_DEFAULT_MODEL_PROVIDER") or "openai").strip().lower()
-    model_name = str(os.environ.get("XYN_DEFAULT_MODEL_NAME") or "gpt-4o-mini").strip()
+    provider_alias = str(
+        os.environ.get("XYN_AI_PROVIDER")
+        or os.environ.get("XYN_DEFAULT_MODEL_PROVIDER")
+        or "openai"
+    ).strip().lower()
+    provider_slug = "google" if provider_alias in {"google", "gemini"} else provider_alias
+    model_name = str(
+        os.environ.get("XYN_AI_MODEL")
+        or os.environ.get("XYN_DEFAULT_MODEL_NAME")
+        or PROVIDER_MODEL_DEFAULTS.get(provider_slug, "gpt-5-mini")
+    ).strip()
     provider = ModelProvider.objects.filter(slug=provider_slug).first() or ModelProvider.objects.filter(slug="openai").first()
     if provider:
         provider_slug = provider.slug
@@ -393,6 +407,16 @@ def invoke_model(*, resolved_config: Dict[str, Any], messages: List[Dict[str, st
 
 
 def ensure_default_ai_seeds() -> None:
+    ai_enabled_raw = str(os.environ.get("XYN_AI_ENABLED") or "").strip().lower()
+    provider_env_raw = str(
+        os.environ.get("XYN_AI_PROVIDER")
+        or os.environ.get("XYN_DEFAULT_MODEL_PROVIDER")
+        or ""
+    ).strip().lower()
+    if ai_enabled_raw in {"0", "false", "no"} or provider_env_raw in {"none", "disabled"}:
+        logger.info("AI bootstrap skipped: provider disabled by runtime config")
+        return
+
     provider_specs = [
         ("openai", "OpenAI", True),
         ("anthropic", "Anthropic", True),
@@ -403,8 +427,19 @@ def ensure_default_ai_seeds() -> None:
         provider, _ = ModelProvider.objects.get_or_create(slug=slug, defaults={"name": name, "enabled": enabled})
         provider_map[slug] = provider
 
-    provider_slug = str(os.environ.get("XYN_DEFAULT_MODEL_PROVIDER") or "openai").strip().lower()
-    model_name = str(os.environ.get("XYN_DEFAULT_MODEL_NAME") or "gpt-4o-mini").strip()
+    provider_alias = str(
+        os.environ.get("XYN_AI_PROVIDER")
+        or os.environ.get("XYN_DEFAULT_MODEL_PROVIDER")
+        or "openai"
+    ).strip().lower()
+    provider_slug = "google" if provider_alias in {"google", "gemini"} else provider_alias
+    if provider_slug not in {"openai", "anthropic", "google"}:
+        provider_slug = "openai"
+    model_name = str(
+        os.environ.get("XYN_AI_MODEL")
+        or os.environ.get("XYN_DEFAULT_MODEL_NAME")
+        or PROVIDER_MODEL_DEFAULTS.get(provider_slug, "gpt-5-mini")
+    ).strip()
     provider = provider_map.get(provider_slug) or provider_map.get("openai")
 
     def _seed_bootstrap_credential(slug: str, provider_obj: Optional[ModelProvider]) -> Optional[ProviderCredential]:
@@ -413,12 +448,51 @@ def ensure_default_ai_seeds() -> None:
         existing_default = (
             ProviderCredential.objects.filter(provider=provider_obj, is_default=True, enabled=True).order_by("-created_at").first()
         )
-        if existing_default:
-            return existing_default
         env_value = _read_provider_env_key(slug)
         if not env_value and slug == "openai":
             legacy = OpenAIConfig.objects.first()
             env_value = str(legacy.api_key if legacy else "").strip()
+        if existing_default:
+            if existing_default.auth_type == "env_ref" and not str(existing_default.env_var_name or "").strip():
+                existing_default.env_var_name = PROVIDER_ENV_API_KEY.get(slug, [""])[0] or ""
+                existing_default.save(update_fields=["env_var_name", "updated_at"])
+            if existing_default.auth_type == "api_key" and env_value and existing_default.name == "codex-bootstrap":
+                store = SecretStore.objects.filter(is_default=True).first()
+                if store:
+                    logical = normalize_secret_logical_name(f"ai/{slug}/codex-bootstrap/api_key")
+                    secret_ref = existing_default.secret_ref
+                    if not secret_ref:
+                        secret_ref = SecretRef.objects.filter(scope_kind="platform", scope_id__isnull=True, name=logical).first()
+                    if not secret_ref:
+                        secret_ref = SecretRef.objects.create(
+                            name=logical,
+                            scope_kind="platform",
+                            scope_id=None,
+                            store=store,
+                            external_ref="pending",
+                            type="secrets_manager",
+                            description=f"{slug} bootstrap AI API key",
+                        )
+                    try:
+                        external_ref, metadata = write_secret_value(
+                            store,
+                            logical_name=logical,
+                            scope_kind="platform",
+                            scope_id=None,
+                            scope_path_id=None,
+                            secret_ref_id=str(secret_ref.id),
+                            value=env_value,
+                            description=f"{slug} bootstrap AI API key",
+                        )
+                        secret_ref.external_ref = external_ref
+                        secret_ref.metadata_json = {**(secret_ref.metadata_json or {}), **metadata}
+                        secret_ref.save(update_fields=["external_ref", "metadata_json", "updated_at"])
+                        existing_default.secret_ref = secret_ref
+                        existing_default.api_key_encrypted = None
+                        existing_default.save(update_fields=["secret_ref", "api_key_encrypted", "updated_at"])
+                    except Exception:
+                        logger.exception("Failed to refresh bootstrap credential secret for provider=%s", slug)
+            return existing_default
         if not env_value:
             return None
         name = "codex-bootstrap"
@@ -526,14 +600,14 @@ def ensure_default_ai_seeds() -> None:
         coding.name = "Coding"
     if not coding.preamble:
         coding.preamble = "Purpose: coding. Focus on production-ready implementation guidance."
-    if not coding.model_config_id and default_model:
+    if default_model and coding.model_config_id != default_model.id:
         coding.model_config = default_model
     coding.save(update_fields=["name", "preamble", "model_config", "updated_at"])
     if not documentation.name:
         documentation.name = "Documentation"
     if not documentation.preamble:
         documentation.preamble = "Purpose: documentation. Produce concise, accurate, publishable drafts."
-    if not documentation.model_config_id and default_model:
+    if default_model and documentation.model_config_id != default_model.id:
         documentation.model_config = default_model
     documentation.save(update_fields=["name", "preamble", "model_config", "updated_at"])
 
@@ -548,7 +622,7 @@ def ensure_default_ai_seeds() -> None:
         },
     )
     assistant.name = "Xyn Default Assistant"
-    if default_model and not assistant.model_config_id:
+    if default_model and assistant.model_config_id != default_model.id:
         assistant.model_config = default_model
     if DEFAULT_ASSISTANT_PROMPT and not str(assistant.system_prompt_text or "").strip():
         assistant.system_prompt_text = DEFAULT_ASSISTANT_PROMPT
@@ -563,3 +637,36 @@ def ensure_default_ai_seeds() -> None:
     # Remove the legacy bootstrap agent to keep a single canonical default assistant.
     AgentDefinition.objects.filter(slug="documentation-default").exclude(id=assistant.id).delete()
     AgentDefinition.objects.filter(name__iexact="Documentation Default").exclude(id=assistant.id).delete()
+
+
+def get_default_agent_bootstrap_status() -> Dict[str, Any]:
+    provider_alias = str(
+        os.environ.get("XYN_AI_PROVIDER")
+        or os.environ.get("XYN_DEFAULT_MODEL_PROVIDER")
+        or ""
+    ).strip().lower()
+    if provider_alias in {"gemini", "google"}:
+        provider_slug = "google"
+        provider_label = "gemini"
+    else:
+        provider_slug = provider_alias
+        provider_label = provider_alias
+    model_name = str(
+        os.environ.get("XYN_AI_MODEL")
+        or os.environ.get("XYN_DEFAULT_MODEL_NAME")
+        or PROVIDER_MODEL_DEFAULTS.get(provider_slug or "openai", "gpt-5-mini")
+    ).strip()
+    key_present = bool(_read_provider_env_key(provider_slug)) if provider_slug in PROVIDER_ENV_API_KEY else False
+    agent = (
+        AgentDefinition.objects.select_related("model_config__provider")
+        .filter(slug="default-assistant")
+        .first()
+    )
+    return {
+        "provider": provider_label or "none",
+        "model": model_name if provider_label else "none",
+        "key_present": key_present,
+        "default_agent_id": str(agent.id) if agent else None,
+        "default_agent_slug": agent.slug if agent else None,
+        "default_agent_updated_at": agent.updated_at if agent else None,
+    }

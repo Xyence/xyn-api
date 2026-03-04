@@ -164,6 +164,7 @@ from .ai_runtime import (
     decrypt_api_key,
     encrypt_api_key,
     ensure_default_ai_seeds,
+    get_default_agent_bootstrap_status,
     invoke_model,
     mask_secret,
     resolve_ai_config,
@@ -13534,6 +13535,33 @@ def _ensure_default_agent_purposes() -> None:
         ensure_default_ai_seeds()
     except Exception:
         logger.exception("Failed to ensure default AI seeds; continuing without blocking request")
+
+
+@csrf_exempt
+def ai_bootstrap_status(request: HttpRequest) -> JsonResponse:
+    identity = _require_authenticated(request)
+    if not identity:
+        return JsonResponse({"error": "not authenticated"}, status=401)
+    if request.method != "GET":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    if not _can_manage_ai(identity):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    _ensure_default_agent_purposes()
+    return JsonResponse({"default_agent": get_default_agent_bootstrap_status()})
+
+
+@csrf_exempt
+def internal_ai_bootstrap_default_agent(request: HttpRequest) -> JsonResponse:
+    if auth_error := _require_internal_token(request):
+        return auth_error
+    if request.method not in {"POST", "PUT"}:
+        return JsonResponse({"error": "method not allowed"}, status=405)
+    try:
+        ensure_default_ai_seeds()
+    except Exception as exc:
+        logger.exception("Internal AI bootstrap failed")
+        return JsonResponse({"error": str(exc)}, status=500)
+    return JsonResponse({"status": "ok", **get_default_agent_bootstrap_status()})
 
 
 def _serialize_agent_purpose(purpose: AgentPurpose) -> Dict[str, Any]:

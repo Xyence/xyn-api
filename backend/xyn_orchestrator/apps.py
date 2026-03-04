@@ -15,9 +15,11 @@ class XynOrchestratorConfig(AppConfig):
         if any(cmd in argv for cmd in ("migrate", "makemigrations", "collectstatic", "shell", "test", "seed_packs")):
             return
         try:
+            from xyn_orchestrator.ai_runtime import ensure_default_ai_seeds
             from xyn_orchestrator.instances.bootstrap import bootstrap_instance_registration
             from xyn_orchestrator.seeds import auto_apply_core_seed_packs
 
+            ensure_default_ai_seeds()
             bootstrap_instance_registration()
             auto_apply_core_seed_packs()
         except Exception:

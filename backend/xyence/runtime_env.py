@@ -104,8 +104,21 @@ def bootstrap_runtime_env() -> None:
         os.environ["ALLOWED_LOGIN_DOMAINS"] = os.environ["XYN_OIDC_ALLOWED_DOMAINS"]
 
     # Optional AI defaults are consumed by orchestration codepaths.
-    _apply_alias("XYN_AI_PROVIDER", default="openai")
-    _apply_alias("XYN_AI_MODEL", default="gpt-5-mini")
+    _apply_alias("XYN_OPENAI_API_KEY", "OPENAI_API_KEY")
+    _apply_alias("XYN_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "XYN_GOOGLE_API_KEY")
+    _apply_alias("XYN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")
+    if not str(os.getenv("OPENAI_API_KEY", "")).strip() and str(os.getenv("XYN_OPENAI_API_KEY", "")).strip():
+        os.environ["OPENAI_API_KEY"] = os.environ["XYN_OPENAI_API_KEY"]
+    if not str(os.getenv("GEMINI_API_KEY", "")).strip() and str(os.getenv("XYN_GEMINI_API_KEY", "")).strip():
+        os.environ["GEMINI_API_KEY"] = os.environ["XYN_GEMINI_API_KEY"]
+    if not str(os.getenv("XYN_GOOGLE_API_KEY", "")).strip() and str(os.getenv("XYN_GEMINI_API_KEY", "")).strip():
+        os.environ["XYN_GOOGLE_API_KEY"] = os.environ["XYN_GEMINI_API_KEY"]
+    if not str(os.getenv("ANTHROPIC_API_KEY", "")).strip() and str(os.getenv("XYN_ANTHROPIC_API_KEY", "")).strip():
+        os.environ["ANTHROPIC_API_KEY"] = os.environ["XYN_ANTHROPIC_API_KEY"]
+    _apply_alias("XYN_AI_PROVIDER")
+    _apply_alias("XYN_AI_MODEL")
+    _apply_alias("XYN_DEFAULT_MODEL_PROVIDER", "XYN_AI_PROVIDER")
+    _apply_alias("XYN_DEFAULT_MODEL_NAME", "XYN_AI_MODEL")
 
     # Backfill legacy names so unchanged modules keep running during migration.
     legacy_pairs = {
