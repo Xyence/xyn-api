@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Xyn Deployment V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "started_at", "ended_at", "release_spec_ref", "instance_ref", "outputs", "driver_state"],
+  "properties": {
+    "schema_version": { "const": "xyn.deployment.v1" },
+    "status": { "type": "string", "enum": ["pending", "running", "succeeded", "failed"] },
+    "started_at": { "type": "string", "format": "date-time" },
+    "ended_at": { "type": "string", "format": "date-time" },
+    "release_spec_ref": {
+      "type": "object",
+      "required": ["artifact_id", "slug"],
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": { "type": "string" },
+        "slug": { "type": "string" }
+      }
+    },
+    "instance_ref": {
+      "type": "object",
+      "required": ["artifact_id", "slug"],
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": { "type": "string" },
+        "slug": { "type": "string" }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "base_url": { "type": "string" },
+        "ui_url": { "type": "string" },
+        "api_url": { "type": "string" }
+      }
+    },
+    "driver_state": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["compose_project", "remote_workdir", "compose_file"],
+      "properties": {
+        "compose_project": { "type": "string" },
+        "remote_workdir": { "type": "string" },
+        "compose_file": { "type": "string" }
+      }
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  }
+}

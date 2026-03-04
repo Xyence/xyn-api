@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Xyn Target V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "const": "xyn.target.v1" },
+    "dns_provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "hosted_zone_id", "credentials_ref"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["route53"] },
+        "hosted_zone_id": { "type": "string", "minLength": 1 },
+        "region": { "type": "string" },
+        "credentials_ref": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["context_pack_id"],
+          "properties": {
+            "context_pack_id": { "type": "string", "format": "uuid" }
+          }
+        }
+      }
+    }
+  }
+}

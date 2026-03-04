@@ -15,6 +15,7 @@ from xyn_orchestrator.models import (
     Workspace,
 )
 from xyn_orchestrator.xyn_api import _resolve_dns_record_from_instance, _validate_instance_v1_payload
+from xyn_orchestrator.instance_drivers import PreparedPlan, DriverResult, HealthResult
 
 
 class InstanceDnsTests(TestCase):
@@ -105,8 +106,17 @@ class InstanceDnsTests(TestCase):
         self.assertEqual(record_type, "A")
         self.assertEqual(record_value, "1.2.3.4")
 
+    @mock.patch("xyn_orchestrator.xyn_api.SshDockerComposeInstanceDriver.check_health")
+    @mock.patch("xyn_orchestrator.xyn_api.SshDockerComposeInstanceDriver.apply")
+    @mock.patch("xyn_orchestrator.xyn_api.SshDockerComposeInstanceDriver.prepare")
     @mock.patch("xyn_orchestrator.xyn_api.Route53DnsProvider.upsert_record")
-    def test_install_xyn_instance_route53_uses_instance_and_records_dns_action(self, mock_upsert):
+    def test_install_xyn_instance_route53_uses_instance_and_records_dns_action(
+        self,
+        mock_upsert,
+        mock_prepare,
+        mock_apply,
+        mock_check_health,
+    ):
         module_type, _ = ArtifactType.objects.get_or_create(slug="module", defaults={"name": "Module"})
         Artifact.objects.get_or_create(
             workspace=self.workspace,
@@ -134,7 +144,52 @@ class InstanceDnsTests(TestCase):
                 }
             ),
         )
+        ssh_identity_pack = ContextPack.objects.create(
+            name="ssh-demo-identity",
+            purpose="operator",
+            scope="global",
+            version="1.0.0",
+            is_active=True,
+            content_markdown=json.dumps(
+                {
+                    "ssh": {
+                        "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\\ndemo\\n-----END OPENSSH PRIVATE KEY-----",
+                        "strict_host_key_checking": False,
+                    }
+                }
+            ),
+        )
+        latest = ArtifactRevision.objects.filter(artifact=self.instance_artifact).order_by("-revision_number").first()
+        payload = dict((latest.content_json if latest and isinstance(latest.content_json, dict) else {}) or {})
+        payload["access"] = {
+            "ssh": {
+                "host": "54.200.65.160",
+                "user": "ubuntu",
+                "port": 22,
+                "identity_ref": {"context_pack_id": str(ssh_identity_pack.id)},
+            }
+        }
+        ArtifactRevision.objects.create(
+            artifact=self.instance_artifact,
+            revision_number=int(getattr(latest, "revision_number", 0) or 0) + 1,
+            content_json=payload,
+        )
         mock_upsert.return_value = {"change_id": "C123", "status": "PENDING"}
+        mock_prepare.return_value = PreparedPlan(
+            compose_project="xyn-demo",
+            remote_workdir="/opt/xyn/deployments/xyn-demo",
+            compose_file_path="/opt/xyn/deployments/xyn-demo/compose.yaml",
+            compose_yaml="services: {}",
+            ssh={"host": "54.200.65.160", "user": "ubuntu", "port": 22, "resolved": {"private_key": "dummy"}},
+            ui_port=42000,
+            api_port=42001,
+            ems_port=None,
+            components=[],
+            fqdn="ems.xyence.io",
+            scheme="https",
+        )
+        mock_apply.return_value = DriverResult(status="succeeded", stdout="ok", stderr="", details={})
+        mock_check_health.return_value = HealthResult(status="succeeded", checks={"api": "ok", "ui": "ok"})
 
         resolve_response = self.client.post(
             "/xyn/api/xyn/intent/resolve",
@@ -165,7 +220,7 @@ class InstanceDnsTests(TestCase):
         )
         self.assertEqual(apply_response.status_code, 200, apply_response.content.decode())
         payload = apply_response.json()
-        dns_action = ((payload.get("result") or {}).get("dns_action") or {})
+        dns_action = ((payload.get("result") or {}).get("dns") or {})
         self.assertEqual(dns_action.get("status"), "succeeded")
         self.assertEqual(dns_action.get("record_type"), "A")
         self.assertEqual(dns_action.get("record_value"), "54.200.65.160")

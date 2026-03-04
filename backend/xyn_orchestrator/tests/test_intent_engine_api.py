@@ -637,8 +637,9 @@ class IntentEngineApiTests(TestCase):
         )
         self.assertEqual(resolve_response.status_code, 200, resolve_response.content.decode())
         draft_payload = resolve_response.json().get("draft_payload") or {}
-        self.assertEqual(draft_payload.get("__operation"), "install_xyn_instance")
+        self.assertEqual(draft_payload.get("__operation"), "deploy_release_spec")
         self.assertEqual(draft_payload.get("fqdn"), "ems.xyence.io")
+        draft_payload["dry_run"] = True
 
         first_apply = self.client.post(
             "/xyn/api/xyn/intent/apply",
@@ -661,11 +662,11 @@ class IntentEngineApiTests(TestCase):
         self.assertTrue(workspace_id)
         self.assertTrue(instance_id)
         self.assertTrue(run_id)
-        self.assertIn("https://ems.xyence.io/", str((first_result.get("endpoints") or {}).get("ui_url") or ""))
+        self.assertIn("https://ems.xyence.io", str(first_result.get("ui_url") or ""))
 
-        panel_action = next((item for item in first_payload.get("next_actions", []) if item.get("action") == "OpenPanel"), None)
-        self.assertIsNotNone(panel_action)
-        self.assertEqual((panel_action or {}).get("panel_key"), "run_detail")
+        panel_actions = [item for item in first_payload.get("next_actions", []) if item.get("action") == "OpenPanel"]
+        self.assertTrue(panel_actions)
+        self.assertTrue(any(str(item.get("panel_key") or "") in {"run_detail", "artifact_detail"} for item in panel_actions))
 
         second_apply = self.client.post(
             "/xyn/api/xyn/intent/apply",

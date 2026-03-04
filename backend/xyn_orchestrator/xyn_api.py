@@ -154,6 +154,10 @@ from .secret_stores import SecretStoreError, normalize_secret_logical_name, writ
 from .storage.registry import StorageProviderRegistry
 from .notifications.registry import NotifierRegistry, resolve_secret_ref_value
 from .dns_providers import Route53DnsProvider
+from .instance_drivers import (
+    SshDockerComposeInstanceDriver,
+    compute_base_urls,
+)
 from .ai_runtime import (
     AiConfigError,
     AiInvokeError,
@@ -235,6 +239,9 @@ VIDEO_CONTEXT_PACK_PURPOSE = "video_explainer"
 VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG = "video_adapter_config"
 VIDEO_RENDER_PACKAGE_ARTIFACT_TYPE_SLUG = "render_package"
 INSTANCE_ARTIFACT_TYPE_SLUG = "instance"
+RELEASE_SPEC_ARTIFACT_TYPE_SLUG = "release_spec"
+TARGET_ARTIFACT_TYPE_SLUG = "target"
+DEPLOYMENT_ARTIFACT_TYPE_SLUG = "deployment"
 VIDEO_RENDERING_MODES = {
     "export_package_only",
     "render_via_adapter",
@@ -616,6 +623,120 @@ def _resolve_instance_artifact_for_dns(identifier: str) -> Optional[Artifact]:
     except Exception:
         pass
     return qs.filter(slug=ident).first()
+
+
+def _validate_release_spec_v1_payload(payload: Dict[str, Any]) -> list[str]:
+    return _validate_schema_payload(payload, "xyn.release_spec.v1.schema.json")
+
+
+def _validate_target_v1_payload(payload: Dict[str, Any]) -> list[str]:
+    return _validate_schema_payload(payload, "xyn.target.v1.schema.json")
+
+
+def _validate_deployment_v1_payload(payload: Dict[str, Any]) -> list[str]:
+    return _validate_schema_payload(payload, "xyn.deployment.v1.schema.json")
+
+
+def _extract_latest_content(artifact: Artifact) -> Dict[str, Any]:
+    latest = _latest_artifact_revision(artifact)
+    return dict((latest.content_json if latest and isinstance(latest.content_json, dict) else {}) or {})
+
+
+def _resolve_target_artifact(identifier: str) -> Optional[Artifact]:
+    ident = str(identifier or "").strip()
+    if not ident:
+        return None
+    qs = Artifact.objects.filter(type__slug=TARGET_ARTIFACT_TYPE_SLUG).select_related("type").order_by("-updated_at")
+    try:
+        direct = qs.filter(id=ident).first()
+        if direct:
+            return direct
+    except Exception:
+        pass
+    return qs.filter(slug=ident).first()
+
+
+def _artifact_slug_fallback(prefix: str) -> str:
+    return f"{prefix}-{timezone.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def _resolve_instance_ssh_from_payload(instance_payload: Dict[str, Any]) -> Dict[str, Any]:
+    access = instance_payload.get("access") if isinstance(instance_payload.get("access"), dict) else {}
+    ssh = access.get("ssh") if isinstance(access.get("ssh"), dict) else {}
+    network = instance_payload.get("network") if isinstance(instance_payload.get("network"), dict) else {}
+    host = str(ssh.get("host") or network.get("public_hostname") or network.get("public_ipv4") or "").strip()
+    user = str(ssh.get("user") or "ubuntu").strip() or "ubuntu"
+    port = int(ssh.get("port") or 22)
+    identity_ref = ssh.get("identity_ref") if isinstance(ssh.get("identity_ref"), dict) else {}
+    context_pack_id = str((identity_ref or {}).get("context_pack_id") or "").strip()
+    if not context_pack_id:
+        raise ValueError("instance.access.ssh.identity_ref.context_pack_id is required")
+    ssh_pack = ContextPack.objects.filter(id=context_pack_id).first()
+    if not ssh_pack:
+        raise ValueError("instance ssh identity context_pack_id not found")
+    payload = _parse_context_pack_content_json(ssh_pack)
+    ssh_payload = payload.get("ssh") if isinstance(payload.get("ssh"), dict) else payload
+    private_key = str((ssh_payload or {}).get("private_key") or "").strip()
+    private_key_ref = str((ssh_payload or {}).get("private_key_ref") or "").strip()
+    if not private_key and private_key_ref:
+        private_key = str(resolve_secret_ref_value(private_key_ref) or "").strip()
+    if not private_key:
+        private_key_path = str((ssh_payload or {}).get("private_key_path") or "").strip()
+        if private_key_path:
+            try:
+                private_key = Path(private_key_path).read_text(encoding="utf-8")
+            except Exception:
+                private_key = ""
+    if not private_key:
+        raise ValueError("SSH private key is required in referenced context pack")
+    return {
+        "host": host,
+        "user": user,
+        "port": port,
+        "resolved": {
+            "private_key": private_key,
+            "strict_host_key_checking": bool((ssh_payload or {}).get("strict_host_key_checking", False)),
+            "known_hosts": str((ssh_payload or {}).get("known_hosts") or ""),
+        },
+    }
+
+
+def _create_immutable_artifact_record(
+    *,
+    workspace: Workspace,
+    artifact_type: ArtifactType,
+    title: str,
+    slug_prefix: str,
+    schema_version: str,
+    content: Dict[str, Any],
+    summary: str,
+    identity: Optional[UserIdentity] = None,
+) -> Artifact:
+    slug = _artifact_slug_fallback(slug_prefix)
+    while _artifact_slug_exists(str(workspace.id), slug):
+        slug = _artifact_slug_fallback(slug_prefix)
+    artifact = Artifact.objects.create(
+        workspace=workspace,
+        type=artifact_type,
+        title=title,
+        slug=slug,
+        summary=summary,
+        schema_version=schema_version,
+        artifact_state="immutable",
+        status="published",
+        visibility="team",
+        author=identity,
+        custodian=identity,
+        scope_json={"slug": slug, "summary": summary},
+        provenance_json={"source_system": "xyn-runtime-driver", "source_id": slug},
+    )
+    ArtifactRevision.objects.create(
+        artifact=artifact,
+        revision_number=1,
+        content_json=content,
+        created_by=identity,
+    )
+    return artifact
 
 
 def _normalize_release_target_payload(
@@ -1392,6 +1513,45 @@ def _ensure_instance_artifact_type() -> ArtifactType:
                 "kind": ["ec2", "generic_host"],
                 "status": ["running", "stopped", "unknown"],
             },
+        },
+    )
+    return artifact_type
+
+
+def _ensure_release_spec_artifact_type() -> ArtifactType:
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug=RELEASE_SPEC_ARTIFACT_TYPE_SLUG,
+        defaults={
+            "name": "Release Spec",
+            "description": "Deployment release specification artifact.",
+            "icon": "Rocket",
+            "schema_json": {"schema_version": "xyn.release_spec.v1"},
+        },
+    )
+    return artifact_type
+
+
+def _ensure_target_artifact_type() -> ArtifactType:
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug=TARGET_ARTIFACT_TYPE_SLUG,
+        defaults={
+            "name": "Target",
+            "description": "Deployment target/provider artifact.",
+            "icon": "Target",
+            "schema_json": {"schema_version": "xyn.target.v1"},
+        },
+    )
+    return artifact_type
+
+
+def _ensure_deployment_artifact_type() -> ArtifactType:
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug=DEPLOYMENT_ARTIFACT_TYPE_SLUG,
+        defaults={
+            "name": "Deployment",
+            "description": "Immutable deployment execution record artifact.",
+            "icon": "FileClock",
+            "schema_json": {"schema_version": "xyn.deployment.v1"},
         },
     )
     return artifact_type
@@ -7962,6 +8122,18 @@ def validate_artifact(artifact: Artifact) -> Tuple[str, List[str]]:
         else:
             schema_errors = _validate_instance_v1_payload(content)
             errors.extend(schema_errors)
+    elif slug == RELEASE_SPEC_ARTIFACT_TYPE_SLUG:
+        content = _extract_latest_content(artifact)
+        schema_errors = _validate_release_spec_v1_payload(content)
+        errors.extend(schema_errors)
+    elif slug == TARGET_ARTIFACT_TYPE_SLUG:
+        content = _extract_latest_content(artifact)
+        schema_errors = _validate_target_v1_payload(content)
+        errors.extend(schema_errors)
+    elif slug == DEPLOYMENT_ARTIFACT_TYPE_SLUG:
+        content = _extract_latest_content(artifact)
+        schema_errors = _validate_deployment_v1_payload(content)
+        errors.extend(schema_errors)
 
     if errors:
         return "fail", errors
@@ -14385,6 +14557,28 @@ def _match_install_xyn_instance_command(message: str) -> Optional[Tuple[str, str
     return (customer_name, fqdn, instance_ref, dns_enabled, dns_mode) if customer_name and fqdn else None
 
 
+def _match_provision_xyn_remote_command(message: str) -> Optional[Dict[str, Any]]:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    if not re.search(r"provision\s+xyn\s+instance", text, flags=re.IGNORECASE):
+        return None
+    fqdn_match = re.search(r"\bfqdn\s+(?:should\s+be|is|=)?\s*([a-z0-9.-]+)", text, flags=re.IGNORECASE)
+    customer_match = re.search(r"\bfor\s+customer\s+(.+?)(?:\s+fqdn|\s+on\s+instance|\s+with\s+ems|$)", text, flags=re.IGNORECASE)
+    instance_match = re.search(r"\b(?:on|using)\s+instance\s+([a-z0-9._-]+)\b", text, flags=re.IGNORECASE)
+    label_match = re.search(r"\blabel\s+([a-z0-9._-]+)\b", text, flags=re.IGNORECASE)
+    include_ems = bool(re.search(r"\bwith\s+ems\b", text, flags=re.IGNORECASE))
+    dns_enabled = not bool(re.search(r"\bdns\s+(off|disabled?)\b", text, flags=re.IGNORECASE))
+    return {
+        "customer_name": str((customer_match.group(1) if customer_match else "Customer") or "").strip().strip("\"' ,."),
+        "fqdn": str((fqdn_match.group(1) if fqdn_match else "") or "").strip().lower().strip("."),
+        "instance_ref": str((instance_match.group(1) if instance_match else "xyn-ec2-demo") or "").strip(),
+        "instance_label": str((label_match.group(1) if label_match else "") or "").strip(),
+        "include_ems": include_ems,
+        "dns_enabled": dns_enabled,
+    }
+
+
 def _match_ems_panel_command(message: str) -> Optional[Tuple[str, Dict[str, Any]]]:
     text = str(message or "").strip().lower()
     if not text:
@@ -14535,22 +14729,16 @@ def _ensure_runtime_artifact(
     return artifact
 
 
-def _intent_apply_install_xyn_instance(
+def _intent_apply_provision_xyn_remote(
     *,
     identity: UserIdentity,
     payload: Dict[str, Any],
     request_id: str,
 ) -> JsonResponse:
-    customer_name = str(payload.get("customer_name") or "").strip()
+    customer_name = str(payload.get("customer_name") or "").strip() or "Customer"
     fqdn = str(payload.get("fqdn") or "").strip().lower().strip(".")
     target_environment = str(payload.get("target_environment") or "local").strip().lower() or "local"
-    dns_mode = str(payload.get("dns_mode") or "manual").strip().lower() or "manual"
     tls_mode = str(payload.get("tls_mode") or "letsencrypt").strip().lower() or "letsencrypt"
-    image_overrides = payload.get("image_overrides") if isinstance(payload.get("image_overrides"), dict) else {}
-    dns_payload = payload.get("dns") if isinstance(payload.get("dns"), dict) else {}
-    dns_enabled = bool(dns_payload.get("enabled", bool(fqdn)))
-    dns_ttl = int(dns_payload.get("ttl") or 60)
-    dns_provider_payload = payload.get("dns_provider") if isinstance(payload.get("dns_provider"), dict) else {}
     instance_ref_payload = payload.get("instance_ref")
     instance_ref = ""
     if isinstance(instance_ref_payload, dict):
@@ -14559,17 +14747,17 @@ def _intent_apply_install_xyn_instance(
         instance_ref = str(instance_ref_payload).strip()
     if not instance_ref:
         instance_ref = "xyn-ec2-demo"
+    dns_payload = payload.get("dns") if isinstance(payload.get("dns"), dict) else {}
+    dns_enabled = bool(dns_payload.get("enabled", bool(fqdn)))
+    dns_ttl = int(dns_payload.get("ttl") or 60)
+    dry_run = bool(payload.get("dry_run", False))
+    include_ems = bool(payload.get("include_ems", False))
+    instance_label = str(payload.get("instance_label") or "").strip()
 
     if target_environment not in {"local", "k8s"}:
         return JsonResponse({"error": "target_environment must be local or k8s"}, status=400)
-    if dns_mode not in {"manual", "route53"}:
-        return JsonResponse({"error": "dns_mode must be manual or route53"}, status=400)
     if tls_mode not in {"letsencrypt", "provided"}:
         return JsonResponse({"error": "tls_mode must be letsencrypt or provided"}, status=400)
-    if not customer_name:
-        return JsonResponse({"error": "customer_name is required"}, status=400)
-    if not fqdn or "." not in fqdn:
-        return JsonResponse({"error": "fqdn is required"}, status=400)
     if dns_ttl < 30 or dns_ttl > 86400:
         return JsonResponse({"error": "dns.ttl must be between 30 and 86400"}, status=400)
 
@@ -14577,23 +14765,6 @@ def _intent_apply_install_xyn_instance(
     operator_workspace = _resolve_workspace_for_identity(identity, operator_workspace_id)
     if not operator_workspace:
         return JsonResponse({"error": "operator workspace not found or forbidden"}, status=403)
-
-    selected_instance_artifact = _resolve_instance_artifact_for_dns(instance_ref)
-    if not selected_instance_artifact:
-        return JsonResponse({"error": f"instance artifact '{instance_ref}' not found"}, status=404)
-    selected_instance_payload = _extract_instance_payload_from_artifact(selected_instance_artifact)
-    if not selected_instance_payload:
-        return JsonResponse(
-            {"error": f"instance artifact '{selected_instance_artifact.slug}' has no xyn.instance.v1 payload"},
-            status=400,
-        )
-    payload_errors = _validate_instance_v1_payload(selected_instance_payload)
-    if payload_errors:
-        return JsonResponse({"error": "instance artifact validation failed", "details": payload_errors}, status=400)
-    try:
-        dns_record_type, dns_record_value = _resolve_dns_record_from_instance(selected_instance_payload)
-    except ValueError as exc:
-        return JsonResponse({"error": str(exc)}, status=400)
 
     workspace, workspace_created = _find_or_create_customer_workspace(
         operator_workspace=operator_workspace,
@@ -14626,14 +14797,16 @@ def _intent_apply_install_xyn_instance(
         manifest_ref="registry/modules/xyn-ui.artifact.manifest.json",
         summary="Deployable Xyn UI runtime artifact.",
     )
-    binding_created_by_slug: Dict[str, bool] = {}
-    for artifact in [runtime_artifact, xyn_api_artifact, xyn_ui_artifact]:
-        binding, binding_created = WorkspaceArtifactBinding.objects.get_or_create(
+    ems_artifact = Artifact.objects.filter(slug="ems").order_by("-updated_at", "-created_at").first() if include_ems else None
+
+    for artifact in [runtime_artifact, xyn_api_artifact, xyn_ui_artifact, ems_artifact]:
+        if artifact is None:
+            continue
+        binding, _ = WorkspaceArtifactBinding.objects.get_or_create(
             workspace=workspace,
             artifact=artifact,
             defaults={"enabled": True, "installed_state": "installed", "config_ref": None},
         )
-        binding_created_by_slug[artifact.slug] = binding_created
         update_fields: List[str] = []
         if not binding.enabled:
             binding.enabled = True
@@ -14646,197 +14819,307 @@ def _intent_apply_install_xyn_instance(
             binding.save(update_fields=update_fields)
 
     deployment_target = "local" if target_environment == "local" else "aws"
-    dns_stub = {
-        "mode": dns_mode,
-        "provider": "local-demo" if dns_mode == "manual" else "route53",
-        "fqdn": fqdn,
-        "desired_record_type": dns_record_type,
-        "desired_value": dns_record_value,
-        "instance_ref": {"artifact_id": str(selected_instance_artifact.id), "slug": selected_instance_artifact.slug},
-        "apply_external_changes": dns_mode == "route53" and dns_enabled,
-        "status": "pending",
-    }
-    instance, instance_created = WorkspaceAppInstance.objects.get_or_create(
+    app_instance, app_instance_created = WorkspaceAppInstance.objects.get_or_create(
         workspace=workspace,
         app_slug="xyn-runtime",
-        fqdn=fqdn,
+        fqdn=fqdn or "pending-fqdn.local",
         defaults={
             "artifact": runtime_artifact,
             "customer_name": customer_name,
             "deployment_target": deployment_target,
             "status": "active",
-            "dns_config_json": dns_stub,
+            "dns_config_json": {"enabled": dns_enabled, "ttl": dns_ttl, "mode": "route53" if dns_enabled else "manual"},
         },
     )
-    if not instance_created:
-        update_fields: List[str] = []
-        if instance.artifact_id != runtime_artifact.id:
-            instance.artifact = runtime_artifact
-            update_fields.append("artifact")
-        if instance.customer_name != customer_name:
-            instance.customer_name = customer_name
-            update_fields.append("customer_name")
-        if instance.deployment_target != deployment_target:
-            instance.deployment_target = deployment_target
-            update_fields.append("deployment_target")
-        if instance.status != "active":
-            instance.status = "active"
-            update_fields.append("status")
-        if not isinstance(instance.dns_config_json, dict) or instance.dns_config_json != dns_stub:
-            instance.dns_config_json = dns_stub
-            update_fields.append("dns_config_json")
-        if update_fields:
-            update_fields.append("updated_at")
-            instance.save(update_fields=update_fields)
+    if app_instance.artifact_id != runtime_artifact.id:
+        app_instance.artifact = runtime_artifact
+        app_instance.save(update_fields=["artifact", "updated_at"])
 
-    deployment_plan = {
-        "operation": "install_xyn_instance",
-        "workspace_id": str(workspace.id),
-        "workspace_created": workspace_created,
-        "instance_id": str(instance.id),
-        "fqdn": fqdn,
-        "target_environment": target_environment,
-        "dns_mode": dns_mode,
-        "dns_enabled": dns_enabled,
-        "dns_provider": dns_provider_payload,
-        "dns_ttl": dns_ttl,
-        "tls_mode": tls_mode,
-        "instance_ref": {"artifact_id": str(selected_instance_artifact.id), "slug": selected_instance_artifact.slug},
-        "image_overrides": image_overrides,
-        "artifacts": {
-            "runtime": {"slug": runtime_artifact.slug, "id": str(runtime_artifact.id)},
-            "xyn_api": {"slug": xyn_api_artifact.slug, "id": str(xyn_api_artifact.id)},
-            "xyn_ui": {"slug": xyn_ui_artifact.slug, "id": str(xyn_ui_artifact.id)},
+    instance_artifact = _resolve_instance_artifact_for_dns(instance_ref)
+    if not instance_artifact:
+        return JsonResponse({"error": f"instance artifact '{instance_ref}' not found"}, status=404)
+    instance_payload = _extract_instance_payload_from_artifact(instance_artifact)
+    if not instance_payload:
+        return JsonResponse({"error": f"instance artifact '{instance_artifact.slug}' has no xyn.instance.v1 payload"}, status=400)
+    instance_errors = _validate_instance_v1_payload(instance_payload)
+    if instance_errors:
+        return JsonResponse({"error": "instance artifact validation failed", "details": instance_errors}, status=400)
+
+    try:
+        ssh_resolved = _resolve_instance_ssh_from_payload(instance_payload)
+    except ValueError as exc:
+        if not dry_run:
+            return JsonResponse({"error": str(exc)}, status=400)
+        ssh_resolved = {
+            "host": str((instance_payload.get("network") or {}).get("public_hostname") or (instance_payload.get("network") or {}).get("public_ipv4") or ""),
+            "user": "ubuntu",
+            "port": 22,
+            "resolved": {"private_key": "dry-run", "strict_host_key_checking": False, "known_hosts": ""},
+        }
+
+    release_spec_payload = {
+        "schema_version": "xyn.release_spec.v1",
+        "name": str(payload.get("release_spec_name") or f"xyn-runtime-{customer_name.lower().replace(' ', '-')}"[:120]),
+        "instance_ref": {"artifact_id": str(instance_artifact.id)},
+        "parameters": {
+            "instance_label": instance_label,
+            "fqdn": fqdn,
+            "scheme": "https" if fqdn else "http",
+            "ui_port": payload.get("ui_port"),
+            "api_port": payload.get("api_port"),
+            "dns": {"enabled": dns_enabled, "ttl": dns_ttl},
         },
+        "components": [
+            {
+                "slug": "xyn-api",
+                "enabled": True,
+                "image_ref": str(payload.get("xyn_api_image_ref") or "ghcr.io/xyence/xyn-api:latest"),
+                "env": payload.get("xyn_api_env") if isinstance(payload.get("xyn_api_env"), dict) else {},
+            },
+            {
+                "slug": "xyn-ui",
+                "enabled": True,
+                "image_ref": str(payload.get("xyn_ui_image_ref") or "ghcr.io/xyence/xyn-ui:latest"),
+                "env": payload.get("xyn_ui_env") if isinstance(payload.get("xyn_ui_env"), dict) else {},
+            },
+            {
+                "slug": "ems",
+                "enabled": bool(include_ems),
+                "image_ref": str(payload.get("ems_image_ref") or "ghcr.io/xyence/ems:latest"),
+                "env": payload.get("ems_env") if isinstance(payload.get("ems_env"), dict) else {},
+            },
+        ],
     }
+    release_spec_payload["parameters"] = {
+        key: value
+        for key, value in (release_spec_payload.get("parameters") or {}).items()
+        if value is not None and value != ""
+    }
+    release_spec_errors = _validate_release_spec_v1_payload(release_spec_payload)
+    if release_spec_errors:
+        return JsonResponse({"error": "release_spec validation failed", "details": release_spec_errors}, status=400)
+
+    release_spec_type = _ensure_release_spec_artifact_type()
+    deployment_type = _ensure_deployment_artifact_type()
+    _ensure_target_artifact_type()
+    release_spec_artifact = _create_immutable_artifact_record(
+        workspace=workspace,
+        artifact_type=release_spec_type,
+        title=f"ReleaseSpec {release_spec_payload.get('name')}",
+        slug_prefix="release-spec",
+        schema_version="xyn.release_spec.v1",
+        content=release_spec_payload,
+        summary=f"Remote deployment spec for instance {instance_artifact.slug}",
+        identity=identity,
+    )
+
+    release_spec_for_driver = json.loads(json.dumps(release_spec_payload))
+    release_spec_for_driver["parameters"]["_prepared_ssh"] = ssh_resolved
+
     run = Run.objects.create(
         entity_type="module",
         entity_id=runtime_artifact.id,
         status="running",
-        summary=f"Install Xyn runtime for {fqdn}",
+        summary=f"Provision remote Xyn runtime for {customer_name}",
         started_at=timezone.now(),
-        metadata_json={"operation": "install_xyn_instance", "plan": deployment_plan, "status": "running"},
+        metadata_json={"operation": "deploy_release_spec", "status": "running"},
     )
-    run.log_text = (
-        f"Starting Xyn runtime install for {customer_name} ({fqdn})\n"
-        f"Target environment: {target_environment}\n"
-        f"DNS mode: {dns_mode}\n"
-        f"DNS enabled: {dns_enabled}\n"
-        f"TLS mode: {tls_mode}\n"
-        f"Instance ref: {selected_instance_artifact.slug}\n"
-        "Step 1/5: Ensured workspace and membership\n"
-        "Step 2/5: Ensured runtime artifacts and bindings\n"
-        "Step 3/5: Ensured app instance + FQDN configuration\n"
-        "Step 4/5: DNS provider resolution and upsert (when enabled)\n"
-        "Step 5/5: Runtime deploy plan generated (demo orchestration)\n"
-    )
-    dns_action: Dict[str, Any] = {
-        "enabled": dns_enabled,
-        "mode": dns_mode,
-        "provider": "local-demo" if dns_mode == "manual" else "route53",
-        "status": "skipped",
-        "fqdn": fqdn,
-        "record_type": dns_record_type,
-        "record_value": dns_record_value,
-        "ttl": dns_ttl,
-    }
-    if dns_enabled and dns_mode == "route53":
-        hosted_zone_id = str(dns_provider_payload.get("hosted_zone_id") or "").strip()
-        credentials_ref = dns_provider_payload.get("credentials_ref") if isinstance(dns_provider_payload.get("credentials_ref"), dict) else {}
-        context_pack_id = str((credentials_ref or {}).get("context_pack_id") or "").strip()
-        if not hosted_zone_id:
-            return JsonResponse({"error": "dns_provider.hosted_zone_id is required for route53"}, status=400)
-        if not context_pack_id:
-            return JsonResponse({"error": "dns_provider.credentials_ref.context_pack_id is required for route53"}, status=400)
-        try:
-            resolved_credentials = _resolve_context_pack_credentials(context_pack_id)
-            provider = Route53DnsProvider(
-                hosted_zone_id=hosted_zone_id,
-                region=str(dns_provider_payload.get("region") or resolved_credentials.get("region") or "").strip() or None,
-                aws_access_key_id=resolved_credentials.get("aws_access_key_id") or None,
-                aws_secret_access_key=resolved_credentials.get("aws_secret_access_key") or None,
-                aws_session_token=resolved_credentials.get("aws_session_token") or None,
-            )
-            provider_result = provider.upsert_record(
-                fqdn=fqdn,
-                record_type=dns_record_type,
-                value=dns_record_value,
-                ttl=dns_ttl,
-            )
-            dns_action = {
-                **dns_action,
-                "provider": "route53",
-                "status": "succeeded",
-                "hosted_zone_id": hosted_zone_id,
-                "context_pack_id": context_pack_id,
-                "change_id": provider_result.get("change_id"),
-            }
-        except Exception as exc:
-            dns_action = {
-                **dns_action,
-                "provider": "route53",
-                "status": "failed",
-                "error": str(exc),
-            }
-    elif dns_enabled:
-        dns_action["status"] = "recorded"
 
-    instance.dns_config_json = {
-        **dns_stub,
-        "status": str(dns_action.get("status") or "pending"),
-        "result": dns_action,
+    driver = SshDockerComposeInstanceDriver(dry_run=dry_run)
+    started_at = timezone.now()
+    driver_result: Dict[str, Any] = {}
+    health_result: Dict[str, Any] = {}
+    deployment_status = "running"
+    errors: List[Dict[str, str]] = []
+    prepared = None
+    try:
+        prepared = driver.prepare(
+            instance={
+                **instance_payload,
+                "access": {
+                    **(instance_payload.get("access") if isinstance(instance_payload.get("access"), dict) else {}),
+                    "ssh": {**(instance_payload.get("access", {}).get("ssh") if isinstance(instance_payload.get("access", {}).get("ssh"), dict) else {}), **ssh_resolved},
+                },
+            },
+            release_spec=release_spec_for_driver,
+        )
+        release_spec_for_driver["parameters"]["_prepared_ssh"] = prepared.ssh
+        release_spec_for_driver["parameters"]["_prepared_ui_port"] = prepared.ui_port
+        release_spec_for_driver["parameters"]["_prepared_api_port"] = prepared.api_port
+        apply_result = driver.apply(prepared)
+        health = driver.check_health(apply_result, release_spec_for_driver)
+        driver_result = {
+            "status": apply_result.status,
+            "stdout": apply_result.stdout,
+            "stderr": apply_result.stderr,
+            "details": apply_result.details,
+        }
+        health_result = {"status": health.status, "checks": health.checks}
+        deployment_status = "pending" if apply_result.status == "pending" else ("succeeded" if health.status in {"succeeded", "pending"} else "failed")
+    except Exception as exc:
+        deployment_status = "failed"
+        errors.append({"code": "driver_failed", "message": str(exc)})
+        driver_result = {"status": "failed", "stdout": "", "stderr": str(exc), "details": {}}
+        health_result = {"status": "failed", "checks": {}}
+
+    network = instance_payload.get("network") if isinstance(instance_payload.get("network"), dict) else {}
+    ui_port = int((prepared.ui_port if prepared else release_spec_for_driver.get("parameters", {}).get("ui_port") or 0) or 80)
+    api_port = int((prepared.api_port if prepared else release_spec_for_driver.get("parameters", {}).get("api_port") or 0) or 8000)
+    urls = compute_base_urls(
+        fqdn=fqdn,
+        scheme=str(release_spec_for_driver.get("parameters", {}).get("scheme") or "https"),
+        public_hostname=str((network or {}).get("public_hostname") or ""),
+        public_ipv4=str((network or {}).get("public_ipv4") or ""),
+        ui_port=ui_port,
+        api_port=api_port,
+    )
+
+    dns_action: Dict[str, Any] = {"enabled": dns_enabled, "status": "skipped", "mode": "manual"}
+    if fqdn and dns_enabled:
+        try:
+            record_type, record_value = _resolve_dns_record_from_instance(instance_payload)
+            target_ref = str(payload.get("target_ref") or "").strip()
+            target_payload = payload.get("dns_provider") if isinstance(payload.get("dns_provider"), dict) else {}
+            if target_ref:
+                target_artifact = _resolve_target_artifact(target_ref)
+                if target_artifact:
+                    target_content = _extract_latest_content(target_artifact)
+                    if isinstance(target_content.get("dns_provider"), dict):
+                        target_payload = target_content.get("dns_provider") or target_payload
+            if dry_run:
+                dns_action = {
+                    "enabled": True,
+                    "status": "pending",
+                    "mode": "route53",
+                    "fqdn": fqdn,
+                    "record_type": record_type,
+                    "record_value": record_value,
+                    "hosted_zone_id": str(target_payload.get("hosted_zone_id") or ""),
+                }
+            else:
+                hosted_zone_id = str(target_payload.get("hosted_zone_id") or "").strip()
+                credentials_ref = target_payload.get("credentials_ref") if isinstance(target_payload.get("credentials_ref"), dict) else {}
+                context_pack_id = str((credentials_ref or {}).get("context_pack_id") or "").strip()
+                if not hosted_zone_id or not context_pack_id:
+                    raise ValueError("target dns_provider.hosted_zone_id and credentials_ref.context_pack_id are required")
+                resolved_credentials = _resolve_context_pack_credentials(context_pack_id)
+                provider = Route53DnsProvider(
+                    hosted_zone_id=hosted_zone_id,
+                    region=str(target_payload.get("region") or resolved_credentials.get("region") or "").strip() or None,
+                    aws_access_key_id=resolved_credentials.get("aws_access_key_id") or None,
+                    aws_secret_access_key=resolved_credentials.get("aws_secret_access_key") or None,
+                    aws_session_token=resolved_credentials.get("aws_session_token") or None,
+                )
+                provider_result = provider.upsert_record(
+                    fqdn=fqdn,
+                    record_type=record_type,
+                    value=record_value,
+                    ttl=dns_ttl,
+                )
+                dns_action = {
+                    "enabled": True,
+                    "status": "succeeded",
+                    "mode": "route53",
+                    "fqdn": fqdn,
+                    "record_type": record_type,
+                    "record_value": record_value,
+                    "ttl": dns_ttl,
+                    "hosted_zone_id": hosted_zone_id,
+                    "change_id": provider_result.get("change_id"),
+                }
+        except Exception as exc:
+            dns_action = {"enabled": True, "status": "failed", "mode": "route53", "error": str(exc)}
+
+    ended_at = timezone.now()
+    deployment_payload = {
+        "schema_version": "xyn.deployment.v1",
+        "status": deployment_status,
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "release_spec_ref": {"artifact_id": str(release_spec_artifact.id), "slug": release_spec_artifact.slug},
+        "instance_ref": {"artifact_id": str(instance_artifact.id), "slug": instance_artifact.slug},
+        "outputs": {
+            **urls,
+            "ui_port": ui_port,
+            "api_port": api_port,
+            "health": health_result,
+            "dns": dns_action,
+        },
+        "driver_state": {
+            "compose_project": prepared.compose_project if prepared else "",
+            "remote_workdir": prepared.remote_workdir if prepared else "",
+            "compose_file": prepared.compose_file_path if prepared else "",
+            "dry_run": dry_run,
+        },
+        "logs": {
+            "stdout": str((driver_result or {}).get("stdout") or ""),
+            "stderr": str((driver_result or {}).get("stderr") or ""),
+        },
+        "errors": errors,
     }
-    instance.save(update_fields=["dns_config_json", "updated_at"])
-    endpoints = {
-        "ui_url": f"https://{fqdn}/",
-        "api_url": f"https://{fqdn}/xyn/api",
-        "workbench_url": f"/w/{workspace.id}/workbench",
-    }
+    app_instance.fqdn = fqdn or str(urls.get("base_url") or "")
+    app_instance.status = "error" if deployment_status == "failed" else "active"
+    app_instance.deployment_target = deployment_target
+    app_instance.dns_config_json = {"enabled": dns_enabled, "ttl": dns_ttl, "result": dns_action}
+    app_instance.save(update_fields=["fqdn", "status", "deployment_target", "dns_config_json", "updated_at"])
+    deployment_errors = _validate_deployment_v1_payload(deployment_payload)
+    if deployment_errors:
+        return JsonResponse({"error": "deployment payload validation failed", "details": deployment_errors}, status=500)
+    deployment_artifact = _create_immutable_artifact_record(
+        workspace=workspace,
+        artifact_type=deployment_type,
+        title=f"Deployment {release_spec_payload.get('name')}",
+        slug_prefix="deployment",
+        schema_version="xyn.deployment.v1",
+        content=deployment_payload,
+        summary=f"Deployment execution for {release_spec_payload.get('name')}",
+        identity=identity,
+    )
+
+    run.status = "failed" if deployment_status == "failed" else ("running" if deployment_status == "pending" else "succeeded")
+    run.finished_at = ended_at if run.status != "running" else None
+    run.log_text = (
+        f"Deployment status: {deployment_status}\\n"
+        f"Instance: {instance_artifact.slug}\\n"
+        f"Base URL: {urls.get('base_url')}\\n"
+        f"Compose project: {(prepared.compose_project if prepared else '')}\\n"
+    )
     run.metadata_json = {
-        "operation": "install_xyn_instance",
-        "plan": deployment_plan,
-        "status": "failed" if dns_action.get("status") == "failed" else "succeeded",
-        "endpoints": endpoints,
-        "binding_created": binding_created_by_slug,
-        "dns_action": dns_action,
+        "operation": "deploy_release_spec",
+        "status": deployment_status,
+        "release_spec_artifact_id": str(release_spec_artifact.id),
+        "deployment_artifact_id": str(deployment_artifact.id),
+        "outputs": deployment_payload.get("outputs") or {},
     }
-    run.status = "failed" if dns_action.get("status") == "failed" else "succeeded"
-    run.finished_at = timezone.now()
     run.save(update_fields=["status", "finished_at", "log_text", "metadata_json", "updated_at"])
-    _write_run_artifact(run, "xyn_runtime_install_plan.json", deployment_plan, "deployment_plan")
-    _write_run_artifact(run, "xyn_runtime_install_endpoints.json", endpoints, "deployment_result")
-    _write_run_artifact(run, "dns_deployment_action.json", dns_action, "deployment_result")
+    _write_run_artifact(run, "release_spec.json", release_spec_payload, "deployment_plan")
+    _write_run_artifact(run, "deployment_result.json", deployment_payload, "deployment_result")
+    if prepared:
+        _write_run_artifact(run, "compose.yaml", prepared.compose_yaml, "deployment_result")
     _write_run_summary(run)
 
     response_payload = {
         "status": "DraftReady",
         "action_type": "CreateDraft",
         "artifact_type": "Workspace",
-        "artifact_id": str(runtime_artifact.id),
-        "summary": (
-            f'Installed Xyn runtime instance for "{customer_name}" at {fqdn}. '
-            f"DNS {dns_action.get('status') or 'pending'} ({dns_record_type} -> {dns_record_value})."
-        ),
+        "artifact_id": str(deployment_artifact.id),
+        "summary": f"Provisioned remote Xyn instance ({deployment_status}).",
         "result": {
             "workspace": {"id": str(workspace.id), "created": workspace_created},
-            "runtime": {"slug": runtime_artifact.slug, "installed": True},
-            "instance": {
-                "id": str(instance.id),
-                "created": instance_created,
-                "fqdn": fqdn,
-                "deployment_target": deployment_target,
-                "instance_ref": {"artifact_id": str(selected_instance_artifact.id), "slug": selected_instance_artifact.slug},
-            },
-            "run": {
-                "id": str(run.id),
-                "status": run.status,
-                "summary": run.summary,
-            },
-            "endpoints": endpoints,
-            "dns_action": dns_action,
+            "instance": {"id": str(instance_artifact.id), "slug": instance_artifact.slug},
+            "app_instance": {"id": str(app_instance.id), "created": app_instance_created, "fqdn": app_instance.fqdn},
+            "release_spec": {"id": str(release_spec_artifact.id), "slug": release_spec_artifact.slug},
+            "deployment": {"id": str(deployment_artifact.id), "slug": deployment_artifact.slug, "status": deployment_status},
+            "run": {"id": str(run.id), "status": run.status},
+            "base_url": urls.get("base_url"),
+            "ui_url": urls.get("ui_url"),
+            "api_url": urls.get("api_url"),
+            "dns": dns_action,
+            "driver_state": deployment_payload.get("driver_state"),
         },
         "next_actions": [
-            {"label": "Open Deployment Run", "action": "OpenPanel", "panel_key": "run_detail", "params": {"run_id": str(run.id)}},
+            {"label": "Open deployment details", "action": "OpenPanel", "panel_key": "artifact_detail", "params": {"slug": deployment_artifact.slug}},
+            {"label": "Open deployment run", "action": "OpenPanel", "panel_key": "run_detail", "params": {"run_id": str(run.id)}},
             {"label": "Open Workbench", "action": "OpenPath", "path": f"/w/{workspace.id}/workbench"},
         ],
         "audit": {
@@ -14845,14 +15128,28 @@ def _intent_apply_install_xyn_instance(
         },
     }
     _audit_intent_event(
-        message="intent.apply.install_xyn_instance",
+        message="intent.apply.deploy_release_spec",
         identity=identity,
         request_id=request_id,
-        artifact_id=str(runtime_artifact.id),
-        proposal={"operation": "install_xyn_instance", "customer_name": customer_name, "fqdn": fqdn},
+        artifact_id=str(deployment_artifact.id),
+        proposal={"operation": "deploy_release_spec", "instance_ref": instance_ref, "fqdn": fqdn},
         resolution=response_payload,
     )
     return JsonResponse(response_payload)
+
+
+def _intent_apply_install_xyn_instance(
+    *,
+    identity: UserIdentity,
+    payload: Dict[str, Any],
+    request_id: str,
+) -> JsonResponse:
+    # Canonical path now routes through instance-driver based remote deployment.
+    return _intent_apply_provision_xyn_remote(
+        identity=identity,
+        payload=payload,
+        request_id=request_id,
+    )
 
 
 def _intent_apply_deploy_ems_customer(
@@ -15182,6 +15479,41 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
     context_artifact_id = str(context_payload.get("artifact_id") or "").strip()
     context_artifact_type = str(context_payload.get("artifact_type") or "").strip()
 
+    remote_provision_request = _match_provision_xyn_remote_command(message)
+    if remote_provision_request:
+        operator_workspace = _resolve_workspace_for_identity(identity, context_workspace_id)
+        if not operator_workspace:
+            return JsonResponse({"error": "workspace context is required for remote provisioning flow"}, status=400)
+        return JsonResponse(
+            {
+                "status": "DraftReady",
+                "action_type": "CreateDraft",
+                "artifact_type": "Workspace",
+                "artifact_id": None,
+                "summary": "Will provision a remote Xyn instance via SSH + docker compose.",
+                "draft_payload": {
+                    "__operation": "deploy_release_spec",
+                    "customer_name": str(remote_provision_request.get("customer_name") or "Customer"),
+                    "fqdn": str(remote_provision_request.get("fqdn") or ""),
+                    "operator_workspace_id": str(operator_workspace.id),
+                    "target_environment": "local",
+                    "instance_ref": {"artifact_id": str(remote_provision_request.get("instance_ref") or "xyn-ec2-demo")},
+                    "instance_label": str(remote_provision_request.get("instance_label") or ""),
+                    "dns": {"enabled": bool(remote_provision_request.get("dns_enabled", True)), "ttl": 60},
+                    "include_ems": bool(remote_provision_request.get("include_ems", False)),
+                    "dry_run": False,
+                    "tls_mode": "letsencrypt",
+                },
+                "next_actions": [
+                    {"label": "Provision Xyn instance (remote)", "action": "CreateDraft"},
+                ],
+                "audit": {
+                    "request_id": str(uuid.uuid4()),
+                    "timestamp": timezone.now().isoformat(),
+                },
+            }
+        )
+
     xyn_instance_request = _match_install_xyn_instance_command(message)
     if xyn_instance_request:
         customer_name, fqdn, instance_ref, dns_enabled, dns_mode = xyn_instance_request
@@ -15199,7 +15531,7 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
                     f"and configure deployment for {fqdn} using instance {instance_ref}."
                 ),
                 "draft_payload": {
-                    "__operation": "install_xyn_instance",
+                    "__operation": "deploy_release_spec",
                     "customer_name": customer_name,
                     "fqdn": fqdn,
                     "operator_workspace_id": str(operator_workspace.id),
@@ -15407,6 +15739,8 @@ def xyn_intent_apply(request: HttpRequest) -> JsonResponse:
                 return _intent_apply_create_ems_instance(identity=identity, payload=body_payload, request_id=request_id)
             if operation == "install_xyn_instance":
                 return _intent_apply_install_xyn_instance(identity=identity, payload=body_payload, request_id=request_id)
+            if operation == "deploy_release_spec":
+                return _intent_apply_provision_xyn_remote(identity=identity, payload=body_payload, request_id=request_id)
             if operation == "open_ems_panel":
                 return _intent_apply_open_ems_panel(identity=identity, payload=body_payload, request_id=request_id)
             if operation == "open_artifact_panel":
