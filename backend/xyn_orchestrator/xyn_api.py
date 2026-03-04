@@ -153,6 +153,7 @@ from .oidc import (
 from .secret_stores import SecretStoreError, normalize_secret_logical_name, write_secret_value
 from .storage.registry import StorageProviderRegistry
 from .notifications.registry import NotifierRegistry, resolve_secret_ref_value
+from .dns_providers import Route53DnsProvider
 from .ai_runtime import (
     AiConfigError,
     AiInvokeError,
@@ -233,6 +234,7 @@ WORKFLOW_DEFAULT_CATEGORY = "xyn_usage"
 VIDEO_CONTEXT_PACK_PURPOSE = "video_explainer"
 VIDEO_ADAPTER_CONFIG_ARTIFACT_TYPE_SLUG = "video_adapter_config"
 VIDEO_RENDER_PACKAGE_ARTIFACT_TYPE_SLUG = "render_package"
+INSTANCE_ARTIFACT_TYPE_SLUG = "instance"
 VIDEO_RENDERING_MODES = {
     "export_package_only",
     "render_via_adapter",
@@ -536,6 +538,86 @@ def _validate_schema_payload(payload: Dict[str, Any], schema_name: str) -> list[
     return errors
 
 
+def _parse_context_pack_content_json(pack: ContextPack) -> Dict[str, Any]:
+    raw = str(pack.content_markdown or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_context_pack_credentials(context_pack_id: str) -> Dict[str, str]:
+    pack = ContextPack.objects.filter(id=context_pack_id).first()
+    if not pack:
+        raise ValueError("credentials_ref.context_pack_id not found")
+    payload = _parse_context_pack_content_json(pack)
+    aws = payload.get("aws") if isinstance(payload.get("aws"), dict) else payload
+    if not isinstance(aws, dict):
+        return {}
+
+    def _value(key: str, ref_key: str) -> str:
+        direct = str(aws.get(key) or "").strip()
+        if direct:
+            return direct
+        ref_text = str(aws.get(ref_key) or "").strip()
+        if not ref_text:
+            return ""
+        try:
+            return str(resolve_secret_ref_value(ref_text) or "").strip()
+        except Exception:
+            return ""
+
+    return {
+        "aws_access_key_id": _value("access_key_id", "access_key_id_ref"),
+        "aws_secret_access_key": _value("secret_access_key", "secret_access_key_ref"),
+        "aws_session_token": _value("session_token", "session_token_ref"),
+        "region": str(aws.get("region") or "").strip(),
+    }
+
+
+def _validate_instance_v1_payload(payload: Dict[str, Any]) -> list[str]:
+    return _validate_schema_payload(payload, "xyn.instance.v1.schema.json")
+
+
+def _extract_instance_payload_from_artifact(artifact: Artifact) -> Dict[str, Any]:
+    latest = _latest_artifact_revision(artifact)
+    content = latest.content_json if latest and isinstance(latest.content_json, dict) else {}
+    if str(content.get("schema_version") or "").strip() == "xyn.instance.v1":
+        return content
+    candidate = content.get("instance") if isinstance(content.get("instance"), dict) else {}
+    if isinstance(candidate, dict) and str(candidate.get("schema_version") or "").strip() == "xyn.instance.v1":
+        return candidate
+    return {}
+
+
+def _resolve_dns_record_from_instance(instance_payload: Dict[str, Any]) -> Tuple[str, str]:
+    network = instance_payload.get("network") if isinstance(instance_payload.get("network"), dict) else {}
+    hostname = str((network or {}).get("public_hostname") or "").strip().rstrip(".")
+    ipv4 = str((network or {}).get("public_ipv4") or "").strip()
+    if hostname:
+        return ("CNAME", hostname)
+    if ipv4:
+        return ("A", ipv4)
+    raise ValueError("instance artifact is missing network.public_ipv4 and network.public_hostname")
+
+
+def _resolve_instance_artifact_for_dns(identifier: str) -> Optional[Artifact]:
+    ident = str(identifier or "").strip()
+    if not ident:
+        return None
+    qs = Artifact.objects.filter(type__slug=INSTANCE_ARTIFACT_TYPE_SLUG).select_related("type").order_by("-updated_at")
+    try:
+        direct = qs.filter(id=ident).first()
+        if direct:
+            return direct
+    except Exception:
+        pass
+    return qs.filter(slug=ident).first()
+
+
 def _normalize_release_target_payload(
     payload: Dict[str, Any], blueprint_id: str, target_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -550,6 +632,7 @@ def _normalize_release_target_payload(
         "name": payload.get("name") or "",
         "environment": payload.get("environment") or "",
         "target_instance_id": payload.get("target_instance_id") or "",
+        "instance_ref": payload.get("instance_ref") if isinstance(payload.get("instance_ref"), dict) else {},
         "fqdn": payload.get("fqdn") or "",
         "dns": {
             "provider": dns.get("provider") or "route53",
@@ -579,6 +662,7 @@ def _normalize_release_target_payload(
         },
         "env": payload.get("env") or {},
         "secret_refs": payload.get("secret_refs") or [],
+        "dns_provider": payload.get("dns_provider") if isinstance(payload.get("dns_provider"), dict) else {},
         "auto_generated": bool(payload.get("auto_generated", False)),
         "editable": bool(payload.get("editable", True)),
         "created_at": payload.get("created_at") or timezone.now().isoformat(),
@@ -602,8 +686,10 @@ def _serialize_release_target(target: ReleaseTarget) -> Dict[str, Any]:
             "name": target.name,
             "environment": target.environment or "",
             "target_instance_id": target_instance_id,
+            "instance_ref": (target.config_json or {}).get("instance_ref") if isinstance(target.config_json, dict) else {},
             "fqdn": target.fqdn,
             "dns": target.dns_json or {},
+            "dns_provider": (target.config_json or {}).get("dns_provider") if isinstance(target.config_json, dict) else {},
             "runtime": target.runtime_json or {},
             "tls": target.tls_json or {},
             "ingress": (target.config_json or {}).get("ingress") or {},
@@ -1289,6 +1375,23 @@ def _ensure_render_package_artifact_type() -> ArtifactType:
             "description": "Versioned render package snapshot produced from explainer artifacts",
             "icon": "Package",
             "schema_json": {"version": 1, "fields": ["scenes", "storyboard", "narration", "visual_prompts", "metadata"]},
+        },
+    )
+    return artifact_type
+
+
+def _ensure_instance_artifact_type() -> ArtifactType:
+    artifact_type, _ = ArtifactType.objects.get_or_create(
+        slug=INSTANCE_ARTIFACT_TYPE_SLUG,
+        defaults={
+            "name": "Instance",
+            "description": "Deployable host/runtime instance descriptor artifact.",
+            "icon": "Server",
+            "schema_json": {
+                "schema_version": "xyn.instance.v1",
+                "kind": ["ec2", "generic_host"],
+                "status": ["running", "stopped", "unknown"],
+            },
         },
     )
     return artifact_type
@@ -7852,6 +7955,13 @@ def validate_artifact(artifact: Artifact) -> Tuple[str, List[str]]:
             errors.append("context pack source record not found")
         elif not str(source.content_markdown or "").strip():
             errors.append("context pack content is required")
+    elif slug == INSTANCE_ARTIFACT_TYPE_SLUG:
+        content = _extract_instance_payload_from_artifact(artifact)
+        if not content:
+            errors.append("instance content is missing")
+        else:
+            schema_errors = _validate_instance_v1_payload(content)
+            errors.extend(schema_errors)
 
     if errors:
         return "fail", errors
@@ -9311,6 +9421,8 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
                 return JsonResponse({"error": str(exc)}, status=500)
             return JsonResponse({"artifact": payload, "created": created})
         type_slug = str(payload.get("type") or "article").strip().lower()
+        if type_slug == INSTANCE_ARTIFACT_TYPE_SLUG:
+            _ensure_instance_artifact_type()
         artifact_type = ArtifactType.objects.filter(slug=type_slug).first()
         if not artifact_type:
             return JsonResponse({"error": "artifact type not found"}, status=404)
@@ -9329,6 +9441,39 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
         visibility = str(payload.get("visibility") or "private")
         if visibility not in {"private", "team", "public"}:
             visibility = "private"
+        revision_content: Dict[str, Any] = {
+            "title": title,
+            "summary": summary,
+            "body_markdown": body_markdown,
+            "body_html": body_html,
+            "tags": tags,
+        }
+        schema_version = str(payload.get("schema_version") or "").strip()
+        if type_slug == INSTANCE_ARTIFACT_TYPE_SLUG:
+            instance_payload = payload.get("instance") if isinstance(payload.get("instance"), dict) else {}
+            if not instance_payload:
+                instance_payload = {
+                    "schema_version": "xyn.instance.v1",
+                    "name": title,
+                    "kind": str(payload.get("kind") or "ec2").strip() or "ec2",
+                    "status": str(payload.get("status") or "unknown").strip() or "unknown",
+                    "network": {
+                        "public_ipv4": str(payload.get("public_ipv4") or "").strip() or None,
+                        "public_hostname": str(payload.get("public_hostname") or "").strip() or None,
+                    },
+                    "notes": payload.get("notes") if isinstance(payload.get("notes"), dict) else {},
+                }
+                network = instance_payload.get("network") if isinstance(instance_payload.get("network"), dict) else {}
+                instance_payload["network"] = {
+                    key: value
+                    for key, value in (network or {}).items()
+                    if value not in {None, ""}
+                }
+            schema_errors = _validate_instance_v1_payload(instance_payload)
+            if schema_errors:
+                return JsonResponse({"error": "invalid instance payload", "details": schema_errors}, status=400)
+            revision_content = dict(instance_payload)
+            schema_version = "xyn.instance.v1"
         with transaction.atomic():
             artifact = Artifact.objects.create(
                 workspace=workspace,
@@ -9337,6 +9482,7 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
                 slug=slug,
                 status="draft",
                 version=1,
+                schema_version=schema_version,
                 visibility=visibility,
                 author=identity,
                 custodian=identity,
@@ -9346,13 +9492,7 @@ def workspace_artifacts_collection(request: HttpRequest, workspace_id: str) -> J
             ArtifactRevision.objects.create(
                 artifact=artifact,
                 revision_number=1,
-                content_json={
-                    "title": title,
-                    "summary": summary,
-                    "body_markdown": body_markdown,
-                    "body_html": body_html,
-                    "tags": tags,
-                },
+                content_json=revision_content,
                 created_by=identity,
             )
             ArtifactExternalRef.objects.create(
@@ -14223,7 +14363,7 @@ def _match_create_ems_instance_command(message: str) -> Optional[Tuple[str, str]
     return (customer_name, fqdn) if customer_name and fqdn else None
 
 
-def _match_install_xyn_instance_command(message: str) -> Optional[Tuple[str, str]]:
+def _match_install_xyn_instance_command(message: str) -> Optional[Tuple[str, str, str, bool, str]]:
     text = str(message or "").strip()
     if not text:
         return None
@@ -14238,7 +14378,11 @@ def _match_install_xyn_instance_command(message: str) -> Optional[Tuple[str, str
     fqdn = str(match.group(2) or "").strip().lower().strip(".")
     if "." not in fqdn:
         return None
-    return (customer_name, fqdn) if customer_name and fqdn else None
+    instance_match = re.search(r"\b(?:on|using)\s+instance\s+([a-z0-9._-]+)\b", text, flags=re.IGNORECASE)
+    instance_ref = str(instance_match.group(1) or "").strip() if instance_match else "xyn-ec2-demo"
+    dns_enabled = not bool(re.search(r"\bdns\s+(off|disabled?)\b", text, flags=re.IGNORECASE))
+    dns_mode = "route53" if bool(re.search(r"\broute53\b", text, flags=re.IGNORECASE)) else "manual"
+    return (customer_name, fqdn, instance_ref, dns_enabled, dns_mode) if customer_name and fqdn else None
 
 
 def _match_ems_panel_command(message: str) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -14403,6 +14547,19 @@ def _intent_apply_install_xyn_instance(
     dns_mode = str(payload.get("dns_mode") or "manual").strip().lower() or "manual"
     tls_mode = str(payload.get("tls_mode") or "letsencrypt").strip().lower() or "letsencrypt"
     image_overrides = payload.get("image_overrides") if isinstance(payload.get("image_overrides"), dict) else {}
+    dns_payload = payload.get("dns") if isinstance(payload.get("dns"), dict) else {}
+    dns_enabled = bool(dns_payload.get("enabled", bool(fqdn)))
+    dns_ttl = int(dns_payload.get("ttl") or 60)
+    dns_provider_payload = payload.get("dns_provider") if isinstance(payload.get("dns_provider"), dict) else {}
+    instance_ref_payload = payload.get("instance_ref")
+    instance_ref = ""
+    if isinstance(instance_ref_payload, dict):
+        instance_ref = str(instance_ref_payload.get("artifact_id") or "").strip()
+    elif isinstance(instance_ref_payload, str):
+        instance_ref = str(instance_ref_payload).strip()
+    if not instance_ref:
+        instance_ref = "xyn-ec2-demo"
+
     if target_environment not in {"local", "k8s"}:
         return JsonResponse({"error": "target_environment must be local or k8s"}, status=400)
     if dns_mode not in {"manual", "route53"}:
@@ -14413,11 +14570,30 @@ def _intent_apply_install_xyn_instance(
         return JsonResponse({"error": "customer_name is required"}, status=400)
     if not fqdn or "." not in fqdn:
         return JsonResponse({"error": "fqdn is required"}, status=400)
+    if dns_ttl < 30 or dns_ttl > 86400:
+        return JsonResponse({"error": "dns.ttl must be between 30 and 86400"}, status=400)
 
     operator_workspace_id = str(payload.get("operator_workspace_id") or "").strip()
     operator_workspace = _resolve_workspace_for_identity(identity, operator_workspace_id)
     if not operator_workspace:
         return JsonResponse({"error": "operator workspace not found or forbidden"}, status=403)
+
+    selected_instance_artifact = _resolve_instance_artifact_for_dns(instance_ref)
+    if not selected_instance_artifact:
+        return JsonResponse({"error": f"instance artifact '{instance_ref}' not found"}, status=404)
+    selected_instance_payload = _extract_instance_payload_from_artifact(selected_instance_artifact)
+    if not selected_instance_payload:
+        return JsonResponse(
+            {"error": f"instance artifact '{selected_instance_artifact.slug}' has no xyn.instance.v1 payload"},
+            status=400,
+        )
+    payload_errors = _validate_instance_v1_payload(selected_instance_payload)
+    if payload_errors:
+        return JsonResponse({"error": "instance artifact validation failed", "details": payload_errors}, status=400)
+    try:
+        dns_record_type, dns_record_value = _resolve_dns_record_from_instance(selected_instance_payload)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
 
     workspace, workspace_created = _find_or_create_customer_workspace(
         operator_workspace=operator_workspace,
@@ -14474,8 +14650,10 @@ def _intent_apply_install_xyn_instance(
         "mode": dns_mode,
         "provider": "local-demo" if dns_mode == "manual" else "route53",
         "fqdn": fqdn,
-        "desired_record_type": "A",
-        "apply_external_changes": dns_mode == "route53",
+        "desired_record_type": dns_record_type,
+        "desired_value": dns_record_value,
+        "instance_ref": {"artifact_id": str(selected_instance_artifact.id), "slug": selected_instance_artifact.slug},
+        "apply_external_changes": dns_mode == "route53" and dns_enabled,
         "status": "pending",
     }
     instance, instance_created = WorkspaceAppInstance.objects.get_or_create(
@@ -14519,7 +14697,11 @@ def _intent_apply_install_xyn_instance(
         "fqdn": fqdn,
         "target_environment": target_environment,
         "dns_mode": dns_mode,
+        "dns_enabled": dns_enabled,
+        "dns_provider": dns_provider_payload,
+        "dns_ttl": dns_ttl,
         "tls_mode": tls_mode,
+        "instance_ref": {"artifact_id": str(selected_instance_artifact.id), "slug": selected_instance_artifact.slug},
         "image_overrides": image_overrides,
         "artifacts": {
             "runtime": {"slug": runtime_artifact.slug, "id": str(runtime_artifact.id)},
@@ -14539,12 +14721,72 @@ def _intent_apply_install_xyn_instance(
         f"Starting Xyn runtime install for {customer_name} ({fqdn})\n"
         f"Target environment: {target_environment}\n"
         f"DNS mode: {dns_mode}\n"
+        f"DNS enabled: {dns_enabled}\n"
         f"TLS mode: {tls_mode}\n"
-        "Step 1/4: Ensured workspace and membership\n"
-        "Step 2/4: Ensured runtime artifacts and bindings\n"
-        "Step 3/4: Ensured app instance + FQDN configuration\n"
-        "Step 4/4: Runtime deploy plan generated (demo orchestration)\n"
+        f"Instance ref: {selected_instance_artifact.slug}\n"
+        "Step 1/5: Ensured workspace and membership\n"
+        "Step 2/5: Ensured runtime artifacts and bindings\n"
+        "Step 3/5: Ensured app instance + FQDN configuration\n"
+        "Step 4/5: DNS provider resolution and upsert (when enabled)\n"
+        "Step 5/5: Runtime deploy plan generated (demo orchestration)\n"
     )
+    dns_action: Dict[str, Any] = {
+        "enabled": dns_enabled,
+        "mode": dns_mode,
+        "provider": "local-demo" if dns_mode == "manual" else "route53",
+        "status": "skipped",
+        "fqdn": fqdn,
+        "record_type": dns_record_type,
+        "record_value": dns_record_value,
+        "ttl": dns_ttl,
+    }
+    if dns_enabled and dns_mode == "route53":
+        hosted_zone_id = str(dns_provider_payload.get("hosted_zone_id") or "").strip()
+        credentials_ref = dns_provider_payload.get("credentials_ref") if isinstance(dns_provider_payload.get("credentials_ref"), dict) else {}
+        context_pack_id = str((credentials_ref or {}).get("context_pack_id") or "").strip()
+        if not hosted_zone_id:
+            return JsonResponse({"error": "dns_provider.hosted_zone_id is required for route53"}, status=400)
+        if not context_pack_id:
+            return JsonResponse({"error": "dns_provider.credentials_ref.context_pack_id is required for route53"}, status=400)
+        try:
+            resolved_credentials = _resolve_context_pack_credentials(context_pack_id)
+            provider = Route53DnsProvider(
+                hosted_zone_id=hosted_zone_id,
+                region=str(dns_provider_payload.get("region") or resolved_credentials.get("region") or "").strip() or None,
+                aws_access_key_id=resolved_credentials.get("aws_access_key_id") or None,
+                aws_secret_access_key=resolved_credentials.get("aws_secret_access_key") or None,
+                aws_session_token=resolved_credentials.get("aws_session_token") or None,
+            )
+            provider_result = provider.upsert_record(
+                fqdn=fqdn,
+                record_type=dns_record_type,
+                value=dns_record_value,
+                ttl=dns_ttl,
+            )
+            dns_action = {
+                **dns_action,
+                "provider": "route53",
+                "status": "succeeded",
+                "hosted_zone_id": hosted_zone_id,
+                "context_pack_id": context_pack_id,
+                "change_id": provider_result.get("change_id"),
+            }
+        except Exception as exc:
+            dns_action = {
+                **dns_action,
+                "provider": "route53",
+                "status": "failed",
+                "error": str(exc),
+            }
+    elif dns_enabled:
+        dns_action["status"] = "recorded"
+
+    instance.dns_config_json = {
+        **dns_stub,
+        "status": str(dns_action.get("status") or "pending"),
+        "result": dns_action,
+    }
+    instance.save(update_fields=["dns_config_json", "updated_at"])
     endpoints = {
         "ui_url": f"https://{fqdn}/",
         "api_url": f"https://{fqdn}/xyn/api",
@@ -14553,15 +14795,17 @@ def _intent_apply_install_xyn_instance(
     run.metadata_json = {
         "operation": "install_xyn_instance",
         "plan": deployment_plan,
-        "status": "succeeded",
+        "status": "failed" if dns_action.get("status") == "failed" else "succeeded",
         "endpoints": endpoints,
         "binding_created": binding_created_by_slug,
+        "dns_action": dns_action,
     }
-    run.status = "succeeded"
+    run.status = "failed" if dns_action.get("status") == "failed" else "succeeded"
     run.finished_at = timezone.now()
     run.save(update_fields=["status", "finished_at", "log_text", "metadata_json", "updated_at"])
     _write_run_artifact(run, "xyn_runtime_install_plan.json", deployment_plan, "deployment_plan")
     _write_run_artifact(run, "xyn_runtime_install_endpoints.json", endpoints, "deployment_result")
+    _write_run_artifact(run, "dns_deployment_action.json", dns_action, "deployment_result")
     _write_run_summary(run)
 
     response_payload = {
@@ -14569,7 +14813,10 @@ def _intent_apply_install_xyn_instance(
         "action_type": "CreateDraft",
         "artifact_type": "Workspace",
         "artifact_id": str(runtime_artifact.id),
-        "summary": f'Installed Xyn runtime instance for "{customer_name}" at {fqdn}.',
+        "summary": (
+            f'Installed Xyn runtime instance for "{customer_name}" at {fqdn}. '
+            f"DNS {dns_action.get('status') or 'pending'} ({dns_record_type} -> {dns_record_value})."
+        ),
         "result": {
             "workspace": {"id": str(workspace.id), "created": workspace_created},
             "runtime": {"slug": runtime_artifact.slug, "installed": True},
@@ -14578,6 +14825,7 @@ def _intent_apply_install_xyn_instance(
                 "created": instance_created,
                 "fqdn": fqdn,
                 "deployment_target": deployment_target,
+                "instance_ref": {"artifact_id": str(selected_instance_artifact.id), "slug": selected_instance_artifact.slug},
             },
             "run": {
                 "id": str(run.id),
@@ -14585,6 +14833,7 @@ def _intent_apply_install_xyn_instance(
                 "summary": run.summary,
             },
             "endpoints": endpoints,
+            "dns_action": dns_action,
         },
         "next_actions": [
             {"label": "Open Deployment Run", "action": "OpenPanel", "panel_key": "run_detail", "params": {"run_id": str(run.id)}},
@@ -14935,7 +15184,7 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
 
     xyn_instance_request = _match_install_xyn_instance_command(message)
     if xyn_instance_request:
-        customer_name, fqdn = xyn_instance_request
+        customer_name, fqdn, instance_ref, dns_enabled, dns_mode = xyn_instance_request
         operator_workspace = _resolve_workspace_for_identity(identity, context_workspace_id)
         if not operator_workspace:
             return JsonResponse({"error": "workspace context is required for xyn instance install flow"}, status=400)
@@ -14947,7 +15196,7 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
                 "artifact_id": None,
                 "summary": (
                     f'Will create/find workspace for "{customer_name}", install xyn runtime artifacts, '
-                    f"and configure deployment for {fqdn}."
+                    f"and configure deployment for {fqdn} using instance {instance_ref}."
                 ),
                 "draft_payload": {
                     "__operation": "install_xyn_instance",
@@ -14955,7 +15204,9 @@ def xyn_intent_resolve(request: HttpRequest) -> JsonResponse:
                     "fqdn": fqdn,
                     "operator_workspace_id": str(operator_workspace.id),
                     "target_environment": "local",
-                    "dns_mode": "manual",
+                    "dns_mode": dns_mode,
+                    "dns": {"enabled": dns_enabled, "ttl": 60},
+                    "instance_ref": {"artifact_id": instance_ref},
                     "tls_mode": "letsencrypt",
                 },
                 "next_actions": [

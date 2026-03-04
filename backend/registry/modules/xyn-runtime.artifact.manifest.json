@@ -77,6 +77,36 @@
         "enum": ["manual", "route53"],
         "default": "manual"
       },
+      "instance_ref": {
+        "type": "object",
+        "required": false,
+        "properties": {
+          "artifact_id": { "type": "string" }
+        }
+      },
+      "dns": {
+        "type": "object",
+        "required": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "ttl": { "type": "integer", "default": 60 }
+        }
+      },
+      "dns_provider": {
+        "type": "object",
+        "required": false,
+        "properties": {
+          "kind": { "type": "string", "enum": ["route53"] },
+          "hosted_zone_id": { "type": "string" },
+          "region": { "type": "string" },
+          "credentials_ref": {
+            "type": "object",
+            "properties": {
+              "context_pack_id": { "type": "string" }
+            }
+          }
+        }
+      },
       "tls_mode": {
         "type": "string",
         "enum": ["letsencrypt", "provided"],

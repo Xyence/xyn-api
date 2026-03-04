@@ -38,6 +38,21 @@
       "type": "string",
       "enum": ["route53"]
     },
+    "instance_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "dns": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ttl": { "type": "integer", "minimum": 30, "maximum": 86400 }
+      }
+    },
     "runtime": {
       "type": "object",
       "additionalProperties": false,
